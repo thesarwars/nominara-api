@@ -16,6 +16,7 @@ import { keepChoiceForAdoption } from "../../lib/billing/downgrade-keep.js";
 import type { KeepChoice } from "../../lib/billing/downgrade-pause.js";
 import { enqueueDowngradeNotices } from "../../lib/billing/downgrade-notice-outbox.js";
 import { reconcileAndRecordDowngradePause } from "../../lib/billing/downgrade-pause-record.js";
+import { loadEnv } from "../../config/env.js";
 import { recordRetentionShortening } from "../../lib/billing/retention-shortening.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 
@@ -314,7 +315,7 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     toPlanKey: string,
     afterCommit: StripeEventContext["afterCommit"],
   ): Promise<void> {
-    const notices = await recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId: eventId, actorUa: `operator:${WEBHOOK_OPERATOR}` });
+    const notices = await recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId: eventId, actorUa: `operator:${WEBHOOK_OPERATOR}`, appOrigin: loadEnv().WEBAUTHN_ORIGIN });
     if (notices.length > 0) {
       const producer = this.producer;
       const enqueue = producer === undefined ? undefined : (...args: Parameters<QueueProducer["enqueueTenantJob"]>) => producer.enqueueTenantJob(...args);

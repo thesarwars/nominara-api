@@ -63,6 +63,8 @@ export function windowShortened(from: RetentionWindow, to: RetentionWindow): boo
 
 export interface PurgeProjectLine {
   readonly name: string;
+  /** The project's id for its reports link; `null` for a soft-deleted project (named, but nothing to export through). */
+  readonly projectId?: string | null;
   readonly count: number;
   readonly oldest: Date;
   readonly newest: Date;
@@ -86,6 +88,8 @@ export interface RetentionShorteningNotice {
   readonly attribution?: PurgeListSection | null;
   /** What the NEW plan's exports allow (`exports.csv`, `exports.pdf_per_cycle`): the email offers only an export the plan can run. */
   readonly newPlanExports: { readonly csv: boolean; readonly pdfPerCycle: number | "unlimited" };
+  /** The app's public origin (`WEBAUTHN_ORIGIN`), for the export link; absent, the link is the app-relative path (as in the notification emails). */
+  readonly appOrigin?: string | undefined;
 }
 
 const day = (d: Date): string => d.toISOString().slice(0, 10);
@@ -121,6 +125,20 @@ function exportSentence(toPlanName: string, date: string, exports: RetentionShor
   );
 }
 
+/** One reports-page link per listed, non-deleted project, in first-listed order. The reports page is per project (`/p/{id}/reports`). */
+function exportLinks(notice: RetentionShorteningNotice): string[] {
+  const exports = notice.newPlanExports;
+  if (!exports.csv && !(exports.pdfPerCycle === "unlimited" || exports.pdfPerCycle > 0)) return [];
+  const origin = notice.appOrigin === undefined ? "" : notice.appOrigin.replace(/\/+$/u, "");
+  const seen = new Map<string, string>();
+  for (const section of [notice.raw, notice.rollups, notice.attribution ?? null]) {
+    for (const p of section?.projects ?? []) {
+      if (typeof p.projectId === "string" && !seen.has(p.projectId)) seen.set(p.projectId, `  ${p.name}: ${origin}/p/${p.projectId}/reports`);
+    }
+  }
+  return [...seen.values()];
+}
+
 /** The notice's email: what goes, per project, and when; that nothing goes sooner; how to export; what survives. */
 export function retentionShorteningEmail(to: string, notice: RetentionShorteningNotice): EmailMessage {
   const date = day(notice.purgeNotBefore);
@@ -149,6 +167,7 @@ export function retentionShorteningEmail(to: string, notice: RetentionShortening
       "Milestones you recorded are never purged by retention.",
     "",
     exportSentence(notice.toPlanName, date, notice.newPlanExports),
+    ...exportLinks(notice),
     `If you move to a plan with a longer window before then, the longer window applies again.`,
   );
   return { to, subject: RETENTION_NOTICE_SUBJECT, textBody: lines.join("\n") };
@@ -178,16 +197,24 @@ async function planRetention(tx: ClientBase, planKey: string): Promise<PlanReten
   return { name: row.display_name, raw: row.raw as RetentionWindow, rollups: row.rollups as RetentionWindow, exports: { csv: row.csv === true, pdfPerCycle: pdf } };
 }
 
+/**
+ * A soft-deleted project's rows are still expired by the sweep until its hard delete, so it stays in the list, labelled: the
+ * customer thinks it is gone. It gets no `projectId`, so no reports link.
+ */
+function projectRef(row: { id: string; name: string; deleted: boolean }): { name: string; projectId: string | null } {
+  return row.deleted ? { name: `${row.name} (deleted project)`, projectId: null } : { name: row.name, projectId: row.id };
+}
+
 /** Per project: raw captures that the purge would expire (the sweep's own predicate) older than `cutoff`. */
 async function rawPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date): Promise<PurgeProjectLine[]> {
-  const r = await tx.query<{ name: string; count: string; oldest: Date; newest: Date }>(
-    `SELECT p.name, count(*) AS count, min(c.captured_at) AS oldest, max(c.captured_at) AS newest
+  const r = await tx.query<{ id: string; name: string; deleted: boolean; count: string; oldest: Date; newest: Date }>(
+    `SELECT p.id, p.name, (p.deleted_at IS NOT NULL) AS deleted, count(*) AS count, min(c.captured_at) AS oldest, max(c.captured_at) AS newest
        FROM answer_captures c JOIN projects p ON p.id = c.project_id
       WHERE c.workspace_id = $1 AND c.captured_at < $2 AND c.raw_object_key IS NOT NULL
-      GROUP BY p.id, p.name ORDER BY p.name, p.id`,
+      GROUP BY p.id, p.name, p.deleted_at ORDER BY p.name, p.id`,
     [workspaceId, cutoff.toISOString()],
   );
-  return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: row.oldest, newest: row.newest }));
+  return r.rows.map((row) => ({ ...projectRef(row), count: Number(row.count), oldest: row.oldest, newest: row.newest }));
 }
 
 /** A date-only ISO string (`YYYY-MM-DD`) is read as UTC midnight by the Date constructor. */
@@ -195,26 +222,26 @@ const utcMidnightOf = (dateOnly: string): Date => new Date(dateOnly);
 
 /** Per project: rollup DAYS (not rows: a day has a row per engine and entity) older than `cutoff`. */
 async function rollupPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date): Promise<PurgeProjectLine[]> {
-  const r = await tx.query<{ name: string; count: string; oldest: string; newest: string }>(
-    `SELECT p.name, count(DISTINCT m.metric_date) AS count, min(m.metric_date)::text AS oldest, max(m.metric_date)::text AS newest
+  const r = await tx.query<{ id: string; name: string; deleted: boolean; count: string; oldest: string; newest: string }>(
+    `SELECT p.id, p.name, (p.deleted_at IS NOT NULL) AS deleted, count(DISTINCT m.metric_date) AS count, min(m.metric_date)::text AS oldest, max(m.metric_date)::text AS newest
        FROM metric_daily m JOIN projects p ON p.id = m.project_id
       WHERE m.workspace_id = $1 AND m.metric_date < $2::date
-      GROUP BY p.id, p.name ORDER BY p.name, p.id`,
+      GROUP BY p.id, p.name, p.deleted_at ORDER BY p.name, p.id`,
     [workspaceId, day(cutoff)],
   );
-  return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
+  return r.rows.map((row) => ({ ...projectRef(row), count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
 }
 
 /** Per project: `attribution_daily` days (not rows) older than `cutoff`: the same window the rollups use. */
 async function attributionPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date): Promise<PurgeProjectLine[]> {
-  const r = await tx.query<{ name: string; count: string; oldest: string; newest: string }>(
-    `SELECT p.name, count(DISTINCT a.metric_date) AS count, min(a.metric_date)::text AS oldest, max(a.metric_date)::text AS newest
+  const r = await tx.query<{ id: string; name: string; deleted: boolean; count: string; oldest: string; newest: string }>(
+    `SELECT p.id, p.name, (p.deleted_at IS NOT NULL) AS deleted, count(DISTINCT a.metric_date) AS count, min(a.metric_date)::text AS oldest, max(a.metric_date)::text AS newest
        FROM attribution_daily a JOIN projects p ON p.id = a.project_id
       WHERE a.workspace_id = $1 AND a.metric_date < $2::date
-      GROUP BY p.id, p.name ORDER BY p.name, p.id`,
+      GROUP BY p.id, p.name, p.deleted_at ORDER BY p.name, p.id`,
     [workspaceId, day(cutoff)],
   );
-  return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
+  return r.rows.map((row) => ({ ...projectRef(row), count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
 }
 
 export interface RetentionShorteningInput {
@@ -226,6 +253,8 @@ export interface RetentionShorteningInput {
   readonly actorUa: string;
   /** Injectable for tests; the plan change's own instant otherwise. */
   readonly now?: Date;
+  /** The app's public origin for the export link in the email (`WEBAUTHN_ORIGIN`). The outbox stores the rendered body, so the writer supplies it. */
+  readonly appOrigin?: string;
 }
 
 /**
@@ -307,7 +336,7 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
         return [];
       }
 
-      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution, newPlanExports: to.exports });
+      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution, newPlanExports: to.exports, appOrigin: input.appOrigin });
       const recorded = await recordDowngradeNotices(tx, workspaceId, input.requestId, [{ kind: RETENTION_NOTICE_KIND, message: email }]);
       if (recorded.length === 0) {
         // A redelivery: its notice exists, and the deferral it set must not move.

@@ -66,6 +66,50 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
     expect(body).toMatch(/export your data before 2026-11-11 with the report export \(CSV or PDF\)/i);
   });
 
+  // Review round 3 (major): the owner decision says the notice LINKS the report export; naming it is not a link.
+  describe("R1 · the export link (review round 3)", () => {
+    const withIds = {
+      ...base,
+      appOrigin: "https://app.nominara.test/",
+      raw: {
+        ...base.raw,
+        projects: [
+          { name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z"), projectId: "0190a000-0000-7000-8000-00000000000a" },
+          { name: "Gone (deleted project)", count: 2, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2025-10-02T00:00:00.000Z"), projectId: null },
+        ],
+      },
+    };
+
+    it("R1 · links each listed project's reports page with an absolute URL when the new plan can export", () => {
+      const body = retentionShorteningEmail("o@example.com", withIds).textBody;
+      expect(body).toContain("https://app.nominara.test/p/0190a000-0000-7000-8000-00000000000a/reports");
+      expect(body, "no double slash after the origin").not.toContain("test//p/");
+    });
+
+    it("R1 · a deleted project has no link", () => {
+      const body = retentionShorteningEmail("o@example.com", withIds).textBody;
+      expect(body.match(/\/reports/g)).toHaveLength(1);
+    });
+
+    it("R1 · a plan with no export gets no link (the export would be refused)", () => {
+      const body = retentionShorteningEmail("o@example.com", { ...withIds, newPlanExports: { csv: false, pdfPerCycle: 0 } }).textBody;
+      expect(body).not.toContain("/reports");
+    });
+
+    it("R1 · with no configured origin the link is the app-relative path, as the notification emails do", () => {
+      const body = retentionShorteningEmail("o@example.com", { ...withIds, appOrigin: undefined }).textBody;
+      expect(body).toContain("/p/0190a000-0000-7000-8000-00000000000a/reports");
+      expect(body).not.toContain("http");
+    });
+
+    it("R1 · a project named in two sections is linked once", () => {
+      const line = withIds.raw.projects[0]!;
+      const section = { from: 730 as number | null, to: 395 as number | null, cutoff: new Date("2026-08-13T09:30:00.000Z"), projects: [line] };
+      const body = retentionShorteningEmail("o@example.com", { ...withIds, rollups: section }).textBody;
+      expect(body.match(/\/reports/g)).toHaveLength(1);
+    });
+  });
+
   // Review round 2 (minor): the sweep keeps expiring data under the REPLACED plan's window during the deferral, so the notice
   // may not claim "nothing is deleted" outright; it promises only that this change deletes nothing before the date.
   it("R1 · the deferral promise is exact: this change deletes nothing before the date, and data the old plan already expired still goes", () => {

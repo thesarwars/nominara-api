@@ -81,10 +81,10 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     );
   }
 
-  async function record(workspaceId: string, fromPlanKey: string, toPlanKey: string, requestId: string, now: Date, actorUa = "operator:test-writer") {
+  async function record(workspaceId: string, fromPlanKey: string, toPlanKey: string, requestId: string, now: Date, actorUa = "operator:test-writer", appOrigin?: string) {
     const client = await pool.connect();
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId, now, actorUa }));
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId, now, actorUa, ...(appOrigin === undefined ? {} : { appOrigin }) }));
     } finally {
       client.release();
     }
@@ -146,6 +146,38 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     const [row] = await notices(ws);
     expect(row!.text_body).toMatch(/with the report export \(CSV or PDF\)/i);
     expect(row!.text_body).not.toMatch(/does not include data export/i);
+  });
+
+  it("R1 (review round 3) · the stored email LINKS the reports page of each project it lists when the new plan can export", async () => {
+    const ws = await workspace("enterprise"); // raw 1095 -> business 395; business exports
+    const site = await project(ws, "Acme Site");
+    const cutoff = new Date(NOW.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY - 395 * DAY);
+    await capture(ws, site, new Date(cutoff.getTime() - 3 * DAY));
+    await record(ws, "enterprise", "business", "evt_link_1", NOW, undefined, "https://app.nominara.test");
+    const [row] = await notices(ws);
+    expect(row!.text_body).toContain(`https://app.nominara.test/p/${site}/reports`);
+  });
+
+  it("R1 (review round 3) · a soft-deleted project is still named (the sweep expires its rows) but labelled, and has no link", async () => {
+    const ws = await workspace("enterprise");
+    const gone = await project(ws, "Old Site");
+    const cutoff = new Date(NOW.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY - 395 * DAY);
+    await capture(ws, gone, new Date(cutoff.getTime() - 3 * DAY));
+    await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [gone]);
+    await record(ws, "enterprise", "business", "evt_del_1", NOW, undefined, "https://app.nominara.test");
+    const [row] = await notices(ws);
+    expect(row!.text_body).toContain("Old Site (deleted project): 1 capture");
+    expect(row!.text_body).not.toContain(`/p/${gone}/reports`);
+  });
+
+  it("R1 (review round 3) · a downgrade to a plan with no export has no link", async () => {
+    const ws = await workspace("business");
+    const site = await project(ws, "Acme Site");
+    const cutoff = new Date(NOW.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY - 90 * DAY);
+    await capture(ws, site, new Date(cutoff.getTime() - 3 * DAY));
+    await record(ws, "business", "starter", "evt_nolink_1", NOW, undefined, "https://app.nominara.test");
+    const [row] = await notices(ws);
+    expect(row!.text_body).not.toContain("/reports");
   });
 
   it("scenario 6 · shortening the rollup window names the daily rollups that will go", async () => {
