@@ -444,22 +444,32 @@ export function resolveMaxRetentionDays(values: readonly unknown[]): number | nu
   return max;
 }
 
-export async function resolveDetachDropCutoffDays(client: ClientBase): Promise<number | null> {
-  const result = await client.query<{ value: unknown }>(
+export async function resolveDetachDropCutoffDays(client: ClientBase, referenceDate: Date = new Date()): Promise<number | null> {
+  const result = await client.query<{ value: unknown; until: Date | null; deferred_raw: number | null }>(
     // ->'value': entitlements are {value, live} since STORY-069.
-    `SELECT DISTINCT p.entitlements->'retention.raw_captures_days'->'value' AS value
+    `SELECT DISTINCT p.entitlements->'retention.raw_captures_days'->'value' AS value,
+                     w.retention_purge_not_before                          AS until,
+                     w.retention_deferred_raw_days                         AS deferred_raw
        FROM workspaces w
        JOIN plans p ON p.key = w.plan_key
       WHERE w.deleted_at IS NULL`,
   );
-  return resolveMaxRetentionDays(result.rows.map((row) => row.value));
+  // STORY-077 slice B (EC-41): a workspace whose retention shortening is still deferred keeps the window it was moved off
+  // until its purge date, so that window counts in the maximum too. A NULL kept window is "never purged": null in the
+  // reduction means no partition is dropped. Nothing here shortens a window; the deferral can only keep a partition longer.
+  const values: unknown[] = [];
+  for (const row of result.rows) {
+    values.push(row.value);
+    if (row.until !== null && row.until.getTime() >= referenceDate.getTime()) values.push(row.deferred_raw);
+  }
+  return resolveMaxRetentionDays(values);
 }
 
 export async function detachAndDropPartitions(
   client: ClientBase,
   referenceDate: Date = new Date(),
 ): Promise<DroppedPartitionGroup[]> {
-  const cutoffDays = await resolveDetachDropCutoffDays(client);
+  const cutoffDays = await resolveDetachDropCutoffDays(client, referenceDate);
   if (cutoffDays === null) {
     return [];
   }

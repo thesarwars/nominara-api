@@ -338,6 +338,56 @@ describe("STORY-013 · partition & vacuum maintenance", () => {
     expect(stillThere.rowCount).toBe(1);
   });
 
+  // -- STORY-077 slice B (EC-41) — the monthly drop honours a retention deferral ---------------
+
+  const DAY = 86_400_000;
+  const monthPartitionExists = async (table: string, suffix: string): Promise<boolean> =>
+    ((await client.query("SELECT 1 FROM pg_class WHERE relname = $1", [`${table}_${suffix}`])).rowCount ?? 0) > 0;
+
+  it("STORY-077B EC-41 · a workspace deferring a retention shortening keeps its older partitions until the purge date, then they are dropped", async () => {
+    // The only workspace in the platform on a long window just moved to a short plan: the plan max would fall at once.
+    const reference = new Date("2041-09-15T00:00:00.000Z");
+    const month = new Date("2041-01-01T00:00:00.000Z"); // ~225 days old at `reference`: past 30 days, inside 395
+    for (const table of ["answer_captures", "mention_facts", "citation_facts"] as const) {
+      await ensurePartitionsForTable(client, table, month, 0);
+    }
+    const workspaceId = await createWorkspace("free");
+    await client.query(
+      "UPDATE workspaces SET retention_purge_not_before = $2, retention_deferred_raw_days = 395, retention_deferred_rollups_days = 1095 WHERE id = $1",
+      [workspaceId, new Date(reference.getTime() + 5 * DAY).toISOString()],
+    );
+    try {
+      expect(await resolveDetachDropCutoffDays(client, reference)).toBe(395);
+      const during = await detachAndDropPartitions(client, reference);
+      expect(during.some((g) => g.monthSuffix === "2041_01")).toBe(false);
+      expect(await monthPartitionExists("answer_captures", "2041_01")).toBe(true);
+
+      const after = await detachAndDropPartitions(client, new Date(reference.getTime() + 6 * DAY));
+      expect(after.some((g) => g.monthSuffix === "2041_01")).toBe(true);
+      expect(await monthPartitionExists("answer_captures", "2041_01")).toBe(false);
+    } finally {
+      await client.query("UPDATE workspaces SET deleted_at = now() WHERE id = $1", [workspaceId]);
+    }
+  });
+
+  it("STORY-077B EC-41 · a deferral that kept no finite window (NULL) means never drop while it runs", async () => {
+    const reference = new Date("2042-09-15T00:00:00.000Z");
+    const month = new Date("2042-01-01T00:00:00.000Z");
+    for (const table of ["answer_captures", "mention_facts", "citation_facts"] as const) {
+      await ensurePartitionsForTable(client, table, month, 0);
+    }
+    const workspaceId = await createWorkspace("free");
+    await client.query("UPDATE workspaces SET retention_purge_not_before = $2 WHERE id = $1", [workspaceId, new Date(reference.getTime() + 5 * DAY).toISOString()]);
+    try {
+      expect(await resolveDetachDropCutoffDays(client, reference)).toBeNull();
+      expect(await detachAndDropPartitions(client, reference)).toEqual([]);
+      expect(await monthPartitionExists("answer_captures", "2042_01")).toBe(true);
+      expect(await resolveDetachDropCutoffDays(client, new Date(reference.getTime() + 6 * DAY))).toBe(30);
+    } finally {
+      await client.query("UPDATE workspaces SET deleted_at = now() WHERE id = $1", [workspaceId]);
+    }
+  });
+
   // -- Test Scenario 7 — vector recall + concurrent rebuild ------------------
 
   it("T7 mechanism-only · the rebuild-triggering wiring fires when recall < threshold, using an artificially high threshold to isolate it from real recall degradation (see the REAL-threshold test below for the actual degradation condition)", async () => {
