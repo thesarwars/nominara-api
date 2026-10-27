@@ -6,7 +6,9 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { resetDatabase } from "../../src/db/reset-database.js";
 import { SYNTHETIC_TENANTS } from "../../src/db/seed/synthetic/constants.js";
 import { runSyntheticSeed, type SyntheticSeedPool, type SyntheticSeedPoolClient } from "../../src/db/seed/synthetic/seed-tenants.js";
+import { planSetViaCli } from "../../src/db/seed/synthetic/plan-set-cli.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
+import { planSetChildEnv } from "../support/seed-plan-set-env.js";
 import { testDek } from "../support/test-dek.js";
 
 // STORY-004 AC7 / test scenario 5 ("Run the reset command -> a clean
@@ -47,6 +49,8 @@ describe("STORY-004 · db:reset then db:seed (scenario 5)", () => {
     };
   }
 
+  const setPlan = () => planSetViaCli(planSetChildEnv(container.getHost(), container.getMappedPort(5432), container.getDatabase()));
+
   async function count(client: Client, sql: string): Promise<number> {
     const result = await client.query<{ n: string }>(sql);
     return Number(result.rows[0]!.n);
@@ -59,7 +63,7 @@ describe("STORY-004 · db:reset then db:seed (scenario 5)", () => {
       // A half-used local database: migrated, credentialed, seeded, plus debris.
       await migrateUp(client);
       await applyDevCredentials(client, {});
-      await runSyntheticSeed({ pool: appPool(), dekProvisioner, log: () => {} });
+      await runSyntheticSeed({ pool: appPool(), dekProvisioner, setPlan: setPlan(), log: () => {} });
       await client.query("CREATE TABLE public.stray_debris (id int)");
       await client.query(`INSERT INTO users (id, email, status) VALUES (gen_random_uuid(), 'stray@example.test', 'active')`);
       expect(await count(client, "SELECT count(*)::text AS n FROM workspaces")).toBe(3);
@@ -75,7 +79,7 @@ describe("STORY-004 · db:reset then db:seed (scenario 5)", () => {
       expect(await count(client, "SELECT count(*)::text AS n FROM pg_tables WHERE tablename = 'stray_debris'")).toBe(0);
 
       await applyDevCredentials(client, {});
-      const outcomes = await runSyntheticSeed({ pool: appPool(), dekProvisioner, log: () => {} });
+      const outcomes = await runSyntheticSeed({ pool: appPool(), dekProvisioner, setPlan: setPlan(), log: () => {} });
 
       expect(outcomes.map((outcome) => outcome.workspaceCreated)).toEqual([true, true, true]);
       expect(await count(client, "SELECT count(*)::text AS n FROM workspaces")).toBe(SYNTHETIC_TENANTS.length);

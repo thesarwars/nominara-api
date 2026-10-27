@@ -42,37 +42,58 @@ export interface DemoSeedGuardInput {
   readonly optIn: string | undefined;
 }
 
+/**
+ * STORY-004 — the same three conditions, worded for whichever dev-only seed
+ * is asking. `pnpm db:seed` (the synthetic tenants) reuses this rather than
+ * retyping the checks; only the noun in each message and the name of the
+ * opt-in variable differ, so the two refusals cannot drift apart.
+ */
+export interface LocalSeedWording {
+  /** What the refusal says it will not seed, e.g. "demo data". */
+  readonly what: string;
+  /** The opt-in variable the operator must set to exactly "1". */
+  readonly optInName: string;
+}
+
+const DEMO_WORDING: LocalSeedWording = { what: "demo data", optInName: "NOMINARA_DEMO_SEED" };
+
 /** Throws a `DemoSeedRefusedError` naming the first unmet condition. Exported for its test — no database required. */
 export function assertDemoSeedAllowed(input: DemoSeedGuardInput): void {
+  assertLocalSeedAllowed(input, DEMO_WORDING);
+}
+
+/** The shared refusal behind every dev-only seed: NODE_ENV, both hosts local, an explicit opt-in. */
+export function assertLocalSeedAllowed(input: DemoSeedGuardInput, wording: LocalSeedWording): void {
+  const what = wording.what;
   if (input.nodeEnv === "production") {
     throw new DemoSeedRefusedError(
-      "refusing to seed demo data: NODE_ENV=production. This is a dev-only tool; it never runs in a production deploy.",
+      `refusing to seed ${what}: NODE_ENV=production. This is a dev-only tool; it never runs in a production deploy.`,
     );
   }
 
   if (input.databaseUrl === undefined || input.databaseUrl.trim() === "") {
-    throw new DemoSeedRefusedError("refusing to seed demo data: DATABASE_URL is not set.");
+    throw new DemoSeedRefusedError(`refusing to seed ${what}: DATABASE_URL is not set.`);
   }
   if (input.databaseUrlPooled === undefined || input.databaseUrlPooled.trim() === "") {
-    throw new DemoSeedRefusedError("refusing to seed demo data: DATABASE_URL_POOLED is not set.");
+    throw new DemoSeedRefusedError(`refusing to seed ${what}: DATABASE_URL_POOLED is not set.`);
   }
 
   if (!isLocalTarget(input.databaseUrl)) {
     throw new DemoSeedRefusedError(
-      `refusing to seed demo data: DATABASE_URL names "${hostnameOf(input.databaseUrl)}", not a local host. ` +
+      `refusing to seed ${what}: DATABASE_URL names "${hostnameOf(input.databaseUrl)}", not a local host. ` +
         "This seed writes synthetic tenant data and must never run against anything but a developer's own database.",
     );
   }
   if (!isLocalTarget(input.databaseUrlPooled)) {
     throw new DemoSeedRefusedError(
-      `refusing to seed demo data: DATABASE_URL_POOLED names "${hostnameOf(input.databaseUrlPooled)}", not a local host. ` +
+      `refusing to seed ${what}: DATABASE_URL_POOLED names "${hostnameOf(input.databaseUrlPooled)}", not a local host. ` +
         "Both connections must be local, or a hybrid setup could seed synthetic rows onto a shared database.",
     );
   }
 
   if (input.optIn !== "1") {
     throw new DemoSeedRefusedError(
-      "refusing to seed demo data: set NOMINARA_DEMO_SEED=1 to opt in explicitly. Passing every other check is not consent.",
+      `refusing to seed ${what}: set ${wording.optInName}=1 to opt in explicitly. Passing every other check is not consent.`,
     );
   }
 }

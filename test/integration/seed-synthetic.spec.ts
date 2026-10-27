@@ -13,10 +13,12 @@ import {
 import { runSyntheticSeed, type SyntheticSeedPool, type SyntheticSeedPoolClient } from "../../src/db/seed/synthetic/seed-tenants.js";
 import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
+import { planSetViaCli } from "../../src/db/seed/synthetic/plan-set-cli.js";
 import { LocalDekProvisioner } from "../../src/modules/workspaces/adapters/local-dek-provisioner.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { verifyWorkspaceChain } from "../../src/workers/rollup/audit-verify.js";
+import { planSetChildEnv } from "../support/seed-plan-set-env.js";
 import { testDek } from "../support/test-dek.js";
 
 // STORY-004 AC5 / test scenario 4 ("Run the seed twice -> idempotent; no
@@ -86,7 +88,8 @@ describe("STORY-004 · db:seed — three awkward synthetic tenants (scenario 4)"
     };
   }
 
-  const seed = (pool: SyntheticSeedPool = testPool()) => runSyntheticSeed({ pool, dekProvisioner, log: () => {} });
+  const seed = (pool: SyntheticSeedPool = testPool()) =>
+    runSyntheticSeed({ pool, dekProvisioner, setPlan: planSetViaCli(planSetChildEnv(container.getHost(), container.getMappedPort(5432), container.getDatabase())), log: () => {} });
 
   const workspaceIds = SYNTHETIC_TENANTS.map((tenant) => tenant.workspaceId);
 

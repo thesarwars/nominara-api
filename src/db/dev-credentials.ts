@@ -34,20 +34,27 @@ export function resolvePassword(role: string, env: NodeJS.ProcessEnv = process.e
   return env[envVarName(role)] ?? DEFAULT_PASSWORDS[role]!;
 }
 
-/** STORY-004 AC7 — RED stub. Implemented in the next commit. */
-export async function applyDevCredentials(_client: ClientBase, _env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
-  throw new Error("not implemented");
+/**
+ * Sets every runtime + break-glass role's local password. Returns the roles
+ * it set. Exported (STORY-004) so `pnpm db:reset --seed` and the reset test
+ * apply the exact same step as `pnpm db:dev-credentials`.
+ */
+export async function applyDevCredentials(client: ClientBase, env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+  const roles = [...RUNTIME_ROLES, BREAKGLASS_ROLE];
+  for (const role of roles) {
+    const password = resolvePassword(role, env);
+    // client.escapeLiteral, not hand-rolled quote-doubling: the latter is
+    // exactly the string-concatenation-into-SQL pattern the coding
+    // standards ban, and breaks under non-default standard_conforming_strings.
+    await client.query(`ALTER ROLE ${role} PASSWORD ${client.escapeLiteral(password)}`);
+  }
+  return roles;
 }
 
 async function main() {
   const client = await connect(requireDatabaseUrl());
   try {
-    for (const role of [...RUNTIME_ROLES, BREAKGLASS_ROLE]) {
-      const password = resolvePassword(role);
-      // client.escapeLiteral, not hand-rolled quote-doubling: the latter is
-      // exactly the string-concatenation-into-SQL pattern the coding
-      // standards ban, and breaks under non-default standard_conforming_strings.
-      await client.query(`ALTER ROLE ${role} PASSWORD ${client.escapeLiteral(password)}`);
+    for (const role of await applyDevCredentials(client)) {
       console.log(`set local dev password for ${role}`);
     }
   } finally {
