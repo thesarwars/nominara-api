@@ -1,3 +1,4 @@
+import { RETENTION_NOTICE_SUBJECT } from "../../src/lib/billing/retention-shortening.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -81,7 +82,9 @@ describe("STORY-077 D2 · the keep choice and the most-recently-active default",
   function spyEmail(): EmailMessage[] {
     const sent: EmailMessage[] = [];
     vi.spyOn(LoggingEmailSenderAdapter.prototype, "send").mockImplementation(async (message: EmailMessage) => {
-      sent.push(message);
+      // STORY-077 slice B: a downgrade that shortens retention also sends the retention notice (retention-notice.spec.ts owns it).
+      // These scenarios are about the pause list, so that email is not counted here.
+      if (message.subject !== RETENTION_NOTICE_SUBJECT) sent.push(message);
     });
     return sent;
   }

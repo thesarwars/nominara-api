@@ -30,6 +30,7 @@ import { downgradeNoticeContact } from "./downgrade-pause-notice.js";
 export const RETENTION_NOTICE_DAYS = 14;
 export const RETENTION_FIRST_PURGE_DAYS = 15;
 export const RETENTION_NOTICE_KIND = "retention_shortened" as const;
+export const RETENTION_NOTICE_SUBJECT = "Your plan change shortens how long Nominara keeps your data";
 /** The most projects named per list in one email; the totals are always exact. */
 const MAX_NAMED_PROJECTS = 50;
 const DAY_MS = 86_400_000;
@@ -117,7 +118,7 @@ export function retentionShorteningEmail(to: string, notice: RetentionShortening
     `To keep a copy, export your data before ${date} with the report export in Nominara (CSV or PDF). ` +
       `If you move to a plan with a longer window before then, the longer window applies again.`,
   );
-  return { to, subject: "Your plan change shortens how long Nominara keeps your data", textBody: lines.join("\n") };
+  return { to, subject: RETENTION_NOTICE_SUBJECT, textBody: lines.join("\n") };
 }
 
 interface PlanRetention {
