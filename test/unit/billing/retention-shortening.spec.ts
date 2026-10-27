@@ -48,7 +48,6 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
       ],
     },
     rollups: null,
-    newPlanExports: { csv: true, pdfPerCycle: 25 },
   };
 
   it("R1 · names the purge date, each project's exact count and its oldest and newest capture dates", () => {
@@ -61,53 +60,39 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
     expect(m.textBody).toContain("2026-08-13");
   });
 
-  it("R1 · offers the report export when the new plan has one", () => {
-    const body = retentionShorteningEmail("o@example.com", base).textBody;
-    expect(body).toMatch(/export your data before 2026-11-11 with the report export \(CSV or PDF\)/i);
-  });
-
-  // Review round 3 (major): the owner decision says the notice LINKS the report export; naming it is not a link.
-  describe("R1 · the export link (review round 3)", () => {
+  // Owner decision 2026-10-27 #7: the report export is metric_daily capped at 90 days, so it cannot contain any purged item.
+  // The notice states what is purged and when; it offers no export and links no reports page, whatever the new plan allows.
+  describe("R1 · no export offer (owner decision 2026-10-27 #7)", () => {
     const withIds = {
       ...base,
-      appOrigin: "https://app.nominara.test/",
       raw: {
         ...base.raw,
         projects: [
-          { name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z"), projectId: "0190a000-0000-7000-8000-00000000000a" },
-          { name: "Gone (deleted project)", count: 2, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2025-10-02T00:00:00.000Z"), projectId: null },
+          { name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z") },
+          { name: "Gone (deleted project)", count: 2, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2025-10-02T00:00:00.000Z") },
         ],
       },
     };
-
-    it("R1 · links each listed project's reports page with an absolute URL when the new plan can export", () => {
-      const body = retentionShorteningEmail("o@example.com", withIds).textBody;
-      expect(body).toContain("https://app.nominara.test/p/0190a000-0000-7000-8000-00000000000a/reports");
-      expect(body, "no double slash after the origin").not.toContain("test//p/");
-    });
-
-    it("R1 · a deleted project has no link", () => {
-      const body = retentionShorteningEmail("o@example.com", withIds).textBody;
-      expect(body.match(/\/reports/g)).toHaveLength(1);
-    });
-
-    it("R1 · a plan with no export gets no link (the export would be refused)", () => {
-      const body = retentionShorteningEmail("o@example.com", { ...withIds, newPlanExports: { csv: false, pdfPerCycle: 0 } }).textBody;
-      expect(body).not.toContain("/reports");
-    });
-
-    it("R1 · with no configured origin the link is the app-relative path, as the notification emails do", () => {
-      const body = retentionShorteningEmail("o@example.com", { ...withIds, appOrigin: undefined }).textBody;
-      expect(body).toContain("/p/0190a000-0000-7000-8000-00000000000a/reports");
-      expect(body).not.toContain("http");
-    });
-
-    it("R1 · a project named in two sections is linked once", () => {
-      const line = withIds.raw.projects[0]!;
-      const section = { from: 730 as number | null, to: 395 as number | null, cutoff: new Date("2026-08-13T09:30:00.000Z"), projects: [line] };
-      const body = retentionShorteningEmail("o@example.com", { ...withIds, rollups: section }).textBody;
-      expect(body.match(/\/reports/g)).toHaveLength(1);
-    });
+    const planPairs: ReadonlyArray<readonly [string, string]> = [
+      ["Business", "Growth"], // the new plan has exports
+      ["Enterprise", "Business"],
+      ["Growth", "Starter"], // the new plan has none
+      ["Business", "Free"],
+    ];
+    for (const [fromPlanName, toPlanName] of planPairs) {
+      it(`R1 · ${fromPlanName} to ${toPlanName}: no export sentence and no reports link, but the purge list and date stay`, () => {
+        const section = { from: 730 as number | null, to: 395 as number | null, cutoff: new Date("2026-08-13T09:30:00.000Z"), projects: [withIds.raw.projects[0]!] };
+        const body = retentionShorteningEmail("o@example.com", { ...withIds, fromPlanName, toPlanName, rollups: section }).textBody;
+        expect(body).not.toMatch(/export/i);
+        expect(body).not.toMatch(/to keep a copy/i);
+        expect(body).not.toMatch(/support/i);
+        expect(body).not.toContain("/reports");
+        expect(body).not.toContain("http");
+        expect(body).toContain("Acme Site: 120 captures, 2025-10-01 to 2026-08-12");
+        expect(body).toContain("Gone (deleted project): 2 captures");
+        expect(body).toContain("2026-11-11");
+      });
+    }
   });
 
   // Review round 2 (minor): the sweep keeps expiring data under the REPLACED plan's window during the deferral, so the notice
@@ -118,28 +103,6 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
     expect(body).toMatch(/because of this change/i);
     expect(body).toMatch(/previous plan/i);
     expect(body).toContain("2026-11-11");
-  });
-
-  // Review round 2 (major): Starter and Free have exports.csv=false and exports.pdf_per_cycle=0, so the export the email names
-  // would be refused. The email says so plainly rather than offering it.
-  it("R1 · a new plan with no export says so plainly and does not offer the report export", () => {
-    const body = retentionShorteningEmail("o@example.com", { ...base, newPlanExports: { csv: false, pdfPerCycle: 0 } }).textBody;
-    expect(body).not.toMatch(/with the report export/i);
-    expect(body).toMatch(/Starter plan does not include data export/i);
-    expect(body).toMatch(/longer window/i);
-  });
-
-  it("R1 · a new plan with only a PDF quota names the PDF and its quota, not CSV", () => {
-    const body = retentionShorteningEmail("o@example.com", { ...base, newPlanExports: { csv: false, pdfPerCycle: 25 } }).textBody;
-    expect(body).toMatch(/PDF report export/i);
-    expect(body).toContain("25");
-    expect(body).not.toMatch(/CSV/);
-  });
-
-  it("R1 · a new plan with only CSV names CSV, not PDF", () => {
-    const body = retentionShorteningEmail("o@example.com", { ...base, newPlanExports: { csv: true, pdfPerCycle: 0 } }).textBody;
-    expect(body).toMatch(/CSV report export/i);
-    expect(body).not.toMatch(/PDF/);
   });
 
   it("R1 · says charts and milestones outlive the raw text", () => {

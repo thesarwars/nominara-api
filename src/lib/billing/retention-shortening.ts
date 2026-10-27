@@ -10,7 +10,7 @@ import { recordDowngradeNotices, type RecordedNotice } from "./downgrade-notice-
 import { downgradeNoticeContact } from "./downgrade-pause-notice.js";
 
 // STORY-077 slice B · EC-41 · data-model.md §7 "Plan downgrade shortening retention": a 14-day notice names exactly what will be
-// purged and when, offers a full export, and DEFERS THE FIRST PURGE TO DAY 15.
+// purged and when, and DEFERS THE FIRST PURGE TO DAY 15.
 //
 // Run by EVERY plan writer, inside its own tenant-context transaction, right after the plan is adopted (the Stripe webhook's
 // adoption and the operator CLI `plan:set`, beside the downgrade pause of slice A):
@@ -63,8 +63,6 @@ export function windowShortened(from: RetentionWindow, to: RetentionWindow): boo
 
 export interface PurgeProjectLine {
   readonly name: string;
-  /** The project's id for its reports link; `null` for a soft-deleted project (named, but nothing to export through). */
-  readonly projectId?: string | null;
   readonly count: number;
   readonly oldest: Date;
   readonly newest: Date;
@@ -86,10 +84,6 @@ export interface RetentionShorteningNotice {
   readonly rollups: PurgeListSection | null;
   /** `attribution_daily` days, which go under the rollup window; absent when the rollup window is not shortened. */
   readonly attribution?: PurgeListSection | null;
-  /** What the NEW plan's exports allow (`exports.csv`, `exports.pdf_per_cycle`): the email offers only an export the plan can run. */
-  readonly newPlanExports: { readonly csv: boolean; readonly pdfPerCycle: number | "unlimited" };
-  /** The app's public origin (`WEBAUTHN_ORIGIN`), for the export link; absent, the link is the app-relative path (as in the notification emails). */
-  readonly appOrigin?: string | undefined;
 }
 
 const day = (d: Date): string => d.toISOString().slice(0, 10);
@@ -113,33 +107,7 @@ function sectionLines(title: string, noun: [string, string], emptyText: string, 
   return lines;
 }
 
-function exportSentence(toPlanName: string, date: string, exports: RetentionShorteningNotice["newPlanExports"]): string {
-  const pdf = exports.pdfPerCycle === "unlimited" || exports.pdfPerCycle > 0;
-  const quota = exports.pdfPerCycle === "unlimited" ? "unlimited per billing cycle" : `${String(exports.pdfPerCycle)} per billing cycle`;
-  if (exports.csv && pdf) return `To keep a copy, export your data before ${date} with the report export (CSV or PDF).`;
-  if (exports.csv) return `To keep a copy, export your data before ${date} with the CSV report export.`;
-  if (pdf) return `To keep a copy, export your data before ${date} with the PDF report export (${quota}).`;
-  return (
-    `Your ${toPlanName} plan does not include data export, so you cannot export your data from Nominara on this plan. ` +
-    `To keep it, move to a plan with a longer window before ${date} (the longer window then applies again), or contact Nominara support to ask for a copy.`
-  );
-}
-
-/** One reports-page link per listed, non-deleted project, in first-listed order. The reports page is per project (`/p/{id}/reports`). */
-function exportLinks(notice: RetentionShorteningNotice): string[] {
-  const exports = notice.newPlanExports;
-  if (!exports.csv && !(exports.pdfPerCycle === "unlimited" || exports.pdfPerCycle > 0)) return [];
-  const origin = notice.appOrigin === undefined ? "" : notice.appOrigin.replace(/\/+$/u, "");
-  const seen = new Map<string, string>();
-  for (const section of [notice.raw, notice.rollups, notice.attribution ?? null]) {
-    for (const p of section?.projects ?? []) {
-      if (typeof p.projectId === "string" && !seen.has(p.projectId)) seen.set(p.projectId, `  ${p.name}: ${origin}/p/${p.projectId}/reports`);
-    }
-  }
-  return [...seen.values()];
-}
-
-/** The notice's email: what goes, per project, and when; that nothing goes sooner; how to export; what survives. */
+/** The notice's email: what goes, per project, and when; that nothing goes sooner; what survives. It offers no export: owner decision 2026-10-27 #7 (the report export is 90-day rollups only and cannot contain any purged item). */
 export function retentionShorteningEmail(to: string, notice: RetentionShorteningNotice): EmailMessage {
   const date = day(notice.purgeNotBefore);
   const lines: string[] = [
@@ -166,8 +134,6 @@ export function retentionShorteningEmail(to: string, notice: RetentionShortening
     "What stays: your charts are built from rollups, which are kept longer than the raw answer text at every plan, so a chart survives even when the answer text behind it is gone. " +
       "Milestones you recorded are never purged by retention.",
     "",
-    exportSentence(notice.toPlanName, date, notice.newPlanExports),
-    ...exportLinks(notice),
     `If you move to a plan with a longer window before then, the longer window applies again.`,
   );
   return { to, subject: RETENTION_NOTICE_SUBJECT, textBody: lines.join("\n") };
@@ -177,32 +143,27 @@ interface PlanRetention {
   readonly name: string;
   readonly raw: RetentionWindow;
   readonly rollups: RetentionWindow;
-  readonly exports: RetentionShorteningNotice["newPlanExports"];
 }
 
 async function planRetention(tx: ClientBase, planKey: string): Promise<PlanRetention | null> {
   const r = await tx.query<{ display_name: string; raw: unknown; rollups: unknown; csv: unknown; pdf: unknown }>(
     `SELECT display_name,
             entitlements->'retention.raw_captures_days'->'value' AS raw,
-            entitlements->'retention.rollups_days'->'value'      AS rollups,
-            entitlements->'exports.csv'->'value'                 AS csv,
-            entitlements->'exports.pdf_per_cycle'->'value'       AS pdf
+            entitlements->'retention.rollups_days'->'value'      AS rollups
        FROM plans WHERE key = $1`,
     [planKey],
   );
   const row = r.rows[0];
   if (row === undefined) return null;
-  // Fail closed: an export entitlement that is absent or malformed offers no export (the email then says so plainly).
-  const pdf = row.pdf === "unlimited" ? "unlimited" : typeof row.pdf === "number" ? row.pdf : 0;
-  return { name: row.display_name, raw: row.raw as RetentionWindow, rollups: row.rollups as RetentionWindow, exports: { csv: row.csv === true, pdfPerCycle: pdf } };
+  return { name: row.display_name, raw: row.raw as RetentionWindow, rollups: row.rollups as RetentionWindow };
 }
 
 /**
  * A soft-deleted project's rows are still expired by the sweep until its hard delete, so it stays in the list, labelled: the
- * customer thinks it is gone. It gets no `projectId`, so no reports link.
+ * customer thinks it is gone.
  */
-function projectRef(row: { id: string; name: string; deleted: boolean }): { name: string; projectId: string | null } {
-  return row.deleted ? { name: `${row.name} (deleted project)`, projectId: null } : { name: row.name, projectId: row.id };
+function projectRef(row: { name: string; deleted: boolean }): { name: string } {
+  return { name: row.deleted ? `${row.name} (deleted project)` : row.name };
 }
 
 /** Per project: raw captures that the purge would expire (the sweep's own predicate) older than `cutoff`. */
@@ -253,8 +214,6 @@ export interface RetentionShorteningInput {
   readonly actorUa: string;
   /** Injectable for tests; the plan change's own instant otherwise. */
   readonly now?: Date;
-  /** The app's public origin for the export link in the email (`WEBAUTHN_ORIGIN`). The outbox stores the rendered body, so the writer supplies it. */
-  readonly appOrigin?: string;
 }
 
 /**
@@ -336,7 +295,7 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
         return [];
       }
 
-      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution, newPlanExports: to.exports, appOrigin: input.appOrigin });
+      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution });
       const recorded = await recordDowngradeNotices(tx, workspaceId, input.requestId, [{ kind: RETENTION_NOTICE_KIND, message: email }]);
       if (recorded.length === 0) {
         // A redelivery: its notice exists, and the deferral it set must not move.

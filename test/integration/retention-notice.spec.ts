@@ -81,10 +81,10 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     );
   }
 
-  async function record(workspaceId: string, fromPlanKey: string, toPlanKey: string, requestId: string, now: Date, actorUa = "operator:test-writer", appOrigin?: string) {
+  async function record(workspaceId: string, fromPlanKey: string, toPlanKey: string, requestId: string, now: Date, actorUa = "operator:test-writer") {
     const client = await pool.connect();
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId, now, actorUa, ...(appOrigin === undefined ? {} : { appOrigin }) }));
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId, now, actorUa }));
     } finally {
       client.release();
     }
@@ -122,9 +122,8 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     expect(row!.text_body).toContain("Acme Site: 3 captures");
     expect(row!.text_body).toContain("Acme Blog: 1 capture,");
     expect(row!.text_body).toContain("2027-03-16");
-    // Starter has no export (exports.csv=false, exports.pdf_per_cycle=0): the email must not offer one the plan would refuse.
-    expect(row!.text_body).toMatch(/Starter plan does not include data export/i);
-    expect(row!.text_body).not.toMatch(/with the report export/i);
+    // Owner decision 2026-10-27 #7: the notice never offers an export, whatever the new plan allows.
+    expect(row!.text_body).not.toMatch(/export/i);
     expect(row!.text_body).toContain("Total: 4 captures");
     expect(row!.text_body, "the in-window capture is not counted").not.toContain("5 captures");
   });
@@ -140,43 +139,39 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     expect(await ua(ws2, "evt_ua_2")).toBe("operator:plan-set:alice");
   });
 
-  it("scenario 6 (review round 2) · a downgrade to a plan that still exports offers the export it can run", async () => {
-    const ws = await workspace("enterprise");
-    await record(ws, "enterprise", "business", "evt_exp_1", NOW);
-    const [row] = await notices(ws);
-    expect(row!.text_body).toMatch(/with the report export \(CSV or PDF\)/i);
-    expect(row!.text_body).not.toMatch(/does not include data export/i);
-  });
-
-  it("R1 (review round 3) · the stored email LINKS the reports page of each project it lists when the new plan can export", async () => {
+  it("R1 (owner decision #7) · a downgrade to a plan that still exports (Enterprise to Business) offers no export and links no reports page", async () => {
     const ws = await workspace("enterprise"); // raw 1095 -> business 395; business exports
     const site = await project(ws, "Acme Site");
     const cutoff = new Date(NOW.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY - 395 * DAY);
     await capture(ws, site, new Date(cutoff.getTime() - 3 * DAY));
-    await record(ws, "enterprise", "business", "evt_link_1", NOW, undefined, "https://app.nominara.test");
+    await record(ws, "enterprise", "business", "evt_exp_1", NOW);
     const [row] = await notices(ws);
-    expect(row!.text_body).toContain(`https://app.nominara.test/p/${site}/reports`);
+    expect(row!.text_body).toContain("Acme Site: 1 capture");
+    expect(row!.text_body).not.toMatch(/export|to keep a copy/i);
+    expect(row!.text_body).not.toContain("/reports");
+    expect(row!.text_body).not.toContain(`/p/${site}`);
   });
 
-  it("R1 (review round 3) · a soft-deleted project is still named (the sweep expires its rows) but labelled, and has no link", async () => {
+  it("R1 (review round 3) · a soft-deleted project is still named (the sweep expires its rows) but labelled", async () => {
     const ws = await workspace("enterprise");
     const gone = await project(ws, "Old Site");
     const cutoff = new Date(NOW.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY - 395 * DAY);
     await capture(ws, gone, new Date(cutoff.getTime() - 3 * DAY));
     await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [gone]);
-    await record(ws, "enterprise", "business", "evt_del_1", NOW, undefined, "https://app.nominara.test");
+    await record(ws, "enterprise", "business", "evt_del_1", NOW);
     const [row] = await notices(ws);
     expect(row!.text_body).toContain("Old Site (deleted project): 1 capture");
     expect(row!.text_body).not.toContain(`/p/${gone}/reports`);
   });
 
-  it("R1 (review round 3) · a downgrade to a plan with no export has no link", async () => {
+  it("R1 (owner decision #7) · a downgrade to a plan with no export (Business to Starter) says nothing about export", async () => {
     const ws = await workspace("business");
     const site = await project(ws, "Acme Site");
     const cutoff = new Date(NOW.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY - 90 * DAY);
     await capture(ws, site, new Date(cutoff.getTime() - 3 * DAY));
-    await record(ws, "business", "starter", "evt_nolink_1", NOW, undefined, "https://app.nominara.test");
+    await record(ws, "business", "starter", "evt_nolink_1", NOW);
     const [row] = await notices(ws);
+    expect(row!.text_body).not.toMatch(/export|support/i);
     expect(row!.text_body).not.toContain("/reports");
   });
 
