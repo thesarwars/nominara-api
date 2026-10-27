@@ -81,10 +81,10 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     );
   }
 
-  async function record(workspaceId: string, fromPlanKey: string, toPlanKey: string, requestId: string, now: Date) {
+  async function record(workspaceId: string, fromPlanKey: string, toPlanKey: string, requestId: string, now: Date, actorUa = "operator:test-writer") {
     const client = await pool.connect();
     try {
-      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId, now }));
+      return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId, now, actorUa }));
     } finally {
       client.release();
     }
@@ -122,9 +122,30 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     expect(row!.text_body).toContain("Acme Site: 3 captures");
     expect(row!.text_body).toContain("Acme Blog: 1 capture,");
     expect(row!.text_body).toContain("2027-03-16");
-    expect(row!.text_body).toMatch(/export/i);
+    // Starter has no export (exports.csv=false, exports.pdf_per_cycle=0): the email must not offer one the plan would refuse.
+    expect(row!.text_body).toMatch(/Starter plan does not include data export/i);
+    expect(row!.text_body).not.toMatch(/with the report export/i);
     expect(row!.text_body).toContain("Total: 4 captures");
     expect(row!.text_body, "the in-window capture is not counted").not.toContain("5 captures");
+  });
+
+  it("scenario 6 (review round 2) · the audit row carries the UA of the writer that made the change, not a fixed label", async () => {
+    const ws = await workspace("business");
+    await record(ws, "business", "starter", "evt_ua_1", NOW, "operator:stripe-webhook");
+    const ws2 = await workspace("business");
+    await record(ws2, "business", "starter", "evt_ua_2", NOW, "operator:plan-set:alice");
+    const ua = async (id: string, req: string) =>
+      (await db.query<{ actor_ua: string }>("SELECT actor_ua FROM audit_log WHERE workspace_id = $1 AND action = 'billing.retention.shortened' AND request_id = $2", [id, req])).rows[0]!.actor_ua;
+    expect(await ua(ws, "evt_ua_1")).toBe("operator:stripe-webhook");
+    expect(await ua(ws2, "evt_ua_2")).toBe("operator:plan-set:alice");
+  });
+
+  it("scenario 6 (review round 2) · a downgrade to a plan that still exports offers the export it can run", async () => {
+    const ws = await workspace("enterprise");
+    await record(ws, "enterprise", "business", "evt_exp_1", NOW);
+    const [row] = await notices(ws);
+    expect(row!.text_body).toMatch(/with the report export \(CSV or PDF\)/i);
+    expect(row!.text_body).not.toMatch(/does not include data export/i);
   });
 
   it("scenario 6 · shortening the rollup window names the daily rollups that will go", async () => {

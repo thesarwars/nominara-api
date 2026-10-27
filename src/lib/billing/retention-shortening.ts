@@ -40,8 +40,6 @@ export const RETENTION_FIRST_PURGE_DAYS = 15;
 export const RETENTION_NOTICE_KIND = "retention_shortened" as const;
 const RETENTION_AUDIT_ACTION = "billing.retention.shortened";
 export const RETENTION_NOTICE_SUBJECT = "Your plan change shortens how long Nominara keeps your data";
-/** The most projects named per list in one email; the totals are always exact. */
-const MAX_NAMED_PROJECTS = 50;
 const DAY_MS = 86_400_000;
 
 const tracer = trace.getTracer("nominara-api");
@@ -86,6 +84,8 @@ export interface RetentionShorteningNotice {
   readonly rollups: PurgeListSection | null;
   /** `attribution_daily` days, which go under the rollup window; absent when the rollup window is not shortened. */
   readonly attribution?: PurgeListSection | null;
+  /** What the NEW plan's exports allow (`exports.csv`, `exports.pdf_per_cycle`): the email offers only an export the plan can run. */
+  readonly newPlanExports: { readonly csv: boolean; readonly pdfPerCycle: number | "unlimited" };
 }
 
 const day = (d: Date): string => d.toISOString().slice(0, 10);
@@ -101,13 +101,24 @@ function sectionLines(title: string, noun: [string, string], emptyText: string, 
     lines.push(`  ${emptyText} ${day(section.cutoff)}, so nothing is affected yet.`);
     return lines;
   }
-  for (const p of section.projects.slice(0, MAX_NAMED_PROJECTS)) {
+  for (const p of section.projects) {
     lines.push(`  - ${p.name}: ${plural(p.count, noun[0], noun[1])}, ${day(p.oldest)} to ${day(p.newest)}`);
   }
-  if (section.projects.length > MAX_NAMED_PROJECTS) lines.push(`  - and ${String(section.projects.length - MAX_NAMED_PROJECTS)} more`);
   const total = section.projects.reduce((sum, p) => sum + p.count, 0);
   lines.push(`  Total: ${plural(total, noun[0], noun[1])}`);
   return lines;
+}
+
+function exportSentence(toPlanName: string, date: string, exports: RetentionShorteningNotice["newPlanExports"]): string {
+  const pdf = exports.pdfPerCycle === "unlimited" || exports.pdfPerCycle > 0;
+  const quota = exports.pdfPerCycle === "unlimited" ? "unlimited per billing cycle" : `${String(exports.pdfPerCycle)} per billing cycle`;
+  if (exports.csv && pdf) return `To keep a copy, export your data before ${date} with the report export (CSV or PDF).`;
+  if (exports.csv) return `To keep a copy, export your data before ${date} with the CSV report export.`;
+  if (pdf) return `To keep a copy, export your data before ${date} with the PDF report export (${quota}).`;
+  return (
+    `Your ${toPlanName} plan does not include data export, so you cannot export your data from Nominara on this plan. ` +
+    `To keep it, move to a plan with a longer window before ${date} (the longer window then applies again), or contact Nominara support to ask for a copy.`
+  );
 }
 
 /** The notice's email: what goes, per project, and when; that nothing goes sooner; how to export; what survives. */
@@ -116,7 +127,7 @@ export function retentionShorteningEmail(to: string, notice: RetentionShortening
   const lines: string[] = [
     `Your workspace moved from the ${notice.fromPlanName} plan to the ${notice.toPlanName} plan, which keeps data for a shorter time.`,
     "",
-    `Nothing is deleted before ${date}. That is ${String(RETENTION_NOTICE_DAYS)} days of notice, and the first purge is on day ${String(RETENTION_FIRST_PURGE_DAYS)}. ` +
+    `Nothing beyond what your previous plan already expired is deleted because of this change before ${date}. That is ${String(RETENTION_NOTICE_DAYS)} days of notice, and the first purge is on day ${String(RETENTION_FIRST_PURGE_DAYS)}. ` +
       `From ${date} the nightly retention job removes what is listed below.`,
     "",
   ];
@@ -137,8 +148,8 @@ export function retentionShorteningEmail(to: string, notice: RetentionShortening
     "What stays: your charts are built from rollups, which are kept longer than the raw answer text at every plan, so a chart survives even when the answer text behind it is gone. " +
       "Milestones you recorded are never purged by retention.",
     "",
-    `To keep a copy, export your data before ${date} with the report export in Nominara (CSV or PDF). ` +
-      `If you move to a plan with a longer window before then, the longer window applies again.`,
+    exportSentence(notice.toPlanName, date, notice.newPlanExports),
+    `If you move to a plan with a longer window before then, the longer window applies again.`,
   );
   return { to, subject: RETENTION_NOTICE_SUBJECT, textBody: lines.join("\n") };
 }
@@ -147,18 +158,24 @@ interface PlanRetention {
   readonly name: string;
   readonly raw: RetentionWindow;
   readonly rollups: RetentionWindow;
+  readonly exports: RetentionShorteningNotice["newPlanExports"];
 }
 
 async function planRetention(tx: ClientBase, planKey: string): Promise<PlanRetention | null> {
-  const r = await tx.query<{ display_name: string; raw: unknown; rollups: unknown }>(
+  const r = await tx.query<{ display_name: string; raw: unknown; rollups: unknown; csv: unknown; pdf: unknown }>(
     `SELECT display_name,
             entitlements->'retention.raw_captures_days'->'value' AS raw,
-            entitlements->'retention.rollups_days'->'value'      AS rollups
+            entitlements->'retention.rollups_days'->'value'      AS rollups,
+            entitlements->'exports.csv'->'value'                 AS csv,
+            entitlements->'exports.pdf_per_cycle'->'value'       AS pdf
        FROM plans WHERE key = $1`,
     [planKey],
   );
   const row = r.rows[0];
-  return row === undefined ? null : { name: row.display_name, raw: row.raw as RetentionWindow, rollups: row.rollups as RetentionWindow };
+  if (row === undefined) return null;
+  // Fail closed: an export entitlement that is absent or malformed offers no export (the email then says so plainly).
+  const pdf = row.pdf === "unlimited" ? "unlimited" : typeof row.pdf === "number" ? row.pdf : 0;
+  return { name: row.display_name, raw: row.raw as RetentionWindow, rollups: row.rollups as RetentionWindow, exports: { csv: row.csv === true, pdfPerCycle: pdf } };
 }
 
 /** Per project: raw captures that the purge would expire (the sweep's own predicate) older than `cutoff`. */
@@ -205,6 +222,8 @@ export interface RetentionShorteningInput {
   readonly toPlanKey: string;
   /** The provider's event id or the plan writer's change key: the notice's idempotency key. */
   readonly requestId: string;
+  /** The writer's own `operator:<writer>` label for the audit row: the webhook's system UA or the plan:set operator's. */
+  readonly actorUa: string;
   /** Injectable for tests; the plan change's own instant otherwise. */
   readonly now?: Date;
 }
@@ -242,7 +261,7 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
           actorType: "system",
           actorId: SYSTEM_ACTOR_ID,
           actorIp: null,
-          actorUa: "operator:retention-notice",
+          actorUa: input.actorUa,
           action: RETENTION_AUDIT_ACTION,
           resourceType: "workspace",
           resourceId: workspaceId,
@@ -288,7 +307,7 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
         return [];
       }
 
-      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution });
+      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution, newPlanExports: to.exports });
       const recorded = await recordDowngradeNotices(tx, workspaceId, input.requestId, [{ kind: RETENTION_NOTICE_KIND, message: email }]);
       if (recorded.length === 0) {
         // A redelivery: its notice exists, and the deferral it set must not move.

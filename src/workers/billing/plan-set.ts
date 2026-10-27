@@ -191,7 +191,7 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
   // shorten a window (it refuses downgrades, and no upgrade has a shorter one), but plans are data, so the same step the Stripe
   // webhook runs sits here: a shortening records its notice and defers the first purge instead of purging at the next sweep.
   if (outcome.changed && outcome.from !== outcome.to) {
-    notices.push(...(await recordRetentionShortening(tx, args.workspaceId, { fromPlanKey: outcome.from, toPlanKey: outcome.to, requestId: noticeRequestId })));
+    notices.push(...(await recordRetentionShortening(tx, args.workspaceId, { fromPlanKey: outcome.from, toPlanKey: outcome.to, requestId: noticeRequestId, actorUa: `operator:plan-set:${args.operator}` })));
   }
   return { outcome, notices, noticeRequestId };
 }

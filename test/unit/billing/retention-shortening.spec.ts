@@ -48,6 +48,7 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
       ],
     },
     rollups: null,
+    newPlanExports: { csv: true, pdfPerCycle: 25 },
   };
 
   it("R1 · names the purge date, each project's exact count and its oldest and newest capture dates", () => {
@@ -60,10 +61,41 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
     expect(m.textBody).toContain("2026-08-13");
   });
 
-  it("R1 · offers the report export and says nothing is deleted before the purge date", () => {
+  it("R1 · offers the report export when the new plan has one", () => {
     const body = retentionShorteningEmail("o@example.com", base).textBody;
-    expect(body).toMatch(/export/i);
-    expect(body).toMatch(/nothing is deleted before 2026-11-11/i);
+    expect(body).toMatch(/export your data before 2026-11-11 with the report export \(CSV or PDF\)/i);
+  });
+
+  // Review round 2 (minor): the sweep keeps expiring data under the REPLACED plan's window during the deferral, so the notice
+  // may not claim "nothing is deleted" outright; it promises only that this change deletes nothing before the date.
+  it("R1 · the deferral promise is exact: this change deletes nothing before the date, and data the old plan already expired still goes", () => {
+    const body = retentionShorteningEmail("o@example.com", base).textBody;
+    expect(body).not.toMatch(/nothing is deleted before/i);
+    expect(body).toMatch(/because of this change/i);
+    expect(body).toMatch(/previous plan/i);
+    expect(body).toContain("2026-11-11");
+  });
+
+  // Review round 2 (major): Starter and Free have exports.csv=false and exports.pdf_per_cycle=0, so the export the email names
+  // would be refused. The email says so plainly rather than offering it.
+  it("R1 · a new plan with no export says so plainly and does not offer the report export", () => {
+    const body = retentionShorteningEmail("o@example.com", { ...base, newPlanExports: { csv: false, pdfPerCycle: 0 } }).textBody;
+    expect(body).not.toMatch(/with the report export/i);
+    expect(body).toMatch(/Starter plan does not include data export/i);
+    expect(body).toMatch(/longer window/i);
+  });
+
+  it("R1 · a new plan with only a PDF quota names the PDF and its quota, not CSV", () => {
+    const body = retentionShorteningEmail("o@example.com", { ...base, newPlanExports: { csv: false, pdfPerCycle: 25 } }).textBody;
+    expect(body).toMatch(/PDF report export/i);
+    expect(body).toContain("25");
+    expect(body).not.toMatch(/CSV/);
+  });
+
+  it("R1 · a new plan with only CSV names CSV, not PDF", () => {
+    const body = retentionShorteningEmail("o@example.com", { ...base, newPlanExports: { csv: true, pdfPerCycle: 0 } }).textBody;
+    expect(body).toMatch(/CSV report export/i);
+    expect(body).not.toMatch(/PDF/);
   });
 
   it("R1 · says charts and milestones outlive the raw text", () => {
@@ -95,12 +127,12 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
     expect(body).toMatch(/each later night/i);
   });
 
-  it("R1 · bounds the named projects but keeps the totals exact", () => {
+  it("R1 · names every project (no cap) and keeps the totals exact", () => {
     const many = Array.from({ length: 80 }, (_, i) => ({ name: `P${String(i)}`, count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-02-01T00:00:00.000Z") }));
     const body = retentionShorteningEmail("o@example.com", { ...base, raw: { ...base.raw, projects: many } }).textBody;
     expect(body).toContain("160");
-    expect(body).toMatch(/and 30 more/);
-    expect(body).not.toContain("P79:");
+    expect(body).not.toMatch(/and \d+ more/);
+    expect(body).toContain("P79:");
   });
 
   it("R1 · the body carries no workspace id and no raw engine text (names, counts and dates only)", () => {
