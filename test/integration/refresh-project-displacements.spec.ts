@@ -543,6 +543,38 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       expect(lagLines()).toHaveLength(1);
     });
 
+    const rollupJob = (payload: Record<string, unknown>): Job =>
+      ({ data: { payload: { workspaceId, kid: "k", projectId, ...payload } } }) as unknown as Job;
+    const rollupHandler = () => createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext);
+
+    it("STORY-056 #12 · a single-date rollup job (the live path) observes the lag", async () => {
+      const date = await lossTwoMinutesAgo();
+      await rollupHandler()(db, rollupJob({ metricDate: date }));
+      expect(lagLines()).toHaveLength(1);
+    });
+
+    it("STORY-056 #12 · a fromDate/toDate rebuild job observes no lag, so a rebuild cannot put days-old lags into the p95 series", async () => {
+      const date = await lossTwoMinutesAgo();
+      await rollupHandler()(db, rollupJob({ fromDate: date, toDate: date }));
+      expect(await events()).toHaveLength(1);
+      expect(lagLines()).toHaveLength(0);
+    });
+
+    it("STORY-056 #12 · a transaction that rolls back after the refresh observes nothing; its retry observes the event once", async () => {
+      const date = await lossTwoMinutesAgo();
+      const ctx = { workspaceId, actorId: randomUUID() } as never;
+      await expect(
+        withTenantContext(worker, ctx, async (tx) => {
+          await refreshProjectDisplacements(tx, projectId, date, "UTC");
+          throw new Error("a later rollup step failed");
+        }),
+      ).rejects.toThrow("a later rollup step failed");
+      expect(await events()).toHaveLength(0);
+      expect(lagLines()).toHaveLength(0);
+      await withTenantContext(worker, ctx, (tx) => refreshProjectDisplacements(tx, projectId, date, "UTC"));
+      expect(lagLines()).toHaveLength(1);
+    });
+
     it("STORY-056 #12 · a cell with no loss observes no lag", async () => {
       await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
       await capture({ at: `${D2}T10:00:00Z`, present: true, position: 1 });

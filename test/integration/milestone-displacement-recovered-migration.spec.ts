@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -91,6 +93,31 @@ describe("STORY-056 · migration 0142 — milestone kind displacement_recovered"
     const rows = await client.query("SELECT kind FROM milestones");
     expect(rows.rows).toEqual([{ kind: "annotation" }]);
     await expect(milestone("displacement_recovered")).rejects.toThrow(/violates check constraint/i);
+  });
+
+  it("S056-MS-5 · run as the NOSUPERUSER, NOBYPASSRLS owner (production), the down keeps the row as an annotation and leaves FORCE RLS on", async () => {
+    await milestone("displacement_recovered");
+    // beforeEach recreates `public` as the superuser, which leaves it without USAGE for other roles.
+    await client.query("GRANT USAGE ON SCHEMA public TO nominara_owner");
+    await client.query("ALTER TABLE milestones OWNER TO nominara_owner");
+    const attrs = (await client.query("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'nominara_owner'")).rows[0];
+    expect(attrs).toEqual({ rolsuper: false, rolbypassrls: false });
+    const down = await readFile(path.join(MIGRATIONS_DIR, `${MIGRATION}.down.sql`), "utf8");
+    await client.query("BEGIN");
+    try {
+      await client.query("SET LOCAL ROLE nominara_owner");
+      await client.query(down);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
+    await client.query("RESET ROLE");
+    expect((await client.query("SELECT kind FROM milestones")).rows).toEqual([{ kind: "annotation" }]);
+    expect((await client.query("SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'milestones' AND relkind = 'r'")).rows[0]).toEqual({
+      relrowsecurity: true,
+      relforcerowsecurity: true,
+    });
   });
 
   it("S056-MS-4 · the migration re-applies cleanly after a rollback", async () => {

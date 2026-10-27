@@ -20,6 +20,7 @@ import { displacementImpactForEvent, type FunnelStage } from "../scoring/displac
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 import { datesWithFacts, measurementStatusSql } from "./aggregate-day.js";
+import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 
 // NEW-C-3 / STORY-056 AC1/3/5/8/9/10 + STORY-057 AC1/2/10 — persists
 // `displacement_events` on the rollup path.
@@ -92,7 +93,9 @@ export async function refreshProjectDisplacements(
 ): Promise<number> {
   return tracer.startActiveSpan("displacement.refresh", async (span) => {
     try {
-      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true);
+      const lags: number[] = [];
+      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true, lags);
+      emitLagObservations(lags);
       span.setAttribute("nominara.project_id", projectId);
       span.setAttribute("nominara.displacement.events", persisted);
       return persisted;
@@ -105,12 +108,28 @@ export async function refreshProjectDisplacements(
   });
 }
 
+/**
+ * Lag observations are emitted AFTER the rollup transaction commits, so a retry of a rolled-back transaction
+ * (which inserts the event again) never double-counts. With no ambient tenant transaction (a direct call) there is
+ * no commit to wait for and they are emitted at once. `detected_at` is the transaction's start (`now()`), so the
+ * observed lag is a lower bound by up to the transaction's length (seconds against a 20-minute objective).
+ */
+function emitLagObservations(lags: readonly number[]): void {
+  if (lags.length === 0) return;
+  const emit = (): void => {
+    for (const lag of lags) observeValue(LAG_METRIC, lag, { outcome: "ok" });
+  };
+  if (currentTenantStore() !== undefined) afterCommit(emit);
+  else emit();
+}
+
 async function refreshProjectDisplacementsInner(
   tx: ClientBase,
   projectId: string,
   date: string,
   timezone: string,
   observeLag: boolean,
+  lags: number[],
 ): Promise<number> {
   const project = await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId]);
   const workspaceId = project.rows[0]?.workspace_id;
@@ -197,7 +216,7 @@ async function refreshProjectDisplacementsInner(
         ],
       );
       const row = written.rows[0];
-      if (observeLag && row?.inserted === true) observeValue(LAG_METRIC, row.lag_seconds, { outcome: "ok" });
+      if (observeLag && row?.inserted === true) lags.push(row.lag_seconds);
       persisted += 1;
     }
   }
