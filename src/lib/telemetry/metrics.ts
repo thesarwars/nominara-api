@@ -14,11 +14,11 @@ export function incrementCounter(name: string, labels: Record<string, string> = 
 }
 
 /**
- * A histogram observation (a duration or a lag), in the unit the metric name
- * carries (`_ms`, `_seconds`). Same Logger-backed shape as the counter until a
- * metrics backend is wired in by its own story: the aggregation (p95) happens
- * where the log line is collected, not here.
+ * One observation of a distribution (the Logger-based stand-in for a histogram, same no-dependency pattern as
+ * `incrementCounter`; the backend that buckets it is a later story). A non-finite value is not an observation and is
+ * refused rather than logged as 0 — `0` is a real measurement and stays distinct from "nothing measured".
  */
-export function observeHistogram(name: string, value: number, labels: Record<string, string | number> = {}): void {
+export function observeValue(name: string, value: number, labels: Record<string, string | number> = {}): void {
+  if (!Number.isFinite(value)) return;
   logger.log({ metric: name, value, ...labels });
 }

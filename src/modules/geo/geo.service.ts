@@ -13,7 +13,7 @@ import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { composeDigest, summarize, validFindings, type StoredAnalysis, type TaskLookup } from "../../lib/geo/insights.js";
 import { writeGeoAnalysis } from "../../lib/geo/persist-analysis.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
-import { incrementCounter, observeHistogram } from "../../lib/telemetry/metrics.js";
+import { incrementCounter, observeValue } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { TasksService } from "../tasks/tasks.service.js";
 
@@ -106,7 +106,7 @@ export class GeoService {
         active.setStatus({ code: SpanStatusCode.ERROR });
         throw error;
       } finally {
-        observeHistogram(metric, Math.round(performance.now() - started), { workspace_id: currentTenantStore()?.context.workspaceId ?? "none", ...labels });
+        observeValue(metric, Math.round(performance.now() - started), { workspace_id: currentTenantStore()?.context.workspaceId ?? "none", ...labels });
         active.end();
       }
     });

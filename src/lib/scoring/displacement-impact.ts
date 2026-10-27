@@ -90,10 +90,11 @@ export type DisplacementKind = "presence_lost" | "position_lost" | "recommendati
  * `null` means the table has no row for it and the penalty term is 0. Two
  * readings are FLAGGED FOR THE SPEC: `recommendation -> neutral_list` is taken
  * as the `recommendation_to_ranked` demotion, and a position-only loss inside
- * one class has no row (0). A THIRD is flagged too: `presence_lost` from ANY
- * before class takes `recommendation_to_absent` (1.00), because §9 has a row only
- * for recommendation -> absent. A brand leaving a negative caveat therefore scores
- * the maximum. Spec-owner ruling needed; behaviour is pinned by a test until then.
+ * one class has no row (0). A THIRD, CONFIRMED as the v1 rule by the owner on
+ * 2026-10-27: `presence_lost` from ANY before class takes
+ * `recommendation_to_absent` (1.00), because §9 has a row only for
+ * recommendation -> absent. A brand leaving a negative caveat therefore scores
+ * the maximum. Pinned by a test; the first two readings above stay flagged.
  *
  * Each kind is scored on its own dimension: `render_downgraded` is the "render
  * downgrade only" row (and carries no position loss, see

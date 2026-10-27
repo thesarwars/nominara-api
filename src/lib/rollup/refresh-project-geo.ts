@@ -7,7 +7,7 @@ import { rankGeoLevers } from "../geo/lever-rank.js";
 import { buildSentiment, loadSentimentInput } from "../geo/sentiment.js";
 import { buildStructure, loadStructureInput, windowStartFor } from "../geo/structure.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
-import { incrementCounter, observeHistogram } from "../telemetry/metrics.js";
+import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 
 // STORY-060/061 — recompute a project's GEO analyses and persist them to
 // `geo_analyses` (through the one write path, `writeGeoAnalysis`). `structure`
@@ -94,7 +94,7 @@ export function observeGeoFreshness(workspaceId: string, projectId: string, trig
   const lagSeconds = Math.max(0, nowMs - triggeredAtMs) / 1000;
   const withinObjective = lagSeconds <= GEO_FRESHNESS_OBJECTIVE_SECONDS;
   // project_id is not a label a metrics backend should index (cardinality), so it rides a separate event line.
-  observeHistogram("nominara_geo_recompute_freshness_seconds", lagSeconds, {
+  observeValue("nominara_geo_recompute_freshness_seconds", lagSeconds, {
     workspace_id: workspaceId,
     within_objective: String(withinObjective),
   });
@@ -119,7 +119,7 @@ export async function refreshProjectGeoWindows(
       for (const windowDays of GEO_WINDOWS) out.push(await refreshProjectGeo(tx, projectId, { ...options, windowDays }));
       span.setAttribute("nominara.geo_refresh.windows", out.length);
       const workspaceId = currentTenantStore()?.context.workspaceId ?? "none";
-      observeHistogram("nominara_geo_recompute_duration_seconds", Math.round(((performance.now() - started) / 1000) * 1000) / 1000, {
+      observeValue("nominara_geo_recompute_duration_seconds", Math.round(((performance.now() - started) / 1000) * 1000) / 1000, {
         workspace_id: workspaceId,
         windows: out.length,
       });
