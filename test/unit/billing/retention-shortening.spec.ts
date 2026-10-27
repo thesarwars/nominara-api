@@ -73,10 +73,12 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
         ],
       },
     };
+    // The template takes no export input, so these pairs pin only the wording; whether the new plan's
+    // entitlements leak an offer is pinned by the integration Enterprise -> Business case.
     const planPairs: ReadonlyArray<readonly [string, string]> = [
-      ["Business", "Growth"], // the new plan has exports
+      ["Business", "Growth"],
       ["Enterprise", "Business"],
-      ["Growth", "Starter"], // the new plan has none
+      ["Growth", "Starter"],
       ["Business", "Free"],
     ];
     for (const [fromPlanName, toPlanName] of planPairs) {

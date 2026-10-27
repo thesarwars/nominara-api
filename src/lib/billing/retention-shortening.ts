@@ -146,7 +146,7 @@ interface PlanRetention {
 }
 
 async function planRetention(tx: ClientBase, planKey: string): Promise<PlanRetention | null> {
-  const r = await tx.query<{ display_name: string; raw: unknown; rollups: unknown; csv: unknown; pdf: unknown }>(
+  const r = await tx.query<{ display_name: string; raw: unknown; rollups: unknown }>(
     `SELECT display_name,
             entitlements->'retention.raw_captures_days'->'value' AS raw,
             entitlements->'retention.rollups_days'->'value'      AS rollups
