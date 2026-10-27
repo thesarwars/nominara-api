@@ -188,6 +188,7 @@ describe("STORY-062 · GEO insights persistence and read", () => {
         const line = lines.find((l) => l.metric === metric);
         expect(line, metric).toBeDefined();
         expect(line!.value).toBeGreaterThanOrEqual(0);
+        expect(line!.workspace_id, metric).toBe(workspaceId);
       }
       expect(JSON.stringify(spy.mock.calls)).not.toContain("SECRET HEADLINE");
     } finally {

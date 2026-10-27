@@ -6,18 +6,18 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { GEO_FRESHNESS_OBJECTIVE_SECONDS, GEO_WINDOWS, refreshProjectGeoWindows } from "../../src/lib/rollup/refresh-project-geo.js";
+import { GEO_FRESHNESS_OBJECTIVE_SECONDS, GEO_WINDOWS, observeGeoFreshness, refreshProjectGeoWindows } from "../../src/lib/rollup/refresh-project-geo.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-062 AC12 / scenario 11 — recomputation is scheduled per project and per
 // window, and the freshness objective (edge-cases-and-slos #28: daily, p95 <= 30
 // min per project, measured on `geo_analyses.computed_at`) is met.
 //
-// WHAT THIS PROVES, PLAINLY: that one project's recompute of all three served
-// windows lands every row's `computed_at` inside the 30-minute objective of the
-// moment it was triggered, on a fixture, and that the measure the production
-// SLO is read from (`nominara_geo_recompute_freshness_seconds`) is emitted. It
-// does NOT prove the production p95; that is observed on the metric.
+// WHAT THIS PROVES, PLAINLY: (1) `computed_at` is the moment a row was WRITTEN (clock_timestamp), not the transaction start, so a
+// slow recompute shows up on it; (2) `observeGeoFreshness`, which the rollup handler calls after COMMIT with the job's enqueue
+// time, measures trigger-to-visible and breaches when a run is slower than the objective; (3) the compute step's own duration is a
+// separate metric (`nominara_geo_recompute_duration_seconds`). It does NOT prove the production p95; that is observed on
+// `nominara_geo_recompute_freshness_seconds`. The handler wiring is proven in rollup-sweeps.spec.ts.
 
 const AS_OF = new Date("2026-10-01T12:00:00Z");
 const IN_WINDOW = "2026-09-20T10:00:00Z";
@@ -87,16 +87,36 @@ describe("STORY-062 AC12 · GEO recompute freshness", () => {
     expect([...GEO_WINDOWS]).toEqual([7, 30, 90]);
   });
 
-  it("[F2] scenario 11 · a project's recompute lands every window's rows inside the freshness objective", async () => {
+  it("[F2] scenario 11 · computed_at is the write time: a recompute that takes N seconds stamps rows N seconds after the trigger, inside the objective", async () => {
     const trigger = (await db.query<{ t: Date }>("SELECT clock_timestamp() AS t")).rows[0]!.t;
-    await refresh();
+    await withTenantContext(db, { workspaceId, actorId: randomUUID() }, async (tx) => {
+      await tx.query("SELECT pg_sleep(1.2)"); // queue wait / earlier rollup steps: transaction start is now 1.2 s in the past
+      await refreshProjectGeoWindows(tx, projectId, { asOf: AS_OF });
+    });
     const rows = (await db.query<{ analysis: string; window_days: number; computed_at: Date }>("SELECT analysis, window_days, computed_at FROM geo_analyses")).rows;
     expect(rows).toHaveLength(6); // structure + sentiment, three windows
     expect(new Set(rows.map((r) => r.window_days))).toEqual(new Set([7, 30, 90]));
     for (const r of rows) {
       const lagSeconds = (r.computed_at.getTime() - trigger.getTime()) / 1000;
-      expect(lagSeconds).toBeGreaterThanOrEqual(0);
+      expect(lagSeconds).toBeGreaterThanOrEqual(1.2); // fails when computed_at = now() (transaction start)
       expect(lagSeconds).toBeLessThanOrEqual(GEO_FRESHNESS_OBJECTIVE_SECONDS);
+    }
+  });
+
+  it("[F2b] scenario 11 · freshness is trigger-to-visible: a run that waited past the objective breaches it, exactly 30 minutes does not", () => {
+    const now = Date.parse("2026-10-27T12:00:00Z");
+    const spy = vi.spyOn(Logger.prototype, "log");
+    try {
+      expect(observeGeoFreshness(workspaceId, projectId, now - 31 * 60_000, now)).toBe(31 * 60);
+      expect(observeGeoFreshness(workspaceId, projectId, now - 30 * 60_000, now)).toBe(30 * 60);
+      expect(observeGeoFreshness(workspaceId, projectId, now - 60_000, now)).toBe(60);
+      const lines = spy.mock.calls.map((c) => c[0] as Record<string, unknown>).filter((l) => l.metric === "nominara_geo_recompute_freshness_seconds");
+      expect(lines.map((l) => l.within_objective)).toEqual(["false", "true", "true"]);
+      expect(lines[0]!.workspace_id).toBe(workspaceId);
+      expect(lines[0]!.project_id).toBe(projectId);
+      expect(JSON.stringify(spy.mock.calls)).not.toContain(SECRET_WORKSPACE_NAME);
+    } finally {
+      spy.mockRestore();
     }
   });
 
@@ -109,18 +129,19 @@ describe("STORY-062 AC12 · GEO recompute freshness", () => {
     expect(Number((await db.query("SELECT count(*) FROM geo_analyses")).rows[0].count)).toBe(6);
   });
 
-  it("[F4] observability · a geo.refresh span, the freshness measure and a log line with the project ID, never the workspace's name or answer text", async () => {
+  it("[F4] observability · a geo.refresh span, the compute-duration measure and a log line with the project ID, never the workspace's name or answer text", async () => {
     const exporter = new InMemorySpanExporter();
     trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
     const spy = vi.spyOn(Logger.prototype, "log");
     try {
       await refresh();
       const lines = spy.mock.calls.map((c) => c[0] as Record<string, unknown>);
-      const measure = lines.find((l) => l.metric === "nominara_geo_recompute_freshness_seconds");
+      const measure = lines.find((l) => l.metric === "nominara_geo_recompute_duration_seconds");
       expect(measure).toBeDefined();
       expect(measure!.project_id).toBe(projectId);
+      expect(measure!.workspace_id).toBe(workspaceId);
+      expect(lines.find((l) => l.metric === "nominara_geo_recompute_freshness_seconds")).toBeUndefined(); // compute time is not freshness
       expect(measure!.value).toBeGreaterThanOrEqual(0);
-      expect(measure!.value).toBeLessThanOrEqual(GEO_FRESHNESS_OBJECTIVE_SECONDS);
       expect(measure!.windows).toBe(3);
       const logged = JSON.stringify(spy.mock.calls);
       expect(logged).not.toContain(SECRET_WORKSPACE_NAME);

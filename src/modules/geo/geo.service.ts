@@ -106,7 +106,7 @@ export class GeoService {
         active.setStatus({ code: SpanStatusCode.ERROR });
         throw error;
       } finally {
-        observeHistogram(metric, Math.round(performance.now() - started), labels);
+        observeHistogram(metric, Math.round(performance.now() - started), { workspace_id: currentTenantStore()?.context.workspaceId ?? "none", ...labels });
         active.end();
       }
     });

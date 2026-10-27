@@ -6,6 +6,7 @@ import { writeGeoAnalysis } from "../geo/persist-analysis.js";
 import { rankGeoLevers } from "../geo/lever-rank.js";
 import { buildSentiment, loadSentimentInput } from "../geo/sentiment.js";
 import { buildStructure, loadStructureInput, windowStartFor } from "../geo/structure.js";
+import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { incrementCounter, observeHistogram } from "../telemetry/metrics.js";
 
 // STORY-060/061 — recompute a project's GEO analyses and persist them to
@@ -77,15 +78,34 @@ export const GEO_WINDOWS: readonly (7 | 30 | 90)[] = [7, 30, 90];
 
 /**
  * The freshness objective (edge-cases-and-slos #28): GEO analyses recompute daily and are visible within 30 minutes of the
- * trigger, p95 per project, read from `geo_analyses.computed_at`. The production p95 is observed on
- * `nominara_geo_recompute_freshness_seconds`; the integration spec proves a fixture project fits.
+ * trigger, p95 per project. The production p95 is observed on `nominara_geo_recompute_freshness_seconds`, which
+ * `observeGeoFreshness` emits from the rollup job's enqueue time until the transaction COMMITS (so queue wait, every earlier
+ * rollup step and the commit are inside it). `nominara_geo_recompute_duration_seconds` is the compute step alone, and is NOT
+ * freshness.
  */
 export const GEO_FRESHNESS_OBJECTIVE_SECONDS = 30 * 60;
 
 /**
+ * One freshness observation: seconds from `triggeredAtMs` (the rollup job's enqueue time) to NOW. Call it from an `afterCommit`
+ * hook so the rows are visible when it fires. The line carries the workspace ID and project ID, never the workspace's name.
+ * Returns the lag, so a caller can assert on it.
+ */
+export function observeGeoFreshness(workspaceId: string, projectId: string, triggeredAtMs: number, nowMs: number = Date.now()): number {
+  const lagSeconds = Math.max(0, nowMs - triggeredAtMs) / 1000;
+  const withinObjective = lagSeconds <= GEO_FRESHNESS_OBJECTIVE_SECONDS;
+  // project_id stays in the log line; it is not a label a metrics backend should index (cardinality).
+  observeHistogram("nominara_geo_recompute_freshness_seconds", lagSeconds, {
+    workspace_id: workspaceId,
+    project_id: projectId,
+    within_objective: String(withinObjective),
+  });
+  return lagSeconds;
+}
+
+/**
  * Recompute every analysis for all three served windows, so no timeframe on the read side answers "not computed yet".
- * One span per project, and one freshness observation: seconds from the trigger (this call) until the last window's rows are
- * written. The line carries the project ID and counts, never the workspace's name and never answer text.
+ * One span per project, and one duration observation: the compute step alone (NOT freshness; see `observeGeoFreshness`).
+ * The line carries the workspace and project IDs and counts, never the workspace's name and never answer text.
  */
 export async function refreshProjectGeoWindows(
   tx: ClientBase,
@@ -98,7 +118,8 @@ export async function refreshProjectGeoWindows(
       const out: GeoAnalysisWrite[] = [];
       for (const windowDays of GEO_WINDOWS) out.push(await refreshProjectGeo(tx, projectId, { ...options, windowDays }));
       span.setAttribute("nominara.geo_refresh.windows", out.length);
-      observeHistogram("nominara_geo_recompute_freshness_seconds", Math.round(((performance.now() - started) / 1000) * 1000) / 1000, {
+      observeHistogram("nominara_geo_recompute_duration_seconds", Math.round(((performance.now() - started) / 1000) * 1000) / 1000, {
+        workspace_id: currentTenantStore()?.context.workspaceId ?? "none",
         project_id: projectId,
         windows: out.length,
       });

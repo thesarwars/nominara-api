@@ -547,6 +547,18 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       }
     }, 60_000);
 
+    const geoFreshness = (logs: unknown[]) => logs.filter((l) => typeof l === "object" && l !== null && (l as { metric?: string }).metric === "nominara_geo_recompute_freshness_seconds") as Array<{ value: number; within_objective: string; workspace_id: string }>;
+
+    it("STORY-062 AC12 · the rollup reports GEO freshness from the job's enqueue time to commit, and a 31-minute wait breaches the 30-minute objective", async () => {
+      const slow = geoFreshness((await runRollup("closed_day", Date.now() - 31 * 60_000)).logs);
+      expect(slow).toHaveLength(1);
+      expect(slow[0]!.value).toBeGreaterThanOrEqual(31 * 60);
+      expect(slow[0]!.within_objective).toBe("false");
+      const fast = geoFreshness((await runRollup("closed_day", Date.now() - 60_000)).logs);
+      expect(fast[fast.length - 1]!.within_objective).toBe("true");
+      expect(geoFreshness((await runRollup("closed_day", undefined)).logs), "no enqueue time, no figure (never 0)").toHaveLength(0);
+    }, 120_000);
+
     it("STORY-042 AC11 · closed-day, dirty-date and rebuild rollups are not parse-to-metric latency and report nothing; neither does a job with no timestamp", async () => {
       for (const reason of ["closed_day", "dirty_date", "rebuild"]) {
         expect(observation((await runRollup(reason, Date.now() - 60_000)).logs), reason).toBeUndefined();
