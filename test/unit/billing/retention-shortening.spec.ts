@@ -77,6 +77,24 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
     expect(body).toMatch(/no existing .* older than/i);
   });
 
+  // Review round 1 (minor): the rollup window also removes attribution_daily and the derived analyses, so the notice names them,
+  // and the cutoff is a rolling one (the nightly job runs up to a day after the purge date).
+  it("R1 · a rollup shortening also names the attribution chart data and the derived analyses that go with it", () => {
+    const section = { from: 730 as number | "unlimited" | null, to: 395 as number | "unlimited" | null, cutoff: new Date("2026-08-13T00:00:00.000Z"), projects: [{ name: "Rollup Co", count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-01-02T00:00:00.000Z") }] };
+    const attribution = { ...section, projects: [{ name: "Rollup Co", count: 4, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-01-04T00:00:00.000Z") }] };
+    const body = retentionShorteningEmail("o@example.com", { ...base, raw: null, rollups: section, attribution }).textBody;
+    expect(body).toContain("Rollup Co: 4 days, 2025-01-01 to 2025-01-04");
+    expect(body).toMatch(/attribution/i);
+    expect(body).toMatch(/geo analyses/i);
+    expect(body).toMatch(/topic clusters/i);
+  });
+
+  it("R1 · the cutoff is worded as a rolling window: each later night removes one more day, so the list is 'as of' the purge date", () => {
+    const body = retentionShorteningEmail("o@example.com", base).textBody;
+    expect(body).toMatch(/as of 2026-11-11/i);
+    expect(body).toMatch(/each later night/i);
+  });
+
   it("R1 · bounds the named projects but keeps the totals exact", () => {
     const many = Array.from({ length: 80 }, (_, i) => ({ name: `P${String(i)}`, count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-02-01T00:00:00.000Z") }));
     const body = retentionShorteningEmail("o@example.com", { ...base, raw: { ...base.raw, projects: many } }).textBody;

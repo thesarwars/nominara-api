@@ -4,6 +4,7 @@ import type { ClientBase } from "pg";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import type { EmailMessage } from "../../modules/identity/ports/email-sender.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
+import { longerRetentionWindow } from "../../workers/rollup/retention.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { recordDowngradeNotices, type RecordedNotice } from "./downgrade-notice-outbox.js";
 import { downgradeNoticeContact } from "./downgrade-pause-notice.js";
@@ -19,9 +20,16 @@ import { downgradeNoticeContact } from "./downgrade-pause-notice.js";
 //   3. record the email in `downgrade_notices` (kind `retention_shortened`), the outbox the downgrade pause already uses:
 //      the caller enqueues the signed tenant job `billing.downgrade_notice` AFTER its commit, which sends with no transaction
 //      open and retries, so there is exactly one send path;
-//   4. set `workspaces.retention_purge_not_before` = now + 15 days, which the nightly sweep honours.
+//   4. set `workspaces.retention_purge_not_before` = now + 15 days, and keep the window being replaced beside it
+//      (`retention_deferred_raw_days` / `_rollups_days`, the longer of it and any window an earlier deferral is still keeping):
+//      until that date the nightly sweep and the read paths run on the OLD window, not on none.
 // The deferral is set EVEN WHEN NOBODY CAN BE EMAILED (no billing contact): the data is protected whether or not the notice
-// is deliverable. A redelivered request (the outbox row already exists) neither re-sends nor pushes the date out again.
+// is deliverable. A request is recorded once, by its `billing.retention.shortened` audit row (written on both paths): a
+// redelivered request neither re-sends nor pushes the date out again.
+//
+// The purge list is "as of" the purge date. The nightly job runs up to a day after it and its window keeps moving, so the email
+// says each later night also removes one more day. It also names attribution_daily (chart data) and the derived analyses that
+// go under the rollup window.
 //
 // "Day 15": the notice goes out on day 0 and promises 14 days of notice. The first purge is `RETENTION_FIRST_PURGE_DAYS` = 15
 // days after the plan change, so the notice period is at least 14 full days and the day of the purge is day 15. A builder
@@ -30,6 +38,7 @@ import { downgradeNoticeContact } from "./downgrade-pause-notice.js";
 export const RETENTION_NOTICE_DAYS = 14;
 export const RETENTION_FIRST_PURGE_DAYS = 15;
 export const RETENTION_NOTICE_KIND = "retention_shortened" as const;
+const RETENTION_AUDIT_ACTION = "billing.retention.shortened";
 export const RETENTION_NOTICE_SUBJECT = "Your plan change shortens how long Nominara keeps your data";
 /** The most projects named per list in one email; the totals are always exact. */
 const MAX_NAMED_PROJECTS = 50;
@@ -46,7 +55,8 @@ export type RetentionWindow = number | "unlimited" | null;
  *
  * A `null` `from` is the matrix's "—" (not applicable at that tier: the free tier's rollups) and is NOT a promise to keep
  * anything, so a move off it is never a shortening. (The sweep itself treats null as "never purge", so a free workspace's
- * rollups older than the new plan's window go at the first sweep after an upgrade; reported to the owner, not decided here.)
+ * rollups older than the new plan's window go at the first sweep after an upgrade; an OPEN OWNER DECISION, recorded in the
+ * STORY-077 delivery note, not decided here.)
  */
 export function windowShortened(from: RetentionWindow, to: RetentionWindow): boolean {
   if (typeof to !== "number" || from === null) return false;
@@ -74,14 +84,19 @@ export interface RetentionShorteningNotice {
   readonly purgeNotBefore: Date;
   readonly raw: PurgeListSection | null;
   readonly rollups: PurgeListSection | null;
+  /** `attribution_daily` days, which go under the rollup window; absent when the rollup window is not shortened. */
+  readonly attribution?: PurgeListSection | null;
 }
 
 const day = (d: Date): string => d.toISOString().slice(0, 10);
 const plural = (n: number, one: string, many: string): string => `${String(n)} ${n === 1 ? one : many}`;
 const windowText = (w: RetentionWindow): string => (typeof w === "number" ? `${String(w)} days` : "no limit");
 
-function sectionLines(title: string, noun: [string, string], emptyText: string, section: PurgeListSection): string[] {
-  const lines = [`${title} (${windowText(section.from)} before, ${windowText(section.to)} now). Anything older than ${day(section.cutoff)} is removed:`];
+function sectionLines(title: string, noun: [string, string], emptyText: string, section: PurgeListSection, asOf: string): string[] {
+  const lines = [
+    `${title} (${windowText(section.from)} before, ${windowText(section.to)} now). As of ${asOf}, anything older than ${day(section.cutoff)} is removed ` +
+      `(the window keeps moving, so each later night also removes one more day):`,
+  ];
   if (section.projects.length === 0) {
     lines.push(`  ${emptyText} ${day(section.cutoff)}, so nothing is affected yet.`);
     return lines;
@@ -106,10 +121,17 @@ export function retentionShorteningEmail(to: string, notice: RetentionShortening
     "",
   ];
   if (notice.raw !== null) {
-    lines.push(...sectionLines("Raw answer text", ["capture", "captures"], "No existing raw answer text is older than", notice.raw), "");
+    lines.push(...sectionLines("Raw answer text", ["capture", "captures"], "No existing raw answer text is older than", notice.raw, date), "");
   }
   if (notice.rollups !== null) {
-    lines.push(...sectionLines("Daily rollups behind your charts", ["day", "days"], "No existing rollup is older than", notice.rollups), "");
+    lines.push(...sectionLines("Daily rollups behind your charts", ["day", "days"], "No existing rollup is older than", notice.rollups, date), "");
+    if (notice.attribution !== null && notice.attribution !== undefined) {
+      lines.push(...sectionLines("Daily attribution data behind your traffic charts", ["day", "days"], "No existing attribution data is older than", notice.attribution, date), "");
+    }
+    lines.push(
+      "The analyses derived from those rollups (geo analyses, URL attribution rollups and topic clusters) are removed on the same schedule; they can be recomputed from the data that remains.",
+      "",
+    );
   }
   lines.push(
     "What stays: your charts are built from rollups, which are kept longer than the raw answer text at every plan, so a chart survives even when the answer text behind it is gone. " +
@@ -166,6 +188,18 @@ async function rollupPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date
   return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
 }
 
+/** Per project: `attribution_daily` days (not rows) older than `cutoff`: the same window the rollups use. */
+async function attributionPurgeList(tx: ClientBase, workspaceId: string, cutoff: Date): Promise<PurgeProjectLine[]> {
+  const r = await tx.query<{ name: string; count: string; oldest: string; newest: string }>(
+    `SELECT p.name, count(DISTINCT a.metric_date) AS count, min(a.metric_date)::text AS oldest, max(a.metric_date)::text AS newest
+       FROM attribution_daily a JOIN projects p ON p.id = a.project_id
+      WHERE a.workspace_id = $1 AND a.metric_date < $2::date
+      GROUP BY p.id, p.name ORDER BY p.name, p.id`,
+    [workspaceId, day(cutoff)],
+  );
+  return r.rows.map((row) => ({ name: row.name, count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
+}
+
 export interface RetentionShorteningInput {
   readonly fromPlanKey: string;
   readonly toPlanKey: string;
@@ -198,22 +232,63 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
       const sum = (s: PurgeListSection | null): number => (s === null ? 0 : s.projects.reduce((n, p) => n + p.count, 0));
       span.setAttributes({ "nominara.retention_notice.raw_captures": sum(raw), "nominara.retention_notice.rollup_days": sum(rollups) });
 
+      const attribution: PurgeListSection | null = rollups === null ? null : { ...rollups, projects: await attributionPurgeList(tx, workspaceId, rollups.cutoff) };
+      span.setAttributes({ "nominara.retention_notice.attribution_days": sum(attribution) });
+
+      const afterState = { raw_captures: sum(raw), rollup_days: sum(rollups), attribution_days: sum(attribution), purge_not_before: purgeNotBefore.toISOString() };
+      const audit = async (emailed: boolean): Promise<void> => {
+        await new AuditChainService().append(tx, {
+          workspaceId,
+          actorType: "system",
+          actorId: SYSTEM_ACTOR_ID,
+          actorIp: null,
+          actorUa: "operator:retention-notice",
+          action: RETENTION_AUDIT_ACTION,
+          resourceType: "workspace",
+          resourceId: workspaceId,
+          beforeState: null,
+          afterState: { ...afterState, emailed },
+          requestId: input.requestId,
+          supportGrantId: null,
+          severity: "notice",
+        });
+      };
+
+      // The window being replaced is kept until the purge date; a deferral still running keeps the LONGER of its window and this one.
       const defer = async (): Promise<void> => {
+        const current = (
+          await tx.query<{ until: Date | null; raw: number | null; rollups: number | null }>(
+            "SELECT retention_purge_not_before AS until, retention_deferred_raw_days AS raw, retention_deferred_rollups_days AS rollups FROM workspaces WHERE id = $1",
+            [workspaceId],
+          )
+        ).rows[0];
+        const running = current?.until != null && current.until.getTime() >= now.getTime();
+        const keep = (replaced: RetentionWindow, stored: number | null | undefined): number | null => (running ? longerRetentionWindow(replaced, stored ?? null) : typeof replaced === "number" ? replaced : null);
         await tx.query(
-          "UPDATE workspaces SET retention_purge_not_before = GREATEST(COALESCE(retention_purge_not_before, $2), $2) WHERE id = $1",
-          [workspaceId, purgeNotBefore.toISOString()],
+          `UPDATE workspaces SET retention_purge_not_before = GREATEST(COALESCE(retention_purge_not_before, $2), $2),
+                                 retention_deferred_raw_days = $3, retention_deferred_rollups_days = $4 WHERE id = $1`,
+          [workspaceId, purgeNotBefore.toISOString(), keep(from.raw, current?.raw), keep(from.rollups, current?.rollups)],
         );
       };
+
+      // One recording per request, whether or not anyone can be emailed: the audit row is the key (a redelivered Stripe event
+      // must not move the date out again on the no-contact path, where there is no outbox row to conflict on).
+      const seen = await tx.query("SELECT 1 FROM audit_log WHERE workspace_id = $1 AND action = $2 AND request_id = $3 LIMIT 1", [workspaceId, RETENTION_AUDIT_ACTION, input.requestId]);
+      if (seen.rowCount !== null && seen.rowCount > 0) {
+        incrementCounter("nominara_retention_notice_total", { outcome: "already_recorded" });
+        return [];
+      }
 
       const contact = await downgradeNoticeContact(tx, workspaceId);
       if (contact === null) {
         await defer();
+        await audit(false);
         incrementCounter("nominara_retention_notice_total", { outcome: "no_billing_contact" });
         logger.error({ message: "retention shortened and the first purge deferred, but nobody could be emailed: no billing contact", workspace_id: workspaceId });
         return [];
       }
 
-      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups });
+      const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution });
       const recorded = await recordDowngradeNotices(tx, workspaceId, input.requestId, [{ kind: RETENTION_NOTICE_KIND, message: email }]);
       if (recorded.length === 0) {
         // A redelivery: its notice exists, and the deferral it set must not move.
@@ -221,23 +296,9 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
         return [];
       }
       await defer();
-      await new AuditChainService().append(tx, {
-        workspaceId,
-        actorType: "system",
-        actorId: SYSTEM_ACTOR_ID,
-        actorIp: null,
-        actorUa: "operator:retention-notice",
-        action: "billing.retention.shortened",
-        resourceType: "workspace",
-        resourceId: workspaceId,
-        beforeState: null,
-        afterState: { raw_captures: sum(raw), rollup_days: sum(rollups), purge_not_before: purgeNotBefore.toISOString() },
-        requestId: input.requestId,
-        supportGrantId: null,
-        severity: "notice",
-      });
+      await audit(true);
       incrementCounter("nominara_retention_notice_total", { outcome: "recorded" });
-      logger.log({ message: "retention shortened: notice recorded, first purge deferred", workspace_id: workspaceId, raw_captures: sum(raw), rollup_days: sum(rollups), purge_not_before: purgeNotBefore.toISOString() });
+      logger.log({ message: "retention shortened: notice recorded, first purge deferred", workspace_id: workspaceId, raw_captures: sum(raw), rollup_days: sum(rollups), attribution_days: sum(attribution), purge_not_before: purgeNotBefore.toISOString() });
       return recorded;
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });

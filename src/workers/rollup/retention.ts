@@ -89,12 +89,15 @@ export function resolveRetentionCutoff(window: RetentionWindow, referenceDate: D
 }
 
 export interface WorkspaceRetention {
+  /** The raw-capture window IN FORCE at the reference date: while a deferral is running, the longer of the plan's and the replaced plan's. */
   readonly rawCapturesDays: RetentionWindow;
+  /** The rollup window IN FORCE at the reference date (same rule). */
   readonly rollupsDays: RetentionWindow;
   /**
-   * STORY-077 slice B (EC-41): while this is in the future the retention sweep expires NOTHING for the workspace, and the read
-   * paths hide nothing by window. A plan change that shortens retention sets it to day 15 (lib/billing/retention-shortening.ts).
-   * `null` is no deferral. It can only delay a purge; nothing reads it to purge more.
+   * STORY-077 slice B (EC-41): a plan change that shortens retention sets this to day 15 (lib/billing/retention-shortening.ts).
+   * Until then the workspace keeps the window it is moving AWAY from (`retention_deferred_*_days`), on the sweep and on the read
+   * paths alike, so the deferral never makes data readable that the old plan already hid, nor stops the old window's expiry.
+   * `null` is no deferral. It can only lengthen a window; nothing reads it to purge more.
    */
   readonly purgeNotBefore: Date | null;
 }
@@ -107,14 +110,28 @@ export function retentionPurgeDeferred(retention: WorkspaceRetention, referenceD
   return retention.purgeNotBefore !== null && retention.purgeNotBefore.getTime() >= referenceDate.getTime();
 }
 
-export async function resolveWorkspaceRetention(client: ClientBase, workspaceId: string): Promise<WorkspaceRetention> {
-  const result = await client.query<{ raw: unknown; rollups: unknown; purge_not_before: Date | null }>(
+/** The longer of two windows; `null` and "unlimited" (never purged) are the longest. The result is a day count or `null`. */
+export function longerRetentionWindow(a: RetentionWindow, b: RetentionWindow): number | null {
+  if (typeof a !== "number" || typeof b !== "number") return null;
+  return Math.max(a, b);
+}
+
+export async function resolveWorkspaceRetention(client: ClientBase, workspaceId: string, referenceDate: Date = new Date()): Promise<WorkspaceRetention> {
+  const result = await client.query<{
+    raw: unknown;
+    rollups: unknown;
+    purge_not_before: Date | null;
+    deferred_raw: number | null;
+    deferred_rollups: number | null;
+  }>(
     // ->'value' because STORY-069 wrapped every entitlement as
     // {value, live}. Reading the key directly now yields the whole object,
     // which resolveRetentionWindow would see as neither a number nor null.
     `SELECT p.entitlements->'retention.raw_captures_days'->'value' AS raw,
             p.entitlements->'retention.rollups_days'->'value'       AS rollups,
-            w.retention_purge_not_before                            AS purge_not_before
+            w.retention_purge_not_before                            AS purge_not_before,
+            w.retention_deferred_raw_days                           AS deferred_raw,
+            w.retention_deferred_rollups_days                       AS deferred_rollups
        FROM workspaces w
        JOIN plans p ON p.key = w.plan_key
       WHERE w.id = $1`,
@@ -124,7 +141,15 @@ export async function resolveWorkspaceRetention(client: ClientBase, workspaceId:
   if (!row) {
     throw new Error(`resolveWorkspaceRetention: workspace ${workspaceId} not found`);
   }
-  return { rawCapturesDays: row.raw as RetentionWindow, rollupsDays: row.rollups as RetentionWindow, purgeNotBefore: row.purge_not_before };
+  const planRaw = row.raw as RetentionWindow;
+  const planRollups = row.rollups as RetentionWindow;
+  const deferred = row.purge_not_before !== null && row.purge_not_before.getTime() >= referenceDate.getTime();
+  // A NULL deferred window is "never purged", so a deferral recorded without windows keeps everything: the side that retains.
+  return {
+    rawCapturesDays: deferred ? longerRetentionWindow(planRaw, row.deferred_raw) : planRaw,
+    rollupsDays: deferred ? longerRetentionWindow(planRollups, row.deferred_rollups) : planRollups,
+    purgeNotBefore: row.purge_not_before,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +789,7 @@ export interface NightlySweepResult {
   readonly derivedAnalysesExpired: DerivedAnalysesExpired;
   readonly attributionDailyExpired: number;
   readonly toolSnapshotsExpired: number;
-  /** Workspaces skipped because their first purge is deferred past a retention-shortening notice (STORY-077 slice B). */
+  /** Workspaces swept under the replaced plan's longer windows because their first purge is deferred (STORY-077 slice B). */
   readonly deferredWorkspaces: number;
   readonly orphans: readonly OrphanReport[];
 }
@@ -786,15 +811,15 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
 
   let workspacesDeferred = 0;
   for (const { id: workspaceId } of workspaces.rows) {
-    const retention = await resolveWorkspaceRetention(privilegedClient, workspaceId);
-    // STORY-077 slice B (EC-41): a plan change that shortened retention defers the FIRST purge past its notice. The check can
-    // only SKIP this workspace's expiries (it adds no predicate to any DELETE or UPDATE below), so it cannot widen what this
-    // owner-role connection removes. A workspace with no deferral runs exactly as before.
+    const retention = await resolveWorkspaceRetention(privilegedClient, workspaceId, referenceDate);
+    // STORY-077 slice B (EC-41): while a plan change's first purge is deferred past its notice, the windows in force are the
+    // replaced plan's (resolveWorkspaceRetention returns the longer of the two), so everything the OLD plan already expired is
+    // still expired, tool snapshots included, and nothing the new, shorter window would remove goes yet. The deferral adds no
+    // predicate to any DELETE or UPDATE below, so it cannot widen what this owner-role connection removes.
     if (retentionPurgeDeferred(retention, referenceDate)) {
       workspacesDeferred += 1;
       incrementCounter("nominara_retention_sweep_deferred_total");
-      logger.log({ message: "retention sweep deferred for a workspace (shortened-retention notice period)", workspace_id: workspaceId });
-      continue;
+      logger.log({ message: "retention sweep running under the replaced plan's windows for a workspace (shortened-retention notice period)", workspace_id: workspaceId });
     }
     rawCapturesExpired += await expireRawCaptures(privilegedClient, workspaceId, retention.rawCapturesDays, referenceDate);
     rollupsExpired += await expireRollups(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);

@@ -169,6 +169,49 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
     expect(await deferral(ws)).toBeNull();
   });
 
+  it("R1 · the replaced plan's windows are stored with the deferral; a second shortening keeps the LONGER of the two", async () => {
+    const ws = await workspace("business");
+    await record(ws, "business", "starter", "evt_w1", NOW);
+    const windows = async () => (await db.query<{ r: number | null; u: number | null }>("SELECT retention_deferred_raw_days AS r, retention_deferred_rollups_days AS u FROM workspaces WHERE id = $1", [ws])).rows[0]!;
+    expect(await windows()).toEqual({ r: 395, u: 1095 });
+    await record(ws, "starter", "free", "evt_w2", new Date(NOW.getTime() + DAY)); // free: raw 30, rollups "-"
+    expect(await windows(), "starter's 90/395 is shorter than the 395/1095 already being kept").toEqual({ r: 395, u: 1095 });
+  });
+
+  it("R1 · a shortening after an EXPIRED deferral starts from the plan being left, not the stale stored windows", async () => {
+    const ws = await workspace("starter");
+    await db.query("UPDATE workspaces SET retention_purge_not_before = $2, retention_deferred_raw_days = 395, retention_deferred_rollups_days = 1095 WHERE id = $1", [ws, new Date(NOW.getTime() - DAY)]);
+    await record(ws, "starter", "free", "evt_stale", NOW);
+    const row = (await db.query<{ r: number | null }>("SELECT retention_deferred_raw_days AS r FROM workspaces WHERE id = $1", [ws])).rows[0]!;
+    expect(row.r).toBe(90);
+  });
+
+  it("R1 · no billing contact: the deferral is audited, and a redelivered event does not push the date out again", async () => {
+    const ws = await workspace("business", null);
+    await record(ws, "business", "starter", "evt_nobody_2", NOW);
+    const first = await deferral(ws);
+    await record(ws, "business", "starter", "evt_nobody_2", new Date(NOW.getTime() + 3 * DAY));
+    expect(await deferral(ws)).toEqual(first);
+    const audit = await db.query("SELECT 1 FROM audit_log WHERE workspace_id = $1 AND action = 'billing.retention.shortened' AND request_id = 'evt_nobody_2'", [ws]);
+    expect(audit.rowCount, "one audit row, not one per delivery").toBe(1);
+  });
+
+  it("R1 · the rollup section also names attribution_daily days, and the email names the derived analyses", async () => {
+    const ws = await workspace("growth"); // rollups 730 -> starter 395
+    const p = await project(ws, "Attr Co");
+    const cutoffDate = new Date(NOW.getTime() + 15 * DAY - 395 * DAY);
+    const d = new Date(cutoffDate.getTime() - 5 * DAY).toISOString().slice(0, 10);
+    await db.query(
+      "INSERT INTO attribution_daily (workspace_id, project_id, metric_date, landing_url_hash, landing_url, referrer_class, country, device) VALUES ($1, $2, $3, decode('01','hex'), 'https://example.com/a', 'chatgpt', 'US', 'desktop')",
+      [ws, p, d],
+    );
+    await record(ws, "growth", "starter", "evt_attr", NOW);
+    const body = (await notices(ws))[0]!.text_body;
+    expect(body).toContain("Attr Co: 1 day");
+    expect(body).toMatch(/attribution/i);
+    expect(body).toMatch(/geo analyses/i);
+  });
+
   it("observability · one span, one counted outcome and one log line carrying the workspace ID (never its name, the address or the body)", async () => {
     const exporter = new InMemorySpanExporter();
     const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
@@ -254,6 +297,21 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
       expect(await key(), "purged after the date").toBeNull();
     });
 
+    it("R1 · a deferred workspace still loses what the OLD plan's window already expired (500 day old capture and rollup), and keeps the rest", async () => {
+      const ws = await workspace("starter");
+      const p = await project(ws, "P");
+      const ancient = await capture(ws, p, new Date(NOW.getTime() - 500 * DAY)); // past 395: gone under the old plan too
+      const aged = await capture(ws, p, new Date(NOW.getTime() - 200 * DAY)); // past 90 (new) but inside 395 (old): kept until the date
+      await metric(ws, p, new Date(NOW.getTime() - 1200 * DAY).toISOString().slice(0, 10)); // past the old 1095 rollup window
+      await metric(ws, p, new Date(NOW.getTime() - 200 * DAY).toISOString().slice(0, 10));
+      await db.query("UPDATE workspaces SET retention_purge_not_before = $2, retention_deferred_raw_days = 395, retention_deferred_rollups_days = 1095 WHERE id = $1", [ws, new Date(NOW.getTime() + 15 * DAY)]);
+      await runNightlySweep(db, NOW);
+      const key = async (id: string) => (await db.query<{ raw_object_key: string | null }>("SELECT raw_object_key FROM answer_captures WHERE id = $1", [id])).rows[0]!.raw_object_key;
+      expect(await key(ancient), "old window still enforced").toBeNull();
+      expect(await key(aged), "new window not applied yet").not.toBeNull();
+      expect((await db.query("SELECT 1 FROM metric_daily WHERE workspace_id = $1", [ws])).rowCount).toBe(1);
+    });
+
     it("R1 · the instant of the purge date itself is still deferred (strictly after, never at)", async () => {
       const ws = await workspace("starter");
       const p = await project(ws, "P");
@@ -298,14 +356,29 @@ describe("STORY-077 slice B · retention-shortening notice and deferred first pu
   });
 
   describe("the deferral on the read paths", () => {
-    it("R1 · while deferred, a capture older than the new window is still readable (not hidden by window); after, it is", async () => {
+    it("R1 · while deferred, the read window is the OLD plan's (never none); after the date, the new window", async () => {
       const ws = await workspace("starter");
       const client = await pool.connect();
       try {
         const cutoffOf = async (now: Date) => await withTenantContext(client, { workspaceId: ws, actorId: SYSTEM_ACTOR_ID }, (tx) => rawRetentionCutoff(tx, ws, now));
-        await db.query("UPDATE workspaces SET retention_purge_not_before = $2 WHERE id = $1", [ws, new Date(NOW.getTime() + 15 * DAY)]);
-        expect(await cutoffOf(NOW)).toBeNull();
+        // Business (395 raw) -> starter (90 raw): the deferral recorded the window being replaced.
+        await db.query("UPDATE workspaces SET retention_purge_not_before = $2, retention_deferred_raw_days = 395, retention_deferred_rollups_days = 1095 WHERE id = $1", [ws, new Date(NOW.getTime() + 15 * DAY)]);
+        expect(await cutoffOf(NOW)).toEqual(new Date(NOW.getTime() - 395 * DAY));
         expect(await cutoffOf(new Date(NOW.getTime() + 16 * DAY))).toEqual(new Date(NOW.getTime() + 16 * DAY - 90 * DAY));
+      } finally {
+        client.release();
+      }
+    });
+
+    it("R1 · starter -> free: during the deferral a capture 120 days old stays hidden by the OLD (90 day) window, not readable again", async () => {
+      const ws = await workspace("starter");
+      await project(ws, "P");
+      await record(ws, "starter", "free", "evt_s2f", NOW);
+      await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [ws]);
+      const client = await pool.connect();
+      try {
+        const cutoff = await withTenantContext(client, { workspaceId: ws, actorId: SYSTEM_ACTOR_ID }, (tx) => rawRetentionCutoff(tx, ws, NOW));
+        expect(cutoff, "the old (starter) 90-day window, which is longer than free's 30").toEqual(new Date(NOW.getTime() - 90 * DAY));
       } finally {
         client.release();
       }
