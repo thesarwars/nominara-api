@@ -4,9 +4,9 @@
 //
 //   1. install      `pnpm install --frozen-lockfile`, only when node_modules is absent
 //   2. env          write .env from .env.example with locally generated secrets (never overwrites one)
-//   3. start        `docker compose up -d --build --wait`: Postgres, pgBouncer, both Valkeys,
-//                   then the one-shot migrate + dev-credentials services, then the API, the
-//                   gateway and the workers, gated on the API's readiness probe
+//   3. start        `docker compose up -d --build`, then `docker compose up -d --wait api`: Postgres,
+//                   pgBouncer, both Valkeys, then the one-shot migrate + dev-credentials services,
+//                   then the API, the gateway and the workers, gated on the API's readiness probe
 //   4. seed         `pnpm db:seed` on the host, against the stack's published ports: three
 //                   awkward synthetic tenants (idempotent: a second run writes nothing)
 //
@@ -14,7 +14,9 @@
 // .env. So `COMPOSE_PROJECT_NAME=other POSTGRES_PORT=15432 ... pnpm dev:up` runs a second,
 // independent stack, and the seed follows it to the moved ports.
 //
-// Flags: --no-seed (skip step 4), --no-build (start the last built image).
+// Flags: --no-seed (skip step 4), --no-build (start the last built image), --reset (STORY-004 AC7: in place of
+// step 4, `pnpm db:reset --seed` — drop everything, re-migrate, re-apply the role passwords, re-seed — with the
+// same derived environment, so starting over is one command too).
 import { spawnSync } from "node:child_process";
 import console from "node:console";
 import { existsSync, readFileSync } from "node:fs";
@@ -25,9 +27,13 @@ import { composeHostUrls, ensureDevEnv, parseEnvText } from "./dev-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2).filter((arg) => arg !== "--");
-const unknown = args.filter((arg) => arg !== "--no-seed" && arg !== "--no-build");
+const unknown = args.filter((arg) => arg !== "--no-seed" && arg !== "--no-build" && arg !== "--reset");
 if (unknown.length > 0) {
-  console.error(`dev:up: unknown argument(s): ${unknown.join(" ")} (accepted: --no-seed, --no-build)`);
+  console.error(`dev:up: unknown argument(s): ${unknown.join(" ")} (accepted: --no-seed, --no-build, --reset)`);
+  process.exit(2);
+}
+if (args.includes("--reset") && args.includes("--no-seed")) {
+  console.error("dev:up: --reset re-seeds by definition; it cannot be combined with --no-seed");
   process.exit(2);
 }
 
@@ -62,21 +68,30 @@ const effective = { ...parseEnvText(readFileSync(path, "utf8")), ...process.env 
 const urls = composeHostUrls(effective);
 
 step("docker compose up");
-run("docker", ["compose", "up", "-d", ...(args.includes("--no-build") ? [] : ["--build"]), "--wait"]);
+run("docker", ["compose", "up", "-d", ...(args.includes("--no-build") ? [] : ["--build"])]);
+// `--wait` across EVERY service fails here by design: the gateway and the workers disable the image's healthcheck
+// (docker-compose.yml says why) and compose refuses to wait on a service with none ("has no healthcheck configured").
+// So wait on the API alone: its healthcheck is /health/ready, which needs the database through pgBouncer and the
+// queue, and its dependencies include the one-shot migrate + dev-credentials services having exited successfully.
+run("docker", ["compose", "up", "-d", "--wait", "api"]);
 
+const seedEnv = {
+  ...effective,
+  NODE_ENV: "development",
+  DATABASE_URL: urls.databaseUrl,
+  DATABASE_URL_POOLED: urls.databaseUrlPooled,
+  VALKEY_CACHE_URL: urls.valkeyCacheUrl,
+  QUEUE_REDIS_URL: urls.queueRedisUrl,
+  NOMINARA_SYNTHETIC_SEED: "1",
+};
 if (args.includes("--no-seed")) {
   console.log("\n--no-seed: skipping the synthetic seed");
+} else if (args.includes("--reset")) {
+  step("reset: drop, re-migrate, role passwords, seed");
+  run("pnpm", ["--silent", "db:reset", "--seed"], seedEnv);
 } else {
   step("seed: three synthetic tenants");
-  run("pnpm", ["--silent", "db:seed"], {
-    ...effective,
-    NODE_ENV: "development",
-    DATABASE_URL: urls.databaseUrl,
-    DATABASE_URL_POOLED: urls.databaseUrlPooled,
-    VALKEY_CACHE_URL: urls.valkeyCacheUrl,
-    QUEUE_REDIS_URL: urls.queueRedisUrl,
-    NOMINARA_SYNTHETIC_SEED: "1",
-  });
+  run("pnpm", ["--silent", "db:seed"], seedEnv);
 }
 
 console.log(`
@@ -85,4 +100,4 @@ nominara-api is up.
   gateway   ${urls.gatewayUrl}
   Postgres  ${urls.databaseUrl.replace("nominara:nominara@", "nominara:***@")}
 OTP codes are logged by the api container: docker compose logs -f api
-Start over from empty: docker compose down -v && pnpm dev:up`);
+Start over: pnpm dev:up --reset (or, to drop the volumes too, docker compose down -v && pnpm dev:up)`);

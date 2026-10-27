@@ -16,10 +16,11 @@ pnpm dev:up
 
 It installs dependencies when `node_modules` is absent, writes `.env` from `.env.example` with secrets
 generated on your machine (never overwriting an existing `.env`, and setting **no vendor credential** —
-fixture adapters cover every engine), runs `docker compose up -d --build --wait` (Postgres + pgvector,
-pgBouncer, both Valkeys, the one-shot `migrate` and `dev-credentials` services, then the API on
-`localhost:4000`, the gateway on `localhost:3001` and the workers, gated on `/health/ready`), and finally
-`pnpm db:seed`. `pnpm dev:api` is an alias. Flags: `--no-seed`, `--no-build`. The app repository's
+fixture adapters cover every engine), runs `docker compose up -d --build` (Postgres + pgvector, pgBouncer,
+both Valkeys, the one-shot `migrate` and `dev-credentials` services, then the API on `localhost:4000`, the
+gateway on `localhost:3001` and the workers), waits on the API's `/health/ready` with
+`docker compose up -d --wait api` (the gateway and workers have no healthcheck to wait on), and finally
+`pnpm db:seed`. `pnpm dev:api` is an alias. Flags: `--no-seed`, `--no-build`, `--reset`. The app repository's
 `pnpm dev:stack` calls this and then starts the app against it.
 
 `pnpm db:seed` writes three synthetic tenants with deliberately awkward shapes (testing-strategy.md §12),
@@ -37,9 +38,11 @@ one per paid tier, each set through `pnpm plan:set` and given one 500-credit gra
 `DATABASE_URL_POOLED` both name a local host, and `NOMINARA_SYNTHETIC_SEED=1` (`dev:up` sets all of this
 from the stack's published ports). Every write goes through `DATABASE_URL_POOLED` as `nominara_app`.
 
-**Starting over:** `docker compose down -v && pnpm dev:up`, or, against a running stack,
-`pnpm db:reset --seed` with the seed's environment exported (it drops and re-migrates, re-applies the role
-passwords, then re-seeds; the seed guard is checked before anything is dropped).
+**Starting over (AC7):** `pnpm dev:up --reset` runs `pnpm db:reset --seed` against the stack with the
+same derived environment: it drops everything this project owns, re-applies every migration, re-applies the
+role passwords and re-seeds (the seed guard is checked before anything is dropped). `pnpm db:reset --seed`
+can also be run directly with that environment exported. To discard the volumes as well:
+`docker compose down -v && pnpm dev:up`.
 
 **A second stack on one machine** (another worktree, a verification run): every host port and the image
 tag are overridable, and the seed follows the ports.
