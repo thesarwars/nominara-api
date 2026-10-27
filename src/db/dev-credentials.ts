@@ -10,6 +10,7 @@
 // (NFR-SEC-16) — this script has no production path and does not attempt one
 // (disclosed gap G-2).
 import { fileURLToPath } from "node:url";
+import type { ClientBase } from "pg";
 import { BREAKGLASS_ROLE, RUNTIME_ROLES } from "./conventions.js";
 import { connect, requireDatabaseUrl } from "./client.js";
 
@@ -31,6 +32,11 @@ function envVarName(role: string): string {
 
 export function resolvePassword(role: string, env: NodeJS.ProcessEnv = process.env): string {
   return env[envVarName(role)] ?? DEFAULT_PASSWORDS[role]!;
+}
+
+/** STORY-004 AC7 — RED stub. Implemented in the next commit. */
+export async function applyDevCredentials(_client: ClientBase, _env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+  throw new Error("not implemented");
 }
 
 async function main() {
