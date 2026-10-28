@@ -13,7 +13,7 @@ import {
 import { buildIdempotencyKey } from "../../../src/lib/queue/idempotency.js";
 import { EmbeddingProviderError } from "../../../src/modules/prompts/ports/embedding-provider.js";
 import { StandInEmbeddingProvider, STAND_IN_EMBEDDING_MODEL } from "../../../src/modules/prompts/adapters/stand-in-embedding-provider.js";
-import { OpenAiEmbeddingProvider } from "../../../src/modules/prompts/adapters/openai-embedding-provider.js";
+import { OPENAI_EMBEDDINGS_ENDPOINT, OpenAiEmbeddingProvider } from "../../../src/modules/prompts/adapters/openai-embedding-provider.js";
 import { selectEmbeddingProvider } from "../../../src/modules/prompts/embedding-provider.selector.js";
 
 // STORY-133 — the pure parts of the embedding client. The handler's database behaviour is test/integration/embed-batch-handler.spec.ts.
@@ -148,7 +148,8 @@ describe("STORY-133 · the OpenAI adapter, against an injected HTTP layer (never
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
     const [url, init] = fetchFn.mock.calls[0]!;
-    expect(url).toBe("https://api.openai.com/v1/embeddings");
+    expect(url).toBe(OPENAI_EMBEDDINGS_ENDPOINT);
+    expect(new URL(url).pathname).toBe("/v1/embeddings");
     expect(JSON.parse(String(init!.body))).toEqual({ model: "text-embedding-3-large", input: ["one", "two"], dimensions: 1536, encoding_format: "float" });
     expect((init!.headers as Record<string, string>).authorization).toBe("Bearer sk-test");
     expect(result.totalTokens).toBe(11);
@@ -222,7 +223,7 @@ describe("STORY-133 · NFR-ARCH-01 — the port is reachable from the embed.batc
   });
 
   it("a controller importing an adapter or the selector fails lint too", async () => {
-    expect(await lintMessages("src/modules/prompts/prompts.controller.ts", 'import { OpenAiEmbeddingProvider } from "./adapters/openai-embedding-provider.js";\nexport const x = OpenAiEmbeddingProvider;\n')).not.toEqual([]);
+    expect(await lintMessages("src/modules/prompts/prompts.controller.ts", 'import { OPENAI_EMBEDDINGS_ENDPOINT, OpenAiEmbeddingProvider } from "./adapters/openai-embedding-provider.js";\nexport const x = OpenAiEmbeddingProvider;\n')).not.toEqual([]);
     expect(await lintMessages("src/api/anything.ts", 'import { selectEmbeddingProvider } from "../modules/prompts/embedding-provider.selector.js";\nexport const x = selectEmbeddingProvider;\n')).not.toEqual([]);
   });
 

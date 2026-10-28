@@ -247,7 +247,7 @@ export class PromptActivationService {
         [projectId, Math.min(cap, PROMPTS_CAP_COLUMN_MAX)],
       );
 
-      // STORY-133 DECISION 3 - the activated prompts are queued for embedding in THIS transaction (the job is enqueued after
+      // STORY-133 the producer-edge decision (STORY-133 D3) - the activated prompts are queued for embedding in THIS transaction (the job is enqueued after
       // COMMIT, so a rollback leaves no orphan). Without it a prompt is permanently invisible to L2, dedupe and clustering.
       const embedEnqueue = embedBatchEnqueuerFor(this.producer);
       if (embedEnqueue !== undefined) {

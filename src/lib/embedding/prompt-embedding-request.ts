@@ -4,7 +4,7 @@ import type { QueueProducer } from "../queue/queue-producer.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { embedBatchKey, splitIdsIntoJobs } from "./embed-batch.js";
 
-// STORY-133 DECISION 3 - prompt activation is the fourth producer of `embed.batch`.
+// STORY-133 the producer-edge decision (STORY-133 D3) - prompt activation is the fourth producer of `embed.batch`.
 //
 // `tracked_prompts.embedding` is the column L2, generation dedupe and clustering read; a prompt that activates without an embed
 // job queued is permanently invisible to all three. So the request is made INSIDE the activation's transaction and the job is

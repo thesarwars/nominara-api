@@ -147,7 +147,7 @@ describe("STORY-046 · PromptActivationService.activate", () => {
   });
 
   it("STORY-133 scenario 16 - the activated prompts are queued for embedding AFTER the active-count update, and enqueued only after COMMIT", async () => {
-    // DECISION 3: the request is made in the activation's own transaction (so a rollback queues nothing); the job itself is
+    // the producer-edge decision (D3): the request is made in the activation's own transaction (so a rollback queues nothing); the job itself is
     // enqueued by afterCommit, never inline.
     calls = [];
     const client = clientAnsweringWith(calls, [

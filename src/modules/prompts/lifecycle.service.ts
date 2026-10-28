@@ -413,7 +413,7 @@ export class PromptLifecycleService {
   }
 
   /**
-   * STORY-133 DECISION 3 - a prompt that is ACTIVE after this change and has no vector yet is queued for embedding in this
+   * STORY-133 the producer-edge decision (STORY-133 D3) - a prompt that is ACTIVE after this change and has no vector yet is queued for embedding in this
    * transaction (enqueued after COMMIT). A no-op for a paused or archived result, and for a prompt already embedded.
    */
   private async requestEmbedding(client: TenantClient, context: TenantContext, status: string, promptId: string): Promise<void> {
