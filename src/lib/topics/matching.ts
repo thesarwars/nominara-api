@@ -1,7 +1,9 @@
 // STORY-047 AC3 - which new group is which old cluster.
 //
 // BY MEMBERSHIP, NOT BY CENTROID. A user's rename must survive a model switch, and a centroid from another model's vector space
-// cannot be compared (EC-23); membership can. A group takes the old cluster most of its members came from, so the cluster keeps its
+// cannot be compared (EC-23); membership can. That holds for a switch of the WHOLE project at once. A gradual re-embed releases the
+// prompts re-embedded so far at every run, so the evidence thins out and a rename can be lost: STORY-186 must switch a project's
+// prompts atomically (or keep membership evidence across the switch), and needs a gradual re-embed test when it has a producer. A group takes the old cluster most of its members came from, so the cluster keeps its
 // id (goals and the UI hold it), its label and, if renamed, its `label_source = 'user'`.
 //
 // A cluster that DISSOLVES - no new group shares at least half of the smaller side with it - is deleted with its label, a user's

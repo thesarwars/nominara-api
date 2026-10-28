@@ -94,7 +94,7 @@ export async function findProjectsDueForClustering(client: ClientBase, now: Date
                  AND p.cluster_id IS NULL AND c.last_at IS NOT NULL AND p.updated_at > c.last_at)::text AS arrived,
             (SELECT count(*) FROM tracked_prompts p
                WHERE p.project_id = pr.id AND p.cluster_id IS NOT NULL
-                 AND (p.deleted_at IS NOT NULL OR p.status <> 'active' OR p.superseded_by IS NOT NULL
+                 AND (NOT (${CLUSTERABLE_BASE_SQL})
                       OR p.embedding_model <> (SELECT cl.embedding_model FROM topic_clusters cl WHERE cl.id = p.cluster_id)))::text AS departed,
             (SELECT count(*) FROM tracked_prompts p
                WHERE p.project_id = pr.id AND ${CLUSTERABLE_BASE_SQL} AND p.embedding_model = d.embedding_model

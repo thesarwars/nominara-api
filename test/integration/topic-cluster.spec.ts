@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client, Pool, type PoolClient } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { topicClusterJobPayloadSchema } from "../../contracts/projects/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -23,6 +23,18 @@ import { StandInEmbeddingProvider, STAND_IN_EMBEDDING_MODEL } from "../../src/mo
 // Vectors are written directly (axis-aligned, with a little noise) so every cosine in a scenario is known by construction. The
 // stand-in provider test at the end proves the pipeline embed.batch -> topic.cluster, not the model: ACs that need a REAL embedding
 // (label quality on real prompts) stay open until the OpenAI key is configured and one run is read by a person.
+
+const counters: { name: string; labels: Record<string, string> }[] = [];
+vi.mock("../../src/lib/telemetry/metrics.js", async () => {
+  const actual = await vi.importActual<typeof import("../../src/lib/telemetry/metrics.js")>("../../src/lib/telemetry/metrics.js");
+  return {
+    ...actual,
+    incrementCounter: (name: string, labels: Record<string, string> = {}) => {
+      counters.push({ name, labels });
+      actual.incrementCounter(name, labels);
+    },
+  };
+});
 
 const KEYS = { current: { kid: "k1", key: Buffer.from("topic-cluster-test-signing-key-32") } };
 const ENTRY = QUEUE_TOPOLOGY.find((entry) => entry.name === "topic.cluster")!;
@@ -302,6 +314,65 @@ describe("STORY-047 - topic.cluster", () => {
     expect(rows.map((r) => [r.id, r.label, r.label_source])).toEqual([[before!.id, "Mine", "user"]]);
   });
 
+  async function renameToUser(id: string, label: string): Promise<void> {
+    await db.query("UPDATE topic_clusters SET label = $2, label_source = 'user' WHERE id = $1", [id, label]);
+  }
+  /** What the reword path does: the original is archived and keeps its cluster_id; the replacement starts unassigned and embedded. */
+  async function reword(id: string, k: number, g = 0): Promise<string> {
+    const replacement = await addPrompt(`Reworded ${String(k)}: ${TOPICS[g]!(50 + k)}`, member(g, 50 + k));
+    await db.query("UPDATE tracked_prompts SET status = 'archived', superseded_by = $2 WHERE id = $1", [id, replacement]);
+    return replacement;
+  }
+
+  it("AC3 - a renamed 2-prompt cluster whose BOTH prompts are reworded keeps its id, its user label and its count", async () => {
+    const ids = (await seedGroups(1, 2))[0]!;
+    await run();
+    const [before] = await clusters();
+    await renameToUser(before!.id, "Our enterprise CRM");
+    for (const [k, id] of ids.entries()) await reword(id, k);
+    await run();
+    const rows = await clusters();
+    expect(rows.map((r) => [r.id, r.label, r.label_source, r.prompt_count])).toEqual([[before!.id, "Our enterprise CRM", "user", 2]]);
+  });
+
+  it("AC3 - a renamed 5-prompt cluster whose five prompts are ALL reworded keeps its id and its user label", async () => {
+    const ids = (await seedGroups(1, 5))[0]!;
+    await run();
+    const [before] = await clusters();
+    await renameToUser(before!.id, "Our enterprise CRM");
+    for (const [k, id] of ids.entries()) await reword(id, k);
+    await run();
+    const rows = await clusters();
+    expect(rows.map((r) => [r.id, r.label, r.label_source, r.prompt_count])).toEqual([[before!.id, "Our enterprise CRM", "user", 5]]);
+    expect(await orphans()).toBe(0);
+  });
+
+  it("AC3 - a reword of a reword (A -> A' -> A'') still resolves to the original's cluster", async () => {
+    const ids = (await seedGroups(1, 2))[0]!;
+    await run();
+    const [before] = await clusters();
+    await renameToUser(before!.id, "Mine");
+    for (const [k, id] of ids.entries()) {
+      const first = await reword(id, k);
+      await reword(first, k + 10);
+    }
+    await run();
+    const rows = await clusters();
+    expect(rows.map((r) => [r.id, r.label, r.label_source, r.prompt_count])).toEqual([[before!.id, "Mine", "user", 2]]);
+  });
+
+  it("AC3 - members that carry the non-dominant model do not count against an old cluster (a partial re-embed does not dissolve it)", async () => {
+    const ids = (await seedGroups(1, 12))[0]!;
+    await run();
+    const [before] = await clusters();
+    await renameToUser(before!.id, "Mine");
+    await db.query("UPDATE tracked_prompts SET embedding_model = 'other-model-1536' WHERE id = ANY($1::uuid[])", [ids.slice(0, 8)]);
+    for (let k = 0; k < 5; k += 1) await addPrompt(`Another way ${TOPICS[0]!(20 + k)}`, member(0, 20 + k));
+    await run();
+    const rows = await clusters();
+    expect(rows.map((r) => [r.id, r.label, r.label_source])).toEqual([[before!.id, "Mine", "user"]]);
+  });
+
   it("AC3 - a label a user chose between prepare and commit that equals a freshly chosen label does not fail the run", async () => {
     await seedGroups(2, 3);
     await run();
@@ -314,6 +385,47 @@ describe("STORY-047 - topic.cluster", () => {
     const rows = await clusters();
     expect(rows.map((r) => r.label).sort()).toEqual(["Enterprise CRM", "Security & compliance", "Security & compliance (2)"]);
     expect(rows.find((r) => r.label === "Security & compliance")?.label_source).toBe("user");
+  });
+
+  it("AC3 - a label that collided in the run phase is not suffixed twice when the commit finds the suffixed name taken too", async () => {
+    await seedGroups(1, 3);
+    const same = new StubLabeller();
+    same.label = () => Promise.resolve("Same");
+    await run(handler(same));
+    for (let i = 0; i < 3; i += 1) await addPrompt(TOPICS[1]!(i), member(1, i));
+    const [first] = await clusters();
+    const racing: TopicLabeller = {
+      label: async () => {
+        await renameToUser(first!.id, "Same (2)");
+        return "Same";
+      },
+    };
+    await run(handler(racing));
+    expect((await clusters()).map((r) => r.label).sort()).toEqual(["Same", "Same (2)"]);
+  });
+
+  it("AC3 - the label recheck locks the kept rows: a rename in flight is waited for, not raced into the unique index", async () => {
+    await seedGroups(2, 3);
+    await run();
+    for (let i = 0; i < 3; i += 1) await addPrompt(TOPICS[2]!(i), member(2, i));
+    const renamer = new Client({ connectionString: container.getConnectionUri() });
+    await renamer.connect();
+    try {
+      // The rename is open (uncommitted) when the commit phase reads the kept labels; it commits only after the run has had time to hit it.
+      await renamer.query("BEGIN");
+      await renamer.query("UPDATE topic_clusters SET label = 'Security & compliance', label_source = 'user' WHERE project_id = $1 AND label = 'Pricing comparison'", [projectId]);
+      let finished = false;
+      const running = run(handler()).finally(() => {
+        finished = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(finished).toBe(false);
+      await renamer.query("COMMIT");
+      await running;
+    } finally {
+      await renamer.end();
+    }
+    expect((await clusters()).map((r) => r.label).sort()).toEqual(["Enterprise CRM", "Security & compliance", "Security & compliance (2)"]);
   });
 
   it("AC5 - a prompt set that changes and changes back during a run is not mistaken for 'another run did this': the prompt is still assigned", async () => {
@@ -356,6 +468,59 @@ describe("STORY-047 - topic.cluster", () => {
     assigned = await assignments();
     expect(assigned.get(d)).toBeNull();
     expect((await clusters())[0]!.prompt_count).toBe(2);
+  });
+
+  it("AC7 - a planned cluster left with fewer than two clusterable members is not written: no empty cluster, no stale count", async () => {
+    const [a, b, c] = (await seedGroups(1, 3))[0]! as [string, string, string];
+    // Every planned member stopped being clusterable after the plan: a NEW cluster must not be written at all.
+    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = ANY($1::uuid[])", [[a, b, c]]);
+    const gone = randomUUID();
+    await writeClusters(db, workspaceId, projectId, MODEL, [{ clusterId: gone, memberIds: [a, b, c], newLabel: "T" }]);
+    expect(await clusters()).toHaveLength(0);
+    // A KEPT cluster that loses all but one member is removed, and the lone member is released rather than left pointing at it.
+    await db.query("UPDATE tracked_prompts SET status = 'active' WHERE id = ANY($1::uuid[])", [[a, b, c]]);
+    const kept = randomUUID();
+    await writeClusters(db, workspaceId, projectId, MODEL, [{ clusterId: kept, memberIds: [a, b, c], newLabel: "T" }]);
+    expect((await clusters())[0]!.prompt_count).toBe(3);
+    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = ANY($1::uuid[])", [[b, c]]);
+    await writeClusters(db, workspaceId, projectId, MODEL, [{ clusterId: kept, memberIds: [a, b, c] }]);
+    expect(await clusters()).toHaveLength(0);
+    expect([...(await assignments()).values()].every((cluster) => cluster === null)).toBe(true);
+    expect(await orphans()).toBe(0);
+  });
+
+  it("observability - the label counters and the committed log count the labels that were WRITTEN, not the ones a discarded plan chose", async () => {
+    // The A/B/A race: A named its group (one model label), but B's run committed first, so A re-plans onto B's cluster and writes no label.
+    const [, , , , x] = (await seedGroups(1, 5))[0]! as [string, string, string, string, string];
+    let raced = false;
+    const racing = new StubLabeller(async () => {
+      if (raced) return;
+      raced = true;
+      await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = $1", [x]);
+      await run(handler(new StubLabeller()));
+      await db.query("UPDATE tracked_prompts SET status = 'active' WHERE id = $1", [x]);
+    });
+    counters.length = 0;
+    await run(handler(racing));
+    expect(counters.filter((c) => c.name === "nominara_topic_cluster_labels_total" && c.labels.source === "model")).toHaveLength(1);
+    expect(counters.filter((c) => c.name === "nominara_topic_cluster_runs_total" && c.labels.outcome === "replanned")).toHaveLength(1);
+  });
+
+  it("AC3 - a re-plan reuses the label already chosen for a group with the same members instead of discarding it", async () => {
+    // The cluster state moves during the run (an unrelated, memberless row appears) but the prompt set does not, so the commit plans
+    // again. The group is still unmatched and has the same members: the label the run chose for it is the one written, and it counts once.
+    await seedGroups(1, 4);
+    let raced = false;
+    const racing = new StubLabeller(async () => {
+      if (raced) return;
+      raced = true;
+      await db.query("INSERT INTO topic_clusters (id, workspace_id, project_id, label, label_source) VALUES ($1, $2, $3, 'Unrelated', 'auto')", [randomUUID(), workspaceId, projectId]);
+    });
+    counters.length = 0;
+    await run(handler(racing));
+    expect((await clusters()).map((r) => r.label)).toEqual(["Enterprise CRM"]);
+    expect(counters.filter((c) => c.name === "nominara_topic_cluster_runs_total" && c.labels.outcome === "replanned")).toHaveLength(1);
+    expect(counters.filter((c) => c.name === "nominara_topic_cluster_labels_total").map((c) => c.labels.source)).toEqual(["model"]);
   });
 
   // ---- AC5, scenario 4 ------------------------------------------------------------------------------------------------
@@ -645,6 +810,14 @@ describe("STORY-047 - topic.cluster", () => {
       expect((await due())[0]?.reason).toBe("prompt_set_change");
       await run();
       expect(await due()).toHaveLength(0);
+    });
+
+    it("a clustered prompt whose embedding was cleared has left the set and counts toward the 10%", async () => {
+      await seedGroups(2, 5);
+      await run();
+      expect(await due()).toHaveLength(0);
+      await db.query("UPDATE tracked_prompts SET embedding = NULL, embedding_model = NULL WHERE id IN (SELECT id FROM tracked_prompts WHERE cluster_id IS NOT NULL ORDER BY id LIMIT 3)");
+      expect((await due())[0]?.reason).toBe("prompt_set_change");
     });
 
     it("the periodic schedule - an unchanged project is due once its clusters are older than seven days, not before", async () => {

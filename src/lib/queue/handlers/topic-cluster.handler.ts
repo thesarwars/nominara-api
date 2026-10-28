@@ -51,12 +51,18 @@ interface Prepared {
   readonly matched: ReadonlyMap<number, string>;
 }
 
-interface Fetched {
-  /** group index -> the label of a NEW cluster. */
-  readonly labels: ReadonlyMap<number, string>;
-  readonly modelLabels: number;
-  readonly templateLabels: number;
+interface ChosenLabel {
+  /** The name as chosen, BEFORE it is made unique: uniqueness is decided once, at commit, against what is committed then. */
+  readonly label: string;
+  readonly source: "model" | "template";
 }
+
+interface Fetched {
+  /** group index -> the label chosen for a NEW cluster. */
+  readonly labels: ReadonlyMap<number, ChosenLabel>;
+}
+
+const membersKey = (ids: readonly string[]): string => [...ids].sort().join(",");
 
 export interface TopicClusterDeps {
   /** The model behind cluster names. Defaults to the deterministic template; binding Gemini waits on STORY-045's client being merged. */
@@ -98,22 +104,13 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
   };
 
   const run = async (prepared: Prepared): Promise<Fetched> => {
-    // A matched cluster keeps its label; the labels in force are the taken ones a NEW label must not collide with (lower-cased,
-    // like `ux_topic_clusters`).
-    const kept = new Set(
-      prepared.snapshot.olds.filter((old) => [...prepared.matched.values()].includes(old.id)).map((old) => old.label.toLowerCase()),
-    );
-    const labels = new Map<number, string>();
-    let modelLabels = 0;
-    let templateLabels = 0;
+    // A matched cluster keeps its label, so only the new groups are named.
+    const labels = new Map<number, ChosenLabel>();
     for (const group of prepared.snapshot.groups) {
       if (prepared.matched.has(group.index)) continue;
-      const named = await labelOrFallback(labeller, { prompts: group.samples });
-      if (named.source === "model") modelLabels += 1;
-      else templateLabels += 1;
-      labels.set(group.index, uniqueLabel(named.label, kept));
+      labels.set(group.index, await labelOrFallback(labeller, { prompts: group.samples }));
     }
-    return { labels, modelLabels, templateLabels };
+    return { labels };
   };
 
   const commit = async (tx: ClientBase, prepared: Prepared, fetched: Fetched): Promise<void> => {
@@ -133,7 +130,7 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
           // no cluster to inherit is named by the deterministic template.
           let plannedGroups = snapshot.groups;
           let matched = prepared.matched;
-          let labels = fetched.labels;
+          let labels: ReadonlyMap<number, ChosenLabel> = fetched.labels;
           let clusterable = snapshot.clusterable;
           if ((await clusterStateHash(tx, payload.projectId)) !== snapshot.clusterStateHash) {
             const again = await snapshotClusters(tx, payload.projectId);
@@ -149,26 +146,32 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
               again.groups.map((group) => ({ index: group.index, memberCount: group.memberIds.length, overlaps: group.overlaps })),
               again.olds,
             );
+            // A group with the same members as one named in the run phase keeps that name; any other is named by the template.
             const template = new TemplateTopicLabeller();
-            const named = new Map<number, string>();
+            const byMembers = new Map(snapshot.groups.map((group) => [membersKey(group.memberIds), fetched.labels.get(group.index)]));
+            const named = new Map<number, ChosenLabel>();
             for (const group of again.groups) {
-              if (!matched.has(group.index)) named.set(group.index, (await labelOrFallback(template, { prompts: group.samples })).label);
+              if (matched.has(group.index)) continue;
+              named.set(group.index, byMembers.get(membersKey(group.memberIds)) ?? (await labelOrFallback(template, { prompts: group.samples })));
             }
             labels = named;
           }
 
-          // A label is only unique against what is committed NOW: a user may have renamed a kept cluster since `run` chose the names.
-          const kept = await tx.query<{ label: string }>("SELECT label FROM topic_clusters WHERE project_id = $1 AND id = ANY($2::uuid[])", [
+          // A label is only unique against what is committed NOW: a user may have renamed a kept cluster since `run` chose the names. The
+          // rows are locked (FOR UPDATE) so a rename in flight is waited for rather than racing the insert into `ux_topic_clusters`.
+          const kept = await tx.query<{ label: string }>("SELECT label FROM topic_clusters WHERE project_id = $1 AND id = ANY($2::uuid[]) FOR UPDATE", [
             payload.projectId,
             [...matched.values()],
           ]);
           const taken = new Set(kept.rows.map((row) => row.label.toLowerCase()));
 
+          const sources = { model: 0, template: 0 };
           const plan: ClusterPlanEntry[] = plannedGroups.map((group) => {
             const existing = matched.get(group.index);
-            return existing !== undefined
-              ? { clusterId: existing, memberIds: group.memberIds }
-              : { clusterId: uuidV7(), memberIds: group.memberIds, newLabel: uniqueLabel(labels.get(group.index) ?? "General questions", taken) };
+            if (existing !== undefined) return { clusterId: existing, memberIds: group.memberIds };
+            const chosen = labels.get(group.index) ?? { label: "General questions", source: "template" as const };
+            sources[chosen.source] += 1;
+            return { clusterId: uuidV7(), memberIds: group.memberIds, newLabel: uniqueLabel(chosen.label, taken) };
           });
           const written = await writeClusters(tx, payload.workspaceId, payload.projectId, snapshot.model, plan);
 
@@ -177,8 +180,8 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
           incrementCounter("nominara_topic_cluster_runs_total", { outcome: "clustered" });
           observeValue("nominara_topic_cluster_clusters_written", plan.length, { reason: payload.reason });
           observeValue("nominara_topic_cluster_outlier_prompts", outliers);
-          for (let i = 0; i < fetched.modelLabels; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "model" });
-          for (let i = 0; i < fetched.templateLabels; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "template" });
+          for (let i = 0; i < sources.model; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "model" });
+          for (let i = 0; i < sources.template; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "template" });
           span.setAttributes({ "nominara.topic_cluster.clusters": plan.length, "nominara.topic_cluster.outliers": outliers });
           // Ids and counts only: never a label or a prompt (customer text).
           logger.log({
@@ -191,8 +194,8 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
             removed: written.deleted,
             members,
             outliers,
-            model_labels: fetched.modelLabels,
-            template_labels: fetched.templateLabels,
+            model_labels: sources.model,
+            template_labels: sources.template,
           });
         } catch (error) {
           span.setStatus({ code: SpanStatusCode.ERROR });

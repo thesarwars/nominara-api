@@ -28,6 +28,18 @@ export function promptSetHashSql(modelExpr: string, idsExpr: string): string {
   return `encode(sha256(convert_to(coalesce(${modelExpr}, '') || '|' || coalesce(${idsExpr}, ''), 'UTF8')), 'hex')`;
 }
 
+/**
+ * `eff(pid, cid)`: for a prompt with no cluster of its own that REPLACES one (a reword), the cluster its predecessor was in, followed
+ * along the `superseded_by` chain so a reword of a reword resolves too. `UNION` (not `ALL`) ends a cycle. Bind the project as `$1`.
+ */
+const EFFECTIVE_CLUSTER_CTE = `RECURSIVE chain(pid, cid) AS (
+       SELECT q.superseded_by, q.cluster_id FROM tracked_prompts q
+        WHERE q.project_id = $1 AND q.superseded_by IS NOT NULL AND q.cluster_id IS NOT NULL
+       UNION
+       SELECT n.superseded_by, ch.cid FROM chain ch JOIN tracked_prompts n ON n.id = ch.pid
+        WHERE n.project_id = $1 AND n.superseded_by IS NOT NULL AND n.cluster_id IS NULL
+     ), eff AS (SELECT DISTINCT ON (pid) pid, cid FROM chain ORDER BY pid, cid)`;
+
 export interface PromptGroup {
   readonly index: number;
   readonly memberIds: readonly string[];
@@ -84,14 +96,18 @@ export async function snapshotClusters(tx: ClientBase, projectId: string): Promi
   const { hash, clusterable } = await promptSetHash(tx, projectId, model);
   const state = await clusterStateHash(tx, projectId);
 
-  // An old cluster's size is the members that COULD be grouped now. A paused row, or the archived original an edit leaves behind
-  // (it keeps its cluster_id; the replacement starts unassigned), is in no group and must not count against the match, or an
-  // ordinary reword would dissolve a cluster and delete the user's label with it (AC3).
+  // An old cluster's size is the members that COULD be grouped now, under the same model the groups use. A paused row, a prompt of
+  // another model, or the archived original an edit leaves behind (it keeps its cluster_id; the replacement starts unassigned) is
+  // in no group and must not count against the match, or an ordinary reword would dissolve a cluster and delete the user's label
+  // with it (AC3). A replacement counts as the cluster its predecessor was in (EFFECTIVE_CLUSTER_CTE), so rewording EVERY member
+  // leaves the cluster whole as well.
   const olds = await tx.query<{ id: string; label: string; label_source: "auto" | "user"; n: string }>(
-    `SELECT c.id, c.label, c.label_source,
-            (SELECT count(*) FROM tracked_prompts p WHERE p.cluster_id = c.id AND ${CLUSTERABLE_BASE_SQL})::text AS n
+    `WITH ${EFFECTIVE_CLUSTER_CTE}
+     SELECT c.id, c.label, c.label_source,
+            (SELECT count(*) FROM tracked_prompts p LEFT JOIN eff ON eff.pid = p.id
+              WHERE coalesce(p.cluster_id, eff.cid) = c.id AND ${CLUSTERABLE_BASE_SQL} AND p.embedding_model = $2::text)::text AS n
        FROM topic_clusters c WHERE c.project_id = $1 ORDER BY c.id`,
-    [projectId],
+    [projectId, model ?? ""],
   );
 
   const raw: { memberIds: string[] }[] = [];
@@ -129,8 +145,11 @@ export async function snapshotClusters(tx: ClientBase, projectId: string): Promi
       [group.memberIds, LABEL_SAMPLE_SIZE],
     );
     const overlap = await tx.query<{ cluster_id: string; n: string }>(
-      `SELECT cluster_id, count(*)::text AS n FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND cluster_id IS NOT NULL GROUP BY cluster_id`,
-      [group.memberIds],
+      `WITH ${EFFECTIVE_CLUSTER_CTE}
+       SELECT coalesce(p.cluster_id, eff.cid) AS cluster_id, count(*)::text AS n
+         FROM tracked_prompts p LEFT JOIN eff ON eff.pid = p.id
+        WHERE p.id = ANY($2::uuid[]) AND coalesce(p.cluster_id, eff.cid) IS NOT NULL GROUP BY 1`,
+      [projectId, group.memberIds],
     );
     groups.push({
       index,
@@ -206,6 +225,18 @@ export async function writeClusters(
       WHERE p.id = v.pid AND p.project_id = $3 AND p.cluster_id IS DISTINCT FROM v.cid
         AND ${CLUSTERABLE_BASE_SQL} AND p.embedding_model IS NOT DISTINCT FROM $4::text`,
     [memberIds, clusterOfMember, projectId, model ?? null],
+  );
+  // A planned cluster whose members all stopped being clusterable since the plan (or all but one) is no cluster: it would keep a
+  // default count and a NULL centroid, or a stale count and centroid. Remove it and let go of any lone member.
+  await tx.query(
+    `WITH thin AS (
+       SELECT c.id FROM topic_clusters c
+        WHERE c.project_id = $1 AND (SELECT count(*) FROM tracked_prompts p WHERE p.cluster_id = c.id) < $2::int
+     ), freed AS (
+       UPDATE tracked_prompts SET cluster_id = NULL WHERE cluster_id IN (SELECT id FROM thin) RETURNING 1
+     )
+     DELETE FROM topic_clusters WHERE id IN (SELECT id FROM thin)`,
+    [projectId, MIN_CLUSTER_SIZE],
   );
   // Centroid, count and commercial intent come from the rows now assigned, in one statement: a mean of the members' vectors and of
   // their funnel weights. Touches every kept cluster, so `min(updated_at)` is the time of the last clustering (see the sweep).
