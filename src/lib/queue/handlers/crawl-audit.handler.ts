@@ -682,9 +682,10 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       return;
     }
 
-    // The catalog is versioned data: assert its weights on every load (NFR-AUX-03).
+    // The catalog is versioned data: assert its weights on every load (NFR-AUX-03) — all six categories and the category weights
+    // (STORY-051 AC6), not only crawler_access.
     const catalogRows = await tx.query<{ code: string; category: string; title: string; weight: number; rule_version: string; thresholds: Record<string, unknown>; task_threshold: string }>(
-      "SELECT code, category, title, weight, rule_version, thresholds, task_threshold FROM aux_rule_catalog WHERE category = 'crawler_access'",
+      "SELECT code, category, title, weight, rule_version, thresholds, task_threshold FROM aux_rule_catalog",
     );
     const catalog: AuxCatalog = loadAuxCatalog(
       catalogRows.rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, thresholds: r.thresholds })),
