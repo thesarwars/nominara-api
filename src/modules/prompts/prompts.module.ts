@@ -16,14 +16,14 @@ import { TopicsService } from "./topics.service.js";
 
 // STORY-045 — the prompts bounded area.
 //
-// NATURALISER (owner decision 3, 2026-10-28). `PROMPT_NATURALISER` is bound by naturaliser.selector.ts from configuration:
+// NATURALISER (owner decision 2026-10-28 #3). `PROMPT_NATURALISER` is bound by naturaliser.selector.ts from configuration:
 // `none` (the default) binds null and every pass runs §4's `template_only` path; `gemini` binds a Flash-class Gemini model behind the
 // port. A missing key also yields null, so the fallback is always the deterministic text.
 //
 // REQUEST PATH, AND WHY THAT IS A RISK RATHER THAN A DECISION. The route is documented synchronous (api-specification.md §5) and
 // NFR-ARCH-01 names engines, embedding providers and crawl targets - not a naturaliser - so the letter allows the call. But the
 // ambient request transaction is open while it runs (ADR-0003 / NFR-ARCH-04 forbid that), bounded by PROMPT_NATURALISER_TIMEOUT_MS
-// (default 8 s) and the adapter's circuit breaker. That is why the default is `none`. STORY-045 decision 5 closes it.
+// (default 8 s) and the adapter's circuit breaker. That is why the default is `none`. The story's decision #5 closes it.
 //
 // CacheModule is imported EXPLICITLY even though it is @Global(), following
 // EntitlementsModule's precedent and for the reason its comment gives: a

@@ -5,7 +5,7 @@ import { CircuitBreaker, CircuitOpenError } from "../../../lib/resilience/circui
 import { incrementCounter, observeValue } from "../../../lib/telemetry/metrics.js";
 import type { NaturaliseRequest, PromptNaturaliser } from "../ports/naturaliser.js";
 
-// STORY-045 AC3 (owner decision 3, 2026-10-28) - the PROMPT_NATURALISER port bound to a Flash-class Gemini model, over the platform
+// STORY-045 AC3 (owner decision 2026-10-28 #3) - the PROMPT_NATURALISER port bound to a Flash-class Gemini model, over the platform
 // `fetch` (no SDK: the engine adapter and the OpenAI embedding adapter set the precedent). It is selected by configuration
 // (naturaliser.selector.ts) and every test runs it against an injected fetch.
 //

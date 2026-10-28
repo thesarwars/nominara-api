@@ -8,7 +8,7 @@
 // external call - which the ambient request transaction does for the whole handler. Building the bridge (an adapter importing the
 // provider port into src/modules) would defeat the rule that exists to prevent exactly it.
 //
-// So the pass is written, tested against real pgvector with the stand-in embedder, and left unplugged, until STORY-045 decision 5 is
+// So the pass is written, tested against real pgvector with the stand-in embedder, and left unplugged, until the story's decision #5 is
 // answered. Its options: (a) generation becomes a phased job (prepare / embed+rewrite outside any transaction / persist), the route
 // answers 202 and the result is read back by `generation_batch_id` - a contract change; (b) NFR-ARCH-01 is amended to allow ONE bounded,
 // breaker-guarded embedding call on this route; (c) vector dedupe moves after persistence, on embed.batch, and a near-duplicate is

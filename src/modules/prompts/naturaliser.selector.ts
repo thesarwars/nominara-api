@@ -5,7 +5,7 @@ import type { PromptNaturaliser } from "./ports/naturaliser.js";
 // STORY-045 AC3 - which PromptNaturaliser this process runs with. Same shape as embedding-provider.selector.ts.
 //
 //   PROMPT_NATURALISER=none (default)          -> null: every pass is the template-only path (FR-FAN-01d).
-//   PROMPT_NATURALISER=gemini and a key        -> the Gemini adapter (a Flash-class model, owner decision 3).
+//   PROMPT_NATURALISER=gemini and a key        -> the Gemini adapter (a Flash-class model, owner decision 2026-10-28 #3).
 //   PROMPT_NATURALISER=gemini and NO key       -> null, with one warning. A naturaliser is an optimisation of the text, never a
 //                                                precondition of generating it, so a missing credential must not fail boot or a request.
 //

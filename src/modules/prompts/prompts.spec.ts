@@ -33,7 +33,7 @@ describe("STORY-022 · PromptsModule compiles", () => {
   });
 
   it("binds NO naturaliser by default — §4's template_only path stays the live one", async () => {
-    // PROMPT_NATURALISER defaults to `none` (owner decision 3, STORY-045 AC3): the token resolves, to null, so the service still runs
+    // PROMPT_NATURALISER defaults to `none` (owner decision 2026-10-28 #3, STORY-045 AC3): the token resolves, to null, so the service still runs
     // the deterministic template-only path unless configuration says otherwise.
     delete process.env.PROMPT_NATURALISER;
     const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
