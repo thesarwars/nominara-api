@@ -62,11 +62,12 @@ describe("STORY-051 AUX-R-021 · context block truncation risk", () => {
       expect(await findings(section(5000, over), "AUX-R-021")).toEqual([]);
     }
   });
-  it("STORY-051 AUX-R-021 · the largest unstructured section is the one measured; each long section is located", async () => {
-    const doc = makeDoc({ blocks: [block({ tokens: 2000 }), block({ tokens: 100 }), block({ tokens: 3500 })] });
+  it("STORY-051 AUX-R-021 · the largest unstructured section is the one measured: one finding per page, critical, located at it", async () => {
+    const doc = makeDoc({ blocks: [block({ tokens: 2000 }), block({ tokens: 2500 }), block({ tokens: 100 }), block({ tokens: 3500 })] });
     const fs = await findings(doc, "AUX-R-021");
-    expect(fs.map((f) => f.evidence.locator)).toEqual(["blocks[0]", "blocks[2]"]);
-    expect(fs.map((f) => f.severity)).toEqual(["high", "critical"]);
+    expect(fs).toHaveLength(1);
+    expect(fs[0]).toMatchObject({ severity: "critical", measured_value: 3500 });
+    expect(fs[0]!.evidence.locator).toBe("blocks[3]");
   });
   it("STORY-051 AUX-R-021 · no blocks, no finding", async () => {
     expect(await findings(makeDoc({ blocks: [] }), "AUX-R-021")).toEqual([]);

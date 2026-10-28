@@ -163,10 +163,11 @@ const unitBesideDigit = (body: string, units: readonly string[]): boolean =>
 
 const offersOf = (node: Record<string, unknown>): unknown[] => asArray(node["offers"]);
 // An AggregateOffer states its price as a range (lowPrice / highPrice); its lowPrice is the price a visitor starts from.
+// A subscription price is usually marked up as Offer.priceSpecification (a UnitPriceSpecification with its own price + priceCurrency).
 const hasPrice = (o: unknown): boolean =>
   isRecord(o) &&
-  (present(o["price"]) || (typesOf(o).includes("AggregateOffer") && present(o["lowPrice"]))) &&
-  present(o["priceCurrency"]);
+  (((present(o["price"]) || (typesOf(o).includes("AggregateOffer") && present(o["lowPrice"]))) && present(o["priceCurrency"])) ||
+    asArray(o["priceSpecification"]).some((s) => isRecord(s) && present(s["price"]) && present(s["priceCurrency"])));
 
 export const offerDataAbsent = defineRule({
   code: "AUX-R-012",
@@ -220,6 +221,7 @@ export const schemaTextContradiction = defineRule({
     rating_context_words: z.array(z.string().min(1)).min(1),
     context_window_chars: z.number().int().positive(),
     free_words: z.array(z.string().min(1)).min(1),
+    article_types: z.array(z.string().min(1)).min(1),
   }),
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
@@ -255,13 +257,21 @@ export const schemaTextContradiction = defineRule({
         hits.push({ reason: "price", snippet: `schema variant prices ${variantPrices.slice(0, 5).join(", ")}; page prices ${[...new Set(prices.map((rs) => rs[0]!))].slice(0, 5).join(", ")}`, locator: `${e.locator}.hasVariant` });
       }
     }
-    for (const e of entitiesOfType(all, t.name_entity_types)) {
+    // A name disagrees only for the thing the page is about. A product reached through mainEntity / about is that; failing that, the
+    // page's one top-level product is, unless the page is an article (a site-wide SoftwareApplication block on a blog post is not its
+    // subject). Anything else, and a listing's items, is a name the page need not show: absence is not disagreement.
+    const named = entitiesOfType(all, t.name_entity_types).filter((e) => !e.locator.includes(".itemListElement"));
+    const reached = named.filter((e) => /\.(?:mainEntity|mainEntityOfPage|about)(?![\p{L}\p{N}])/u.test(e.locator));
+    const topLevel = named.filter((e) => !e.locator.includes("."));
+    const pageIsArticle = jsonLdEntities(doc.structured.jsonLd).some((e) => typesOf(e.node).some((x) => t.article_types.includes(x)));
+    const aboutPage = reached.length > 0 ? reached : topLevel.length === 1 && !pageIsArticle ? topLevel : [];
+    for (const e of aboutPage) {
       const name = text(e.node["name"]);
       if (name !== undefined && !nameShown(flat, name)) hits.push({ reason: "name", snippet: `schema name ${name}`, locator: `${e.locator}.name` });
     }
     for (const e of all) {
       const rating = e.node["aggregateRating"];
-      if (!isRecord(rating)) continue;
+      if (!isRecord(rating) || e.locator.includes(".itemListElement")) continue;
       // A field the data leaves out has not contradicted the page: Number("") is 0, so an absent or blank one is skipped, not compared.
       const declaredValue = present(rating["ratingValue"]) ? toNumber(String(rating["ratingValue"])) : Number.NaN;
       // "N/5" or "N out of 10", not a date ("3/5/2026": a further "/digits" follows, or a "/" precedes), and with a rating word beside it.

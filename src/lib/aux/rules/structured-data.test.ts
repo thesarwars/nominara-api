@@ -675,3 +675,39 @@ describe("STORY-051 AUX-R-013 · an absent count or value is not a contradiction
     expect(await findings(withLd([org, list], { mainText: "Alpha\nPrice $0 - $500" }), "AUX-R-013")).toEqual([]);
   });
 });
+
+describe("STORY-051 AUX-R-013 · a name the page does not show, round 6", () => {
+  const blog = { "@context": "https://schema.org", "@type": "BlogPosting", headline: "Five ways to clean a sales pipeline" };
+  const crm = { "@context": "https://schema.org", "@type": "SoftwareApplication", name: "Acme CRM" };
+  const blogText = { mainText: "Five ways to clean a sales pipeline\nAcme helps teams. Pick one stage and tidy it." };
+  it("STORY-051 AUX-R-013 · a site-wide product block on a blog page, whose name the post never uses, is not a contradiction", async () => {
+    const doc = withLd([org, crm, blog], blogText);
+    const hits = await findings({ ...doc, meta: { ...doc.meta, title: "Five ways to clean a sales pipeline | Acme" } }, "AUX-R-013");
+    expect(hits).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a WebPage whose mainEntity is a product with another name than the page shows still fires critical", async () => {
+    const page = { "@context": "https://schema.org", "@type": "WebPage", mainEntity: { "@type": "Product", name: "Zed Gadget" } };
+    const [f] = await findings(withLd([org, page], { mainText: CLEAN_TEXT }), "AUX-R-013");
+    expect(f).toMatchObject({ severity: "critical" });
+    expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].mainEntity.name" });
+  });
+  it("STORY-051 AUX-R-013 · a listing's product names that only client-rendered markup shows are not a contradiction", async () => {
+    const list = { "@context": "https://schema.org", "@type": "ItemList", itemListElement: [{ "@type": "ListItem", position: 1, item: { "@type": "Product", name: "Unshown thing", aggregateRating: { "@type": "AggregateRating", ratingValue: "2.0", reviewCount: "9" } } }] };
+    expect(await findings(withLd([org, list], { mainText: "Category\nRated 4.6/5 from 120 reviews." }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · two top-level products, neither tied to the page, give no name contradiction", async () => {
+    const other = { "@context": "https://schema.org", "@type": "Product", name: "Unshown thing" };
+    expect(await findings(withLd([org, app, other], { mainText: CLEAN_TEXT }), "AUX-R-013")).toEqual([]);
+  });
+});
+
+describe("STORY-051 AUX-R-012 · a price carried by priceSpecification, round 6", () => {
+  it("STORY-051 AUX-R-012 · an offer whose price sits in a UnitPriceSpecification is priced", async () => {
+    const offers = { "@type": "Offer", priceSpecification: { "@type": "UnitPriceSpecification", price: "47.00", priceCurrency: "USD" } };
+    expect(await findings(withApp({ offers }), "AUX-R-012")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-012 · a priceSpecification with no currency is not priced", async () => {
+    const offers = { "@type": "Offer", priceSpecification: { "@type": "UnitPriceSpecification", price: "47.00" } };
+    expect((await findings(withApp({ offers }), "AUX-R-012"))[0]!.evidence.reason).toBe("offers_incomplete");
+  });
+});

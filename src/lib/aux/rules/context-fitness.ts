@@ -45,14 +45,18 @@ export const contextBlockTruncation = defineRule({
   autoFixable: false,
   thresholds: strict({ warn_tokens: z.number().int().positive(), critical_tokens: z.number().int().positive() }),
   evaluate(doc, t) {
-    const hits: RuleHit[] = [];
+    // One finding per page: the largest unstructured section (a page's penalty is its rule's weight once, not once per long section).
+    let largest: { tokens: number; index: number } | null = null;
     doc.blocks.forEach((b, i) => {
       // A heading section already ends at its next heading; a table or list inside it is the other kind of break.
       if (!(b.tokens > t.warn_tokens) || hasStructure(b)) return;
-      const critical = b.tokens > t.critical_tokens;
-      hits.push({ severity: critical ? "critical" : "high", measured: b.tokens, threshold: critical ? t.critical_tokens : t.warn_tokens, reason: "section_tokens", snippet: b.heading === null ? "(content before the first heading)" : b.heading, locator: `blocks[${String(i)}]` });
+      if (largest === null || b.tokens > largest.tokens) largest = { tokens: b.tokens, index: i };
     });
-    return hits;
+    if (largest === null) return [];
+    const { tokens, index } = largest as { tokens: number; index: number };
+    const critical = tokens > t.critical_tokens;
+    const heading = doc.blocks[index]!.heading;
+    return [{ severity: critical ? "critical" : "high", measured: tokens, threshold: critical ? t.critical_tokens : t.warn_tokens, reason: "section_tokens", snippet: heading === null ? "(content before the first heading)" : heading, locator: `blocks[${String(index)}]` }];
   },
 });
 
