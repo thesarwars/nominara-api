@@ -73,6 +73,12 @@ export interface GuardedResponse {
    * optional on the type so a test double that answers `{status, headers, body, finalUrl}` stays a GuardedResponse.
    */
   readonly truncated?: boolean;
+  /**
+   * STORY-050 AC8 — every URL that answered with a redirect we FOLLOWED, in order. Empty = no redirect; `finalUrl` is where the
+   * chain ended (a hop the caller vetoed is not followed, so the URL that redirected is the final one). Optional on the type for
+   * the same reason as `truncated`; `guardedFetch` always sets it.
+   */
+  readonly redirectChain?: readonly string[];
 }
 
 export interface GuardedFetchInit {
@@ -228,13 +234,14 @@ export async function guardedFetch(
   const deadline = Date.now() + TOTAL_TIMEOUT_MS;
   let target = await deps.assertSafe(rawUrl);
   let hops = 0;
+  const redirectChain: string[] = [];
 
   for (;;) {
     const response = await requestOnce(target, init, deadline);
 
     const location = response.headers.location;
     const isRedirect = response.status >= 300 && response.status < 400 && typeof location === "string";
-    if (!isRedirect) return response;
+    if (!isRedirect) return { ...response, redirectChain };
 
     hops += 1;
     if (hops > MAX_REDIRECTS) throw new GuardedFetchRefusal("too_many_redirects");
@@ -243,7 +250,8 @@ export async function guardedFetch(
     // absolute one replaces it — matching how a browser would follow it, which
     // is the behaviour an attacker would be reasoning about.
     const next = new URL(location, target.url).toString();
-    if (init.followRedirect !== undefined && !init.followRedirect(next)) return response;
+    if (init.followRedirect !== undefined && !init.followRedirect(next)) return { ...response, redirectChain };
+    redirectChain.push(target.url.toString());
     try {
       // The SAME validator as the initial URL — one policy for the whole call.
       // In production `deps` is DEFAULT_DEPS, so every hop goes through the

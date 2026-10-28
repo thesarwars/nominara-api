@@ -255,6 +255,19 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
     expect(response.finalUrl).toBe(at("/landed"));
   });
 
+  it("STORY-050 AC8 — the redirect chain lists every URL that redirected, in order, and is empty when nothing did", async () => {
+    const followed = await guardedFetch(at("/relative"), {}, permitTestOrigin);
+    expect(followed.redirectChain).toEqual([at("/relative")]);
+    expect(followed.finalUrl).toBe(at("/landed"));
+    expect((await guardedFetch(at("/"), {}, permitTestOrigin)).redirectChain).toEqual([]);
+  });
+
+  it("STORY-050 AC8 — a vetoed hop is not in the chain: the redirecting URL is the final URL", async () => {
+    const response = await guardedFetch(at("/relative"), { followRedirect: () => false }, permitTestOrigin);
+    expect(response.redirectChain).toEqual([]);
+    expect(response.finalUrl).toBe(at("/relative"));
+  });
+
   // Scenario 15 — headers arrive, body never does.
   it("scenario 15 — aborts when the body never arrives", async () => {
     await expect(guardedFetch(at("/never"), {}, permitTestOrigin)).rejects.toThrow(/timeout/);
