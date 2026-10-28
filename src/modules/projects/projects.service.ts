@@ -21,6 +21,7 @@ import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
 import { lockProjectCompetitors } from "./competitor-cap-lock.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { embedBatchEnqueuerFor, requestPromptEmbeddings } from "../../lib/embedding/prompt-embedding-request.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { insertPromptStatement, manualPromptRow, type PromptRow } from "../../lib/promptgen/persist.js";
 import { assertActiveWithinLimits, lockWorkspaceForActivation } from "../prompts/active-limit.js";
@@ -239,6 +240,11 @@ export class ProjectsService {
     });
 
     await this.insertSuppliedSeeds(client, workspaceId, projectId, input, supplied);
+    // STORY-133 AC10 - supplied prompts are inserted `active` (onboarding), so no activation follows to ask for their embeddings.
+    // Requested in this transaction; the jobs are enqueued after COMMIT, so a refused creation queues nothing.
+    if (supplied.length > 0) {
+      await requestPromptEmbeddings(client, workspaceId, supplied.map((row) => row.id), embedBatchEnqueuerFor(this.queues)!, this.logger);
+    }
 
     const fieldsSupplied = suppliedFields(input);
 

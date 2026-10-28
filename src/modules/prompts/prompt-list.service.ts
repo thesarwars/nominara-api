@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -10,6 +10,8 @@ import type {
 } from "../../../contracts/prompts/index.js";
 import { ConflictError, EntitlementExceededError, NotFoundError } from "../../api/errors/domain-errors.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
+import { embedBatchEnqueuerFor, requestPromptEmbeddings } from "../../lib/embedding/prompt-embedding-request.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { insertPromptStatement, manualPromptRow } from "../../lib/promptgen/persist.js";
@@ -61,7 +63,13 @@ type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ ro
 
 @Injectable()
 export class PromptListService {
-  constructor(private readonly entitlements: EntitlementResolver) {}
+  private readonly logger = new Logger(PromptListService.name);
+
+  // Optional, as in PromptActivationService: a process with no queue producer still creates; it just cannot ask for an embedding.
+  constructor(
+    private readonly entitlements: EntitlementResolver,
+    @Optional() private readonly producer?: QueueProducer,
+  ) {}
 
   async list(projectId: string, query: PromptListQuery): Promise<Page<PromptListItem, PromptListResponse>> {
     const { client, workspaceId } = this.tenant();
@@ -185,6 +193,11 @@ export class PromptListService {
         WHERE id = $1`,
       [projectId],
     );
+
+    // STORY-133 AC10 - this row is inserted `active`, so no activation will ever follow to ask for its embedding. Requested in THIS
+    // transaction, after the count (the job is enqueued after COMMIT), or the prompt is permanently invisible to L2, dedupe and clustering.
+    const embedEnqueue = embedBatchEnqueuerFor(this.producer);
+    if (embedEnqueue !== undefined) await requestPromptEmbeddings(client, workspaceId, [row.id], embedEnqueue, this.logger);
 
     return {
       id: row.id,

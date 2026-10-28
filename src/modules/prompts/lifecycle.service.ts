@@ -1,4 +1,4 @@
-import { Injectable, Optional } from "@nestjs/common";
+import { Injectable, Logger, Optional } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { IntentArchetype, PromptResponse, UpdatePromptRequest } from "../../../contracts/prompts/index.js";
 import type { FunnelStage } from "../../../contracts/prompts/index.js";
@@ -9,6 +9,7 @@ import { parseConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { embedBatchEnqueuerFor, requestPromptEmbeddings } from "../../lib/embedding/prompt-embedding-request.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { chargeForActivation, inheritFirstActivation } from "../../lib/promptgen/activation-charge.js";
 import { insertPromptStatement } from "../../lib/promptgen/persist.js";
@@ -62,6 +63,8 @@ interface PromptRow {
   superseded_by: string | null;
   paused_by_downgrade_at: Date | null;
 }
+
+const embedLogger = new Logger("prompts.lifecycle");
 
 type TenantClient = { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> };
 
@@ -229,6 +232,7 @@ export class PromptLifecycleService {
       : 0;
 
     const counts = await this.refreshCounts(client, prompt.project_id);
+    await this.requestEmbedding(client, context, status, row.id);
     return {
       prompt_id: row.id,
       project_id: prompt.project_id,
@@ -271,6 +275,7 @@ export class PromptLifecycleService {
     );
 
     const counts = await this.refreshCounts(client, prompt.project_id);
+    await this.requestEmbedding(client, context, status, prompt.id);
     return {
       prompt_id: prompt.id,
       project_id: prompt.project_id,
@@ -405,6 +410,17 @@ export class PromptLifecycleService {
       [projectId],
     );
     return result.rows[0]?.n ?? 0;
+  }
+
+  /**
+   * STORY-133 the producer-edge decision (STORY-133 D3) - a prompt that is ACTIVE after this change and has no vector yet is queued for embedding in this
+   * transaction (enqueued after COMMIT). A no-op for a paused or archived result, and for a prompt already embedded.
+   */
+  private async requestEmbedding(client: TenantClient, context: TenantContext, status: string, promptId: string): Promise<void> {
+    if (status !== "active") return;
+    const enqueue = embedBatchEnqueuerFor(this.producer);
+    if (enqueue === undefined) return;
+    await requestPromptEmbeddings(client, context.workspaceId, [promptId], enqueue, embedLogger);
   }
 
   /** Recomputed and written in the same statement sequence (AC10), never incremented. */

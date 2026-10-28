@@ -43,6 +43,9 @@ describe("STORY-046 · the activation charge", () => {
     }),
   } as unknown as QueueProducer;
   let probe: Client;
+  // STORY-133: an activation now also queues `embed.batch` for the prompts it turns on, so the auto-top-up assertions below read
+  // the top-up jobs only. The embedding request has its own assertions (first test below, and embed-batch-handler.spec.ts).
+  const topups = (): typeof enqueued => enqueued.filter((job) => job.name === "billing.auto_topup");
   const activation = new PromptActivationService(resolver, producer);
   const lifecycle = new PromptLifecycleService(resolver, producer);
 
@@ -793,9 +796,14 @@ describe("STORY-046 · the activation charge", () => {
     await activate(project, await seedPrompts(project, 12), "2");
     await settleJobs();
 
-    expect(enqueued).toHaveLength(1);
-    expect(enqueued[0]).toMatchObject({ name: "billing.auto_topup", workspaceId, visibleElsewhere: true });
-    expect(enqueued[0]!.idempotencyKey.startsWith(`autotopup:${workspaceId}:`)).toBe(true);
+    expect(topups()).toHaveLength(1);
+    expect(topups()[0]).toMatchObject({ name: "billing.auto_topup", workspaceId, visibleElsewhere: true });
+    expect(topups()[0]!.idempotencyKey.startsWith(`autotopup:${workspaceId}:`)).toBe(true);
+    // STORY-133 the producer-edge decision (STORY-133 D3) - and the activation queued the prompts' embedding, also only once the transaction had committed.
+    const embeds = enqueued.filter((job) => job.name === "embed.batch");
+    expect(embeds).toHaveLength(1);
+    expect(embeds[0]).toMatchObject({ workspaceId, visibleElsewhere: true });
+    expect(embeds[0]!.idempotencyKey).toMatch(/^emb:[0-9a-f]{64}$/);
   });
 
   it("review 2 - the PATCH door requests it as well", async () => {
@@ -808,8 +816,8 @@ describe("STORY-046 · the activation charge", () => {
     await patch(candidate!, { status: "active" }, "1"); // 99 - 1 = 98 < 99
     await settleJobs();
 
-    expect(enqueued).toHaveLength(1);
-    expect(enqueued[0]).toMatchObject({ name: "billing.auto_topup", workspaceId, visibleElsewhere: true });
+    expect(topups()).toHaveLength(1);
+    expect(topups()[0]).toMatchObject({ name: "billing.auto_topup", workspaceId, visibleElsewhere: true });
   });
 
   it("review 2 - nothing is queued when the transaction rolls back after the debit", async () => {
@@ -846,13 +854,13 @@ describe("STORY-046 · the activation charge", () => {
     await configureAutoTopup(98); // 100 - 2 = 98, NOT below 98
     await activate(project, await seedPrompts(project, 12), "2");
     await settleJobs();
-    expect(enqueued).toEqual([]);
+    expect(topups()).toEqual([]);
 
     await configureAutoTopup(10_000);
     const other = await seedProject();
     await activate(other, await seedPrompts(other, 3)); // free: no debit, so no request
     await settleJobs();
-    expect(enqueued).toEqual([]);
+    expect(topups()).toEqual([]);
   });
 
   it("review 2 - a service built without a queue producer still charges (the producer is optional, as in CreditInterceptor)", async () => {

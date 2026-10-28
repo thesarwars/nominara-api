@@ -80,6 +80,34 @@ export default tseslint.config(
     },
   },
   {
+    // STORY-133 - NFR-ARCH-01 from the other direction. The embedding-provider port, its adapters and its selector are reachable
+    // from the `embed.batch` handler and from nowhere else: a request handler (or any other module) importing them is how a
+    // provider call ends up on the request path. Tests may import them to fake or exercise them.
+    files: ["src/**/*.ts"],
+    ignores: [
+      "src/lib/queue/handlers/embed-batch.handler.ts",
+      "src/modules/prompts/adapters/*-embedding-provider.ts",
+      "src/modules/prompts/embedding-provider.selector.ts",
+      "src/modules/prompts/ports/embedding-provider.ts",
+      "**/*.spec.ts",
+      "**/*.test.ts",
+    ],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["**/ports/embedding-provider.js", "**/embedding-provider.selector.js", "**/adapters/*-embedding-provider.js"],
+              message:
+                "The embedding provider is reachable only from the embed.batch handler (STORY-133, NFR-ARCH-01): a request handler must enqueue an embed.batch job, never call the provider.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     // STORY-031 D12. Scoped to exactly this one file — the AST-level
     // enforcement of D12's guarantee, replacing the defeatable text-regex
     // structural test in test/unit/engines/spend-meter.spec.ts.

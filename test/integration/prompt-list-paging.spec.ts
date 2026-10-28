@@ -174,4 +174,36 @@ describe("STORY-134 · GET /projects/{id}/prompts keyset paging — real SQL", (
     const { ids } = await drain(ctx(ws, actor), project, 2);
     expect(ids).toHaveLength(4);
   });
+
+  // STORY-133 AC10 - a manual prompt is inserted `active`, so creation is its only chance to be embedded.
+  it("[STORY-133 AC10] POST create leads to exactly one embed.batch job after commit, and none when the create rolls back", async () => {
+    const { ws, actor, project } = await workspaceWithProject();
+    const jobs: { queue: string; payload: { table: string; ids: string[] } }[] = [];
+    const producer = { enqueueTenantJob: vi.fn(async (queue: string, _ws: string, payload: unknown) => void jobs.push({ queue, payload: payload as never })) };
+    // A create is held to the workspace-wide cap too (STORY-077), which the paging resolver above does not carry.
+    const creatingResolver = {
+      resolveForWorkspace: vi.fn(async () => ({ entitlements: { "prompts.max_per_project": { value: 500 }, "prompts.max_total": { value: 500 } } })),
+    } as unknown as EntitlementResolver;
+    const creating = new PromptListService(creatingResolver, producer as never);
+
+    const created = await inTenant(ctx(ws, actor), () => creating.create(project, { text: "best crm for a ten person startup" }));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ queue: "embed.batch", payload: { table: "tracked_prompts", ids: [created.id] } });
+
+    jobs.length = 0;
+    await expect(
+      inTenant(ctx(ws, actor), async () => {
+        await creating.create(project, { text: "a second prompt that gets rolled back" });
+        throw new Error("create refused after the embedding request");
+      }),
+    ).rejects.toThrow(/refused/);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(jobs, "a rolled-back create leaves no orphan job").toHaveLength(0);
+
+    // A duplicate wording is refused (409) BEFORE the request is made.
+    await expect(inTenant(ctx(ws, actor), () => creating.create(project, { text: "best crm for a ten person startup" }))).rejects.toMatchObject({ code: "conflict" });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(jobs).toHaveLength(0);
+  }, 60_000);
 });
