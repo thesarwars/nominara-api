@@ -7,7 +7,7 @@ import { AUTO_LABEL_MAX } from "./constants.js";
 // change in `createTopicClusterHandler` once STORY-045 is merged and its client can be shared.
 //
 // A label a model returns is checked (`isReadableLabel`) and replaced by the template when it fails, so a bad model response is a
-// worse label, never a bad row. A model that throws or hangs the job is not allowed either: any error falls back.
+// worse label, never a bad row. A model that throws, or does not answer within LABEL_TIMEOUT_MS, falls back too.
 
 export const TOPIC_LABELLER = Symbol("TOPIC_LABELLER");
 
@@ -56,15 +56,25 @@ export function templateLabel(prompt: string): string {
   return text.length === 0 ? text : text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+/** How long the run phase waits for a model's name before the template is used. A hung provider must not stall the job. */
+export const LABEL_TIMEOUT_MS = 15_000;
+
 export async function labelOrFallback(
   labeller: TopicLabeller,
   request: TopicLabelRequest,
+  timeoutMs: number = LABEL_TIMEOUT_MS,
 ): Promise<{ readonly label: string; readonly source: "model" | "template" }> {
+  let timer: NodeJS.Timeout | undefined;
   try {
-    const label = (await labeller.label(request)).trim();
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("labeller timed out")), timeoutMs);
+    });
+    const label = (await Promise.race([labeller.label(request), timeout])).trim();
     if (isReadableLabel(label)) return { label, source: "model" };
   } catch {
-    // Fall through: a model failure is a template label, not a failed job.
+    // Fall through: a model failure or a hang is a template label, not a failed job.
+  } finally {
+    clearTimeout(timer);
   }
   const fallback = templateLabel(request.prompts[0] ?? "");
   // A prompt that reduces to nothing readable still gets a stable, human label rather than a blank.

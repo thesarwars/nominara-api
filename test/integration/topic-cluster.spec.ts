@@ -241,6 +241,27 @@ describe("STORY-047 - topic.cluster", () => {
     expect(rows.map((r) => r.label).sort()).toEqual(["Same topic", "same TOPIC (2)"]);
   });
 
+  it("AC3 - a new group whose label equals the label of a cluster that DISSOLVES in the same run is written, not refused on the unique index", async () => {
+    // Old cluster X = {A,B,C,D}. B, C, D are paused, so X still counts 4 members; A joins two new prompts, G = {A,N1,N2}: overlap 1,
+    // 2*1 < min(3,4), so G is NOT X. X dissolves, and G's label is X's label. The insert must not see X as still there.
+    const [a, b, c, d] = (await seedGroups(1, 4))[0]! as [string, string, string, string];
+    const same = { label: () => Promise.resolve("Same topic") };
+    await run(handler(same));
+    const [old] = await clusters();
+    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = ANY($1::uuid[])", [[b, c, d]]);
+    const n1 = await addPrompt(TOPICS[0]!(10), member(0, 10));
+    const n2 = await addPrompt(TOPICS[0]!(11), member(0, 11));
+    await run(handler(same));
+    const rows = await clusters();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).not.toBe(old!.id);
+    expect(rows[0]!.label).toBe("Same topic");
+    const assigned = await assignments();
+    expect(new Set([a, n1, n2].map((id) => assigned.get(id)))).toEqual(new Set([rows[0]!.id]));
+    for (const id of [b, c, d]) expect(assigned.get(id)).toBeNull();
+    expect(await orphans()).toBe(0);
+  });
+
   // ---- AC5, scenario 4 ------------------------------------------------------------------------------------------------
 
   it("AC5 / scenario 4 - the recomputation waits on the per-project advisory lock", async () => {
@@ -434,7 +455,7 @@ describe("STORY-047 - topic.cluster", () => {
     expect(await assignments()).toEqual(assigned);
   });
 
-  it("AC9 (preservation) - recomputation keeps a cluster's denormalised performance columns instead of clearing them", async () => {
+  it("preservation (NOT AC9 coverage; AC9 is open) - recomputation keeps a cluster's denormalised performance columns instead of clearing them", async () => {
     await seedGroups(2, 3);
     await run();
     await db.query("UPDATE topic_clusters SET visibility_score = 42.5, gap_priority = 0.3 WHERE project_id = $1", [projectId]);

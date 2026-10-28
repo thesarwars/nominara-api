@@ -3,6 +3,11 @@
 // BY MEMBERSHIP, NOT BY CENTROID. A user's rename must survive a model switch, and a centroid from another model's vector space
 // cannot be compared (EC-23); membership can. A group takes the old cluster most of its members came from, so the cluster keeps its
 // id (goals and the UI hold it), its label and, if renamed, its `label_source = 'user'`.
+//
+// A cluster that DISSOLVES - no new group shares at least half of the smaller side with it - is deleted with its label, a user's
+// rename included: there is no group left that is that topic. The label is then free for the new group to reuse (the writer deletes
+// the dissolved cluster before inserting the new ones). Pinned by a test; transferring a user label to the best-overlapping
+// unmatched group is a possible refinement the story does not ask for.
 
 export interface GroupOverlap {
   readonly index: number;

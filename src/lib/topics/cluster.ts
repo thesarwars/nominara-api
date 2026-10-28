@@ -169,6 +169,14 @@ export async function writeClusters(
   plan: readonly ClusterPlanEntry[],
 ): Promise<{ assigned: number; created: number; deleted: number }> {
   const fresh = plan.filter((entry) => entry.newLabel !== undefined);
+  // Dissolved clusters go FIRST. `ux_topic_clusters` is checked per statement, so a new cluster whose label equals a dissolving
+  // cluster's (a template label is deterministic; a model can repeat itself) would otherwise be refused while the old row is still
+  // there, and every retry would rebuild the same plan and fail the same way. `tracked_prompts.cluster_id` has no FK and the
+  // membership is rewritten below in this same transaction, so AC7 holds whatever the order.
+  const deleted = await tx.query(`DELETE FROM topic_clusters WHERE project_id = $1 AND NOT (id = ANY($2::uuid[]))`, [
+    projectId,
+    plan.map((entry) => entry.clusterId),
+  ]);
   if (fresh.length > 0) {
     await tx.query(
       `INSERT INTO topic_clusters (id, workspace_id, project_id, label, label_source, embedding_model)
@@ -191,11 +199,6 @@ export async function writeClusters(
       WHERE p.id = v.pid AND p.project_id = $3 AND p.cluster_id IS DISTINCT FROM v.cid`,
     [memberIds, clusterOfMember, projectId],
   );
-  const deleted = await tx.query(`DELETE FROM topic_clusters WHERE project_id = $1 AND NOT (id = ANY($2::uuid[]))`, [
-    projectId,
-    plan.map((entry) => entry.clusterId),
-  ]);
-
   // Centroid, count and commercial intent come from the rows now assigned, in one statement: a mean of the members' vectors and of
   // their funnel weights. Touches every kept cluster, so `min(updated_at)` is the time of the last clustering (see the sweep).
   await tx.query(

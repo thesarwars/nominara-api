@@ -56,6 +56,17 @@ describe("STORY-047 AC2 - labels are human-readable", () => {
     expect((await labelOrFallback(boom, { prompts })).source).toBe("template");
     expect(await labelOrFallback({ label: () => Promise.resolve("Pricing comparison") }, { prompts })).toEqual({ label: "Pricing comparison", source: "model" });
   });
+  it("a model that never answers falls back to the template once the bound passes, and the timer is cleared", async () => {
+    const hang: TopicLabeller = { label: () => new Promise<string>(() => undefined) };
+    const started = Date.now();
+    const result = await labelOrFallback(hang, { prompts: ["How does pricing compare across vendors?"] }, 25);
+    expect(result).toEqual({ label: "How does pricing compare across vendors", source: "template" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+  it("a model that answers inside the bound is used", async () => {
+    const slow: TopicLabeller = { label: () => new Promise<string>((resolve) => setTimeout(() => resolve("Pricing comparison"), 5)) };
+    expect((await labelOrFallback(slow, { prompts: ["x"] }, 500)).source).toBe("model");
+  });
   it("uniqueLabel keeps labels distinct case-insensitively (ux_topic_clusters)", () => {
     const taken = new Set(["pricing"]);
     expect(uniqueLabel("Pricing", taken)).toBe("Pricing (2)");
@@ -83,6 +94,10 @@ describe("STORY-047 AC3 - matching keeps a cluster's identity (and so its user l
   });
   it("a group that shares less than half of the smaller side with any old cluster is new", () => {
     const m = matchGroupsToClusters([{ index: 0, memberCount: 10, overlaps: new Map([["a", 1]]) }], [old("a", 10)]);
+    expect(m.size).toBe(0);
+  });
+  it("a USER-labelled cluster that dissolves (no group overlaps half of the smaller side) is not carried: its label goes with it", () => {
+    const m = matchGroupsToClusters([{ index: 0, memberCount: 3, overlaps: new Map([["u", 1]]) }], [old("u", 4, "user")]);
     expect(m.size).toBe(0);
   });
   it("an exact half overlap matches (boundary), one member fewer does not", () => {
