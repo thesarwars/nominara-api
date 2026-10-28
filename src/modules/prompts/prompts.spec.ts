@@ -45,7 +45,7 @@ describe("STORY-022 · PromptsModule compiles", () => {
 
   it("STORY-045 AC3 / NFR-ARCH-04 - PROMPT_NATURALISER=gemini does NOT bind the model onto the request path: the handler's transaction is open", async () => {
     // The route runs inside TenantContextInterceptor's BEGIN..COMMIT, so a bound adapter would await a third party with a transaction held
-    // open (ADR-0003). It stays unbound until decision 5 (enqueued / 202) is answered; the configuration is reported, not honoured silently.
+    // open (ADR-0003). It stays unbound until decision #5 (enqueued / 202) is answered; the configuration is reported, not honoured silently.
     process.env.PROMPT_NATURALISER = "gemini";
     process.env.GEMINI_API_KEY = "fake-key-never-used";
     const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
