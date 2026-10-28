@@ -41,7 +41,12 @@ export interface StructuredItem {
 }
 
 export interface ParseError {
-  readonly format: "jsonld" | "microdata" | "rdfa";
+  /**
+   * Only JSON-LD has a syntax to get wrong. Microdata and RDFa are read leniently: an orphan `itemprop`, a missing `vocab` and an
+   * `itemref` raise no error (and `itemref` properties are not collected). A malformation check for them is a specification gap, not
+   * a silent omission — see STORY-050.
+   */
+  readonly format: "jsonld";
   /** Which copy the broken markup was in. A parse error in the plain copy is a finding even when the rendered copy is clean. */
   readonly variant: "raw" | "rendered";
   /** Ordinal of the offending block among that format's blocks in the document. */
@@ -96,7 +101,11 @@ export interface AuxDocument {
   readonly raw: AuxVariant;
   /** null = no rendered capture exists. */
   readonly rendered: AuxVariant | null;
-  /** The structured data of the rendered copy when there is one, else the raw copy. Each variant also carries its own. */
+  /**
+   * The structured DATA of the rendered copy when there is one, else the raw copy; the PARSE ERRORS of both copies (raw first, each
+   * tagged with its `variant`), because a JSON-LD error that only the raw copy has is what a non-executing crawler sees. Each
+   * variant also carries its own.
+   */
   readonly structured: StructuredData;
   readonly meta: {
     title?: string;
@@ -624,6 +633,10 @@ export function buildAuxDocument(snapshot: DocumentSnapshot, tokenizer: Tokenize
       const raw = parseVariant(snapshot.rawHtml, "raw", tokenizer);
       const rendered = snapshot.renderedHtml === null ? null : parseVariant(snapshot.renderedHtml, "rendered", tokenizer);
       const primary = rendered ?? raw;
+      const structured: StructuredData = {
+        ...primary.variant.structured,
+        parseErrors: [...raw.variant.structured.parseErrors, ...(rendered?.variant.structured.parseErrors ?? [])],
+      };
       const document: AuxDocument = {
         url: snapshot.url,
         finalUrl: snapshot.finalUrl,
@@ -632,7 +645,7 @@ export function buildAuxDocument(snapshot: DocumentSnapshot, tokenizer: Tokenize
         headers: { ...snapshot.headers },
         raw: raw.variant,
         rendered: rendered === null ? null : rendered.variant,
-        structured: primary.variant.structured,
+        structured,
         meta: buildMeta(primary.doc, snapshot.headers, primary.variant.structured),
         blocks: contentBlocks(primary.body, tokenizer),
         links: countLinks(primary.body, snapshot.finalUrl),
@@ -643,7 +656,7 @@ export function buildAuxDocument(snapshot: DocumentSnapshot, tokenizer: Tokenize
       span.setAttribute("nominara.aux.parse_errors", raw.variant.structured.parseErrors.length + (rendered?.variant.structured.parseErrors.length ?? 0));
       span.setAttribute("nominara.aux.blocks", document.blocks.length);
       // Counts only: no URL, no page text.
-      logger.debug({ event: "aux_document_built", blocks: document.blocks.length, parse_errors: document.structured.parseErrors.length, rendered: rendered !== null });
+      logger.debug({ event: "aux_document_built", blocks: document.blocks.length, parse_errors: structured.parseErrors.length, rendered: rendered !== null });
       return document;
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });

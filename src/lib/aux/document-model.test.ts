@@ -91,16 +91,18 @@ describe("STORY-050 document model", () => {
     const html = `<html><head><script type="application/ld+json">{"@type": "Organization", "name": }</script><script type="application/ld+json">{"@type":"Product"}</script></head><body><main><p>x</p></main></body></html>`;
     const d = build({ rawHtml: html });
     expect(d.structured.jsonLd).toEqual([{ "@type": "Product" }]);
-    expect(d.structured.parseErrors).toHaveLength(1);
-    expect(d.structured.parseErrors[0]).toMatchObject({ format: "jsonld", index: 0, variant: "rendered", reason: "invalid_json" });
-    expect(d.structured.parseErrors[0]!.snippet).toContain('"name": }');
+    // The page is identical in both copies, so the one broken block is reported once per copy.
+    expect(d.structured.parseErrors).toHaveLength(2);
+    expect(d.structured.parseErrors[1]).toMatchObject({ format: "jsonld", index: 0, variant: "rendered", reason: "invalid_json" });
+    expect(d.structured.parseErrors[1]!.snippet).toContain('"name": }');
   });
 
   it("STORY-050 #6b · an empty JSON-LD script and a bare scalar are errors, a top-level array is flattened", () => {
     const html = `<html><head><script type="application/ld+json">   </script><script type="application/ld+json">42</script><script type="application/ld+json">[{"@type":"A"},{"@type":"B"}]</script></head><body></body></html>`;
     const d = build({ rawHtml: html });
     expect(d.structured.jsonLd).toEqual([{ "@type": "A" }, { "@type": "B" }]);
-    expect(d.structured.parseErrors.map((e) => [e.index, e.reason])).toEqual([[0, "empty"], [1, "not_object_or_array"]]);
+    expect(d.rendered!.structured.parseErrors.map((e) => [e.index, e.reason])).toEqual([[0, "empty"], [1, "not_object_or_array"]]);
+    expect(d.structured.parseErrors).toHaveLength(4);
   });
 
   it("STORY-050 #6c · a parse error in the plain copy is reported even when the rendered copy is clean", () => {
@@ -112,6 +114,24 @@ describe("STORY-050 document model", () => {
     expect(d.rendered!.structured.parseErrors).toEqual([]);
     expect(d.rendered!.structured.jsonLd).toEqual([{ "@type": "A" }]);
     expect(d.raw.structured.jsonLd).toEqual([]);
+  });
+
+  it("STORY-050 #6d · the top-level parse errors are the union of both copies, so a rule reading d.structured misses neither", () => {
+    const bad = `<html><head><script type="application/ld+json">{oops</script></head><body></body></html>`;
+    const good = `<html><head><script type="application/ld+json">{"@type":"A"}</script></head><body></body></html>`;
+    const rawOnly = build({ rawHtml: bad, renderedHtml: good });
+    expect(rawOnly.structured.parseErrors.map((e) => e.variant)).toEqual(["raw"]);
+    expect(rawOnly.structured.jsonLd).toEqual([{ "@type": "A" }]); // the data is still the rendered copy's
+    const both = build({ rawHtml: bad, renderedHtml: bad });
+    expect(both.structured.parseErrors.map((e) => e.variant)).toEqual(["raw", "rendered"]);
+    expect(build({ rawHtml: bad, renderedHtml: null }).structured.parseErrors.map((e) => e.variant)).toEqual(["raw"]);
+  });
+
+  it("STORY-050 #6e · a parse error names the format it can be raised for: only JSON-LD is reported, microdata and RDFa are read leniently", () => {
+    const d = build({ rawHtml: `<html><body><div itemprop="name">orphan</div><div property="name">orphan</div></body></html>` });
+    expect(d.structured.parseErrors).toEqual([]);
+    expect(d.structured.microdata).toEqual([]);
+    expect(d.structured.rdfa).toEqual([]);
   });
 
   it("STORY-050 #6d · microdata and RDFa are extracted", () => {
