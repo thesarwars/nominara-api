@@ -34,7 +34,7 @@ export function selectNaturaliser(env: NaturaliserSelectionEnv): PromptNaturalis
  * interceptors write into that same transaction after the handler. A bound adapter would therefore await a third party (Gemini) with a
  * transaction open for up to PROMPT_NATURALISER_TIMEOUT_MS, which ADR-0003 / NFR-ARCH-04 forbid, and Gemini is one of our capture
  * engines (NFR-ARCH-01). The only fixes are an enqueued, 202-and-read-back generation (a contract change) or a route outside the
- * ambient transaction (a new pattern): both are STORY-045 decision 5, which is the owner's. Until it is answered the adapter is built,
+ * ambient transaction (a new pattern): both are STORY-045 decision #5, which is the owner's. Until it is answered the adapter is built,
  * tested and selectable (`selectNaturaliser`) but not bound here, and a configuration that asks for it is REPORTED rather than silently
  * ignored or silently honoured.
  */
@@ -43,7 +43,7 @@ export function selectRequestPathNaturaliser(env: NaturaliserSelectionEnv): Prom
     new Logger("prompts.naturaliser").warn({
       event: "prompts.naturaliser.held_off_request_path",
       provider: env.PROMPT_NATURALISER,
-      reason: "ADR-0003 / NFR-ARCH-04: the generate route's transaction is open; awaiting STORY-045 decision 5",
+      reason: "ADR-0003 / NFR-ARCH-04: the generate route's transaction is open; awaiting STORY-045 decision #5",
     });
   }
   return null;

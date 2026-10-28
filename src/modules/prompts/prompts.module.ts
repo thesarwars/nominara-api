@@ -20,7 +20,7 @@ import { TopicsService } from "./topics.service.js";
 // (naturaliser.selector.ts), but it is deliberately NOT bound on the request path: this route's handler runs inside the ambient tenant
 // transaction, so a bound adapter would await Gemini with that transaction open (ADR-0003 / NFR-ARCH-04), and the audit and idempotency
 // interceptors write into the same transaction after the handler, so the route cannot simply step outside it. PROMPT_NATURALISER=gemini is
-// therefore reported at boot and every pass runs the template-only path. Binding it needs STORY-045 decision 5 (enqueued generation read
+// therefore reported at boot and every pass runs the template-only path. Binding it needs STORY-045 decision #5 (enqueued generation read
 // back by generation_batch_id, a contract change), which is the owner's. Before it is enabled it must also draw from the Gemini engine
 // rate-limit bucket (GEMINI_REQUESTS_PER_MINUTE) and count against an engine spend ceiling, or it can starve capture runs.
 //
