@@ -1,6 +1,6 @@
 import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
-import type { Job } from "bullmq";
+import { UnrecoverableError, type Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { EmbeddingProviderError, type EmbeddingProvider } from "../../../modules/prompts/ports/embedding-provider.js";
 import { selectEmbeddingProvider } from "../../../modules/prompts/embedding-provider.selector.js";
@@ -75,16 +75,40 @@ interface EmbedFetched {
   readonly calls: number;
 }
 
-/** A provider failure part-way through `run`, carrying what the calls that DID succeed were charged. */
+/**
+ * A provider failure part-way through `run`, carrying what the calls that DID succeed were charged.
+ *
+ * Retryable (a 429, a 5xx, an open circuit) rides the queue's retry ladder. A PERMANENT one (a 4xx, a response without usage, a model
+ * or shape mismatch after a paid call) is the `UnrecoverableError` subclass below: BullMQ fails it on the first attempt, so a
+ * request that can never succeed is not paid for three more times.
+ */
 export class EmbedBatchFailedError extends Error {
   readonly spentTokens: number;
-  readonly retryable: boolean;
+  readonly retryable: boolean = true;
   constructor(cause: unknown, spentTokens: number) {
-    super(`embed.batch provider failure (${cause instanceof Error ? cause.name : "unknown"})`, { cause });
+    super(embedBatchFailureMessage(cause), { cause });
     this.name = "EmbedBatchFailedError";
     this.spentTokens = spentTokens;
-    this.retryable = !(cause instanceof EmbeddingProviderError) || cause.retryable;
   }
+}
+
+export class EmbedBatchPermanentError extends UnrecoverableError {
+  readonly spentTokens: number;
+  readonly retryable: boolean = false;
+  constructor(cause: unknown, spentTokens: number) {
+    super(embedBatchFailureMessage(cause));
+    this.name = "EmbedBatchPermanentError";
+    this.cause = cause;
+    this.spentTokens = spentTokens;
+  }
+}
+
+function embedBatchFailureMessage(cause: unknown): string {
+  return `embed.batch provider failure (${cause instanceof Error ? cause.name : "unknown"})`;
+}
+
+function isRetryable(cause: unknown): boolean {
+  return !(cause instanceof EmbeddingProviderError) || cause.retryable;
 }
 
 export interface EmbedBatchDeps {
@@ -94,6 +118,13 @@ export interface EmbedBatchDeps {
   readonly breaker?: CircuitBreaker;
 }
 
+// EVERY statement below also carries `workspace_id = app.current_workspace()`. RLS is the guarantee; this is defence in depth for the
+// one connection that does not have it (a superuser run, a BYPASSRLS maintenance role): a job signed for workspace A that names
+// workspace B's ids then still reads, writes and meters nothing of B's.
+//
+// `tracked_prompts` also re-embeds a row whose stored `embedding_model` is not the configured one (the switch from the stand-in to
+// the real provider): comparing vectors from two models is EC-23's silent wrong cosine, so a stale vector is replaced, not kept.
+//
 // One fixed statement set per table. The table name is never interpolated from the payload: the payload's `table` only SELECTS
 // which of these constants runs.
 interface TableSql {
@@ -109,13 +140,15 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
   tracked_prompts: {
     pending: `SELECT id, text, NULL::text AS hash, false AS is_draft
                 FROM tracked_prompts
-               WHERE deleted_at IS NULL AND embedding IS NULL AND id = ANY($1::uuid[]) AND $2::text IS NOT NULL
+               WHERE deleted_at IS NULL AND workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND $2::text IS NOT NULL
+                 AND (embedding IS NULL OR embedding_model IS DISTINCT FROM $2)
                ORDER BY id`,
     reuse: undefined,
     write: `UPDATE tracked_prompts t
                SET embedding = v.vec::halfvec(1536), embedding_model = $3
               FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
-             WHERE t.id = v.id AND t.deleted_at IS NULL AND t.embedding IS NULL
+             WHERE t.id = v.id AND t.deleted_at IS NULL AND t.workspace_id = app.current_workspace()
+               AND (t.embedding IS NULL OR t.embedding_model IS DISTINCT FROM $3)
             RETURNING t.id`,
   },
   content_chunks: {
@@ -123,7 +156,7 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
     // would refuse it the model, and the sibling's vector is the answer. It is not sent.
     pending: `SELECT c.id, c.text, encode(c.content_hash, 'hex') AS hash, c.is_draft
                 FROM content_chunks c
-               WHERE c.embedding IS NULL AND c.id = ANY($1::uuid[])
+               WHERE c.embedding IS NULL AND c.id = ANY($1::uuid[]) AND c.workspace_id = app.current_workspace()
                  AND NOT EXISTS (SELECT 1 FROM content_chunks o
                                   WHERE o.workspace_id = c.workspace_id AND o.content_hash = c.content_hash
                                     AND o.embedding_model = $2 AND o.is_draft = c.is_draft AND o.id <> c.id)
@@ -131,7 +164,7 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
     reuse: `UPDATE content_chunks t
                SET embedding = s.embedding, embedding_model = $2
               FROM content_chunks s
-             WHERE t.id = ANY($1::uuid[]) AND t.embedding IS NULL
+             WHERE t.id = ANY($1::uuid[]) AND t.embedding IS NULL AND t.workspace_id = app.current_workspace()
                AND s.workspace_id = t.workspace_id AND s.content_hash = t.content_hash AND s.id <> t.id
                AND s.embedding IS NOT NULL AND s.embedding_model = $2
                AND NOT EXISTS (SELECT 1 FROM content_chunks o
@@ -141,7 +174,7 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
     write: `UPDATE content_chunks t
                SET embedding = v.vec::halfvec(1536), embedding_model = $3
               FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
-             WHERE t.id = v.id AND t.embedding IS NULL
+             WHERE t.id = v.id AND t.embedding IS NULL AND t.workspace_id = app.current_workspace()
                AND NOT EXISTS (SELECT 1 FROM content_chunks o
                                 WHERE o.workspace_id = t.workspace_id AND o.content_hash = t.content_hash
                                   AND o.embedding_model = $3 AND o.is_draft = t.is_draft AND o.id <> t.id)
@@ -152,13 +185,13 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
     // content, so L7 is the unique key itself; a passage stored under another model is not this job's to embed.
     pending: `SELECT id, text, encode(content_hash, 'hex') AS hash, false AS is_draft
                 FROM corpus_passages
-               WHERE embedding IS NULL AND embedding_model = $2 AND id = ANY($1::uuid[])
+               WHERE embedding IS NULL AND embedding_model = $2 AND id = ANY($1::uuid[]) AND workspace_id = app.current_workspace()
                ORDER BY id`,
     reuse: undefined,
     write: `UPDATE corpus_passages t
                SET embedding = v.vec::halfvec(1536)
               FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
-             WHERE t.id = v.id AND t.embedding IS NULL AND t.embedding_model = $3
+             WHERE t.id = v.id AND t.embedding IS NULL AND t.embedding_model = $3 AND t.workspace_id = app.current_workspace()
             RETURNING t.id`,
   },
 };
@@ -237,10 +270,12 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
           }
           calls += 1;
           incrementCounter("nominara_embed_provider_calls_total", { outcome: "ok" });
+          // Counted BEFORE the shape check: a response we then refuse (wrong model, wrong count) was still charged by the provider,
+          // and `recover` meters `spentTokens`.
+          totalTokens += result.totalTokens;
           if (result.vectors.length !== batch.length || result.model !== prepared.model || result.vectors.some((vector) => vector.length !== prepared.dimensions)) {
             throw new EmbeddingProviderError("provider returned a result that does not match the request", { retryable: false });
           }
-          totalTokens += result.totalTokens;
           // A vector leaves here as a pgvector text literal and is never inspected again.
           for (const vector of result.vectors) vectors.push(JSON.stringify(vector));
         }
@@ -248,7 +283,7 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
         return { vectors, totalTokens, calls };
       } catch (error) {
         span.setStatus({ code: SpanStatusCode.ERROR });
-        throw new EmbedBatchFailedError(error, totalTokens);
+        throw isRetryable(error) ? new EmbedBatchFailedError(error, totalTokens) : new EmbedBatchPermanentError(error, totalTokens);
       } finally {
         span.end();
       }
@@ -311,17 +346,13 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
     // A failed attempt discards its vectors but the provider already charged for the calls that succeeded. Meter that spend (the
     // retry will spend again, and that is truthful), then leave the original error to the queue's retry ladder: always false.
     async recover(tx, job, failure) {
-      const spent =
-        failure.fetched !== undefined
-          ? failure.fetched.totalTokens
-          : failure.error instanceof EmbedBatchFailedError
-            ? failure.error.spentTokens
-            : 0;
+      const failed = failure.error instanceof EmbedBatchFailedError || failure.error instanceof EmbedBatchPermanentError ? failure.error : undefined;
+      const spent = failure.fetched !== undefined ? failure.fetched.totalTokens : (failed?.spentTokens ?? 0);
       const workspaceId = (job.data as { payload?: { workspaceId?: string } }).payload?.workspaceId;
       if (spent > 0 && workspaceId !== undefined) await meterTokens(tx, workspaceId, spent);
-      const circuitOpen = failure.error instanceof EmbedBatchFailedError && failure.error.cause instanceof CircuitOpenError;
+      const circuitOpen = failed?.cause instanceof CircuitOpenError;
       incrementCounter("nominara_embed_batches_total", { outcome: circuitOpen ? "circuit_open" : "failed" });
-      logger.warn({ event: "embed.batch.failed", phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });
+      logger.warn({ event: "embed.batch.failed", workspace_id: workspaceId ?? null, phase: failure.phase, permanent: failed?.retryable === false, error: failure.error instanceof Error ? failure.error.name : "unknown" });
       return false;
     },
   });

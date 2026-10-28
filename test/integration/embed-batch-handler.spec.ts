@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import type { Job } from "bullmq";
+import { UnrecoverableError, type Job } from "bullmq";
 import { Client, Pool, type PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
@@ -15,6 +15,7 @@ import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
 import { CircuitBreaker } from "../../src/lib/resilience/circuit-breaker.js";
 import { resolveBillingPeriod } from "../../src/lib/usage/billing-period.js";
+import { OpenAiEmbeddingProvider } from "../../src/modules/prompts/adapters/openai-embedding-provider.js";
 import { StandInEmbeddingProvider, STAND_IN_EMBEDDING_MODEL } from "../../src/modules/prompts/adapters/stand-in-embedding-provider.js";
 import { EmbeddingProviderError, type EmbeddingBatchResult, type EmbeddingProvider } from "../../src/modules/prompts/ports/embedding-provider.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
@@ -406,6 +407,72 @@ describe("STORY-133 · embed.batch", () => {
     expect(await usedTokens()).toBe(4242);
   }, 60_000);
 
+  // ---- review round 1: permanent failures, model switch, defence in depth ------------------------------------------------
+
+  it("a NON-retryable provider failure is an UnrecoverableError: one attempt, not the whole retry ladder", async () => {
+    const provider = new CountingProvider();
+    const ids = await addPrompts(2);
+    provider.failWith = () => new EmbeddingProviderError("bad request", { status: 400, retryable: false });
+    const failure = await runAsWorker(handler(provider), job(ids)).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(UnrecoverableError);
+    expect((failure as Error).message).toMatch(/embed\.batch provider failure/);
+    expect((await vectorState(ids)).some((row) => row.has_vector)).toBe(false);
+  }, 60_000);
+
+  it("a RETRYABLE provider failure is not unrecoverable: it rides the retry ladder", async () => {
+    const provider = new CountingProvider();
+    provider.failWith = () => new EmbeddingProviderError("down", { status: 503, retryable: true });
+    const failure = await runAsWorker(handler(provider), job(await addPrompts(1))).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UnrecoverableError);
+  }, 60_000);
+
+  it("a paid-for response that does not match the request is permanent, and the spend is still metered", async () => {
+    await seedCounter(-1);
+    const lying = new CountingProvider("pinned-model-v1");
+    const embed = lying.embed.bind(lying);
+    lying.embed = async (texts) => ({ ...(await embed(texts)), model: "some-other-model" });
+    const failure = await runAsWorker(handler(lying), job(await addPrompts(1))).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(UnrecoverableError);
+    expect(await usedTokens(), "the discarded call was still charged").toBeGreaterThan(0);
+  }, 60_000);
+
+  it("EC-23 - prompt vectors written under ANOTHER model (the stand-in) are re-embedded when the configured model changes", async () => {
+    const id = await addPrompt("a prompt the stand-in embedded earlier");
+    await runAsWorker(handler(new CountingProvider("stand-in-model")), job([id]));
+    expect((await vectorState([id]))[0]!.embedding_model).toBe("stand-in-model");
+
+    const real = new CountingProvider("real-model");
+    await runAsWorker(handler(real), job([id]));
+    expect(real.calls, "the stale vector is replaced, not compared against").toHaveLength(1);
+    expect((await vectorState([id]))[0]!.embedding_model).toBe("real-model");
+
+    // And a redelivery under the same model is a no-op again.
+    await runAsWorker(handler(real), job([id]));
+    expect(real.calls).toHaveLength(1);
+  }, 60_000);
+
+  it("defence in depth - even with RLS bypassed (superuser), a job signed for A cannot embed a prompt of workspace B", async () => {
+    const otherWs = randomUUID();
+    const otherProject = randomUUID();
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'Other', $2, 'growth')", [otherWs, `o-${randomUUID().slice(0, 8)}`]);
+    await db.query(
+      `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1, $2, 'P', $3, 'https://other.test', 'other.test')`,
+      [otherProject, otherWs, `p-${randomUUID().slice(0, 8)}`],
+    );
+    const foreign = randomUUID();
+    await db.query(
+      `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
+       VALUES ($1, $2, $3, 'foreign prompt', sha256('foreign prompt'::bytea), 'recommendation', 'consideration', 'active')`,
+      [foreign, otherWs, otherProject],
+    );
+    const provider = new CountingProvider();
+    const own = await addPrompt("my own prompt");
+    await runAsWorker(handler(provider), job([own, foreign]));
+    expect(provider.calls.flat()).toEqual(["my own prompt"]);
+    expect((await vectorState([foreign]))[0]).toMatchObject({ has_vector: false, embedding_model: null });
+  }, 60_000);
+
   // ---- the producer -----------------------------------------------------------------------------------------------------
 
   it("scenario 16 - a committed activation queues an embed job for the prompt; a rolled-back one leaves no orphan", async () => {
@@ -510,3 +577,90 @@ describe("STORY-133 · embed.batch", () => {
     expect(await l2Hits(target)).toBe(0);
   }, 60_000);
 });
+
+// STORY-133 - the ONE acceptance criterion this suite cannot close in CI ("L2 fires against a REAL embedding"). Opt-in: it runs
+// only when OPENAI_API_KEY is set, makes real, paid provider calls, and is therefore excluded from every CI run. Flipping the AC =
+// export the key + `pnpm test:integration -- embed-batch-handler`; no code change.
+describe.runIf(Boolean(process.env.OPENAI_API_KEY))("STORY-133 · scenario 9/10 against the REAL OpenAI embedding (opt-in, needs OPENAI_API_KEY)", () => {
+  let container: StartedPostgreSqlContainer;
+  let db: Client;
+  let pool: Pool;
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer("pgvector/pgvector:pg18").withDatabase("nominara_test").withUsername("nominara").withPassword("nominara").start();
+    db = new Client({ connectionString: container.getConnectionUri() });
+    await db.connect();
+    await migrateUp(db);
+    pool = new Pool({ connectionString: container.getConnectionUri() });
+  }, 300_000);
+  afterAll(async () => {
+    await pool.end();
+    await db.end();
+    await container.stop();
+  });
+
+  async function seed(texts: string[]): Promise<{ workspaceId: string; projectId: string; ids: string[] }> {
+    const workspaceId = randomUUID();
+    const projectId = randomUUID();
+    await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [workspaceId, `w-${randomUUID().slice(0, 8)}`]);
+    await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1, $2, 'P', $3, 'https://example.test', 'example.test')`, [projectId, workspaceId, `p-${randomUUID().slice(0, 8)}`]);
+    const ids: string[] = [];
+    for (const text of texts) {
+      const id = randomUUID();
+      ids.push(id);
+      await db.query(
+        `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
+         VALUES ($1, $2, $3, $4, sha256($5::bytea), 'recommendation', 'consideration', 'active')`,
+        [id, workspaceId, projectId, text, Buffer.from(text, "utf8")],
+      );
+    }
+    return { workspaceId, projectId, ids };
+  }
+
+  async function embedAll(workspaceId: string, ids: string[]): Promise<void> {
+    const context = { pool: undefined, env: { NODE_ENV: "test" } } as unknown as QueueHandlerContext;
+    const process = createJobProcessor(ENTRY, {
+      keys: KEYS,
+      getClient: () => pool.connect(),
+      releaseClient: (client) => (client as PoolClient).release(),
+      process: createEmbedBatchHandler(context, { provider: new OpenAiEmbeddingProvider({ apiKey: openAiKey() }) }),
+    });
+    const payload = embedBatchPayloadSchema.parse({ workspaceId, kid: "k1", table: "tracked_prompts", ids });
+    await process({ data: signQueueJobPayload(payload, KEYS.current.key) } as unknown as Job);
+  }
+
+  const L2_SOURCE = "which project management tool is best for a remote marketing team that needs reporting and client approvals every week";
+
+  async function l2Hits(workspaceId: string, projectId: string, source: string, target: string): Promise<{ cosine: number; hits: number }> {
+    await db.query(
+      `INSERT INTO answer_captures
+         (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at,
+          capture_mode, adapter_version, normalizer_version, content_hash, status, cache_layer)
+       VALUES ($1, $2, $3, $4, $5, 'perplexity', now() - interval '60 seconds', 'api', '1.0.0', 'v1', sha256('x'::bytea), 'parsed', 'live')`,
+      [randomUUID(), workspaceId, projectId, randomUUID(), source],
+    );
+    const cosine = Number((await db.query<{ c: number }>("SELECT 1 - (x.embedding <=> y.embedding) AS c FROM tracked_prompts x, tracked_prompts y WHERE x.id = $1 AND y.id = $2", [source, target])).rows[0]!.c);
+    const hits = await probeSemanticReuse(db, { workspaceId, projectId }, [{ promptId: target, engineKey: "perplexity", sampleIndex: 0, ttlSeconds: 86_400 }]);
+    return { cosine, hits: hits.size };
+  }
+
+  it("scenario 9 (REAL model) - a paraphrase of the same question scores >= 0.94 and L2 suppresses it", async () => {
+    const { workspaceId, projectId, ids } = await seed([L2_SOURCE, "what is the ideal project management tool for a remote marketing team that needs reporting and client approvals each week"]);
+    await embedAll(workspaceId, ids);
+    const result = await l2Hits(workspaceId, projectId, ids[0]!, ids[1]!);
+    expect(result.cosine).toBeGreaterThanOrEqual(0.94);
+    expect(result.hits).toBe(1);
+  }, 120_000);
+
+  it("scenario 10 (REAL model) - a different question about the same product stays under 0.94 and L2 does not suppress it", async () => {
+    const { workspaceId, projectId, ids } = await seed([L2_SOURCE, "how much does a project management tool cost per seat for a ten person agency"]);
+    await embedAll(workspaceId, ids);
+    const result = await l2Hits(workspaceId, projectId, ids[0]!, ids[1]!);
+    expect(result.cosine).toBeLessThan(0.94);
+    expect(result.hits).toBe(0);
+  }, 120_000);
+});
+
+function openAiKey(): string {
+  return process.env.OPENAI_API_KEY ?? "";
+}

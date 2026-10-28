@@ -173,9 +173,22 @@ describe("STORY-133 · the OpenAI adapter, against an injected HTTP layer (never
 
   it("refuses a response with missing usage, the wrong count, or the wrong dimension — it never estimates", async () => {
     const make = (body: unknown) => new OpenAiEmbeddingProvider({ apiKey: "k", fetch: (async () => response(body)) as unknown as typeof fetch });
-    await expect(make({ model: "m", data: [{ index: 0, embedding: vector }] }).embed(["x"])).rejects.toBeInstanceOf(EmbeddingProviderError);
-    await expect(make({ model: "m", data: [], usage: { total_tokens: 1 } }).embed(["x"])).rejects.toBeInstanceOf(EmbeddingProviderError);
-    await expect(make({ model: "m", data: [{ index: 0, embedding: [1, 2] }], usage: { total_tokens: 1 } }).embed(["x"])).rejects.toBeInstanceOf(EmbeddingProviderError);
+    await expect(make({ model: "text-embedding-3-large", data: [{ index: 0, embedding: vector }] }).embed(["x"])).rejects.toBeInstanceOf(EmbeddingProviderError);
+    await expect(make({ model: "text-embedding-3-large", data: [], usage: { total_tokens: 1 } }).embed(["x"])).rejects.toBeInstanceOf(EmbeddingProviderError);
+    await expect(make({ model: "text-embedding-3-large", data: [{ index: 0, embedding: [1, 2] }], usage: { total_tokens: 1 } }).embed(["x"])).rejects.toBeInstanceOf(EmbeddingProviderError);
+  });
+
+  it("review - the response's own model is checked: a different model is refused (non-retryable) and the returned model is the response's", async () => {
+    const make = (model: unknown) =>
+      new OpenAiEmbeddingProvider({ apiKey: "k", fetch: (async () => response({ model, data: [{ index: 0, embedding: vector }], usage: { total_tokens: 3 } })) as unknown as typeof fetch });
+    const ok = await make("text-embedding-3-large").embed(["x"]);
+    expect(ok.model).toBe("text-embedding-3-large");
+    const error = (await make("text-embedding-3-small").embed(["x"]).catch((e: unknown) => e)) as EmbeddingProviderError;
+    expect(error).toBeInstanceOf(EmbeddingProviderError);
+    expect(error.retryable).toBe(false);
+    // A response that names no model at all is not the pinned one either.
+    const missing = await make(undefined).embed(["x"]).catch((e: unknown) => e);
+    expect(missing).toBeInstanceOf(EmbeddingProviderError);
   });
 
   it("a network failure is a retryable provider error", async () => {

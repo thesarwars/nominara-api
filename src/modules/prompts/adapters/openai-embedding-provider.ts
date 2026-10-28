@@ -30,6 +30,7 @@ export interface OpenAiEmbeddingOptions {
 }
 
 interface OpenAiResponse {
+  readonly model?: unknown;
   readonly data?: unknown;
   readonly usage?: { readonly total_tokens?: unknown };
 }
@@ -80,6 +81,11 @@ export class OpenAiEmbeddingProvider implements EmbeddingProvider {
     if (typeof tokens !== "number" || !Number.isInteger(tokens) || tokens < 0) {
       throw new EmbeddingProviderError("embedding response carried no usage", { retryable: false });
     }
+    // The response names the model that actually served it. Trust that, not the constant we sent: a silent alias or a retired model
+    // would otherwise be stored under the requested name (EC-23). The handler compares the returned model to the configured one.
+    if (typeof body.model !== "string" || body.model !== this.model) {
+      throw new EmbeddingProviderError("embedding response was not served by the pinned model", { retryable: false });
+    }
     const data = Array.isArray(body.data) ? (body.data as { index?: unknown; embedding?: unknown }[]) : [];
     if (data.length !== expected) {
       throw new EmbeddingProviderError("embedding response did not return one vector per text", { retryable: false });
@@ -93,6 +99,6 @@ export class OpenAiEmbeddingProvider implements EmbeddingProvider {
       }
       return embedding as number[];
     });
-    return { vectors, model: this.model, totalTokens: tokens };
+    return { vectors, model: body.model, totalTokens: tokens };
   }
 }

@@ -13,8 +13,13 @@ import { embedBatchKey, splitIdsIntoJobs } from "./embed-batch.js";
 //
 // The handler does the provider call (NFR-ARCH-01) - this file only enqueues and imports no provider. A failed enqueue is logged
 // and counted, never thrown: the activation is committed and the customer's request must not fail for an optimisation. The
-// prompt stays at `embedding IS NULL`, which L2 treats as "no suppression" (its guard stays), and the next activation or a replay
-// asks again.
+// prompt stays at `embedding IS NULL`, which L2 treats as "no suppression" (its guard stays).
+//
+// RECOVERY IS NOT AUTOMATIC, and this comment used to say it was. A failed enqueue (Valkey down) is only logged. A job that fails
+// for good (retry ladder 2+4+8 s, shorter than the circuit breaker's 30 s open window, or no OPENAI_API_KEY at all) is
+// dead-lettered, and re-asking with the same ids inside the dedup window is the same `emb:` key and is deduplicated. The recovery
+// paths are an admin DLQ replay (AdminService.replayDeadLetterJob) or a re-activation after the window. A sweep over active
+// prompts with `embedding IS NULL` was rejected (STORY-133 D3) and is a named follow-up needing an owner decision.
 
 /** The slice of a tenant client this file needs: the activation services hold a `(sql, params) => rows` shape, not a full pg client. */
 export interface EmbeddingRequestClient {
