@@ -5,6 +5,7 @@ import { CircuitBreaker, CircuitOpenError } from "../../../lib/resilience/circui
 vi.mock("../../../lib/telemetry/metrics.js", () => ({ incrementCounter: vi.fn(), observeValue: vi.fn() }));
 
 import { incrementCounter, observeValue } from "../../../lib/telemetry/metrics.js";
+import { withTenantContext } from "../../../tenancy/tenant-context.js";
 import { GeminiNaturaliser, GeminiNaturaliserError } from "./gemini-naturaliser.js";
 
 // STORY-045 AC3 - the Gemini binding behind PROMPT_NATURALISER. NO test here touches the network: every call goes through an injected
@@ -147,6 +148,20 @@ describe("STORY-045 AC3 - GeminiNaturaliser", () => {
   it("observability - a failure writes ONE redacted log line: event, outcome, model and status, never the key or a line", async () => {
     await adapter(vi.fn().mockResolvedValue(new Response(`echo ${LINES[0]} ${KEY}`, { status: 429 })) as unknown as typeof fetch).naturalise({ lines: LINES, temperature: 0 }).catch(() => undefined);
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0]![0]).toEqual({ event: "prompts.naturalise.failed", outcome: "error", model: "gemini-2.5-flash", status: 429 });
+    expect(warn.mock.calls[0]![0]).toEqual({ event: "prompts.naturalise.failed", outcome: "error", model: "gemini-2.5-flash", status: 429, workspace_id: null });
+  });
+
+  it("observability - the failure line carries the workspace ID when a tenant context is active, and null when none is", async () => {
+    const failing = (): GeminiNaturaliser => adapter(vi.fn().mockResolvedValue(new Response("x", { status: 503 })) as unknown as typeof fetch);
+    const client = { query: vi.fn().mockResolvedValue({ rows: [] }) };
+    const workspaceId = "0190a0a0-0000-7000-8000-000000000001";
+    await withTenantContext(client as never, { workspaceId, actorId: "0190a0a0-0000-7000-8000-000000000002" }, () =>
+      failing().naturalise({ lines: LINES, temperature: 0 }).catch(() => undefined),
+    );
+    expect(warn.mock.calls[0]![0]).toMatchObject({ event: "prompts.naturalise.failed", workspace_id: workspaceId });
+
+    warn.mockClear();
+    await failing().naturalise({ lines: LINES, temperature: 0 }).catch(() => undefined);
+    expect(warn.mock.calls[0]![0]).toMatchObject({ workspace_id: null });
   });
 });

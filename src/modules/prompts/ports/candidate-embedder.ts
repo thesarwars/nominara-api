@@ -14,6 +14,10 @@
 // breaker-guarded embedding call on this route; (c) vector dedupe moves after persistence, on embed.batch, and a near-duplicate is
 // archived rather than refused - which changes `rejected[]` and the "keep the earlier prompt" guarantee.
 //
+// A phased handler cannot fix it on this route either: the audit and idempotency interceptors write into the ambient transaction after the
+// handler, so the route has no point at which it is outside a transaction. Persisting the batch vectors for generated candidates (so a later
+// pass can see them; STORY-133 embeds only active prompts) is part of wiring this, not before it.
+//
 // Until then: no embedder bound = exact `text_hash` dedupe and `novelty` null (not measured), exactly as before.
 
 export const PROMPT_CANDIDATE_EMBEDDER = Symbol("PROMPT_CANDIDATE_EMBEDDER");

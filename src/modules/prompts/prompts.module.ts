@@ -7,7 +7,7 @@ import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
 import { PromptListService } from "./prompt-list.service.js";
-import { selectNaturaliser } from "./naturaliser.selector.js";
+import { selectRequestPathNaturaliser } from "./naturaliser.selector.js";
 import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsService } from "./prompts.service.js";
@@ -16,14 +16,13 @@ import { TopicsService } from "./topics.service.js";
 
 // STORY-045 — the prompts bounded area.
 //
-// NATURALISER (owner decision 2026-10-28 #3). `PROMPT_NATURALISER` is bound by naturaliser.selector.ts from configuration:
-// `none` (the default) binds null and every pass runs §4's `template_only` path; `gemini` binds a Flash-class Gemini model behind the
-// port. A missing key also yields null, so the fallback is always the deterministic text.
-//
-// REQUEST PATH, AND WHY THAT IS A RISK RATHER THAN A DECISION. The route is documented synchronous (api-specification.md §5) and
-// NFR-ARCH-01 names engines, embedding providers and crawl targets - not a naturaliser - so the letter allows the call. But the
-// ambient request transaction is open while it runs (ADR-0003 / NFR-ARCH-04 forbid that), bounded by PROMPT_NATURALISER_TIMEOUT_MS
-// (default 8 s) and the adapter's circuit breaker. That is why the default is `none`. The story's decision #5 closes it.
+// NATURALISER (owner decision 2026-10-28 #3). The Gemini adapter exists behind PROMPT_NATURALISER and is selectable by configuration
+// (naturaliser.selector.ts), but it is deliberately NOT bound on the request path: this route's handler runs inside the ambient tenant
+// transaction, so a bound adapter would await Gemini with that transaction open (ADR-0003 / NFR-ARCH-04), and the audit and idempotency
+// interceptors write into the same transaction after the handler, so the route cannot simply step outside it. PROMPT_NATURALISER=gemini is
+// therefore reported at boot and every pass runs the template-only path. Binding it needs STORY-045 decision 5 (enqueued generation read
+// back by generation_batch_id, a contract change), which is the owner's. Before it is enabled it must also draw from the Gemini engine
+// rate-limit bucket (GEMINI_REQUESTS_PER_MINUTE) and count against an engine spend ceiling, or it can starve capture runs.
 //
 // CacheModule is imported EXPLICITLY even though it is @Global(), following
 // EntitlementsModule's precedent and for the reason its comment gives: a
@@ -40,7 +39,7 @@ import { TopicsService } from "./topics.service.js";
   imports: [CacheModule, EntitlementsModule, QueueProducerModule],
   controllers: [PromptsController, PromptLifecycleController, TopicsController],
   providers: [
-    { provide: PROMPT_NATURALISER, useFactory: () => selectNaturaliser(loadEnv()) },
+    { provide: PROMPT_NATURALISER, useFactory: () => selectRequestPathNaturaliser(loadEnv()) },
     PromptsService, PromptActivationService, PromptLifecycleService, PromptListService, TopicsService],
 })
 export class PromptsModule {}

@@ -1,5 +1,6 @@
 import { Test } from "@nestjs/testing";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import { GeminiNaturaliser } from "./adapters/gemini-naturaliser.js";
 import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
@@ -42,11 +43,18 @@ describe("STORY-022 · PromptsModule compiles", () => {
     await moduleRef.close();
   });
 
-  it("binds the Gemini naturaliser when PROMPT_NATURALISER=gemini and a key is configured", async () => {
+  it("STORY-045 AC3 / NFR-ARCH-04 - PROMPT_NATURALISER=gemini does NOT bind the model onto the request path: the handler's transaction is open", async () => {
+    // The route runs inside TenantContextInterceptor's BEGIN..COMMIT, so a bound adapter would await a third party with a transaction held
+    // open (ADR-0003). It stays unbound until decision 5 (enqueued / 202) is answered; the configuration is reported, not honoured silently.
     process.env.PROMPT_NATURALISER = "gemini";
     process.env.GEMINI_API_KEY = "fake-key-never-used";
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
     const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
-    expect(moduleRef.get(PROMPT_NATURALISER)).toBeInstanceOf(GeminiNaturaliser);
+    expect(moduleRef.get(PROMPT_NATURALISER)).toBeNull();
+    expect(moduleRef.get(PROMPT_NATURALISER)).not.toBeInstanceOf(GeminiNaturaliser);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "prompts.naturaliser.held_off_request_path" }));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("fake-key-never-used");
+    warn.mockRestore();
     await moduleRef.close();
   });
 

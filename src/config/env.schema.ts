@@ -434,7 +434,8 @@ export const envSchema = z
     GEMINI_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
     // STORY-045 AC3 (owner decision 2026-10-28 #3) - which model naturalises generated prompt text (tracking-engine.md section 4 step 4).
     // `none` (the default) is the template-only path. `gemini` binds a Flash-class Gemini model using GEMINI_API_KEY; with no key it falls
-    // back to template-only rather than failing boot. The call has a hard timeout so a slow model cannot hold a request open.
+    // back to template-only rather than failing boot. NOT YET BOUND ON THE REQUEST PATH: the generate route's transaction is open (ADR-0003),
+    // so `gemini` is reported at boot and passes stay template-only until STORY-045 decision 5 is answered. The adapter's call has a hard timeout.
     PROMPT_NATURALISER: z.enum(["none", "gemini"]).default("none"),
     PROMPT_NATURALISER_MODEL: requiredString.default("gemini-2.5-flash"),
     PROMPT_NATURALISER_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(8_000),

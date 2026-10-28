@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { z } from "zod";
+import { currentTenantStore } from "../../../tenancy/tenant-context.js";
 import { CircuitBreaker, CircuitOpenError } from "../../../lib/resilience/circuit-breaker.js";
 import { incrementCounter, observeValue } from "../../../lib/telemetry/metrics.js";
 import type { NaturaliseRequest, PromptNaturaliser } from "../ports/naturaliser.js";
@@ -99,6 +100,8 @@ export class GeminiNaturaliser implements PromptNaturaliser {
         logger.warn({
           event: "prompts.naturalise.failed",
           outcome,
+          // The ID only, never the workspace name; null when the call is made outside a tenant context.
+          workspace_id: currentTenantStore()?.context.workspaceId ?? null,
           model: this.model,
           status: error instanceof GeminiNaturaliserError ? error.status ?? null : null,
         });
