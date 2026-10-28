@@ -1,4 +1,5 @@
 import { Inject, Injectable, Optional } from "@nestjs/common";
+import type { ClientBase } from "pg";
 import type {
   GeneratePromptsRequest,
   GeneratePromptsResponse,
@@ -7,6 +8,7 @@ import type {
 import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { l5TemplateCacheKey } from "../../lib/promptgen/cache-key.js";
+import type { Candidate } from "../../lib/promptgen/emit.js";
 import { generatePass, type ExistingHashes, type TemplateCache } from "../../lib/promptgen/generate.js";
 import { insertPromptStatement, type PromptRow } from "../../lib/promptgen/persist.js";
 import type { SlotContext } from "../../lib/promptgen/slots.js";
@@ -14,6 +16,8 @@ import { promptTextHash } from "../../lib/promptgen/text-hash.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { loadEnv } from "../../config/env.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { compareInSql, type VectorDedupePort } from "../../lib/promptgen/vector-dedupe.js";
+import { PROMPT_CANDIDATE_EMBEDDER, type CandidateEmbedder } from "./ports/candidate-embedder.js";
 import { PROMPT_NATURALISER, type PromptNaturaliser } from "./ports/naturaliser.js";
 
 // STORY-045 — `POST /v1/projects/{id}/prompts/generate`.
@@ -48,6 +52,8 @@ export class PromptsService {
     // `template_only` path, which is not a degraded mode but FR-FAN-01d's
     // determinism guarantee.
     @Optional() @Inject(PROMPT_NATURALISER) private readonly naturaliser: PromptNaturaliser | null = null,
+    // OPTIONAL and UNBOUND (see ports/candidate-embedder.ts): absent = exact-hash dedupe, `novelty` not measured.
+    @Optional() @Inject(PROMPT_CANDIDATE_EMBEDDER) private readonly embedder: CandidateEmbedder | null = null,
   ) {}
 
   async generate(projectId: string, request: GeneratePromptsRequest): Promise<GeneratePromptsResponse> {
@@ -84,6 +90,7 @@ export class PromptsService {
       prioritySubsetSize: request.options?.priority_subset_size ?? 6,
       naturaliser: naturaliserEnabled ? this.naturaliser : null,
       temperature: generation.temperature,
+      ...(this.embedder === null ? {} : { vectorDedupe: this.vectorDedupe(this.embedder, client, projectId) }),
       ...(request.topic_hint === undefined ? {} : { topicHint: request.topic_hint }),
       ...(project.locale === null ? {} : { locale: project.locale }),
       ...(request.archetype_plan?.include === undefined ? {} : { includeArchetypes: request.archetype_plan.include }),
@@ -102,7 +109,7 @@ export class PromptsService {
 
     return {
       generation_batch_id: pass.rows[0]?.generationBatchId ?? uuidV7(),
-      variants: pass.rows.map((row, index) => this.toVariant(row, pass.candidates[index]!.slots)),
+      variants: pass.rows.map((row, index) => this.toVariant(row, pass.candidates[index]!.slots, pass.candidates[index]!.novelty)),
       rejected: [...pass.rejected],
       coverage: [...pass.coverage],
       summary: pass.summary,
@@ -209,6 +216,14 @@ export class PromptsService {
     return new Map(result.rows.map((row) => [row.text_hash.toString("hex"), row.id]));
   }
 
+  /** §4 step 5: the injected embedder for the vectors, Postgres (pgvector) for every comparison. */
+  private vectorDedupe(embedder: CandidateEmbedder, client: Pick<ClientBase, "query">, projectId: string): VectorDedupePort {
+    return {
+      embed: (texts) => embedder.embed(texts),
+      compare: (vectors) => compareInSql(client, projectId, embedder.model, vectors),
+    };
+  }
+
   /** §8's L5 cache, tenant-scoped and 30-day, behind the pipeline's narrow port. */
   private templateCache(workspaceId: string): TemplateCache {
     const env = loadEnv();
@@ -242,13 +257,15 @@ export class PromptsService {
   /**
    * A stored row as §5's `variants[]` entry.
    *
-   * `novelty` is null on both members, and that is the honest value rather
-   * than a convenience: nothing computes an embedding (`G3`, STORY-133), so
-   * `max_cosine_to_existing` was not MEASURED. Reporting 0 would claim
-   * "measured, and maximally distant from everything" — a novelty check that
-   * reads as passed.
+   * `novelty` is what the vector comparison measured, or null on both members when none ran (no embedder bound, or the embedding
+   * failed): `max_cosine_to_existing` was not MEASURED, and reporting 0 would claim "measured, and maximally distant from
+   * everything" - a novelty check that reads as passed. A MEASURED 0 stays 0.
    */
-  private toVariant(row: PromptRow, slots: Readonly<Record<string, string>>): GeneratedVariant {
+  private toVariant(
+    row: PromptRow,
+    slots: Readonly<Record<string, string>>,
+    novelty: Candidate["novelty"],
+  ): GeneratedVariant {
     const meta = row.generatorMeta as {
       template_id: string;
       naturalized: boolean;
@@ -266,7 +283,10 @@ export class PromptsService {
       brand_named: meta.brand_named,
       competitor_named: meta.competitor_named,
       slots: { ...slots },
-      novelty: { max_cosine_to_existing: null, nearest_prompt_id: null },
+      novelty: {
+        max_cosine_to_existing: novelty?.maxCosineToExisting ?? null,
+        nearest_prompt_id: novelty?.nearestPromptId ?? null,
+      },
       is_priority: row.isPriority,
       status: row.status,
     };
