@@ -13,6 +13,7 @@ import { createTopicClusterHandler } from "../../src/lib/queue/handlers/topic-cl
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
+import { writeClusters } from "../../src/lib/topics/cluster.js";
 import { isReadableLabel, type TopicLabeller } from "../../src/lib/topics/labeller.js";
 import { findProjectsDueForClustering, runTopicClusterSweep } from "../../src/lib/topics/sweep.js";
 import { StandInEmbeddingProvider, STAND_IN_EMBEDDING_MODEL } from "../../src/modules/prompts/adapters/stand-in-embedding-provider.js";
@@ -241,25 +242,120 @@ describe("STORY-047 - topic.cluster", () => {
     expect(rows.map((r) => r.label).sort()).toEqual(["Same topic", "same TOPIC (2)"]);
   });
 
-  it("AC3 - a new group whose label equals the label of a cluster that DISSOLVES in the same run is written, not refused on the unique index", async () => {
-    // Old cluster X = {A,B,C,D}. B, C, D are paused, so X still counts 4 members; A joins two new prompts, G = {A,N1,N2}: overlap 1,
-    // 2*1 < min(3,4), so G is NOT X. X dissolves, and G's label is X's label. The insert must not see X as still there.
-    const [a, b, c, d] = (await seedGroups(1, 4))[0]! as [string, string, string, string];
+  it("AC3 - a new group whose label equals the label of a cluster that GENUINELY DISSOLVES in the same run is written, not refused on the unique index", async () => {
+    // Old cluster X = {A..E}. Then its members scatter: A,B move to topic 1 (joined by four new prompts), C,D to topic 2 (four new),
+    // E keeps topic 0 and is alone, so an outlier. No new group holds half of the smaller side with X (2*2 < min(6,5)), so X dissolves,
+    // and the labeller names the new groups with X's own label. The insert must not see X as still there (delete before insert).
+    const [a, b, c, d, e] = (await seedGroups(1, 5))[0]! as [string, string, string, string, string];
     const same = { label: () => Promise.resolve("Same topic") };
     await run(handler(same));
     const [old] = await clusters();
-    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = ANY($1::uuid[])", [[b, c, d]]);
-    const n1 = await addPrompt(TOPICS[0]!(10), member(0, 10));
-    const n2 = await addPrompt(TOPICS[0]!(11), member(0, 11));
+    expect(old!.label).toBe("Same topic");
+    const toGroup = async (ids: string[], g: number, from: number) => {
+      for (const [k, id] of ids.entries()) await db.query("UPDATE tracked_prompts SET embedding = $2::halfvec WHERE id = $1", [id, member(g, from + k)]);
+    };
+    await toGroup([a, b], 1, 0);
+    await toGroup([c, d], 2, 0);
+    const fresh: string[] = [];
+    for (let i = 0; i < 4; i += 1) fresh.push(await addPrompt(TOPICS[1]!(20 + i), member(1, 10 + i)));
+    for (let i = 0; i < 4; i += 1) fresh.push(await addPrompt(TOPICS[2]!(20 + i), member(2, 10 + i)));
     await run(handler(same));
     const rows = await clusters();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.id).not.toBe(old!.id);
-    expect(rows[0]!.label).toBe("Same topic");
+    expect(rows.map((r) => r.label).sort()).toEqual(["Same topic", "Same topic (2)"]);
+    expect(rows.some((r) => r.id === old!.id)).toBe(false);
     const assigned = await assignments();
-    expect(new Set([a, n1, n2].map((id) => assigned.get(id)))).toEqual(new Set([rows[0]!.id]));
-    for (const id of [b, c, d]) expect(assigned.get(id)).toBeNull();
+    expect(assigned.get(e)).toBeNull();
+    expect(new Set([a, b, ...fresh.slice(0, 4)].map((id) => assigned.get(id))).size).toBe(1);
+    expect(new Set([c, d, ...fresh.slice(4)].map((id) => assigned.get(id))).size).toBe(1);
     expect(await orphans()).toBe(0);
+  });
+
+  it("AC3 - a user-renamed cluster survives an ordinary prompt edit: reworded (archived) originals do not count against it", async () => {
+    // Five prompts, renamed. The user then rewords three: each original is archived (it keeps its cluster_id), each replacement starts
+    // unassigned. The same topic is now {2 originals + 3 replacements}; the old cluster's membership that COULD be grouped is 2.
+    const ids = (await seedGroups(1, 5))[0]!;
+    await run();
+    const [before] = await clusters();
+    await db.query("UPDATE topic_clusters SET label = 'Our enterprise CRM', label_source = 'user' WHERE id = $1", [before!.id]);
+    for (const [k, id] of ids.slice(0, 3).entries()) {
+      const replacement = await addPrompt(`Reworded: ${TOPICS[0]!(30 + k)}`, member(0, 30 + k));
+      await db.query("UPDATE tracked_prompts SET status = 'archived', superseded_by = $2 WHERE id = $1", [id, replacement]);
+    }
+    await run();
+    const rows = await clusters();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).toBe(before!.id);
+    expect(rows[0]!.label).toBe("Our enterprise CRM");
+    expect(rows[0]!.label_source).toBe("user");
+    expect(rows[0]!.prompt_count).toBe(5);
+  });
+
+  it("AC3 - a user-renamed cluster survives when most of its members are paused and replaced by near-identical prompts", async () => {
+    const ids = (await seedGroups(1, 4))[0]!;
+    await run();
+    const [before] = await clusters();
+    await db.query("UPDATE topic_clusters SET label = 'Mine', label_source = 'user' WHERE id = $1", [before!.id]);
+    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = ANY($1::uuid[])", [ids.slice(1)]);
+    for (let k = 0; k < 3; k += 1) await addPrompt(`Another way to ask ${TOPICS[0]!(40 + k)}`, member(0, 40 + k));
+    await run();
+    const rows = await clusters();
+    expect(rows.map((r) => [r.id, r.label, r.label_source])).toEqual([[before!.id, "Mine", "user"]]);
+  });
+
+  it("AC3 - a label a user chose between prepare and commit that equals a freshly chosen label does not fail the run", async () => {
+    await seedGroups(2, 3);
+    await run();
+    // A third topic appears. While its label is being chosen, the user renames an existing cluster to the very label the labeller returns.
+    for (let i = 0; i < 3; i += 1) await addPrompt(TOPICS[2]!(i), member(2, i));
+    const racing = new StubLabeller(async () => {
+      await db.query("UPDATE topic_clusters SET label = 'Security & compliance', label_source = 'user' WHERE project_id = $1 AND label = 'Pricing comparison'", [projectId]);
+    });
+    await run(handler(racing));
+    const rows = await clusters();
+    expect(rows.map((r) => r.label).sort()).toEqual(["Enterprise CRM", "Security & compliance", "Security & compliance (2)"]);
+    expect(rows.find((r) => r.label === "Security & compliance")?.label_source).toBe("user");
+  });
+
+  it("AC5 - a prompt set that changes and changes back during a run is not mistaken for 'another run did this': the prompt is still assigned", async () => {
+    // Job A snapshots P0 = {a,b,c,d,x}. While it names the group, x is paused, job B clusters {a,b,c,d}, and x is un-paused: P0 again,
+    // but the cluster state is B's. A must plan again under the lock, not write nothing.
+    const [a, b, c, d, x] = (await seedGroups(1, 5))[0]! as [string, string, string, string, string];
+    let raced = false;
+    const racing = new StubLabeller(async () => {
+      if (raced) return;
+      raced = true;
+      await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = $1", [x]);
+      await run(handler(new StubLabeller()));
+      await db.query("UPDATE tracked_prompts SET status = 'active' WHERE id = $1", [x]);
+    });
+    await run(handler(racing));
+    const rows = await clusters();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.prompt_count).toBe(5);
+    const assigned = await assignments();
+    expect(new Set([a, b, c, d, x].map((id) => assigned.get(id)))).toEqual(new Set([rows[0]!.id]));
+    expect(await orphans()).toBe(0);
+  });
+
+  it("AC7 - the membership write itself refuses a prompt that stopped being clusterable after the plan was made", async () => {
+    const [a, b, c] = (await seedGroups(1, 3))[0]! as [string, string, string];
+    // New cluster: c is paused between the lock re-check and the write.
+    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = $1", [c]);
+    const clusterId = randomUUID();
+    await writeClusters(db, workspaceId, projectId, MODEL, [{ clusterId, memberIds: [a, b, c], newLabel: "T" }]);
+    let assigned = await assignments();
+    expect(assigned.get(c)).toBeNull();
+    expect(assigned.get(a)).toBe(clusterId);
+    expect((await clusters())[0]!.prompt_count).toBe(2);
+    // Kept cluster: d was a member, is soft-deleted after the plan, and the plan still lists it. It is let go and not counted.
+    const d = await addPrompt(TOPICS[0]!(8), member(0, 8));
+    await writeClusters(db, workspaceId, projectId, MODEL, [{ clusterId, memberIds: [a, b, d] }]);
+    expect((await clusters())[0]!.prompt_count).toBe(3);
+    await db.query("UPDATE tracked_prompts SET deleted_at = now() WHERE id = $1", [d]);
+    await writeClusters(db, workspaceId, projectId, MODEL, [{ clusterId, memberIds: [a, b, d] }]);
+    assigned = await assignments();
+    expect(assigned.get(d)).toBeNull();
+    expect((await clusters())[0]!.prompt_count).toBe(2);
   });
 
   // ---- AC5, scenario 4 ------------------------------------------------------------------------------------------------
@@ -475,6 +571,21 @@ describe("STORY-047 - topic.cluster", () => {
     expect(p.rows[0]!.n).toBe("0");
   });
 
+  it("tenancy - identically embedded prompts in two workspaces: A's run groups, samples and writes only A's rows", async () => {
+    await seedGroups(1, 3);
+    const [wsB, projB] = await newProject();
+    const bIds: string[] = [];
+    for (let i = 0; i < 3; i += 1) bIds.push(await addPrompt(`B-ONLY secret ${String(i)}`, member(0, i), { ws: wsB, project: projB }));
+    const seen: string[] = [];
+    await run(handler({ label: (request) => { seen.push(...request.prompts); return Promise.resolve("Enterprise CRM"); } }));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some((text) => text.includes("B-ONLY"))).toBe(false);
+    expect(await clusters()).toHaveLength(1);
+    const b = await db.query<{ n: string }>("SELECT count(*)::text AS n FROM tracked_prompts WHERE id = ANY($1::uuid[]) AND cluster_id IS NOT NULL", [bIds]);
+    expect(b.rows[0]!.n).toBe("0");
+    expect((await db.query("SELECT 1 FROM topic_clusters WHERE project_id = $1", [projB])).rowCount).toBe(0);
+  });
+
   it("tenancy - clustering one project never touches another project's clusters or assignments in the same workspace", async () => {
     await seedGroups(2, 3);
     const p2 = randomUUID();
@@ -524,6 +635,16 @@ describe("STORY-047 - topic.cluster", () => {
       await run();
       await db.query("UPDATE tracked_prompts SET deleted_at = now() WHERE id IN (SELECT id FROM tracked_prompts WHERE cluster_id IS NOT NULL ORDER BY id LIMIT 3)");
       expect((await due())[0]?.reason).toBe("prompt_set_change");
+    });
+
+    it("a switch of embedding model is a material change: every clustered prompt re-embedded makes the project due", async () => {
+      await seedGroups(2, 3);
+      await run();
+      expect(await due()).toHaveLength(0);
+      await db.query("UPDATE tracked_prompts SET embedding_model = 'other-model-1536' WHERE project_id = $1", [projectId]);
+      expect((await due())[0]?.reason).toBe("prompt_set_change");
+      await run();
+      expect(await due()).toHaveLength(0);
     });
 
     it("the periodic schedule - an unchanged project is due once its clusters are older than seven days, not before", async () => {

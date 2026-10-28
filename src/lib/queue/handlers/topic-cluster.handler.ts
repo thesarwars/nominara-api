@@ -25,8 +25,9 @@ import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-facto
 //
 // The queue's concurrency is 2 and the lock is per project (system-architecture.md section 4), so two triggers for one project
 // serialise at the commit. The loser re-reads under the lock: a changed PROMPT SET means its work is stale and it fails for the
-// retry ladder (the retry re-reads); a changed CLUSTER state with the same prompt set means the other run already did this work, so
-// it writes nothing.
+// retry ladder (the retry re-reads); a changed CLUSTER state with the same prompt set is planned again under the lock (it matches
+// what the other run wrote, so it is a no-op when the other run did this work, and it repairs the case where the set changed and
+// changed back in between).
 //
 // IDEMPOTENT under at-least-once delivery (NFR-ARCH-02): over an unchanged set a re-run matches every group to the cluster it
 // already is, keeps every label, and rewrites the same centroids and counts.
@@ -126,22 +127,53 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
             incrementCounter("nominara_topic_cluster_runs_total", { outcome: "stale" });
             throw new TopicClusterStaleError();
           }
+          // The cluster state moved (another run committed first) while the prompt set is the same. That does NOT mean the work is
+          // done: the set may have changed and changed back, leaving a prompt the other run let go. So plan again, here, under the
+          // lock, from what is committed now. Nothing in this branch can be a network call (a transaction is open), so a group with
+          // no cluster to inherit is named by the deterministic template.
+          let plannedGroups = snapshot.groups;
+          let matched = prepared.matched;
+          let labels = fetched.labels;
+          let clusterable = snapshot.clusterable;
           if ((await clusterStateHash(tx, payload.projectId)) !== snapshot.clusterStateHash) {
-            incrementCounter("nominara_topic_cluster_runs_total", { outcome: "superseded" });
-            logger.log({ event: "topic.cluster.superseded", workspace_id: payload.workspaceId, project_id: payload.projectId });
-            return;
+            const again = await snapshotClusters(tx, payload.projectId);
+            if (again.promptSetHash !== snapshot.promptSetHash) {
+              incrementCounter("nominara_topic_cluster_runs_total", { outcome: "stale" });
+              throw new TopicClusterStaleError();
+            }
+            incrementCounter("nominara_topic_cluster_runs_total", { outcome: "replanned" });
+            logger.log({ event: "topic.cluster.replanned", workspace_id: payload.workspaceId, project_id: payload.projectId });
+            plannedGroups = again.groups;
+            clusterable = again.clusterable;
+            matched = matchGroupsToClusters(
+              again.groups.map((group) => ({ index: group.index, memberCount: group.memberIds.length, overlaps: group.overlaps })),
+              again.olds,
+            );
+            const template = new TemplateTopicLabeller();
+            const named = new Map<number, string>();
+            for (const group of again.groups) {
+              if (!matched.has(group.index)) named.set(group.index, (await labelOrFallback(template, { prompts: group.samples })).label);
+            }
+            labels = named;
           }
 
-          const plan: ClusterPlanEntry[] = snapshot.groups.map((group) => {
-            const existing = prepared.matched.get(group.index);
+          // A label is only unique against what is committed NOW: a user may have renamed a kept cluster since `run` chose the names.
+          const kept = await tx.query<{ label: string }>("SELECT label FROM topic_clusters WHERE project_id = $1 AND id = ANY($2::uuid[])", [
+            payload.projectId,
+            [...matched.values()],
+          ]);
+          const taken = new Set(kept.rows.map((row) => row.label.toLowerCase()));
+
+          const plan: ClusterPlanEntry[] = plannedGroups.map((group) => {
+            const existing = matched.get(group.index);
             return existing !== undefined
               ? { clusterId: existing, memberIds: group.memberIds }
-              : { clusterId: uuidV7(), memberIds: group.memberIds, newLabel: fetched.labels.get(group.index) ?? "General questions" };
+              : { clusterId: uuidV7(), memberIds: group.memberIds, newLabel: uniqueLabel(labels.get(group.index) ?? "General questions", taken) };
           });
           const written = await writeClusters(tx, payload.workspaceId, payload.projectId, snapshot.model, plan);
 
           const members = plan.flatMap((entry) => entry.memberIds).length;
-          const outliers = snapshot.clusterable - members;
+          const outliers = clusterable - members;
           incrementCounter("nominara_topic_cluster_runs_total", { outcome: "clustered" });
           observeValue("nominara_topic_cluster_clusters_written", plan.length, { reason: payload.reason });
           observeValue("nominara_topic_cluster_outlier_prompts", outliers);

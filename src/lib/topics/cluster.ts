@@ -84,9 +84,12 @@ export async function snapshotClusters(tx: ClientBase, projectId: string): Promi
   const { hash, clusterable } = await promptSetHash(tx, projectId, model);
   const state = await clusterStateHash(tx, projectId);
 
+  // An old cluster's size is the members that COULD be grouped now. A paused row, or the archived original an edit leaves behind
+  // (it keeps its cluster_id; the replacement starts unassigned), is in no group and must not count against the match, or an
+  // ordinary reword would dissolve a cluster and delete the user's label with it (AC3).
   const olds = await tx.query<{ id: string; label: string; label_source: "auto" | "user"; n: string }>(
     `SELECT c.id, c.label, c.label_source,
-            (SELECT count(*) FROM tracked_prompts p WHERE p.cluster_id = c.id AND p.deleted_at IS NULL)::text AS n
+            (SELECT count(*) FROM tracked_prompts p WHERE p.cluster_id = c.id AND ${CLUSTERABLE_BASE_SQL})::text AS n
        FROM topic_clusters c WHERE c.project_id = $1 ORDER BY c.id`,
     [projectId],
   );
@@ -188,16 +191,21 @@ export async function writeClusters(
   const memberIds = plan.flatMap((entry) => [...entry.memberIds]);
   const clusterOfMember = plan.flatMap((entry) => entry.memberIds.map(() => entry.clusterId));
 
-  // Everything in the project that held a cluster and is not a member now (an outlier, a paused, deleted or re-embedded prompt) is let go.
+  // Everything in the project that held a cluster and is not a member now (an outlier, a paused, deleted or re-embedded prompt) is let
+  // go. A listed member that stopped being clusterable after the plan was made (the API's prompt writes do not take the project lock)
+  // is let go too, and the assignment below skips it: it can never be given a cluster, or counted in one, past the plan.
   await tx.query(
-    `UPDATE tracked_prompts SET cluster_id = NULL WHERE project_id = $1 AND cluster_id IS NOT NULL AND NOT (id = ANY($2::uuid[]))`,
-    [projectId, memberIds],
+    `UPDATE tracked_prompts p SET cluster_id = NULL
+      WHERE p.project_id = $1 AND p.cluster_id IS NOT NULL
+        AND (NOT (p.id = ANY($2::uuid[])) OR NOT (${CLUSTERABLE_BASE_SQL} AND p.embedding_model IS NOT DISTINCT FROM $3::text))`,
+    [projectId, memberIds, model ?? null],
   );
   const assigned = await tx.query(
     `UPDATE tracked_prompts p SET cluster_id = v.cid
        FROM unnest($1::uuid[], $2::uuid[]) AS v(pid, cid)
-      WHERE p.id = v.pid AND p.project_id = $3 AND p.cluster_id IS DISTINCT FROM v.cid`,
-    [memberIds, clusterOfMember, projectId],
+      WHERE p.id = v.pid AND p.project_id = $3 AND p.cluster_id IS DISTINCT FROM v.cid
+        AND ${CLUSTERABLE_BASE_SQL} AND p.embedding_model IS NOT DISTINCT FROM $4::text`,
+    [memberIds, clusterOfMember, projectId, model ?? null],
   );
   // Centroid, count and commercial intent come from the rows now assigned, in one statement: a mean of the members' vectors and of
   // their funnel weights. Touches every kept cluster, so `min(updated_at)` is the time of the last clustering (see the sweep).

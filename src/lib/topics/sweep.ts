@@ -15,9 +15,11 @@ import { MATERIAL_CHANGE_FRACTION, MIN_CLUSTER_SIZE, TOPIC_CLUSTER_QUEUE, WEEKLY
 //
 // DUE, per project (all from this database, no network call):
 //   initial            clusterable prompts >= MIN_CLUSTER_SIZE, no clusters yet, and a prompt changed in the last week. (A project whose
-//                      prompts are all outliers keeps no cluster row to remember the run by, so it is retried when prompts change, not
-//                      on every tick.)
-//   prompt_set_change  (clusterable prompts that arrived since the last clustering + clustered prompts that left) / (the set) >= 10%.
+//                      prompts are all outliers keeps no cluster row to remember the run by, so it stays due on every tick for that
+//                      week. Only the job key - topic:{project}:{prompt_set_hash}, deduped for the queue's retention - stops it
+//                      re-running, and a run over such a set is cheap and idempotent.)
+//   prompt_set_change  (clusterable prompts that arrived since the last clustering + clustered prompts that left, a prompt re-embedded by
+//                      a different model than its cluster's counting as having left) / (the set) >= 10%.
 //   weekly             the last clustering is seven days old or older.
 //
 // "THE LAST CLUSTERING" is `min(topic_clusters.updated_at)`: every run touches every kept cluster, so the oldest row is the run time,
@@ -92,7 +94,8 @@ export async function findProjectsDueForClustering(client: ClientBase, now: Date
                  AND p.cluster_id IS NULL AND c.last_at IS NOT NULL AND p.updated_at > c.last_at)::text AS arrived,
             (SELECT count(*) FROM tracked_prompts p
                WHERE p.project_id = pr.id AND p.cluster_id IS NOT NULL
-                 AND (p.deleted_at IS NOT NULL OR p.status <> 'active' OR p.superseded_by IS NOT NULL))::text AS departed,
+                 AND (p.deleted_at IS NOT NULL OR p.status <> 'active' OR p.superseded_by IS NOT NULL
+                      OR p.embedding_model <> (SELECT cl.embedding_model FROM topic_clusters cl WHERE cl.id = p.cluster_id)))::text AS departed,
             (SELECT count(*) FROM tracked_prompts p
                WHERE p.project_id = pr.id AND ${CLUSTERABLE_BASE_SQL} AND p.embedding_model = d.embedding_model
                  AND p.updated_at > $1::timestamptz - make_interval(days => $2::int))::text AS recent,

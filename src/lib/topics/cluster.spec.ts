@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CLUSTER_SIMILARITY_FLOOR, FUNNEL_WEIGHT_SQL, FUNNEL_WEIGHTS, MATERIAL_CHANGE_FRACTION, MIN_CLUSTER_SIZE, WEEKLY_RECOMPUTE_DAYS } from "./constants.js";
 import { TemplateTopicLabeller, isReadableLabel, labelOrFallback, uniqueLabel, type TopicLabeller } from "./labeller.js";
 import { matchGroupsToClusters } from "./matching.js";
@@ -57,11 +57,26 @@ describe("STORY-047 AC2 - labels are human-readable", () => {
     expect(await labelOrFallback({ label: () => Promise.resolve("Pricing comparison") }, { prompts })).toEqual({ label: "Pricing comparison", source: "model" });
   });
   it("a model that never answers falls back to the template once the bound passes, and the timer is cleared", async () => {
-    const hang: TopicLabeller = { label: () => new Promise<string>(() => undefined) };
-    const started = Date.now();
-    const result = await labelOrFallback(hang, { prompts: ["How does pricing compare across vendors?"] }, 25);
-    expect(result).toEqual({ label: "How does pricing compare across vendors", source: "template" });
-    expect(Date.now() - started).toBeLessThan(2_000);
+    vi.useFakeTimers();
+    try {
+      const hang: TopicLabeller = { label: () => new Promise<string>(() => undefined) };
+      const pending = labelOrFallback(hang, { prompts: ["How does pricing compare across vendors?"] }, 25);
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(25);
+      expect(await pending).toEqual({ label: "How does pricing compare across vendors", source: "template" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("a model that answers promptly leaves no timer behind", async () => {
+    vi.useFakeTimers();
+    try {
+      await labelOrFallback({ label: () => Promise.resolve("Pricing comparison") }, { prompts: ["x"] }, 15_000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("a model that answers inside the bound is used", async () => {
     const slow: TopicLabeller = { label: () => new Promise<string>((resolve) => setTimeout(() => resolve("Pricing comparison"), 5)) };
