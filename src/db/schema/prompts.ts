@@ -69,4 +69,5 @@ export const trackedPrompts = pgTable("tracked_prompts", {
   firstActivatedAt: timestamp("first_activated_at", { withTimezone: true }),
   activationCredits: integer("activation_credits").notNull().default(sql`0`),
   pausedByDowngradeAt: timestamp("paused_by_downgrade_at", { withTimezone: true }),
+  embeddingModel: text("embedding_model"),
 });
