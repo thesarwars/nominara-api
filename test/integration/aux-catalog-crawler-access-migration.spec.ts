@@ -56,7 +56,7 @@ describe("NEW-C-8 · migration 0070 — crawler_access catalog", () => {
 
   it("NEW-C-8 AC3.9 · the catalog loader accepts what the migration wrote (weights sum to 1.000)", async () => {
     const r = await rows();
-    const catalog = loadAuxCatalog(r.map((x) => ({ code: x.code, category: x.category, weight: x.weight, ruleVersion: x.rule_version, thresholds: x.thresholds })), ["crawler_access"]);
+    const catalog = loadAuxCatalog(r.map((x) => ({ code: x.code, category: x.category, weight: x.weight, ruleVersion: x.rule_version, autoFixable: x.auto_fixable, thresholds: x.thresholds })), ["crawler_access"]);
     expect(catalog.rules).toHaveLength(7);
   });
 

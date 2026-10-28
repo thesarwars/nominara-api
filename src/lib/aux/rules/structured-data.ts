@@ -18,10 +18,18 @@ export const jsonLdSyntaxError = defineRule({
   autoFixable: true,
   thresholds: strict({ min_errors: z.number().int().positive() }),
   evaluate(doc, t) {
-    const errors = doc.structured.parseErrors;
+    // `parseErrors` holds the errors of both copies. A block that is broken in the plain copy and still broken after rendering is
+    // ONE error, so the copies are folded by block index, position and quoted text; the locator names the copy it was first seen in.
+    const seen = new Set<string>();
+    const errors = doc.structured.parseErrors.filter((e) => {
+      const key = `${String(e.index)}|${String(e.position)}|${e.snippet}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     if (errors.length < t.min_errors) return [];
     const first = errors[0]!;
-    return [{ severity: "critical", measured: errors.length, threshold: t.min_errors, reason: "jsonld_parse_error", snippet: first.snippet, locator: `jsonld[${String(first.index)}]${first.position === null ? "" : `@${String(first.position)}`}` }];
+    return [{ severity: "critical", measured: errors.length, threshold: t.min_errors, reason: "jsonld_parse_error", snippet: first.snippet, locator: `${first.variant}.jsonld[${String(first.index)}]${first.position === null ? "" : `@${String(first.position)}`}` }];
   },
 });
 
@@ -80,11 +88,42 @@ export const organizationIncomplete = defineRule({
 // --- AUX-R-012 / 013 ----------------------------------------------------------------------------------------------------------
 
 const symbolClass = (symbols: string): string => `[${symbols.replace(/[\\\]^-]/gu, "\\$&")}]`;
-const AMOUNT = "\\d[\\d,]*(?:\\.\\d+)?";
+// An amount as a page writes it: digits with `.` and `,` between groups. A trailing separator is sentence punctuation, not part of it.
+const AMOUNT = "\\d(?:[\\d.,]*\\d)?";
+// A schema.org number is written with a `.` decimal point; a stray `,` is a thousands separator.
 const toNumber = (s: string): number => Number(s.replace(/,/gu, ""));
+
+/**
+ * Every value a page's number can mean. `1,299.00` and `1.299,00` have one reading (the last separator is the decimal point).
+ * `29,99` and `29.99` have one (one or two digits after a lone separator are decimals). `1,299` and `1.299` are ambiguous (a
+ * thousands group or three decimals), so both readings are returned, and the page agrees with the data under either.
+ */
+function numberReadings(raw: string): number[] {
+  const hasDot = raw.includes(".");
+  const hasComma = raw.includes(",");
+  const asNumber = (digits: string, decimal: string | null): number => Number(decimal === null ? digits : `${digits}.${decimal}`);
+  const clean = (s: string): string => s.replace(/[.,]/gu, "");
+  if (!hasDot && !hasComma) return [Number(raw)];
+  const readings: number[] = [];
+  if (hasDot && hasComma) {
+    const at = Math.max(raw.lastIndexOf("."), raw.lastIndexOf(","));
+    readings.push(asNumber(clean(raw.slice(0, at)), raw.slice(at + 1)));
+  } else {
+    const sep = hasDot ? "." : ",";
+    const parts = raw.split(sep);
+    const last = parts[parts.length - 1]!;
+    const grouped = parts.slice(1).every((g) => g.length === 3) && parts[0]!.length <= 3;
+    if (parts.length > 2) readings.push(grouped ? Number(parts.join("")) : asNumber(clean(parts.slice(0, -1).join("")), last));
+    else if (last.length === 3 && grouped) readings.push(Number(parts.join("")), asNumber(parts[0]!, last));
+    else readings.push(asNumber(parts[0]!, last));
+  }
+  return readings.filter(Number.isFinite);
+}
 
 interface Found {
   readonly value: number;
+  /** Every reading of the number the page wrote (see numberReadings). */
+  readonly readings: readonly number[];
   readonly at: number;
   readonly end: number;
 }
@@ -94,7 +133,8 @@ function amountMatches(body: string, symbols: string, codes: readonly string[]):
   const out: Found[] = [];
   const push = (m: RegExpMatchArray): void => {
     const at = m.index ?? 0;
-    out.push({ value: toNumber(m[1]!), at, end: at + m[0].length });
+    const readings = numberReadings(m[1]!);
+    if (readings.length > 0) out.push({ value: readings[0]!, readings, at, end: at + m[0].length });
   };
   for (const m of body.matchAll(new RegExp(`${symbolClass(symbols)}\\s?(${AMOUNT})`, "gu"))) push(m);
   if (codes.length > 0) for (const m of body.matchAll(new RegExp(`(${AMOUNT})\\s?(?:${codes.map(escapeRegExp).join("|")})\\b`, "giu"))) push(m);
@@ -165,13 +205,13 @@ export const schemaTextContradiction = defineRule({
     // Only an amount that sits beside a pricing word is a price the page shows ("$2B processed", "Save $500" are not).
     const prices = amountMatches(body, t.currency_symbols, t.currency_codes)
       .filter((f) => nearWord(body, f, t.price_context_words, t.context_window_chars))
-      .map((f) => f.value);
+      .map((f) => f.readings);
     for (const e of all) {
       asArray(e.node["offers"]).forEach((o, i) => {
         if (!isRecord(o) || !present(o["price"])) return;
         const declared = toNumber(String(o["price"]));
-        if (Number.isFinite(declared) && prices.length > 0 && !prices.some((p) => Math.abs(p - declared) < t.price_tolerance)) {
-          hits.push({ reason: "price", snippet: `schema price ${String(o["price"])}; page prices ${[...new Set(prices)].slice(0, 5).join(", ")}`, locator: `${e.locator}.offers${Array.isArray(e.node["offers"]) ? `[${String(i)}]` : ""}.price` });
+        if (Number.isFinite(declared) && prices.length > 0 && !prices.some((rs) => rs.some((p) => Math.abs(p - declared) < t.price_tolerance))) {
+          hits.push({ reason: "price", snippet: `schema price ${String(o["price"])}; page prices ${[...new Set(prices.map((rs) => rs[0]!))].slice(0, 5).join(", ")}`, locator: `${e.locator}.offers${Array.isArray(e.node["offers"]) ? `[${String(i)}]` : ""}.price` });
         }
       });
     }
@@ -187,15 +227,18 @@ export const schemaTextContradiction = defineRule({
       const scales = t.rating_scales.map(String).join("|");
       const ratingRe = new RegExp(`(?<![\\d./])(\\d+(?:\\.\\d+)?)\\s*(?:\\/|out of)\\s*(?:${scales})\\b(?!\\s*\\/\\s*\\d)`, "giu");
       const shown = [...body.matchAll(ratingRe)]
-        .filter((m) => nearWord(body, { value: 0, at: m.index ?? 0, end: (m.index ?? 0) + m[0].length }, t.rating_context_words, t.context_window_chars))
+        .filter((m) => nearWord(body, { value: 0, readings: [0], at: m.index ?? 0, end: (m.index ?? 0) + m[0].length }, t.rating_context_words, t.context_window_chars))
         .map((m) => Number(m[1]));
       if (Number.isFinite(declaredValue) && shown.length > 0 && !shown.some((v) => Math.abs(v - declaredValue) < t.rating_tolerance)) {
         hits.push({ reason: "rating_value", snippet: `schema rating ${String(rating["ratingValue"])}; page ratings ${shown.slice(0, 3).join(", ")}`, locator: `${e.locator}.aggregateRating.ratingValue` });
       }
       const declaredCount = toNumber(String(rating["reviewCount"] ?? ""));
-      const counts = [...body.matchAll(/(\d[\d,]*)\s+(?:reviews?|ratings?)\b/giu)].map((m) => toNumber(m[1]!));
-      if (Number.isFinite(declaredCount) && counts.length > 0 && !counts.includes(declaredCount)) {
-        hits.push({ reason: "review_count", snippet: `schema reviewCount ${String(rating["reviewCount"])}; page counts ${counts.slice(0, 3).join(", ")}`, locator: `${e.locator}.aggregateRating.reviewCount` });
+      // A count the page rounds or leaves open ("2,000+", "over 2,000", "2k", "about 2,000") is not a different count from the data's.
+      const counts = [...body.matchAll(/(?<approx>\b(?:over|more than|above|under|fewer than|less than|nearly|almost|about|around|approximately|approx\.?)\s+|~\s*)?(?<n>\d(?:[\d.,]*\d)?)(?<open>\s?(?:\+|[kKmM](?![\p{L}\p{N}])))?\s+(?:reviews?|ratings?)\b/giu)]
+        .filter((m) => m.groups?.["approx"] === undefined && m.groups?.["open"] === undefined)
+        .map((m) => numberReadings(m.groups!["n"]!).flatMap((r) => (Number.isInteger(r) ? [r] : [])));
+      if (Number.isFinite(declaredCount) && counts.length > 0 && !counts.some((rs) => rs.includes(declaredCount))) {
+        hits.push({ reason: "review_count", snippet: `schema reviewCount ${String(rating["reviewCount"])}; page counts ${counts.slice(0, 3).map((rs) => rs.join("/")).join(", ")}`, locator: `${e.locator}.aggregateRating.reviewCount` });
       }
     }
     if (hits.length < t.min_disagreements) return [];

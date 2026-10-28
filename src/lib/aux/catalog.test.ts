@@ -5,7 +5,7 @@ import { AuxCatalogWeightError, assertCatalogWeights, loadAuxCatalog, type AuxCa
 // category, on load, before any audit runs.
 
 const rule = (code: string, weight: number, category = "crawler_access"): AuxCatalogRule => ({
-  code, category, weight, ruleVersion: "t", thresholds: {},
+  code, category, weight, ruleVersion: "t", autoFixable: true, thresholds: {},
 });
 // These tests exercise the per-category rule with one category; the default (all six) is tested in catalog-full.test.ts.
 const SUBSET = ["crawler_access"];

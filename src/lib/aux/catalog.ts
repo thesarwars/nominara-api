@@ -17,6 +17,8 @@ export interface AuxCatalogRule {
   readonly category: string;
   readonly weight: number;
   readonly ruleVersion: string;
+  /** The catalog's own claim; the engine refuses a rule whose code disagrees (STORY-051 AC12). */
+  readonly autoFixable: boolean;
   readonly thresholds: Readonly<Record<string, unknown>>;
 }
 

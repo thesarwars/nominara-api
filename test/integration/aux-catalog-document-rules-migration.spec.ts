@@ -43,7 +43,7 @@ describe("STORY-051 · migration 0148 — document-model rule catalog", () => {
   it("STORY-051 AC6 · the migrated table holds 34 rules and the load-time assertion accepts every category", async () => {
     const rows = await all();
     expect(rows.map((r) => r.code)).toEqual(Array.from({ length: 34 }, (_, i) => `AUX-R-${String(i + 1).padStart(3, "0")}`));
-    const catalog = loadAuxCatalog(rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, thresholds: r.thresholds })));
+    const catalog = loadAuxCatalog(rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, autoFixable: r.auto_fixable, thresholds: r.thresholds })));
     expect(catalog.rules).toHaveLength(34);
   });
 
@@ -63,7 +63,7 @@ describe("STORY-051 · migration 0148 — document-model rule catalog", () => {
   it("STORY-051 AC6 · changing a weight in the stored data makes the loader refuse (the check is on load, not in CI)", async () => {
     await client.query("UPDATE aux_rule_catalog SET weight = 0.20 WHERE code = 'AUX-R-021'");
     const rows = await all();
-    expect(() => loadAuxCatalog(rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, thresholds: r.thresholds })))).toThrow(/context_fitness/);
+    expect(() => loadAuxCatalog(rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, autoFixable: r.auto_fixable, thresholds: r.thresholds })))).toThrow(/context_fitness/);
   });
 
   it("STORY-051 · a demo-seed row for a rule is taken over, keeping the primary key", async () => {

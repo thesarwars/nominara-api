@@ -33,3 +33,16 @@ export const AUX_RULES_NOT_EVALUATED: Readonly<Record<string, string>> = {
   "AUX-R-033": "Needs the product name to decide whether a capability sentence names it, and a definition of a capability sentence; neither is in the document model.",
   "AUX-R-034": "Needs the sameAs links of every page on the domain, not of one page; a single document cannot show their absence.",
 };
+
+/**
+ * Rules in AUX_RULES that run on an INTERIM reading because the document model lacks a field. They are built and they fire, but each
+ * covers only part of its reference row, so the audit must not report them as fully checked: when the rules are wired into the audit,
+ * surface this map next to AUX_RULES_NOT_EVALUATED. Closing a gap means a STORY-050 field, then the rule reads it.
+ */
+export const AUX_RULES_PARTIAL: Readonly<Record<string, string>> = {
+  "AUX-R-016": "Checks the @context host, the @type spelling and deprecated properties only. Whether a @type is valid for its property set needs a schema.org vocabulary data set (classes and their properties), which is not held.",
+  "AUX-R-017": "Reads headings that end in a question mark. Interrogatives written without one, and the Q&A-block arm, need an interrogative / Q&A detection field in the document model.",
+  "AUX-R-021": "A list or table anywhere in a section counts as a break, so a long wall of text with one list at its end passes. Needs the longest unstructured token run per content block (a STORY-050 ContentBlock field).",
+  "AUX-R-023": "A whole short section stands in for the summary paragraph. Needs sentence counts per paragraph (a STORY-050 ContentBlock field).",
+  "AUX-R-025": "Sees images in the plain HTML only, so script-injected images are missed. Needs per-image records (source, alt, adjacent text) in the document model.",
+};

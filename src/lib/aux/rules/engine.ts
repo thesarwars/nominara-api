@@ -42,6 +42,7 @@ async function runOne(rule: AuxRule, document: AuxDocument, catalog: AuxCatalog,
   const row = catalog.byCode.get(rule.code);
   if (row === undefined) throw new AuxRuleConfigError(rule.code, "it has no catalog row");
   if (row.category !== rule.category) throw new AuxRuleConfigError(rule.code, "its catalog row is in a different category");
+  if (row.autoFixable !== rule.autoFixable) throw new AuxRuleConfigError(rule.code, "its catalog row disagrees with the rule on auto-fixability");
   let hits;
   try {
     hits = rule.run(document, row.thresholds);
@@ -63,7 +64,7 @@ async function runOne(rule: AuxRule, document: AuxDocument, catalog: AuxCatalog,
   }));
 }
 
-/** Findings for one page. The rules run concurrently; the result order is by rule code, then locator, never by completion. */
+/** Findings for one page. The rules are started together (the evaluators are synchronous, so this is not CPU parallelism); the result order is by rule code, then locator, never by completion. */
 export async function evaluateDocument(
   document: AuxDocument,
   catalog: AuxCatalog,

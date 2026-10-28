@@ -42,7 +42,7 @@ describe("STORY-051 AUX-R-008 · JSON-LD syntax error", () => {
     const doc = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [err(0)] } }) });
     const [f] = await findings(doc, "AUX-R-008");
     expect(f).toMatchObject({ severity: "critical", measured_value: 1, threshold_value: 1 });
-    expect(f!.evidence).toMatchObject({ snippet: '{"@type": "Org', locator: "jsonld[0]@12" });
+    expect(f!.evidence).toMatchObject({ snippet: '{"@type": "Org', locator: "raw.jsonld[0]@12" });
   });
   it("STORY-051 AUX-R-008 · two errors measure 2; the error in the plain copy only is still a finding", async () => {
     const raw = variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [err(0), err(1, "rendered")] } });
@@ -50,6 +50,24 @@ describe("STORY-051 AUX-R-008 · JSON-LD syntax error", () => {
     const rawOnly = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [] } }), rendered: variant() });
     const withError = { ...rawOnly, structured: { ...rawOnly.structured, parseErrors: [err(0)] } };
     expect(await findings(withError, "AUX-R-008")).toHaveLength(1);
+  });
+});
+
+describe("STORY-051 AUX-R-008 · one broken block seen in both copies", () => {
+  const err = (variantName: "raw" | "rendered", index = 0) => ({ format: "jsonld" as const, variant: variantName, index, reason: "invalid_json" as const, position: 12, snippet: '{"@type": "Org' });
+  it("STORY-051 AUX-R-008 · the same broken block in the plain and the rendered copy is ONE error, not two", async () => {
+    const doc = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [err("raw"), err("rendered")] } }) });
+    const [f] = await findings(doc, "AUX-R-008");
+    expect(f!.measured_value).toBe(1);
+  });
+  it("STORY-051 AUX-R-008 · the locator names the copy the error was found in", async () => {
+    const rendered = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [err("rendered")] } }) });
+    expect((await findings(rendered, "AUX-R-008"))[0]!.evidence.locator).toBe("rendered.jsonld[0]@12");
+  });
+  it("STORY-051 AUX-R-008 · two different blocks at the same index in the two copies stay two errors", async () => {
+    const other = { ...err("rendered"), snippet: '{"@type": "Person' };
+    const doc = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [err("raw"), other] } }) });
+    expect((await findings(doc, "AUX-R-008"))[0]!.measured_value).toBe(2);
   });
 });
 
@@ -200,6 +218,40 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
   it("STORY-051 AUX-R-013 · several disagreements measure their count", async () => {
     const doc = withApp({ name: "Zed Gadget" }, { mainText: CLEAN_TEXT.replace("$47", "$57") });
     expect((await findings(doc, "AUX-R-013"))[0]!.measured_value).toBe(2);
+  });
+});
+
+describe("STORY-051 AUX-R-013 · number formats and rounded counts are not contradictions", () => {
+  const priced = (price: string, currency: string, text: string) =>
+    withApp({ offers: { "@type": "Offer", price, priceCurrency: currency } }, { mainText: CLEAN_TEXT.replace("starts at $47 per month", text) });
+  it("STORY-051 AUX-R-013 · a comma decimal (EUR 29,99) agrees with a schema price of 29.99", async () => {
+    expect(await findings(priced("29.99", "EUR", "price \u20ac29,99 per month"), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a European thousands dot and comma decimal (1.299,00 EUR) agrees with 1299", async () => {
+    expect(await findings(priced("1299", "EUR", "price 1.299,00 EUR per year"), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a US thousands comma still agrees (1,299.00), and a lone 1,299 agrees with 1299", async () => {
+    expect(await findings(priced("1299.00", "USD", "price $1,299.00 per year"), "AUX-R-013")).toEqual([]);
+    expect(await findings(priced("1299", "USD", "price $1,299 per year"), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a comma-decimal price that really differs from the schema still fires", async () => {
+    const [f] = await findings(priced("39.99", "EUR", "price \u20ac29,99 per month"), "AUX-R-013");
+    expect(f!.evidence.reason).toBe("price");
+  });
+  it("STORY-051 AUX-R-013 · a sentence-ending full stop after a price is not part of the number", async () => {
+    expect(await findings(priced("47", "USD", "price $47. Per month"), "AUX-R-013")).toEqual([]);
+  });
+  const counted = (phrase: string, declared = "2134") =>
+    withApp({ aggregateRating: { "@type": "AggregateRating", ratingValue: "4.6", reviewCount: declared } }, { mainText: CLEAN_TEXT.replace("120 reviews", phrase) });
+  it("STORY-051 AUX-R-013 · a rounded or open-ended count (2,000+, over 2,000, 2k, about 2,000) is not a different count", async () => {
+    for (const phrase of ["2,000+ reviews", "over 2,000 reviews", "more than 2,000 reviews", "2k reviews", "about 2,000 reviews"]) {
+      expect(await findings(counted(phrase), "AUX-R-013"), phrase).toEqual([]);
+    }
+  });
+  it("STORY-051 AUX-R-013 · an exact count that differs fires; the exact count in either number format agrees", async () => {
+    expect((await findings(counted("87 reviews"), "AUX-R-013"))[0]!.evidence.reason).toBe("review_count");
+    expect(await findings(counted("2,134 reviews"), "AUX-R-013")).toEqual([]);
+    expect(await findings(counted("2.134 reviews"), "AUX-R-013")).toEqual([]);
   });
 });
 

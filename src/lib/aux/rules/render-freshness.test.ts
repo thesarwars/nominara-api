@@ -104,6 +104,15 @@ describe("STORY-051 AUX-R-030 · dateModified absent", () => {
     const doc = makeDoc({ meta: noMeta, raw: variant({ mainText: noText, structured: { jsonLd: [{ ...ldWithout[0], dateModified: "  " }], microdata: [], rdfa: [], parseErrors: [] } }) });
     expect(await findings(doc, "AUX-R-030")).toHaveLength(1);
   });
+  it("STORY-051 AUX-R-030 · a Microdata or RDFa dateModified property satisfies it, nested or not; a blank one does not", async () => {
+    const item = (v: string, nested = false) => ({ type: "https://schema.org/Article", properties: nested ? { isPartOf: [{ type: "https://schema.org/WebPage", properties: { dateModified: [v] } }] } : { dateModified: [v] } });
+    for (const [key, nested] of [["microdata", false], ["rdfa", false], ["microdata", true]] as const) {
+      const doc = makeDoc({ meta: noMeta, raw: variant({ mainText: noText, structured: { jsonLd: ldWithout, microdata: [], rdfa: [], parseErrors: [], [key]: [item("2026-10-01", nested)] } }) });
+      expect(await findings(doc, "AUX-R-030"), `${key} nested=${String(nested)}`).toEqual([]);
+    }
+    const blank = makeDoc({ meta: noMeta, raw: variant({ mainText: noText, structured: { jsonLd: ldWithout, microdata: [item("  ")], rdfa: [], parseErrors: [] } }) });
+    expect(await findings(blank, "AUX-R-030")).toHaveLength(1);
+  });
   it("STORY-051 AUX-R-030 · no dateModified and no visible date fires medium", async () => {
     const [f] = await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: "Acme Widgets\nNo dates here.", structured: { jsonLd: ldWithout, microdata: [], rdfa: [], parseErrors: [] } }) }), "AUX-R-030");
     expect(f).toMatchObject({ severity: "medium", measured_value: 0, threshold_value: 1, auto_fixable: true });

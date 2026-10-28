@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { guidanceFor, NON_FIXABLE_RULES } from "../patches/guidance.js";
 import { loadAuxCatalog, type AuxCatalog } from "../catalog.js";
 import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateDocuments } from "./engine.js";
-import { AUX_RULES, AUX_RULES_NOT_EVALUATED } from "./index.js";
+import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "./index.js";
 import { CATALOG, CATALOG_ROWS, PROJECT_ID, findings, runAll } from "../../../../test/support/aux-rules.js";
 import { block, makeDoc, variant } from "../../../../test/support/aux-document.js";
 
@@ -73,6 +73,23 @@ describe("STORY-051 · the rule engine", () => {
       expect(rule.autoFixable, rule.code).toBe(row.autoFixable);
       expect(NON_FIXABLE_RULES.includes(rule.code), rule.code).toBe(!rule.autoFixable);
       expect(rule.category, rule.code).toBe(row.category);
+    }
+  });
+
+  it("STORY-051 AC12 · a catalog row whose auto_fixable disagrees with the rule fails the page closed, naming the rule", async () => {
+    const rows = CATALOG_ROWS.map((r) => (r.code === "AUX-R-006" ? { ...r, autoFixable: !r.autoFixable } : r));
+    const err = await evaluateDocument(makeDoc(), loadAuxCatalog(rows), AUX_RULES, { projectId: PROJECT_ID }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AuxRuleConfigError);
+    expect((err as AuxRuleConfigError).ruleCode).toBe("AUX-R-006");
+  });
+
+  it("STORY-051 AC1, AC10 · rules built on an interim reading are recorded as PARTIAL with the document-model field they need", () => {
+    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-016", "AUX-R-017", "AUX-R-021", "AUX-R-023", "AUX-R-025"]);
+    const built = new Set(AUX_RULES.map((r) => r.code));
+    for (const [code, why] of Object.entries(AUX_RULES_PARTIAL)) {
+      expect(built.has(code), code).toBe(true);
+      expect(Object.keys(AUX_RULES_NOT_EVALUATED), code).not.toContain(code);
+      expect(why.length, code).toBeGreaterThan(40);
     }
   });
 
