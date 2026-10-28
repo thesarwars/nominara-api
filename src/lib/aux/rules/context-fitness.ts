@@ -118,6 +118,8 @@ export const headingHierarchyBroken = defineRule({
         visit(c, `${path}.children[${String(i)}]`);
       });
     };
+    // A heading that opens the page below the H1's level (an H3 before the H1) skips the levels above it; a root has no parent to compare with.
+    if (tree.length > 0 && tree[0]!.level - 1 > t.max_level_step) hits.push({ reason: "level_skip", snippet: tree[0]!.text, locator: "headings[0]" });
     tree.forEach((r, i) => visit(r, `headings[${String(i)}]`));
     if (hits.length === 0) return [];
     return [{ severity: "medium", measured: hits.length, threshold: PRESENCE_THRESHOLD, reason: hits[0]!.reason, snippet: hits[0]!.snippet === null ? null : clip(hits[0]!.snippet), locator: hits[0]!.locator }];

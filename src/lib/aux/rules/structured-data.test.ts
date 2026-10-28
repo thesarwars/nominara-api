@@ -540,3 +540,44 @@ describe("STORY-051 AC1 · an entity nested under a property is an entity (round
     expect(await findings(withApp({ offers: undefined }, { mainText: "Acme Widgets\nPlans starting at $20 a seat." }), "AUX-R-012")).toHaveLength(1);
   });
 });
+
+describe("STORY-051 AUX-R-013 · a contradiction on a nested entity (round 3)", () => {
+  const nested = (product: Record<string, unknown>) => ({ "@context": "https://schema.org", "@type": "WebPage", mainEntity: { "@type": "Product", name: "Acme", ...product } });
+  const priced = (price: string) => ({ offers: { "@type": "Offer", price, priceCurrency: "USD" } });
+  const page = (extra: string) => ({ mainText: `Acme\n${extra}` });
+  it("STORY-051 #7 · WebPage > mainEntity > Product whose price disagrees with the page fires critical, located by property path", async () => {
+    const [f] = await findings(withLd([org, nested(priced("49"))], page("Pricing: $99 per month")), "AUX-R-013");
+    expect(f).toMatchObject({ severity: "critical" });
+    expect(f!.evidence).toMatchObject({ reason: "price", locator: "jsonld[1].mainEntity.offers.price" });
+  });
+  it("STORY-051 AUX-R-013 · a nested price that agrees with the page does not fire", async () => {
+    expect(await findings(withLd([org, nested(priced("99"))], page("Pricing: $99 per month")), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a nested product name the page does not show fires", async () => {
+    const [f] = await findings(withLd([org, { ...nested({}), mainEntity: { "@type": "Product", name: "Zed Gadget" } }], page("Acme widgets")), "AUX-R-013");
+    expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].mainEntity.name" });
+  });
+  it("STORY-051 AUX-R-013 · a nested rating the page contradicts fires", async () => {
+    const rated = nested({ aggregateRating: { "@type": "AggregateRating", ratingValue: "4.9", reviewCount: "10" } });
+    const [f] = await findings(withLd([org, rated], page("Rated 3.1/5 by customers")), "AUX-R-013");
+    expect(f!.evidence).toMatchObject({ reason: "rating_value", locator: "jsonld[1].mainEntity.aggregateRating.ratingValue" });
+  });
+  it("STORY-051 AUX-R-013 · a listing (ItemList of Products) whose names and prices are all shown does not start firing", async () => {
+    const list = { "@context": "https://schema.org", "@type": "ItemList", itemListElement: [
+      { "@type": "ListItem", position: 1, item: { "@type": "Product", name: "Alpha Widget", ...priced("10") } },
+      { "@type": "ListItem", position: 2, item: { "@type": "Product", name: "Beta Widget", ...priced("20") } },
+    ] };
+    expect(await findings(withLd([org, list], page("Alpha Widget $10 price. Beta Widget $20 price.")), "AUX-R-013")).toEqual([]);
+  });
+});
+
+describe("STORY-051 AUX-R-016 · vocabulary on a nested entity (round 3)", () => {
+  it("STORY-051 AUX-R-016 · a malformed @type or a deprecated property on a nested entity fires, located by property path", async () => {
+    const page = (main: Record<string, unknown>) => ({ "@context": "https://schema.org", "@type": "WebPage", name: "Acme", mainEntity: main });
+    const [bad] = await findings(withLd([org, page({ "@type": "Pro duct", name: "Acme" })]), "AUX-R-016");
+    expect(bad!.evidence).toMatchObject({ reason: "invalid_type", locator: "jsonld[1].mainEntity.@type" });
+    const [dep] = await findings(withLd([org, page({ "@type": "Event", subEvents: [] })]), "AUX-R-016");
+    expect(dep!.evidence).toMatchObject({ reason: "deprecated_property", locator: "jsonld[1].mainEntity.subEvents" });
+    expect(await findings(withLd([org, page({ "@type": "Product", name: "Acme" })]), "AUX-R-016")).toEqual([]);
+  });
+});

@@ -220,7 +220,8 @@ export const schemaTextContradiction = defineRule({
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
     const flat = foldForComparison(`${body}\n${doc.meta.title ?? ""}`);
-    const all = entities(doc);
+    // The thing the page is about is often nested (WebPage > mainEntity > Product), so this reads the deep view, as AUX-R-012 does.
+    const all = deepEntities(doc);
     const hits: { reason: string; snippet: string; locator: string }[] = [];
 
     // Only an amount that sits beside a pricing word is a price the page shows ("$2B processed", "Save $500" are not).
@@ -355,7 +356,8 @@ export const invalidVocabulary = defineRule({
         if (s !== undefined && (host === null || !t.schema_hosts.includes(host))) hits.push({ reason: "non_schema_context", snippet: s, locator: `${b.locator}.@context` });
       }
     }
-    for (const e of entities(doc)) {
+    // Nested entities (mainEntity, offers, author) are checked too; the @context check above is per block.
+    for (const e of deepEntities(doc)) {
       for (const raw of rawTypesOf(e.node)) {
         const name = raw.replace(/^(?:https?:\/\/(?:www\.)?schema\.org\/|schema:)/iu, "");
         if (!CLASS_NAME.test(name)) hits.push({ reason: "invalid_type", snippet: raw, locator: `${e.locator}.@type` });

@@ -151,6 +151,11 @@ describe("STORY-051 AUX-R-024 · heading hierarchy broken", () => {
     const [f] = await findings(doc(1, 2, 4), "AUX-R-024");
     expect(f!.evidence).toMatchObject({ reason: "level_skip", snippet: "H4 #2" });
   });
+  it("STORY-051 AUX-R-024 · an H3 that opens the page before the H1 is a skipped level (round 3)", async () => {
+    const [f] = await findings(doc(3, 1, 2), "AUX-R-024");
+    expect(f!.evidence).toMatchObject({ reason: "level_skip", snippet: "H3 #0", locator: "headings[0]" });
+    expect(await findings(doc(2, 1, 2), "AUX-R-024")).toEqual([]);
+  });
   it("STORY-051 AUX-R-024 · a page with no headings at all has no H1", async () => {
     expect((await findings(makeDoc({ raw: variant({ headingTree: [] }) }), "AUX-R-024"))[0]!.evidence.reason).toBe("no_h1");
   });

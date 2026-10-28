@@ -12,7 +12,7 @@ import type { AuxRule } from "./types.js";
 // of crawl.audit, so crawled pages get no finding from these rules and `excluded_rules` still names every one of them. STORY-052
 // AC1 and AC9 and STORY-051 AC13 ("per page within the audit's latency budget") wait for the follow-up that wires it. That follow-up:
 // loadDocumentSnapshot -> buildAuxDocument(cl100kTokenizer) -> evaluateDocuments OUTSIDE the transaction, reconcile inside it,
-// remove the codes it runs from EXCLUDED_RULES, and surface AUX_RULES_PARTIAL as a separate annotation.
+// remove the codes it runs from EXCLUDED_RULES (except, per page, AUX-R-026 and AUX-R-027 when rendered is null and AUX-R-029 when there is no measured timing: those stay excluded for that audit), and surface AUX_RULES_PARTIAL as a separate annotation.
 //
 // STORY-051 — the document-model rules, in the reference's order. The five site-file rules (AUX-R-001, 002, 003, 004, 007) live in
 // ../site-files.ts and judge fetched files, not a page.
@@ -56,5 +56,7 @@ export const AUX_RULES_PARTIAL: Readonly<Record<string, string>> = {
   "AUX-R-021": "A list or table anywhere in a section counts as a break, so a long wall of text with one list at its end passes. Needs the longest unstructured token run per content block (a STORY-050 ContentBlock field).",
   "AUX-R-023": "A whole short section stands in for the summary paragraph. Needs sentence counts per paragraph (a STORY-050 ContentBlock field).",
   "AUX-R-025": "Sees images in the plain HTML only, so script-injected images are missed. Needs per-image records (source, alt, adjacent text) in the document model.",
-  "AUX-R-029": "The 3 MiB size bound reads the reference's '3 MB' as binary (an owner decision, the same open reading as AUX-R-003's 500 KiB), and timing.bytes counts the decoded string, not wire bytes (a STORY-050 limit).",
+  "AUX-R-026": "Undecidable without a rendered copy: with rendered null (STORY-049 has no renderer) it returns no finding, so it can never fire today. A page with no rendered copy keeps AUX-R-026 in excluded_rules for that audit; it is not a pass.",
+  "AUX-R-027": "Undecidable without a rendered copy: with rendered null (STORY-049 has no renderer) it returns no finding, so it can never fire today. A page with no rendered copy keeps AUX-R-027 in excluded_rules for that audit; it is not a pass.",
+  "AUX-R-029": "A page with no measured timing is skipped (null is not a slow response), so that page keeps AUX-R-029 in excluded_rules for the audit. The 3 MiB size bound reads the reference's '3 MB' as binary (an owner decision, the same open reading as AUX-R-003's 500 KiB), and timing.bytes counts the decoded string, not wire bytes (a STORY-050 limit).",
 };
