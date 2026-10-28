@@ -178,6 +178,17 @@ describe("STORY-051 AUX-R-025 · key facts locked in media", () => {
   it("STORY-051 AUX-R-025 · a heading next to the image is not text about it", async () => {
     expect(await findings(img("/pricing.png", "Plans", "<h2>Pricing plans for every team</h2>"), "AUX-R-025")).toHaveLength(1);
   });
+  it("STORY-051 AUX-R-025 · the adjacent-text window edge: text 300 characters back counts, 301 does not", async () => {
+    const at = (gap: number) => img("/pricing.png", "Plans", `${"a".repeat(20)}${" ".repeat(gap - 20)}`);
+    expect(await findings(at(300), "AUX-R-025")).toEqual([]);
+    expect(await findings(at(301), "AUX-R-025")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-025 · the window is read from the catalog: a changed row moves the edge", async () => {
+    const near = img("/pricing.png", "Plans", `${"a".repeat(20)}${" ".repeat(80)}`);
+    expect(await findings(near, "AUX-R-025")).toEqual([]);
+    expect(await findings(near, "AUX-R-025", withThresholds("AUX-R-025", { adjacent_window_chars: 100 }))).toEqual([]);
+    expect(await findings(near, "AUX-R-025", withThresholds("AUX-R-025", { adjacent_window_chars: 99 }))).toHaveLength(1);
+  });
   it("STORY-051 AUX-R-025 · a missing alt is length 0, not an exemption", async () => {
     expect((await findings(img("/feature-comparison.png", ""), "AUX-R-025"))[0]!.measured_value).toBe(0);
   });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CLEAN_JSON_LD, CLEAN_TEXT, makeDoc, variant } from "../../../../test/support/aux-document.js";
-import { findings } from "../../../../test/support/aux-rules.js";
+import { findings, withThresholds } from "../../../../test/support/aux-rules.js";
 
 // STORY-051 — the structured_data rules, AUX-R-008..018, and AUX-R-006 (crawler directive). Each rule is a threshold, so each is
 // tested at, below and above it (AC4), and from the hazard the rule exists for.
@@ -125,6 +125,12 @@ describe("STORY-051 AUX-R-012 · offer data absent", () => {
     expect(await findings(withApp({ offers: { "@type": "Offer", price: "47" } }), "AUX-R-012")).toHaveLength(1);
     expect(await findings(withApp({ offers: { "@type": "Offer", priceCurrency: "USD" } }), "AUX-R-012")).toHaveLength(1);
   });
+  it("STORY-051 AUX-R-012 · an AggregateOffer with lowPrice and priceCurrency has a price; without lowPrice it does not", async () => {
+    const agg = { "@type": "AggregateOffer", lowPrice: "9", highPrice: "99", priceCurrency: "USD" };
+    expect(await findings(withApp({ offers: agg }), "AUX-R-012")).toEqual([]);
+    expect(await findings(withApp({ offers: { ...agg, lowPrice: undefined } }), "AUX-R-012")).toHaveLength(1);
+    expect(await findings(withApp({ offers: { "@type": "Offer", lowPrice: "9", priceCurrency: "USD" } }), "AUX-R-012")).toHaveLength(1);
+  });
   it("STORY-051 AUX-R-012 · a price of 0 is a price (free), not an absent one", async () => {
     expect(await findings(withApp({ offers: { "@type": "Offer", price: 0, priceCurrency: "USD" } }), "AUX-R-012")).toEqual([]);
   });
@@ -168,6 +174,28 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
     expect((await findings(withApp({}, { mainText: CLEAN_TEXT.replace("4.6/5", "3.9/5") }), "AUX-R-013"))[0]!.evidence.reason).toBe("rating_value");
     expect((await findings(withApp({}, { mainText: CLEAN_TEXT.replace("120 reviews", "87 reviews") }), "AUX-R-013"))[0]!.evidence.reason).toBe("review_count");
     expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("Rated 4.6/5 from 120 reviews.", "") }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a date shaped like a rating (3/5/2026, 10/10/2026) is not a rating", async () => {
+    for (const d of ["Updated 3/5/2026", "Rated on 10/10/2026 by our team"]) {
+      expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("Rated 4.6/5", d) }), "AUX-R-013"), d).toEqual([]);
+    }
+  });
+  it("STORY-051 AUX-R-013 · a fraction with no rating word near it is not a rating", async () => {
+    const far = `Step 3/5 of onboarding.${" filler".repeat(30)}`;
+    expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("Rated 4.6/5 from 120 reviews.", far) }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a dollar amount that is not a price ($2B processed, Save $500) does not contradict the schema price", async () => {
+    const body = "Acme Widgets\nWe have processed $2B for customers. Save $500 on setup with our partner.\nRated 4.6/5 from 120 reviews.\nLast updated: 2026-10-01";
+    expect(await findings(withApp({}, { mainText: body }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · the tolerance, the scales and the context words are read from the catalog", async () => {
+    const close = { mainText: CLEAN_TEXT.replace("$47", "$47.50") };
+    expect(await findings(withApp({}, close), "AUX-R-013")).toHaveLength(1);
+    expect(await findings(withApp({}, close), "AUX-R-013", withThresholds("AUX-R-013", { price_tolerance: 1 }))).toEqual([]);
+    const ten = { mainText: CLEAN_TEXT.replace("4.6/5", "3.9/100") };
+    expect(await findings(withApp({}, ten), "AUX-R-013")).toEqual([]);
+    expect(await findings(withApp({}, ten), "AUX-R-013", withThresholds("AUX-R-013", { rating_scales: [5, 100] }))).toHaveLength(1);
+    expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("$47", "$57") }), "AUX-R-013", withThresholds("AUX-R-013", { price_context_words: ["zzz"] }))).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · several disagreements measure their count", async () => {
     const doc = withApp({ name: "Zed Gadget" }, { mainText: CLEAN_TEXT.replace("$47", "$57") });
@@ -272,6 +300,23 @@ describe("STORY-051 AUX-R-018 · duplicate conflicting entities", () => {
   it("STORY-051 AUX-R-018 · a different url alone conflicts; different types never do", async () => {
     expect(await findings(withLd([prod("A", { url: "https://a.example" }), prod("A", { url: "https://b.example" })]), "AUX-R-018")).toHaveLength(1);
     expect(await findings(withLd([prod("A"), { ...org, name: "B" }]), "AUX-R-018")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-018 · a second block that restates only the name (no url) is not a disagreement", async () => {
+    const full = { ...org, name: "Acme", url: "https://acme.com" };
+    expect(await findings(withLd([full, { "@context": "https://schema.org", "@type": "Organization", name: "Acme" }]), "AUX-R-018")).toEqual([]);
+    expect(await findings(withLd([full, { "@context": "https://schema.org", "@type": "Organization", url: "https://acme.com" }]), "AUX-R-018")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-018 · a url that differs only by trailing slash, www., scheme or host case, or a name only by case and spacing, is the same", async () => {
+    const o = (extra: Record<string, unknown>) => ({ "@context": "https://schema.org", "@type": "Organization", ...extra });
+    for (const other of ["https://acme.com/", "https://www.acme.com", "http://ACME.com/", "https://acme.com//"]) {
+      expect(await findings(withLd([o({ name: "Acme", url: "https://acme.com" }), o({ name: "Acme", url: other })]), "AUX-R-018"), other).toEqual([]);
+    }
+    expect(await findings(withLd([o({ name: "Acme  Inc" }), o({ name: " acme inc " })]), "AUX-R-018")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-018 · a url on a different path, or a different name beside an equal url, still conflicts", async () => {
+    const o = (extra: Record<string, unknown>) => ({ "@context": "https://schema.org", "@type": "Organization", ...extra });
+    expect(await findings(withLd([o({ url: "https://acme.com/a" }), o({ url: "https://acme.com/b" })]), "AUX-R-018")).toHaveLength(1);
+    expect(await findings(withLd([o({ name: "Acme", url: "https://acme.com" }), o({ name: "Acme Corp", url: "https://acme.com/" })]), "AUX-R-018")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-018 · two entities inside ONE block are not two JSON-LD blocks", async () => {
     expect(await findings(withLd([{ "@context": "https://schema.org", "@graph": [prod("A"), prod("B")] }]), "AUX-R-018")).toEqual([]);

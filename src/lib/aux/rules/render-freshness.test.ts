@@ -82,20 +82,39 @@ describe("STORY-051 AUX-R-029 · slow first byte for bots", () => {
 
 describe("STORY-051 AUX-R-030 · dateModified absent", () => {
   const { dateModified: _gone, ...noMeta } = makeDoc().meta;
-  it("STORY-051 AUX-R-030 · a dateModified (schema or meta) satisfies it", async () => {
+  it("STORY-051 AUX-R-030 · a schema dateModified satisfies it", async () => {
     expect(await findings(makeDoc(), "AUX-R-030")).toEqual([]);
   });
+  const ldWithout = [{ "@context": "https://schema.org", "@type": "Organization", name: "Acme" }];
+  const ldWith = [{ "@context": "https://schema.org", "@graph": [{ "@type": "WebPage", name: "Acme", dateModified: "2026-10-01" }] }];
+  const noLd = { jsonLd: ldWithout, microdata: [], rdfa: [], parseErrors: [] };
+  const noText = "Acme Widgets\nNo dates here.";
+  it("STORY-051 AUX-R-030 · a meta (og/article) modified time alone is not a schema dateModified: it fires", async () => {
+    const doc = makeDoc({ raw: variant({ mainText: noText, structured: { jsonLd: ldWithout, microdata: [], rdfa: [], parseErrors: [] } }) });
+    expect(doc.meta.dateModified).toBeDefined();
+    expect(await findings(doc, "AUX-R-030")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-030 · a schema dateModified (top level or in @graph) satisfies it even when meta has none", async () => {
+    for (const jsonLd of [ldWith, [{ ...ldWithout[0], dateModified: "2026-10-01" }]]) {
+      const doc = makeDoc({ meta: noMeta, raw: variant({ mainText: noText, structured: { jsonLd, microdata: [], rdfa: [], parseErrors: [] } }) });
+      expect(await findings(doc, "AUX-R-030")).toEqual([]);
+    }
+  });
+  it("STORY-051 AUX-R-030 · a blank schema dateModified is no date", async () => {
+    const doc = makeDoc({ meta: noMeta, raw: variant({ mainText: noText, structured: { jsonLd: [{ ...ldWithout[0], dateModified: "  " }], microdata: [], rdfa: [], parseErrors: [] } }) });
+    expect(await findings(doc, "AUX-R-030")).toHaveLength(1);
+  });
   it("STORY-051 AUX-R-030 · no dateModified and no visible date fires medium", async () => {
-    const [f] = await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: "Acme Widgets\nNo dates here." }) }), "AUX-R-030");
+    const [f] = await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: "Acme Widgets\nNo dates here.", structured: { jsonLd: ldWithout, microdata: [], rdfa: [], parseErrors: [] } }) }), "AUX-R-030");
     expect(f).toMatchObject({ severity: "medium", measured_value: 0, threshold_value: 1, auto_fixable: true });
   });
   it("STORY-051 AUX-R-030 · a visible last-updated date satisfies it, in several forms", async () => {
     for (const s of ["Last updated: 2026-10-01", "Updated on March 3, 2026", "Last modified 3 March 2026", "Revised 03/04/2026"]) {
-      expect(await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: `Acme\n${s}` }) }), "AUX-R-030"), s).toEqual([]);
+      expect(await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: `Acme\n${s}`, structured: noLd }) }), "AUX-R-030"), s).toEqual([]);
     }
   });
   it("STORY-051 AUX-R-030 · the word 'updated' with no date after it is not a date", async () => {
-    expect(await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: "We have updated our widgets." }) }), "AUX-R-030")).toHaveLength(1);
+    expect(await findings(makeDoc({ meta: noMeta, raw: variant({ mainText: "We have updated our widgets.", structured: noLd }) }), "AUX-R-030")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-030 · a plain CLEAN_TEXT date is read from the same text the page shows", () => {
     expect(CLEAN_TEXT).toContain("Last updated");

@@ -38,6 +38,7 @@ export const mainContentRatioLow = defineRule({
 
 const hasStructure = (b: ContentBlock): boolean => b.tables > 0 || b.lists.ordered + b.lists.unordered + b.lists.definition > 0;
 
+// Interim reading (STORY-050 model gap: contiguous unstructured-run tokens per block): a list or table anywhere in a section counts as a break.
 export const contextBlockTruncation = defineRule({
   code: "AUX-R-021",
   category: "context_fitness",
@@ -80,6 +81,7 @@ export const paragraphDensity = defineRule({
   },
 });
 
+// Interim reading (STORY-050 model gap: per-paragraph sentence counts): a whole short section stands in for the summary paragraph.
 export const answerShapedContentAbsent = defineRule({
   code: "AUX-R-023",
   category: "context_fitness",
@@ -123,18 +125,18 @@ export const headingHierarchyBroken = defineRule({
 });
 
 // AUX-R-025 reads the plain HTML of the page. It cannot see inside an image, so "key facts" is judged by what the image is called
-// (file name, alt text) against the catalog's keyword list; "adjacent text" is the text within 300 characters of the tag, headings
+// (file name, alt text) against the catalog's keyword list; "adjacent text" is the text within `adjacent_window_chars` characters of the tag, headings
 // excluded, of at least as many characters as the alt bar; the rule says so in its guidance rather than pretending to read pixels.
 const IMG_TAG = /<img\b[^>]*>/giu;
 const attr = (tag: string, name: string): string => new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "iu").exec(tag)?.slice(1).find((x) => x !== undefined) ?? "";
 const stripTags = (s: string): string => s.replace(/<(script|style|h[1-6])\b[\s\S]*?<\/\1>/giu, " ").replace(/<[^>]*>/gu, " ").replace(/\s+/gu, " ").trim();
-const NEAR = 300;
 
+// Interim reading (STORY-050 model gap: per-image records): images come from the plain HTML only, so script-injected images are not seen.
 export const keyFactsInMedia = defineRule({
   code: "AUX-R-025",
   category: "context_fitness",
   autoFixable: false,
-  thresholds: strict({ min_alt_chars: z.number().int().positive(), min_adjacent_chars: z.number().int().positive(), keywords: z.array(z.string().min(1)).min(1) }),
+  thresholds: strict({ min_alt_chars: z.number().int().positive(), min_adjacent_chars: z.number().int().positive(), adjacent_window_chars: z.number().int().positive(), keywords: z.array(z.string().min(1)).min(1) }),
   evaluate(doc, t) {
     const html = doc.raw.html;
     const hits: RuleHit[] = [];
@@ -147,8 +149,8 @@ export const keyFactsInMedia = defineRule({
       const altLength = [...alt].length;
       if (altLength >= t.min_alt_chars) continue;
       const at = m.index;
-      const around = `${stripTags(html.slice(Math.max(0, at - NEAR), at))} ${stripTags(html.slice(at + tag.length, at + tag.length + NEAR))}`.trim();
-      if ([...around].length >= t.min_adjacent_chars || /<figcaption\b/iu.test(html.slice(at, at + tag.length + NEAR))) continue;
+      const around = `${stripTags(html.slice(Math.max(0, at - t.adjacent_window_chars), at))} ${stripTags(html.slice(at + tag.length, at + tag.length + t.adjacent_window_chars))}`.trim();
+      if ([...around].length >= t.min_adjacent_chars || /<figcaption\b/iu.test(html.slice(at, at + tag.length + t.adjacent_window_chars))) continue;
       hits.push({ severity: "high", measured: altLength, threshold: t.min_alt_chars, reason: "key_fact_image", snippet: clip(tag), locator: `raw.html@${String(at)}` });
     }
     return hits.slice(0, 1);

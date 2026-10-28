@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { escapeRegExp, variantOf } from "./helpers.js";
+import { escapeRegExp, jsonLdEntities, variantOf } from "./helpers.js";
 import { defineRule } from "./types.js";
 
 // freshness — AUX-R-030. AUX-R-031 needs the audit date and the cited corpus's median dateModified, neither of which is in the
@@ -14,7 +14,9 @@ export const dateModifiedAbsent = defineRule({
   autoFixable: true,
   thresholds: z.object({ visible_date_labels: z.array(z.string().min(1)).min(1) }).strict(),
   evaluate(doc, t) {
-    if (doc.meta.dateModified !== undefined) return [];
+    // The reference asks for a dateModified in the schema. `meta.dateModified` also takes an article:modified_time / og:updated_time
+    // tag, which is not structured data an engine reads as the page's date, so it is not what is read here.
+    if (jsonLdEntities(doc.structured.jsonLd).some((e) => typeof e.node["dateModified"] === "string" && e.node["dateModified"].trim() !== "")) return [];
     const labels = t.visible_date_labels.map(escapeRegExp).join("|");
     const visible = new RegExp(`\\b(?:${labels})\\s*(?:on|:|-)?\\s*(?:on\\s+)?${DATE}`, "iu");
     if (visible.test(variantOf(doc).mainText)) return [];

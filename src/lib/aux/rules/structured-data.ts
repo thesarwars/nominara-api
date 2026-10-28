@@ -83,16 +83,37 @@ const symbolClass = (symbols: string): string => `[${symbols.replace(/[\\\]^-]/g
 const AMOUNT = "\\d[\\d,]*(?:\\.\\d+)?";
 const toNumber = (s: string): number => Number(s.replace(/,/gu, ""));
 
+interface Found {
+  readonly value: number;
+  readonly at: number;
+  readonly end: number;
+}
+
 /** Every amount the page states as money: a currency symbol before a number, or a currency code after one. */
-function amountsIn(body: string, symbols: string, codes: readonly string[]): number[] {
-  const out: number[] = [];
-  for (const m of body.matchAll(new RegExp(`${symbolClass(symbols)}\\s?(${AMOUNT})`, "gu"))) out.push(toNumber(m[1]!));
-  if (codes.length > 0) for (const m of body.matchAll(new RegExp(`(${AMOUNT})\\s?(?:${codes.map(escapeRegExp).join("|")})\\b`, "giu"))) out.push(toNumber(m[1]!));
+function amountMatches(body: string, symbols: string, codes: readonly string[]): Found[] {
+  const out: Found[] = [];
+  const push = (m: RegExpMatchArray): void => {
+    const at = m.index ?? 0;
+    out.push({ value: toNumber(m[1]!), at, end: at + m[0].length });
+  };
+  for (const m of body.matchAll(new RegExp(`${symbolClass(symbols)}\\s?(${AMOUNT})`, "gu"))) push(m);
+  if (codes.length > 0) for (const m of body.matchAll(new RegExp(`(${AMOUNT})\\s?(?:${codes.map(escapeRegExp).join("|")})\\b`, "giu"))) push(m);
   return out;
+}
+const amountsIn = (body: string, symbols: string, codes: readonly string[]): number[] => amountMatches(body, symbols, codes).map((f) => f.value);
+
+/** Whether any of `words` appears, as a whole word or phrase, within `window` characters before or after the match ("starts" is not "star"). */
+function nearWord(body: string, f: Found, words: readonly string[], window: number): boolean {
+  const around = body.slice(Math.max(0, f.at - window), f.end + window);
+  return words.some((w) => new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(w)}(?![\\p{L}\\p{N}])`, "iu").test(around));
 }
 
 const offersOf = (node: Record<string, unknown>): unknown[] => asArray(node["offers"]);
-const hasPrice = (o: unknown): boolean => isRecord(o) && present(o["price"]) && present(o["priceCurrency"]);
+// An AggregateOffer states its price as a range (lowPrice / highPrice); its lowPrice is the price a visitor starts from.
+const hasPrice = (o: unknown): boolean =>
+  isRecord(o) &&
+  (present(o["price"]) || (typesOf(o).includes("AggregateOffer") && present(o["lowPrice"]))) &&
+  present(o["priceCurrency"]);
 
 export const offerDataAbsent = defineRule({
   code: "AUX-R-012",
@@ -123,19 +144,33 @@ export const schemaTextContradiction = defineRule({
   code: "AUX-R-013",
   category: "structured_data",
   autoFixable: false,
-  thresholds: strict({ name_entity_types: z.array(z.string().min(1)).min(1), currency_symbols: z.string().min(1), currency_codes: z.array(z.string().min(1)), min_disagreements: z.number().int().positive() }),
+  thresholds: strict({
+    name_entity_types: z.array(z.string().min(1)).min(1),
+    currency_symbols: z.string().min(1),
+    currency_codes: z.array(z.string().min(1)),
+    min_disagreements: z.number().int().positive(),
+    price_tolerance: z.number().nonnegative(),
+    rating_tolerance: z.number().nonnegative(),
+    price_context_words: z.array(z.string().min(1)).min(1),
+    rating_scales: z.array(z.number().int().positive()).min(1),
+    rating_context_words: z.array(z.string().min(1)).min(1),
+    context_window_chars: z.number().int().positive(),
+  }),
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
     const flat = normaliseText(`${body}\n${doc.meta.title ?? ""}`);
     const all = entities(doc);
     const hits: { reason: string; snippet: string; locator: string }[] = [];
 
-    const prices = amountsIn(body, t.currency_symbols, t.currency_codes);
+    // Only an amount that sits beside a pricing word is a price the page shows ("$2B processed", "Save $500" are not).
+    const prices = amountMatches(body, t.currency_symbols, t.currency_codes)
+      .filter((f) => nearWord(body, f, t.price_context_words, t.context_window_chars))
+      .map((f) => f.value);
     for (const e of all) {
       asArray(e.node["offers"]).forEach((o, i) => {
         if (!isRecord(o) || !present(o["price"])) return;
         const declared = toNumber(String(o["price"]));
-        if (Number.isFinite(declared) && prices.length > 0 && !prices.some((p) => Math.abs(p - declared) < 0.005)) {
+        if (Number.isFinite(declared) && prices.length > 0 && !prices.some((p) => Math.abs(p - declared) < t.price_tolerance)) {
           hits.push({ reason: "price", snippet: `schema price ${String(o["price"])}; page prices ${[...new Set(prices)].slice(0, 5).join(", ")}`, locator: `${e.locator}.offers${Array.isArray(e.node["offers"]) ? `[${String(i)}]` : ""}.price` });
         }
       });
@@ -148,8 +183,13 @@ export const schemaTextContradiction = defineRule({
       const rating = e.node["aggregateRating"];
       if (!isRecord(rating)) continue;
       const declaredValue = toNumber(String(rating["ratingValue"] ?? ""));
-      const shown = [...body.matchAll(/(\d+(?:\.\d+)?)\s*(?:\/|out of)\s*(?:5|10)\b/giu)].map((m) => Number(m[1]));
-      if (Number.isFinite(declaredValue) && shown.length > 0 && !shown.some((v) => Math.abs(v - declaredValue) < 0.005)) {
+      // "N/5" or "N out of 10", not a date ("3/5/2026": a further "/digits" follows, or a "/" precedes), and with a rating word beside it.
+      const scales = t.rating_scales.map(String).join("|");
+      const ratingRe = new RegExp(`(?<![\\d./])(\\d+(?:\\.\\d+)?)\\s*(?:\\/|out of)\\s*(?:${scales})\\b(?!\\s*\\/\\s*\\d)`, "giu");
+      const shown = [...body.matchAll(ratingRe)]
+        .filter((m) => nearWord(body, { value: 0, at: m.index ?? 0, end: (m.index ?? 0) + m[0].length }, t.rating_context_words, t.context_window_chars))
+        .map((m) => Number(m[1]));
+      if (Number.isFinite(declaredValue) && shown.length > 0 && !shown.some((v) => Math.abs(v - declaredValue) < t.rating_tolerance)) {
         hits.push({ reason: "rating_value", snippet: `schema rating ${String(rating["ratingValue"])}; page ratings ${shown.slice(0, 3).join(", ")}`, locator: `${e.locator}.aggregateRating.ratingValue` });
       }
       const declaredCount = toNumber(String(rating["reviewCount"] ?? ""));
@@ -231,6 +271,7 @@ const hostOf = (s: string): string | null => {
 };
 const CLASS_NAME = /^[A-Z][A-Za-z0-9]*$/u;
 
+// Partial: no schema.org class/property list is held, so "@type invalid for the property set" is not checked (spec gap: a vocabulary data set).
 export const invalidVocabulary = defineRule({
   code: "AUX-R-016",
   category: "structured_data",
@@ -259,6 +300,7 @@ export const invalidVocabulary = defineRule({
 
 // --- AUX-R-017 ----------------------------------------------------------------------------------------------------------------
 
+// Partial: question headings are those ending in "?"; interrogatives without one and the "Q&A block" arm need a document-model field (spec gap).
 export const faqMarkupAbsent = defineRule({
   code: "AUX-R-017",
   category: "structured_data",
@@ -275,29 +317,43 @@ export const faqMarkupAbsent = defineRule({
 
 // --- AUX-R-018 ----------------------------------------------------------------------------------------------------------------
 
+// Two descriptions disagree when both state a field and the values differ. A description that leaves a field out has not
+// contradicted the one that states it, and `https://acme.com/` is `https://acme.com`.
+const nameKey = (n: string | undefined): string | undefined => (n === undefined ? undefined : normaliseText(n));
+function urlKey(u: string | undefined): string | undefined {
+  if (u === undefined) return undefined;
+  try {
+    const url = new URL(u);
+    return `${url.hostname.replace(/^www\./u, "")}${url.port}${url.pathname.replace(/\/+$/u, "")}${url.search}`.toLowerCase();
+  } catch {
+    return u.trim().toLowerCase().replace(/\/+$/u, "");
+  }
+}
+const differs = (a: string | undefined, b: string | undefined): boolean => a !== undefined && b !== undefined && a !== b;
+
 export const duplicateConflictingEntities = defineRule({
   code: "AUX-R-018",
   category: "structured_data",
   autoFixable: true,
   thresholds: strict({ min_conflicts: z.number().int().positive() }),
   evaluate(doc, t) {
-    const byType = new Map<string, { block: number; identity: string; name: string; locator: string }[]>();
+    const byType = new Map<string, { block: number; name: string | undefined; url: string | undefined; label: string; locator: string }[]>();
     for (const e of entities(doc)) {
       const name = text(e.node["name"]);
       const url = text(e.node["url"]);
       if (name === undefined && url === undefined) continue;
       for (const type of typesOf(e.node)) {
         const list = byType.get(type) ?? [];
-        list.push({ block: e.block, identity: `${name ?? ""}|${url ?? ""}`, name: name ?? url ?? "", locator: e.locator });
+        list.push({ block: e.block, name: nameKey(name), url: urlKey(url), label: name ?? url ?? "", locator: e.locator });
         byType.set(type, list);
       }
     }
     const conflicts: { type: string; a: string; b: string; locator: string }[] = [];
     for (const [type, list] of [...byType.entries()].sort(([x], [y]) => x.localeCompare(y))) {
       for (const x of list) {
-        const y = list.find((o) => o.block !== x.block && o.identity !== x.identity);
+        const y = list.find((o) => o.block !== x.block && (differs(o.name, x.name) || differs(o.url, x.url)));
         if (y !== undefined) {
-          conflicts.push({ type, a: x.name, b: y.name, locator: y.locator });
+          conflicts.push({ type, a: x.label, b: y.label, locator: y.locator });
           break;
         }
       }
