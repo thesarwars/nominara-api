@@ -2,10 +2,13 @@ import { Module } from "@nestjs/common";
 import { CacheModule } from "../../lib/cache/cache.module.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
+import { loadEnv } from "../../config/env.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
 import { PromptLifecycleService } from "./lifecycle.service.js";
 import { PromptListService } from "./prompt-list.service.js";
+import { selectNaturaliser } from "./naturaliser.selector.js";
+import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsService } from "./prompts.service.js";
 import { TopicsController } from "./topics.controller.js";
@@ -13,14 +16,14 @@ import { TopicsService } from "./topics.service.js";
 
 // STORY-045 — the prompts bounded area.
 //
-// NO NATURALISER PROVIDER. `PROMPT_NATURALISER` is declared as a port
-// (./ports/naturaliser.ts) and nothing binds it, so PromptsService receives
-// null and every pass runs §4's `template_only` path. That is deliberate:
-// which model naturalises prompt text is a dependency decision, and
-// development-workflow.md §6 puts adding a dependency outside what an agent
-// may decide. Binding a provider here is the last step of STORY-045, and it
-// needs the two answers the port's own file sets out — whether the call may
-// sit on the request path, and which metric absorbs its cost.
+// NATURALISER (owner decision 3, 2026-10-28). `PROMPT_NATURALISER` is bound by naturaliser.selector.ts from configuration:
+// `none` (the default) binds null and every pass runs §4's `template_only` path; `gemini` binds a Flash-class Gemini model behind the
+// port. A missing key also yields null, so the fallback is always the deterministic text.
+//
+// REQUEST PATH, AND WHY THAT IS A RISK RATHER THAN A DECISION. The route is documented synchronous (api-specification.md §5) and
+// NFR-ARCH-01 names engines, embedding providers and crawl targets - not a naturaliser - so the letter allows the call. But the
+// ambient request transaction is open while it runs (ADR-0003 / NFR-ARCH-04 forbid that), bounded by PROMPT_NATURALISER_TIMEOUT_MS
+// (default 8 s) and the adapter's circuit breaker. That is why the default is `none`. STORY-045 decision 5 closes it.
 //
 // CacheModule is imported EXPLICITLY even though it is @Global(), following
 // EntitlementsModule's precedent and for the reason its comment gives: a
@@ -36,6 +39,8 @@ import { TopicsService } from "./topics.service.js";
 @Module({
   imports: [CacheModule, EntitlementsModule, QueueProducerModule],
   controllers: [PromptsController, PromptLifecycleController, TopicsController],
-  providers: [PromptsService, PromptActivationService, PromptLifecycleService, PromptListService, TopicsService],
+  providers: [
+    { provide: PROMPT_NATURALISER, useFactory: () => selectNaturaliser(loadEnv()) },
+    PromptsService, PromptActivationService, PromptLifecycleService, PromptListService, TopicsService],
 })
 export class PromptsModule {}

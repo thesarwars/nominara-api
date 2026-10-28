@@ -432,6 +432,12 @@ export const envSchema = z
     // the free tier of gemini-2.5-flash; raise it with the paid quota. It builds a ONE-token bucket
     // (no burst above the rate) and takes precedence over ENGINE_TOKEN_BUCKETS.gemini.
     GEMINI_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
+    // STORY-045 AC3 (owner decision 3, 2026-10-28) - which model naturalises generated prompt text (tracking-engine.md section 4 step 4).
+    // `none` (the default) is the template-only path. `gemini` binds a Flash-class Gemini model using GEMINI_API_KEY; with no key it falls
+    // back to template-only rather than failing boot. The call has a hard timeout so a slow model cannot hold a request open.
+    PROMPT_NATURALISER: z.enum(["none", "gemini"]).default("none"),
+    PROMPT_NATURALISER_MODEL: requiredString.default("gemini-2.5-flash"),
+    PROMPT_NATURALISER_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(8_000),
 
     // NEW-D-2 — Stripe (SANDBOX keys in every environment this week). All three
     // are OPTIONAL, deliberately: the API must boot without a payment provider,

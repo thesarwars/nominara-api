@@ -208,6 +208,53 @@ describe("STORY-045 · generatePass — the naturaliser and the L5 cache", () =>
     expect(cache.store.size).toBe(0);
   });
 
+  it("AC3 hazard - the cache is keyed on the TEMPLATE input too, so another project's brand is never served from it", async () => {
+    // Same workspace, same (empty) topic, same grammar version, DIFFERENT brand. Keyed on topic alone, project B would be handed project
+    // A's naturalised lines - A's brand name inside B's prompts. It was unreachable while only a stub naturaliser existed.
+    const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l) => `rewritten: ${l}`)) };
+    const cache = memoryCache();
+
+    await generatePass(input({ naturaliser, cache }));
+    const other = await generatePass(input({ naturaliser, cache, context: { ...FULL_CONTEXT, brandName: "Zendesk Sell" } }));
+
+    expect(other.cached).toBe(false);
+    expect(naturaliser.naturalise).toHaveBeenCalledTimes(2);
+    expect(other.rows.some((r) => r.text.includes("HubSpot"))).toBe(false);
+    expect(other.rows.some((r) => r.text.includes("Zendesk Sell"))).toBe(true);
+  });
+
+  it("AC3 hazard - a rewrite that collides with an existing prompt's hash keeps its template text instead of failing the INSERT", async () => {
+    const plain = await generatePass(input());
+    const rewrittenHash = promptTextHash(`real: ${plain.rows[0]!.text}`).bytes.toString("hex");
+    const existing = new Map([[rewrittenHash, "01a06ccd-0000-7000-8000-0000000000aa"]]);
+    const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l) => `real: ${l}`)) };
+
+    const pass = await generatePass(input({ naturaliser, existingHashes: existing }));
+
+    expect(pass.rows[0]!.text).toBe(plain.rows[0]!.text);
+    expect((pass.rows[0]!.generatorMeta as { naturalized: boolean }).naturalized).toBe(false);
+    expect(pass.rows).toHaveLength(15);
+    expect(pass.rows.some((r) => promptTextHash(r.text).bytes.toString("hex") === rewrittenHash)).toBe(false);
+  });
+
+  it("AC3 hazard - two lines rewritten to the SAME text: the earlier keeps the rewrite, the later keeps its template", async () => {
+    const plain = await generatePass(input());
+    const a = plain.rows.findIndex((r) => r.text === "Best crm for pipeline automation?");
+    const b = plain.rows.findIndex((r) => r.text === "Which crm has the best pipeline automation?");
+    expect(a).toBeGreaterThanOrEqual(0);
+    expect(b).toBeGreaterThan(a);
+    const naturaliser = {
+      naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l, i) => (i === a || i === b ? "crm pipeline automation, which is best?" : l))),
+    };
+
+    const pass = await generatePass(input({ naturaliser }));
+
+    const hashes = pass.rows.map((r) => promptTextHash(r.text).bytes.toString("hex"));
+    expect(new Set(hashes).size).toBe(hashes.length);
+    expect(pass.rows[a]!.text).toBe("crm pipeline automation, which is best?");
+    expect(pass.rows[b]!.text).toBe(plain.rows[b]!.text);
+  });
+
   it("keys the cache on the normalised topic, so two phrasings share one entry", async () => {
     const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => [...r.lines]) };
     const cache = memoryCache();

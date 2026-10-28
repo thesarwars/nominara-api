@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   ArchetypeCoverage,
   GeneratableArchetype,
@@ -202,6 +203,32 @@ function coverageFor(
 }
 
 /**
+ * A rewrite is a NEW text, so it has a new `text_hash` - and dedupe ran on the template text. Left unchecked, a rewrite equal to an
+ * existing prompt (or to another line's text) violates `ux_prompts_project_hash` and fails the whole pass at INSERT.
+ *
+ * The template text of every candidate is already known to be unique, so it is the safe fallback: a rewrite is kept only if its hash
+ * is not an existing prompt's, not another candidate's TEMPLATE hash, and not an earlier kept rewrite's. Otherwise that line (and only
+ * that line) keeps its template text and is recorded as not naturalised.
+ */
+function keepDistinct(
+  templates: readonly Candidate[],
+  rewritten: readonly Candidate[],
+  existing: ExistingHashes,
+): readonly Candidate[] {
+  const hexOf = (text: string): string => promptTextHash(text).bytes.toString("hex");
+  const templateHexes = templates.map((candidate) => hexOf(candidate.text));
+  const claimed = new Set<string>();
+  return rewritten.map((candidate, index) => {
+    if (!candidate.naturalized) return candidate;
+    const hex = hexOf(candidate.text);
+    const taken = has(existing, hex) || claimed.has(hex) || templateHexes.some((other, i) => i !== index && other === hex);
+    if (taken) return { ...templates[index]!, naturalized: false };
+    claimed.add(hex);
+    return candidate;
+  });
+}
+
+/**
  * One generation pass.
  *
  * Never charges anything — there is no wallet or ledger call in this file or
@@ -217,7 +244,13 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
   // §4 step 4, with §8's L5 cache in front of it. The key is the NORMALISED
   // topic, so "Lead Management Platforms!" and "lead management platform"
   // share one entry — which is the whole point of step 1 feeding this.
-  const cacheKey = `${topicNorm}|${input.locale ?? ""}|${GRAMMAR_VERSION}|${String(input.batchSize)}`;
+  //
+  // The key ends in a digest of the TEMPLATE lines being rewritten. Topic, locale, grammar version and batch size do not say whose
+  // brand is in the text, and the cache is tenant-scoped, not project-scoped: keyed on those alone, a second project in the same
+  // workspace would be served the first one's rewritten lines - its brand name inside another project's prompts. The digest makes a
+  // hit mean "this exact input was rewritten before".
+  const templateDigest = createHash("sha256").update(JSON.stringify(accepted.map((candidate) => candidate.text))).digest("hex").slice(0, 16);
+  const cacheKey = `${topicNorm}|${input.locale ?? ""}|${GRAMMAR_VERSION}|${String(input.batchSize)}|${templateDigest}`;
   const cachedLines = await input.cache?.get(cacheKey);
 
   let naturalised: readonly Candidate[];
@@ -237,7 +270,7 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
     }
   }
 
-  const candidates = prioritise(naturalised, input.prioritySubsetSize);
+  const candidates = prioritise(keepDistinct(accepted, naturalised, input.existingHashes), input.prioritySubsetSize);
   const rows = candidates.map((candidate) =>
     promptRowFromCandidate(candidate, {
       workspaceId: input.workspaceId,

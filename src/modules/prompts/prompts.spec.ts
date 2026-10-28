@@ -1,6 +1,7 @@
 import { Test } from "@nestjs/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
+import { GeminiNaturaliser } from "./adapters/gemini-naturaliser.js";
 import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
@@ -31,16 +32,21 @@ describe("STORY-022 · PromptsModule compiles", () => {
     await moduleRef.close();
   });
 
-  it("resolves the service with NO naturaliser bound — §4's template_only path", async () => {
-    // STORY-045's actual state, asserted rather than described. Which model
-    // naturalises prompt text is a dependency decision that
-    // development-workflow.md §6 puts outside what an agent may decide, so
-    // the port is declared and nothing binds it. If a provider is bound
-    // later this test should be updated, not deleted: it is the thing that
-    // says the template-only path is the live one.
+  it("binds NO naturaliser by default — §4's template_only path stays the live one", async () => {
+    // PROMPT_NATURALISER defaults to `none` (owner decision 3, STORY-045 AC3): the token resolves, to null, so the service still runs
+    // the deterministic template-only path unless configuration says otherwise.
+    delete process.env.PROMPT_NATURALISER;
     const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
     expect(moduleRef.get(PromptsService)).toBeInstanceOf(PromptsService);
-    expect(() => moduleRef.get(PROMPT_NATURALISER)).toThrow();
+    expect(moduleRef.get(PROMPT_NATURALISER)).toBeNull();
+    await moduleRef.close();
+  });
+
+  it("binds the Gemini naturaliser when PROMPT_NATURALISER=gemini and a key is configured", async () => {
+    process.env.PROMPT_NATURALISER = "gemini";
+    process.env.GEMINI_API_KEY = "fake-key-never-used";
+    const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
+    expect(moduleRef.get(PROMPT_NATURALISER)).toBeInstanceOf(GeminiNaturaliser);
     await moduleRef.close();
   });
 
