@@ -118,13 +118,15 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
             ? await datesWithFacts(tx, payload.projectId, timezone, payload.fromDate, payload.toDate)
             : [await localToday(tx, timezone)];
 
+      const liveLagPath = payload.metricDate !== undefined || payload.fromDate === undefined;
       for (const date of dates) {
         const groups = await rollUpDay(tx, payload.workspaceId, payload.projectId, date, timezone);
         logger.log(`rolled up ${payload.projectId} ${date}: ${String(groups)} groups`);
         // NEW-C-3 — displacement persistence after each day's rollup, in date
         // order (recovery needs the earlier event to exist). Idempotent on a
         // dirty date: the pair's unique key makes a re-run an update.
-        await refreshProjectDisplacements(tx, payload.projectId, date, timezone);
+        // Lag is observed on the live single-date path only: a rebuild range re-detects days-old captures (AC11).
+        await refreshProjectDisplacements(tx, payload.projectId, date, timezone, { observeLag: liveLagPath });
         // STORY-066 AC8/AC9 — the configuration pins (model fingerprint change, material prompt-set change) for the
         // day. Idempotent by a named source, so a re-run of the date pins nothing more.
         await refreshProjectMilestones(tx, payload.workspaceId, payload.projectId, date, timezone);

@@ -12,3 +12,13 @@ const logger = new Logger("metrics");
 export function incrementCounter(name: string, labels: Record<string, string> = {}): void {
   logger.log({ metric: name, value: 1, ...labels });
 }
+
+/**
+ * One observation of a distribution (the Logger-based stand-in for a histogram, same no-dependency pattern as
+ * `incrementCounter`; the backend that buckets it is a later story). A non-finite value is not an observation and is
+ * refused rather than logged as 0 — `0` is a real measurement and stays distinct from "nothing measured".
+ */
+export function observeValue(name: string, value: number, labels: Record<string, string> = {}): void {
+  if (!Number.isFinite(value)) return;
+  logger.log({ metric: name, value, ...labels });
+}
