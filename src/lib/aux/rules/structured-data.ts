@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AuxDocument } from "../document-model.js";
-import { asArray, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
+import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
 import { defineRule, type RuleHit } from "./types.js";
 
 // structured_data — AUX-R-008..018 (aux-and-geo-analysis.md section 2). They read `doc.structured` (the rendered copy's data when
@@ -63,7 +63,7 @@ export const noPrimaryEntity = defineRule({
     const types = [...entities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
     const found = types.filter((x) => t.primary_types.includes(x)).length;
     if (found >= 1) return [];
-    return [{ severity: "high", measured: found, threshold: 1, reason: "no_primary_entity", snippet: types.length === 0 ? null : types.slice(0, 5).join(", "), locator: "structured" }];
+    return [{ severity: "high", measured: found, threshold: PRESENCE_THRESHOLD, reason: "no_primary_entity", snippet: types.length === 0 ? null : types.slice(0, 5).join(", "), locator: "structured" }];
   },
 });
 
@@ -151,6 +151,10 @@ function nearWord(body: string, f: Found, words: readonly string[], window: numb
 const containsFreeWord = (text: string, word: string): boolean =>
   new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(normaliseText(word))}(?![\\p{L}\\p{N}]|[.,]\\d)`, "u").test(text);
 
+/** A price unit ("per user", "/mo") directly after a digit. A bare "per user" is a feature quota as often as a price ("10 GB storage per user" has its digit before the storage, not the unit). */
+const unitBesideDigit = (body: string, units: readonly string[]): boolean =>
+  units.length > 0 && new RegExp(`\\d\\s?(?:${units.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}])`, "iu").test(body);
+
 const offersOf = (node: Record<string, unknown>): unknown[] => asArray(node["offers"]);
 // An AggregateOffer states its price as a range (lowPrice / highPrice); its lowPrice is the price a visitor starts from.
 const hasPrice = (o: unknown): boolean =>
@@ -172,20 +176,27 @@ export const offerDataAbsent = defineRule({
   }),
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
-    const lower = body.toLowerCase();
     // Only an amount beside a pricing word is a pricing token ("$2B processed", "Save $500" are not).
     const talksPricing =
       amountMatches(body, t.currency_symbols, t.currency_codes).some((f) => nearWord(body, f, t.price_context_words, t.context_window_chars)) ||
-      t.price_units.some((u) => lower.includes(u.toLowerCase()));
+      unitBesideDigit(body, t.price_units);
     if (!talksPricing) return [];
     const bad = entitiesOfType(entities(doc), t.entity_types).filter((e) => {
       const offers = offersOf(e.node);
       return offers.length === 0 || offers.some((o) => !hasPrice(o));
     });
     if (bad.length === 0) return [];
-    return [{ severity: "high", measured: bad.length, threshold: 1, reason: "offers_incomplete", snippet: text(bad[0]!.node["name"]) ?? null, locator: `${bad[0]!.locator}.offers` }];
+    return [{ severity: "high", measured: bad.length, threshold: PRESENCE_THRESHOLD, reason: "offers_incomplete", snippet: text(bad[0]!.node["name"]) ?? null, locator: `${bad[0]!.locator}.offers` }];
   },
 });
+
+/** The schema name is on the page, ignoring typography; a variant or pack suffix after a comma ("Acme Widget Pro, 12-pack") need not be shown. */
+function nameShown(flat: string, name: string): boolean {
+  const full = foldForComparison(name);
+  if (flat.includes(full)) return true;
+  const lead = foldForComparison(name.split(",")[0]!);
+  return name.includes(",") && lead.length >= 3 && flat.includes(lead);
+}
 
 export const schemaTextContradiction = defineRule({
   code: "AUX-R-013",
@@ -206,7 +217,7 @@ export const schemaTextContradiction = defineRule({
   }),
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
-    const flat = normaliseText(`${body}\n${doc.meta.title ?? ""}`);
+    const flat = foldForComparison(`${body}\n${doc.meta.title ?? ""}`);
     const all = entities(doc);
     const hits: { reason: string; snippet: string; locator: string }[] = [];
 
@@ -227,7 +238,7 @@ export const schemaTextContradiction = defineRule({
     }
     for (const e of entitiesOfType(all, t.name_entity_types)) {
       const name = text(e.node["name"]);
-      if (name !== undefined && !flat.includes(normaliseText(name))) hits.push({ reason: "name", snippet: `schema name ${name}`, locator: `${e.locator}.name` });
+      if (name !== undefined && !nameShown(flat, name)) hits.push({ reason: "name", snippet: `schema name ${name}`, locator: `${e.locator}.name` });
     }
     for (const e of all) {
       const rating = e.node["aggregateRating"];
@@ -309,7 +320,7 @@ export const ratingWithoutProvenance = defineRule({
       return !t.provenance_keys.some((k) => (COUNT_KEYS.has(k) ? Number(rating[k]) > 0 : present(rating[k])));
     });
     if (bad.length === 0) return [];
-    return [{ severity: "medium", measured: bad.length, threshold: 1, reason: "rating_without_provenance", snippet: `ratingValue ${String((bad[0]!.node["aggregateRating"] as Record<string, unknown>)["ratingValue"] ?? "")}`, locator: `${bad[0]!.locator}.aggregateRating` }];
+    return [{ severity: "medium", measured: bad.length, threshold: PRESENCE_THRESHOLD, reason: "rating_without_provenance", snippet: `ratingValue ${String((bad[0]!.node["aggregateRating"] as Record<string, unknown>)["ratingValue"] ?? "")}`, locator: `${bad[0]!.locator}.aggregateRating` }];
   },
 });
 
@@ -347,7 +358,7 @@ export const invalidVocabulary = defineRule({
       for (const key of Object.keys(e.node)) if (t.deprecated_properties.includes(key)) hits.push({ reason: "deprecated_property", snippet: key, locator: `${e.locator}.${key}` });
     }
     if (hits.length === 0) return [];
-    return [{ severity: "medium", measured: hits.length, threshold: 1, reason: hits[0]!.reason, snippet: hits[0]!.snippet, locator: hits[0]!.locator }];
+    return [{ severity: "medium", measured: hits.length, threshold: PRESENCE_THRESHOLD, reason: hits[0]!.reason, snippet: hits[0]!.snippet, locator: hits[0]!.locator }];
   },
 });
 
@@ -404,7 +415,7 @@ export const duplicateConflictingEntities = defineRule({
       }
     }
     const conflicts: { type: string; a: string; b: string; locator: string }[] = [];
-    for (const [type, list] of [...byType.entries()].sort(([x], [y]) => x.localeCompare(y))) {
+    for (const [type, list] of [...byType.entries()].sort(([x], [y]) => byCodePoint(x, y))) {
       for (const x of list) {
         const y = list.find((o) => o.block !== x.block && !differs(o.id, x.id) && (differs(o.name, x.name) || differs(o.url, x.url)));
         if (y !== undefined) {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { ContentBlock, Heading } from "../document-model.js";
-import { clip, flattenHeadings, variantOf } from "./helpers.js";
+import { PRESENCE_THRESHOLD, clip, flattenHeadings, variantOf } from "./helpers.js";
 import { defineRule, type RuleHit } from "./types.js";
 
 // context_fitness — AUX-R-019..025, the truncation family. Every threshold is a TOKEN count or a ratio over tokens the document
@@ -96,7 +96,7 @@ export const answerShapedContentAbsent = defineRule({
       if (shaped || summary) return [];
       before += b.tokens;
     }
-    return [{ severity: "medium", measured: 0, threshold: 1, reason: "no_answer_shaped_content", snippet: doc.blocks[0]?.heading ?? null, locator: "blocks[0]" }];
+    return [{ severity: "medium", measured: 0, threshold: PRESENCE_THRESHOLD, reason: "no_answer_shaped_content", snippet: doc.blocks[0]?.heading ?? null, locator: "blocks[0]" }];
   },
 });
 
@@ -120,7 +120,7 @@ export const headingHierarchyBroken = defineRule({
     };
     tree.forEach((r, i) => visit(r, `headings[${String(i)}]`));
     if (hits.length === 0) return [];
-    return [{ severity: "medium", measured: hits.length, threshold: 1, reason: hits[0]!.reason, snippet: hits[0]!.snippet === null ? null : clip(hits[0]!.snippet), locator: hits[0]!.locator }];
+    return [{ severity: "medium", measured: hits.length, threshold: PRESENCE_THRESHOLD, reason: hits[0]!.reason, snippet: hits[0]!.snippet === null ? null : clip(hits[0]!.snippet), locator: hits[0]!.locator }];
   },
 });
 

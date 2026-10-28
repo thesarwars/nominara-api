@@ -5,7 +5,7 @@ import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { AuxCatalog } from "../catalog.js";
 import type { AuxDocument } from "../document-model.js";
 import { guidanceFor } from "../patches/guidance.js";
-import { clip } from "./helpers.js";
+import { byCodePoint, clip } from "./helpers.js";
 import type { AuxRule } from "./types.js";
 
 // STORY-051 AC2, AC3, AC5, AC12, AC13 — the rule engine.
@@ -34,8 +34,6 @@ export class AuxRuleEvaluationError extends Error {
   }
 }
 
-// Code-unit order, which is code-point order for the ASCII codes and locators used here. localeCompare would depend on the host's ICU locale.
-const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 export interface EvaluateContext {
   readonly projectId: string;

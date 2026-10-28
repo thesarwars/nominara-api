@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { guidanceFor, NON_FIXABLE_RULES } from "../patches/guidance.js";
 import { loadAuxCatalog, type AuxCatalog } from "../catalog.js";
 import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateDocuments } from "./engine.js";
+import { EXCLUDED_RULES } from "../../queue/handlers/crawl-audit.handler.js";
 import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "./index.js";
 import { CATALOG, CATALOG_ROWS, PROJECT_ID, findings, runAll } from "../../../../test/support/aux-rules.js";
 import { block, makeDoc, variant } from "../../../../test/support/aux-document.js";
@@ -85,13 +86,19 @@ describe("STORY-051 · the rule engine", () => {
   });
 
   it("STORY-051 AC1, AC10 · rules built on an interim reading are recorded as PARTIAL with the document-model field they need", () => {
-    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-016", "AUX-R-017", "AUX-R-021", "AUX-R-023", "AUX-R-025"]);
+    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-029"]);
     const built = new Set(AUX_RULES.map((r) => r.code));
     for (const [code, why] of Object.entries(AUX_RULES_PARTIAL)) {
       expect(built.has(code), code).toBe(true);
       expect(Object.keys(AUX_RULES_NOT_EVALUATED), code).not.toContain(code);
       expect(why.length, code).toBeGreaterThan(40);
     }
+  });
+
+  it("STORY-051 AC1 · the audit does not yet run these rules, so crawl.audit's excluded_rules names every one of them", () => {
+    // EVALUATE (aux-and-geo-analysis.md section 1, step 6) is not wired into crawl.audit. Until it is, silence would read as "checked and fine".
+    // The stream that wires it removes the codes it runs from EXCLUDED_RULES and deletes this test.
+    for (const rule of AUX_RULES) expect(EXCLUDED_RULES, rule.code).toContain(rule.code);
   });
 
   it("STORY-051 #11 · a non-fixable rule's finding carries guidance and an alignment link, never an empty patch", async () => {

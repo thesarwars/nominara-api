@@ -87,6 +87,24 @@ export function flattenHeadings(tree: readonly Heading[]): Heading[] {
   return out;
 }
 
+/** The bar of a presence rule ("at least one"). Not a tunable number: such a rule fires on absence, so there is nothing for the catalog to move. */
+export const PRESENCE_THRESHOLD = 1;
+
+/** Code-unit order, which is code-point order for ASCII; localeCompare would depend on the host's ICU locale. */
+export const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Text compared for meaning, not typography: NFKC, no trademark signs, straight quotes and dashes, "&" as "and". */
+export const foldForComparison = (s: string): string =>
+  normaliseText(
+    s
+      .replace(/[\u2122\u00AE\u00A9]/gu, "")
+      .normalize("NFKC")
+      .replace(/[\u2018\u2019\u201A\u02BC]/gu, "'")
+      .replace(/[\u201C\u201D\u201E]/gu, '"')
+      .replace(/[\u2010-\u2015\u2212]/gu, "-")
+      .replace(/\s*&\s*/gu, " and "),
+  );
+
 export const normaliseText = (s: string): string => s.toLowerCase().replace(/\s+/gu, " ").trim();
 
 export const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

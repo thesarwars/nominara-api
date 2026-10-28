@@ -156,8 +156,13 @@ describe("STORY-051 AUX-R-012 · offer data absent", () => {
     expect(await findings(withApp({ offers: undefined }, { mainText: "Acme Widgets\nA product page with no figures." }), "AUX-R-012")).toEqual([]);
   });
   it("STORY-051 AUX-R-012 · pricing is recognised by symbol+digit, digit+code, and unit phrases", async () => {
-    for (const t of ["Plans from €29", "Price: 29 USD", "Billed per user", "Pay 5/mo"]) {
+    for (const t of ["Plans from €29", "Price: 29 USD", "Billed 12 per user", "Pay 5/mo"]) {
       expect(await findings(withApp({ offers: undefined }, { mainText: t }), "AUX-R-012"), t).toHaveLength(1);
+    }
+  });
+  it("STORY-051 AUX-R-012 · a unit phrase with no amount beside it (a feature quota) is not pricing", async () => {
+    for (const t of ["Includes 10 GB storage per user", "Unlimited API calls /month", "Billed per user"]) {
+      expect(await findings(withApp({ offers: undefined }, { mainText: t }), "AUX-R-012"), t).toEqual([]);
     }
   });
   it("STORY-051 AUX-R-012 · an offers list with one bad entry counts that entity once", async () => {
@@ -187,6 +192,18 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
   it("STORY-051 AUX-R-013 · a product name absent from the visible text fires", async () => {
     const [f] = await findings(withApp({ name: "Zed Gadget" }), "AUX-R-013");
     expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].name" });
+  });
+  it("STORY-051 AUX-R-013 · a name that differs only in a trademark sign, a curly apostrophe, & versus and, or a pack suffix is not a contradiction", async () => {
+    const cases: [string, string][] = [
+      ["Acme Widget\u2122", "Acme Widget"],
+      ["Joe\u2019s Widget", "Joe's Widget"],
+      ["Acme & Sons Widget", "Acme and Sons Widget"],
+      ["Acme Widget Pro, 12-pack", "Acme Widget Pro"],
+    ];
+    for (const [schemaName, pageName] of cases) {
+      const doc = withApp({ name: schemaName }, { mainText: `${CLEAN_TEXT}\n${pageName}` });
+      expect(await findings(doc, "AUX-R-013"), schemaName).toEqual([]);
+    }
   });
   it("STORY-051 AUX-R-013 · a rating or review count that disagrees fires; one that agrees, or is not shown, does not", async () => {
     expect((await findings(withApp({}, { mainText: CLEAN_TEXT.replace("4.6/5", "3.9/5") }), "AUX-R-013"))[0]!.evidence.reason).toBe("rating_value");
@@ -348,6 +365,14 @@ describe("STORY-051 AUX-R-018 · duplicate conflicting entities", () => {
   it("STORY-051 AUX-R-018 · same type with a different name in a second block fires medium", async () => {
     const [f] = await findings(withLd([prod("A"), prod("B")]), "AUX-R-018");
     expect(f).toMatchObject({ severity: "medium", measured_value: 1, threshold_value: 1 });
+  });
+  it("STORY-051 AUX-R-018 · which conflict is reported first follows code-point order, not the host locale", async () => {
+    const thing = (type: string, name: string) => ({ "@context": "https://schema.org", "@type": type, name });
+    const doc = withLd([thing("Product", "A"), thing("Product", "B"), thing("organization", "C"), thing("organization", "D")]);
+    const catalog = withThresholds("AUX-R-018", { singleton_types: ["organization", "Product"] });
+    const [f] = await findings(doc, "AUX-R-018", catalog);
+    expect(f!.measured_value).toBe(2);
+    expect(f!.evidence.snippet).toMatch(/^Product:/u);
   });
   it("STORY-051 AUX-R-018 · a different url alone conflicts; different types never do", async () => {
     expect(await findings(withLd([prod("A", { url: "https://a.example" }), prod("A", { url: "https://b.example" })]), "AUX-R-018")).toHaveLength(1);

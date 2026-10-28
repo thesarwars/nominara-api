@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { StructuredItem } from "../document-model.js";
-import { escapeRegExp, jsonLdEntities, variantOf } from "./helpers.js";
+import { PRESENCE_THRESHOLD, escapeRegExp, jsonLdEntities, variantOf } from "./helpers.js";
 import { defineRule } from "./types.js";
 
 // freshness — AUX-R-030. AUX-R-031 needs the audit date and the cited corpus's median dateModified, neither of which is in the
@@ -29,6 +29,6 @@ export const dateModifiedAbsent = defineRule({
     const labels = t.visible_date_labels.map(escapeRegExp).join("|");
     const visible = new RegExp(`\\b(?:${labels})\\s*(?:on|:|-)?\\s*(?:on\\s+)?${DATE}`, "iu");
     if (visible.test(variantOf(doc).mainText)) return [];
-    return [{ severity: "medium", measured: 0, threshold: 1, reason: "no_date_modified", snippet: null, locator: "meta.dateModified" }];
+    return [{ severity: "medium", measured: 0, threshold: PRESENCE_THRESHOLD, reason: "no_date_modified", snippet: null, locator: "meta.dateModified" }];
   },
 });
