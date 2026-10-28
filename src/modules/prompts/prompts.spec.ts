@@ -1,6 +1,8 @@
 import { Test } from "@nestjs/testing";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
+import { GeminiNaturaliser } from "./adapters/gemini-naturaliser.js";
 import { PROMPT_NATURALISER } from "./ports/naturaliser.js";
 import { PromptActivationService } from "./activation.service.js";
 import { PromptLifecycleController } from "./lifecycle.controller.js";
@@ -31,16 +33,28 @@ describe("STORY-022 · PromptsModule compiles", () => {
     await moduleRef.close();
   });
 
-  it("resolves the service with NO naturaliser bound — §4's template_only path", async () => {
-    // STORY-045's actual state, asserted rather than described. Which model
-    // naturalises prompt text is a dependency decision that
-    // development-workflow.md §6 puts outside what an agent may decide, so
-    // the port is declared and nothing binds it. If a provider is bound
-    // later this test should be updated, not deleted: it is the thing that
-    // says the template-only path is the live one.
+  it("binds NO naturaliser by default — §4's template_only path stays the live one", async () => {
+    // PROMPT_NATURALISER defaults to `none` (owner decision 2026-10-28 #3, STORY-045 AC3): the token resolves, to null, so the service still runs
+    // the deterministic template-only path unless configuration says otherwise.
+    delete process.env.PROMPT_NATURALISER;
     const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
     expect(moduleRef.get(PromptsService)).toBeInstanceOf(PromptsService);
-    expect(() => moduleRef.get(PROMPT_NATURALISER)).toThrow();
+    expect(moduleRef.get(PROMPT_NATURALISER)).toBeNull();
+    await moduleRef.close();
+  });
+
+  it("STORY-045 AC3 / NFR-ARCH-04 - PROMPT_NATURALISER=gemini does NOT bind the model onto the request path: the handler's transaction is open", async () => {
+    // The route runs inside TenantContextInterceptor's BEGIN..COMMIT, so a bound adapter would await a third party with a transaction held
+    // open (ADR-0003). It stays unbound until decision #5 (enqueued / 202) is answered; the configuration is reported, not honoured silently.
+    process.env.PROMPT_NATURALISER = "gemini";
+    process.env.GEMINI_API_KEY = "fake-key-never-used";
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const moduleRef = await Test.createTestingModule({ imports: [PromptsModule] }).compile();
+    expect(moduleRef.get(PROMPT_NATURALISER)).toBeNull();
+    expect(moduleRef.get(PROMPT_NATURALISER)).not.toBeInstanceOf(GeminiNaturaliser);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "prompts.naturaliser.held_off_request_path" }));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("fake-key-never-used");
+    warn.mockRestore();
     await moduleRef.close();
   });
 
