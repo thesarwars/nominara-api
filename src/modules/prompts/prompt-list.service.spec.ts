@@ -258,4 +258,54 @@ describe("STORY-134 · PromptListService", () => {
       expect(insert?.sql, column).toContain(column);
     }
   });
+
+  // STORY-133 AC10 - a manual prompt is INSERTED active, so no activation ever follows: this is its only chance to be embedded.
+  function withProducer(scenario: Scenario = {}) {
+    const deferred: (() => void)[] = [];
+    vi.spyOn(tenantContext, "afterCommit").mockImplementation((task) => void deferred.push(task));
+    const enqueueTenantJob = vi.fn(async () => ({}));
+    const base = setup(scenario);
+    // `setup` built the service without a producer; rebuild it with one over the same mocked tenant store.
+    const service = new PromptListService(resolverReturning(scenario.cap ?? 50), { enqueueTenantJob } as never);
+    void base;
+    return { service, deferred, enqueueTenantJob };
+  }
+
+  it("STORY-133 AC10 - a manual prompt is requested for embedding AFTER the active-count update, and enqueued only after COMMIT", async () => {
+    const { service, deferred, enqueueTenantJob } = withProducer({ counts: { active: 5, paused: 0, archived: 0 } });
+    const store = tenantContext.currentTenantStore() as unknown as { client: { query: ReturnType<typeof vi.fn> } };
+    const original = store.client.query.getMockImplementation() as (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }>;
+    store.client.query.mockImplementation(async (sql: string, params: unknown[]) => {
+      const result = await original(sql, params);
+      return sql.includes("embedding IS NULL") ? { rows: [{ id: params[0] instanceof Array ? (params[0] as string[])[0] : P1 }] } : result;
+    });
+
+    const created = await service.create(PROJECT, { text: "best crm for a 10-person startup" });
+
+    const order = calls.map((call) => call.sql);
+    const countUpdate = order.findIndex((sql) => sql.includes("UPDATE projects") && sql.includes("prompts_active"));
+    const embedRequest = order.findIndex((sql) => sql.includes("embedding IS NULL"));
+    expect(embedRequest, "the request is made in the create's transaction, after the count").toBeGreaterThan(countUpdate);
+    expect(calls[embedRequest]!.params[0]).toEqual([created.id]);
+    expect(enqueueTenantJob, "nothing is enqueued before COMMIT").not.toHaveBeenCalled();
+    expect(deferred).toHaveLength(1);
+    deferred[0]!();
+    await Promise.resolve();
+    expect(enqueueTenantJob).toHaveBeenCalledWith("embed.batch", WS, { table: "tracked_prompts", ids: [created.id] }, { idempotencyKey: expect.stringMatching(/^emb:[0-9a-f]{64}$/) });
+  });
+
+  it("STORY-133 AC10 - a create that is refused (cap, duplicate) requests nothing", async () => {
+    const capped = withProducer({ cap: 50, counts: { active: 50, paused: 0, archived: 0 } });
+    await capped.service.create(PROJECT, { text: "one more?" }).catch(() => undefined);
+    expect(calls.some((call) => call.sql.includes("embedding IS NULL"))).toBe(false);
+    expect(capped.deferred).toHaveLength(0);
+
+    const duplicate = withProducer({
+      counts: { active: 5, paused: 0, archived: 0 },
+      failOn: { match: "INSERT INTO tracked_prompts", error: Object.assign(new Error("dup"), { code: "23505" }) },
+    });
+    await duplicate.service.create(PROJECT, { text: "a duplicate?" }).catch(() => undefined);
+    expect(calls.some((call) => call.sql.includes("embedding IS NULL"))).toBe(false);
+    expect(duplicate.deferred).toHaveLength(0);
+  });
 });
