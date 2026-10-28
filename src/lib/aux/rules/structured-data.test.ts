@@ -546,12 +546,12 @@ describe("STORY-051 AUX-R-013 · a contradiction on a nested entity (round 3)", 
   const priced = (price: string) => ({ offers: { "@type": "Offer", price, priceCurrency: "USD" } });
   const page = (extra: string) => ({ mainText: `Acme\n${extra}` });
   it("STORY-051 #7 · WebPage > mainEntity > Product whose price disagrees with the page fires critical, located by property path", async () => {
-    const [f] = await findings(withLd([org, nested(priced("49"))], page("Pricing: $99 per month")), "AUX-R-013");
+    const [f] = await findings(withLd([org, nested(priced("73"))], page("Pricing: $88 per month")), "AUX-R-013");
     expect(f).toMatchObject({ severity: "critical" });
     expect(f!.evidence).toMatchObject({ reason: "price", locator: "jsonld[1].mainEntity.offers.price" });
   });
   it("STORY-051 AUX-R-013 · a nested price that agrees with the page does not fire", async () => {
-    expect(await findings(withLd([org, nested(priced("99"))], page("Pricing: $99 per month")), "AUX-R-013")).toEqual([]);
+    expect(await findings(withLd([org, nested(priced("88"))], page("Pricing: $88 per month")), "AUX-R-013")).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · a nested product name the page does not show fires", async () => {
     const [f] = await findings(withLd([org, { ...nested({}), mainEntity: { "@type": "Product", name: "Zed Gadget" } }], page("Acme widgets")), "AUX-R-013");
