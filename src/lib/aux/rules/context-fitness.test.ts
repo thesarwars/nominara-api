@@ -32,13 +32,13 @@ describe("STORY-051 AUX-R-019 · page token count excessive", () => {
 
 describe("STORY-051 AUX-R-020 · main-content ratio low", () => {
   it("STORY-051 AUX-R-020 · ratio exactly 0.35 does not fire; just below fires high", async () => {
-    expect(await findings(tokens(1000, 350), "AUX-R-020")).toEqual([]);
-    const [f] = await findings(tokens(1000, 349), "AUX-R-020");
+    expect(await findings(tokens(2000, 700), "AUX-R-020")).toEqual([]);
+    const [f] = await findings(tokens(2000, 699), "AUX-R-020");
     expect(f).toMatchObject({ severity: "high", threshold_value: 0.35 });
-    expect(f!.measured_value).toBeCloseTo(0.349, 6);
+    expect(f!.measured_value).toBeCloseTo(0.3495, 6);
   });
   it("STORY-051 AUX-R-020 · above the threshold does not fire", async () => {
-    expect(await findings(tokens(1000, 351), "AUX-R-020")).toEqual([]);
+    expect(await findings(tokens(2000, 701), "AUX-R-020")).toEqual([]);
   });
   it("STORY-051 AUX-R-020 · a page with no tokens has no ratio: null is not zero", async () => {
     expect(await findings(tokens(0, 0), "AUX-R-020")).toEqual([]);

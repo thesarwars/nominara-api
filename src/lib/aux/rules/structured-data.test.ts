@@ -122,7 +122,7 @@ describe("STORY-051 AUX-R-012 · offer data absent", () => {
     expect(f).toMatchObject({ severity: "high", measured_value: 1, threshold_value: 1 });
   });
   it("STORY-051 AUX-R-012 · offers with a price but no currency, or a currency but no price, fire", async () => {
-    expect(await findings(withApp({ offers: { "@type": "Offer", price: "49" } }), "AUX-R-012")).toHaveLength(1);
+    expect(await findings(withApp({ offers: { "@type": "Offer", price: "47" } }), "AUX-R-012")).toHaveLength(1);
     expect(await findings(withApp({ offers: { "@type": "Offer", priceCurrency: "USD" } }), "AUX-R-012")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-012 · a price of 0 is a price (free), not an absent one", async () => {
@@ -144,15 +144,15 @@ describe("STORY-051 AUX-R-012 · offer data absent", () => {
 
 describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () => {
   it("STORY-051 #7 · a structured price that disagrees with the visible price fires critical", async () => {
-    const [f] = await findings(withApp({}, { mainText: CLEAN_TEXT.replace("$49", "$59") }), "AUX-R-013");
+    const [f] = await findings(withApp({}, { mainText: CLEAN_TEXT.replace("$47", "$57") }), "AUX-R-013");
     expect(f).toMatchObject({ severity: "critical", measured_value: 1, threshold_value: 1, auto_fixable: false });
     expect(f!.evidence).toMatchObject({ reason: "price", locator: "jsonld[1].offers.price" });
-    expect(f!.evidence.snippet).toContain("49");
+    expect(f!.evidence.snippet).toContain("47");
     expect(f!.guidance).not.toBeNull();
   });
   it("STORY-051 AUX-R-013 · a matching price does not fire, including a thousands separator and a decimal form", async () => {
     expect(await findings(makeDoc(), "AUX-R-013")).toEqual([]);
-    expect(await findings(withApp({ offers: { price: "1299.00", priceCurrency: "USD" } }, { mainText: CLEAN_TEXT.replace("$49", "$1,299") }), "AUX-R-013")).toEqual([]);
+    expect(await findings(withApp({ offers: { price: "1299.00", priceCurrency: "USD" } }, { mainText: CLEAN_TEXT.replace("$47", "$1,299") }), "AUX-R-013")).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · a text with no price at all is not a contradiction", async () => {
     expect(await findings(withApp({}, { mainText: "Acme Widgets\nNo figures here." }), "AUX-R-013")).toEqual([]);
@@ -170,7 +170,7 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
     expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("Rated 4.6/5 from 120 reviews.", "") }), "AUX-R-013")).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · several disagreements measure their count", async () => {
-    const doc = withApp({ name: "Zed Gadget" }, { mainText: CLEAN_TEXT.replace("$49", "$59") });
+    const doc = withApp({ name: "Zed Gadget" }, { mainText: CLEAN_TEXT.replace("$47", "$57") });
     expect((await findings(doc, "AUX-R-013"))[0]!.measured_value).toBe(2);
   });
 });
@@ -203,7 +203,7 @@ describe("STORY-051 AUX-R-014 · featureList absent or thin", () => {
 });
 
 describe("STORY-051 AUX-R-015 · aggregateRating without provenance", () => {
-  const rating = (r: Record<string, unknown>) => withApp({ aggregateRating: { "@type": "AggregateRating", ratingValue: "4.6", ...r } }, { mainText: "Acme Widgets\nAcme Widgets starts at $49 per month." });
+  const rating = (r: Record<string, unknown>) => withApp({ aggregateRating: { "@type": "AggregateRating", ratingValue: "4.6", ...r } }, { mainText: "Acme Widgets\nAcme Widgets starts at $47 per month." });
   it("STORY-051 AUX-R-015 · a review count is provenance", async () => {
     expect(await findings(rating({ reviewCount: 1 }), "AUX-R-015")).toEqual([]);
   });

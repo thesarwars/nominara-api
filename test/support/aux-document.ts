@@ -20,14 +20,14 @@ export const CLEAN_JSON_LD: unknown[] = [
     "@type": "SoftwareApplication",
     name: "Acme Widgets",
     featureList: ["Pipeline analytics", "Workflow automation"],
-    offers: { "@type": "Offer", price: "49.00", priceCurrency: "USD" },
+    offers: { "@type": "Offer", price: "47.00", priceCurrency: "USD" },
     aggregateRating: { "@type": "AggregateRating", ratingValue: "4.6", reviewCount: "120" },
     dateModified: "2026-10-01",
   },
 ];
 
 export const CLEAN_TEXT =
-  "Acme Widgets\nAcme Widgets starts at $49 per month. Rated 4.6/5 from 120 reviews.\nPipeline analytics\nSee every deal.\nWorkflow automation\nAutomate follow-ups.\nLast updated: 2026-10-01";
+  "Acme Widgets\nAcme Widgets starts at $47 per month. Rated 4.6/5 from 120 reviews.\nPipeline analytics\nSee every deal.\nWorkflow automation\nAutomate follow-ups.\nLast updated: 2026-10-01";
 
 export function block(over: Partial<ContentBlock> = {}): ContentBlock {
   return {
