@@ -79,6 +79,13 @@ export interface GuardedResponse {
    * the same reason as `truncated`; `guardedFetch` always sets it.
    */
   readonly redirectChain?: readonly string[];
+  /**
+   * STORY-050 AC7 — milliseconds from the start of the `guardedFetch` call (so a redirect hop and the name lookup count: it is
+   * the wait a bot sees) to the response headers, and to the end of the body. Whole milliseconds; a measured 0 is 0. Optional on
+   * the type for the same reason as `truncated`; `guardedFetch` always sets them, and `requestOnce` answers the last hop's.
+   */
+  readonly ttfbMs?: number;
+  readonly loadMs?: number;
 }
 
 export interface GuardedFetchInit {
@@ -232,12 +239,13 @@ export async function guardedFetch(
   deps: GuardedFetchDeps = DEFAULT_DEPS,
 ): Promise<GuardedResponse> {
   const deadline = Date.now() + TOTAL_TIMEOUT_MS;
+  const startedAt = performance.now();
   let target = await deps.assertSafe(rawUrl);
   let hops = 0;
   const redirectChain: string[] = [];
 
   for (;;) {
-    const response = await requestOnce(target, init, deadline);
+    const response = await requestOnce(target, init, deadline, startedAt);
 
     const location = response.headers.location;
     const isRedirect = response.status >= 300 && response.status < 400 && typeof location === "string";
@@ -276,7 +284,7 @@ export async function guardedFetch(
 }
 
 /** One hop: connect to an already-validated address, bounded in time and size. */
-function requestOnce(target: SafeTarget, init: GuardedFetchInit, deadline: number): Promise<GuardedResponse> {
+function requestOnce(target: SafeTarget, init: GuardedFetchInit, deadline: number, startedAt: number): Promise<GuardedResponse> {
   const method = init.method ?? "GET";
   return new Promise<GuardedResponse>((resolve, reject) => {
     const isHttps = target.url.protocol === "https:";
@@ -341,6 +349,7 @@ function requestOnce(target: SafeTarget, init: GuardedFetchInit, deadline: numbe
     req.on("error", (error) => fail(error));
 
     req.on("response", (res: IncomingMessage) => {
+      const ttfbMs = Math.round(performance.now() - startedAt);
       const chunks: Buffer[] = [];
       let received = 0;
 
@@ -354,6 +363,8 @@ function requestOnce(target: SafeTarget, init: GuardedFetchInit, deadline: numbe
           body: Buffer.concat(chunks),
           finalUrl: target.url.toString(),
           truncated,
+          ttfbMs,
+          loadMs: Math.round(performance.now() - startedAt),
         });
       };
 
