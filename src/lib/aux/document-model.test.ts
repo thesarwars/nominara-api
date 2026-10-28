@@ -259,11 +259,49 @@ describe("STORY-050 document model", () => {
 });
 
 describe("STORY-050 no rule fetches", () => {
-  it("STORY-050 #11 · the document model and the tokenizer port import no network or fetch facility", async () => {
-    const { readFileSync } = await import("node:fs");
-    for (const file of ["document-model.ts", "tokenizer.ts"]) {
-      const src = readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
-      expect(src, file).not.toMatch(/guarded-fetch|\bfetch\s*\(|node:https?|node:net|node:dns|undici|\bXMLHttpRequest\b/u);
+  // The files that OWN a network call: the page stage, the sitemap reader and the renderer port. Everything else under src/lib/aux
+  // (the document model, the tokenizer, the snapshot loader, and any rule added under rules/) is checked BY DEFAULT: a new file is
+  // fetch-free unless it is named here, so adding a rule never opts it out.
+  const FETCH_OWNERS: readonly string[] = ["page-crawl.ts", "renderer.ts", "sitemap.ts"];
+  const NETWORK = /guarded-fetch|\bfetch\s*\(|node:https?|node:net|node:dns|undici|\bXMLHttpRequest\b/u;
+  // Prose is not a call: whole-line comments and block comments are dropped (a trailing `//` after code is kept, so code is never hidden).
+  const code = (src: string): string => src.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");
+
+  const sources = async (): Promise<Map<string, string>> => {
+    const { readdirSync, readFileSync } = await import("node:fs");
+    const { join, relative } = await import("node:path");
+    const root = new URL(".", import.meta.url).pathname;
+    const out = new Map<string, string>();
+    const visit = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) visit(full);
+        else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts") && !entry.name.endsWith(".spec.ts")) out.set(relative(root, full), readFileSync(full, "utf8"));
+      }
+    };
+    visit(root);
+    return out;
+  };
+
+  it("STORY-050 #11 · no file under src/lib/aux outside the named fetch owners imports or calls a network facility", async () => {
+    const files = await sources();
+    expect(files.has("document-model.ts") && files.has("tokenizer.ts") && files.has("document-snapshot.ts")).toBe(true);
+    for (const [file, src] of files) {
+      if (FETCH_OWNERS.includes(file)) continue;
+      expect(code(src), file).not.toMatch(NETWORK);
     }
+  });
+
+  it("STORY-050 #11 · the fetch-owner list is honest: every name exists and really owns a network call", async () => {
+    const files = await sources();
+    for (const owner of FETCH_OWNERS) {
+      expect(files.has(owner), owner).toBe(true);
+      expect(code(files.get(owner)!), owner).toMatch(NETWORK);
+    }
+  });
+
+  it("STORY-050 #11 · the scan reads a call hidden after a URL string and ignores prose", () => {
+    expect(code('const u = "http://x"; fetch(u);')).toMatch(NETWORK);
+    expect(code("// a rule cannot fetch (anything)\n/* fetch(x) */\nconst a = 1;")).not.toMatch(NETWORK);
   });
 });
