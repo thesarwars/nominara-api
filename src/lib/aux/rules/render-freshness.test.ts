@@ -153,3 +153,16 @@ describe("STORY-051 AUX-R-030 · dateModified absent", () => {
     expect(CLEAN_TEXT).toContain("Last updated");
   });
 });
+
+describe("STORY-051 AUX-R-030 · a dateModified nested under a property (round 2)", () => {
+  const { dateModified: _gone, ...noMeta } = makeDoc().meta;
+  const nested = [{ "@context": "https://schema.org", "@type": "WebPage", name: "Acme", mainEntity: { "@type": "Article", headline: "x", dateModified: "2026-10-01" } }];
+  const at = (jsonLd: unknown[]) => makeDoc({ meta: noMeta, raw: variant({ mainText: "Acme Widgets\nNo dates here.", structured: { jsonLd, microdata: [], rdfa: [], parseErrors: [] } }) });
+  it("STORY-051 AUX-R-030 · Article.dateModified under mainEntity satisfies it, as a nested Microdata one does", async () => {
+    expect(await findings(at(nested), "AUX-R-030")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-030 · a nested entity with a blank dateModified does not", async () => {
+    const blank = [{ ...nested[0], mainEntity: { "@type": "Article", dateModified: " " } }];
+    expect(await findings(at(blank), "AUX-R-030")).toHaveLength(1);
+  });
+});

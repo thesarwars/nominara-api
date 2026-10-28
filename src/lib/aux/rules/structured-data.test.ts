@@ -498,3 +498,45 @@ describe("STORY-051 AUX-R-013 · a free tier written as a word agrees with a dec
     expect(await findings(tiers("Acme Widgets\nGratis. Pro starts at $47 per month."), "AUX-R-013", cat)).toEqual([]);
   });
 });
+
+describe("STORY-051 AC1 · an entity nested under a property is an entity (round 2)", () => {
+  const webPage = (main: Record<string, unknown>, prop = "mainEntity") => ({ "@context": "https://schema.org", "@type": "WebPage", name: "Acme", [prop]: main });
+  const bareProduct = { "@type": "Product", name: "Acme Widget" };
+  it("STORY-051 AUX-R-010 · WebPage > mainEntity > Product, and ItemPage > mainEntity > Product, satisfy it", async () => {
+    expect(await findings(withLd([webPage(bareProduct)]), "AUX-R-010")).toEqual([]);
+    expect(await findings(withLd([{ ...webPage(bareProduct), "@type": "ItemPage" }]), "AUX-R-010")).toEqual([]);
+    expect(await findings(withLd([webPage(bareProduct, "about")]), "AUX-R-010")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-010 · a nested entity that is not a primary type still leaves the page without one", async () => {
+    expect(await findings(withLd([webPage({ "@type": "Person", name: "Ann" })]), "AUX-R-010")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-012 · a nested Product with no offers on a pricing page fires, located by property path", async () => {
+    const [f] = await findings(withLd([org, webPage(bareProduct)]), "AUX-R-012");
+    expect(f).toMatchObject({ severity: "high", measured_value: 1 });
+    expect(f!.evidence.locator).toBe("jsonld[1].mainEntity.offers");
+  });
+  it("STORY-051 AUX-R-012 · a nested Product with complete offers does not fire", async () => {
+    const priced = { ...bareProduct, offers: { "@type": "Offer", price: "47", priceCurrency: "USD" } };
+    expect(await findings(withLd([org, webPage(priced)]), "AUX-R-012")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-015 · a nested rating with no provenance fires", async () => {
+    const rated = { ...bareProduct, aggregateRating: { "@type": "AggregateRating", ratingValue: "4.8" } };
+    expect(await findings(withLd([org, webPage(rated)]), "AUX-R-015")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-017 · FAQPage nested under a WebPage satisfies the FAQ markup arm", async () => {
+    const heads = { headingTree: [{ level: 1, text: "Acme", children: [1, 2, 3, 4, 5].map((n) => ({ level: 2, text: `Question ${String(n)}?`, children: [] })) }] };
+    const bare = await findings(withLd([org, { "@context": "https://schema.org", "@type": "WebPage", name: "x" }], heads), "AUX-R-017");
+    expect(bare).toHaveLength(1);
+    expect(await findings(withLd([org, webPage({ "@type": "FAQPage" })], heads), "AUX-R-017")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-014 · a short featureList item does not cover a heading it is only a fragment of (word boundary)", async () => {
+    const heads = { headingTree: [{ level: 1, text: "Acme", children: ["Detailed reports", "Beta", "Gamma", "Delta"].map((t) => ({ level: 2, text: t, children: [] })) }] };
+    const [f] = await findings(withApp({ featureList: ["ai", "Beta"] }, heads), "AUX-R-014");
+    expect(f).toMatchObject({ severity: "high", measured_value: 0.25 });
+    expect(await findings(withApp({ featureList: ["Detailed reports for teams", "Beta"] }, heads), "AUX-R-014")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-012 · 'from' alone is not a pricing word ('$20M from investors')", async () => {
+    expect(await findings(withApp({ offers: undefined }, { mainText: "Acme Widgets\nWe raised $20M from investors." }), "AUX-R-012")).toEqual([]);
+    expect(await findings(withApp({ offers: undefined }, { mainText: "Acme Widgets\nPlans starting at $20 a seat." }), "AUX-R-012")).toHaveLength(1);
+  });
+});

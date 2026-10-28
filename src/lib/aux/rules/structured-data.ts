@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AuxDocument } from "../document-model.js";
-import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
+import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, jsonLdEntitiesDeep, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
 import { defineRule, type RuleHit } from "./types.js";
 
 // structured_data — AUX-R-008..018 (aux-and-geo-analysis.md section 2). They read `doc.structured` (the rendered copy's data when
@@ -9,6 +9,8 @@ import { defineRule, type RuleHit } from "./types.js";
 
 const strict = <T extends z.ZodRawShape>(shape: T) => z.object(shape).strict();
 const entities = (d: AuxDocument): Entity[] => jsonLdEntities(d.structured.jsonLd);
+/** Entities at any depth: for the rules that ask what the page declares or checks the thing it is about. */
+const deepEntities = (d: AuxDocument): Entity[] => jsonLdEntitiesDeep(d.structured.jsonLd);
 
 // --- AUX-R-008 ----------------------------------------------------------------------------------------------------------------
 
@@ -60,7 +62,7 @@ export const noPrimaryEntity = defineRule({
   autoFixable: true,
   thresholds: strict({ primary_types: z.array(z.string().min(1)).min(1) }),
   evaluate(doc, t) {
-    const types = [...entities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
+    const types = [...deepEntities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
     const found = types.filter((x) => t.primary_types.includes(x)).length;
     if (found >= 1) return [];
     return [{ severity: "high", measured: found, threshold: PRESENCE_THRESHOLD, reason: "no_primary_entity", snippet: types.length === 0 ? null : types.slice(0, 5).join(", "), locator: "structured" }];
@@ -181,7 +183,7 @@ export const offerDataAbsent = defineRule({
       amountMatches(body, t.currency_symbols, t.currency_codes).some((f) => nearWord(body, f, t.price_context_words, t.context_window_chars)) ||
       unitBesideDigit(body, t.price_units);
     if (!talksPricing) return [];
-    const bad = entitiesOfType(entities(doc), t.entity_types).filter((e) => {
+    const bad = entitiesOfType(deepEntities(doc), t.entity_types).filter((e) => {
       const offers = offersOf(e.node);
       return offers.length === 0 || offers.some((o) => !hasPrice(o));
     });
@@ -281,20 +283,23 @@ export const featureListThin = defineRule({
   }),
   evaluate(doc, t) {
     const skip = new Set(t.non_capability_headings.map(normaliseText));
+    // An item covers a heading when one holds the other as whole words: "ai" is not in "detailed reports".
+    const holds = (long: string, short: string): boolean => new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(short)}(?![\\p{L}\\p{N}])`, "u").test(long);
+    const covers = (i: string, h: string): boolean => i === h || holds(i, h) || holds(h, i);
     const capability = flattenHeadings(variantOf(doc).headingTree)
       .filter((h) => t.heading_levels.includes(h.level) && !skip.has(normaliseText(h.text)))
       .map((h) => normaliseText(h.text));
     let worst: RuleHit | null = null;
-    for (const e of entitiesOfType(entities(doc), t.entity_types)) {
+    for (const e of entitiesOfType(deepEntities(doc), t.entity_types)) {
       const items = asArray(e.node["featureList"]).flatMap((v) => (typeof v === "string" ? [normaliseText(v)] : [])).filter((s) => s !== "");
       let hit: RuleHit | null = null;
       if (items.length === 0) {
         hit = { severity: "high", measured: 0, threshold: t.min_coverage, reason: "feature_list_absent", snippet: text(e.node["name"]) ?? null, locator: `${e.locator}.featureList` };
       } else if (capability.length > 0) {
-        const covered = capability.filter((h) => items.some((i) => i === h || i.includes(h) || h.includes(i))).length;
+        const covered = capability.filter((h) => items.some((i) => covers(i, h))).length;
         const coverage = covered / capability.length;
         if (coverage < t.min_coverage) {
-          hit = { severity: "high", measured: coverage, threshold: t.min_coverage, reason: "feature_list_thin", snippet: capability.filter((h) => !items.some((i) => i === h || i.includes(h) || h.includes(i))).slice(0, 3).join("; "), locator: `${e.locator}.featureList` };
+          hit = { severity: "high", measured: coverage, threshold: t.min_coverage, reason: "feature_list_thin", snippet: capability.filter((h) => !items.some((i) => covers(i, h))).slice(0, 3).join("; "), locator: `${e.locator}.featureList` };
         }
       }
       if (hit !== null && (worst === null || (hit.measured ?? 0) < (worst.measured ?? 0))) worst = hit;
@@ -313,7 +318,7 @@ export const ratingWithoutProvenance = defineRule({
   autoFixable: true,
   thresholds: strict({ provenance_keys: z.array(z.string().min(1)).min(1) }),
   evaluate(doc, t) {
-    const bad = entities(doc).filter((e) => {
+    const bad = deepEntities(doc).filter((e) => {
       const rating = e.node["aggregateRating"];
       if (!isRecord(rating)) return false;
       // A count of 0 is a count that proves nothing; a source only has to be present.
@@ -373,7 +378,7 @@ export const faqMarkupAbsent = defineRule({
   evaluate(doc, t) {
     const questions = flattenHeadings(variantOf(doc).headingTree).filter((h) => t.heading_levels.includes(h.level) && h.text.trim().endsWith("?"));
     if (questions.length < t.min_headings) return [];
-    const declared = [...entities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
+    const declared = [...deepEntities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
     if (declared.some((x) => x === "FAQPage" || x === "QAPage")) return [];
     return [{ severity: "medium", measured: questions.length, threshold: t.min_headings, reason: "question_headings_without_markup", snippet: questions[0]!.text, locator: "headings" }];
   },

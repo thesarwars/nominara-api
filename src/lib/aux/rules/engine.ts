@@ -80,8 +80,8 @@ export async function evaluateDocument(
       observeValue("nominara_aux_rules_evaluated_count", rules.length);
       span.setAttribute("nominara.aux.rules", rules.length);
       span.setAttribute("nominara.aux.findings", findings.length);
-      // Counts only: no URL, no page text, no workspace name.
-      logger.debug({ event: "aux_rules_evaluated", rules: rules.length, findings: findings.length });
+      // Counts and the project ID only: no URL, no page text, no workspace name.
+      logger.debug({ event: "aux_rules_evaluated", project_id: ctx.projectId, rules: rules.length, findings: findings.length });
       return findings;
     } catch (e) {
       span.setStatus({ code: SpanStatusCode.ERROR });

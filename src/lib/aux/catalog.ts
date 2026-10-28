@@ -62,7 +62,10 @@ export function assertCatalogWeights(
   }
 }
 
-/** NFR-AUX-03: Σ W_cat = 1.000 ± 0.001. */
+/**
+ * NFR-AUX-03: Σ W_cat = 1.000 ± 0.001. W_cat lives in code (AUX_CATEGORY_WEIGHTS), not in the catalog, so this checks the code constants and
+ * a data change cannot trip it: the load-time guarantee against bad DATA covers the per-rule weights (assertCatalogWeights) only.
+ */
 export function assertCategoryWeights(weights: Readonly<Record<string, number>> = AUX_CATEGORY_WEIGHTS): void {
   const sum = Object.values(weights).reduce((total, w) => total + w, 0);
   if (Math.abs(sum - 1) > AUX_WEIGHT_TOLERANCE + 1e-9) {

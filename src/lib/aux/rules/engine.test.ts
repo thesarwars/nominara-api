@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { Logger } from "@nestjs/common";
 import { guidanceFor, NON_FIXABLE_RULES } from "../patches/guidance.js";
 import { loadAuxCatalog, type AuxCatalog } from "../catalog.js";
 import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateDocuments } from "./engine.js";
@@ -86,7 +87,7 @@ describe("STORY-051 · the rule engine", () => {
   });
 
   it("STORY-051 AC1, AC10 · rules built on an interim reading are recorded as PARTIAL with the document-model field they need", () => {
-    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-029"]);
+    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-029"]);
     const built = new Set(AUX_RULES.map((r) => r.code));
     for (const [code, why] of Object.entries(AUX_RULES_PARTIAL)) {
       expect(built.has(code), code).toBe(true);
@@ -161,5 +162,19 @@ describe("STORY-051 AC3 · a clipped snippet is well-formed text", () => {
     const exact = `${"x".repeat(198)}\u{1F600}`;
     const [f] = await evaluateDocument(makeDoc(), CATALOG, [fake("AUX-R-008", [{ locator: "l", snippet: exact }])], { projectId: PROJECT_ID });
     expect(f!.evidence.snippet).toBe(exact);
+  });
+});
+
+describe("STORY-051 · observability (round 2)", () => {
+  it("STORY-051 · the engine's log line carries the project ID and no URL, and the counts", async () => {
+    const spy = vi.spyOn(Logger.prototype, "debug").mockImplementation(() => undefined);
+    try {
+      await runAll(makeDoc());
+      const line = spy.mock.calls.map((c) => c[0] as Record<string, unknown>).find((l) => l["event"] === "aux_rules_evaluated");
+      expect(line).toMatchObject({ project_id: PROJECT_ID });
+      expect(JSON.stringify(line)).not.toContain(makeDoc().url);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
