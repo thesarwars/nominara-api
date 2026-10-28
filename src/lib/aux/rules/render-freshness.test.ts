@@ -53,6 +53,30 @@ describe("STORY-051 AUX-R-027 · structured data injected client-side only", () 
   });
 });
 
+describe("STORY-051 AUX-R-027 · a block the HTML serves and scripts then change is not a block added by scripts", () => {
+  const ldOf = (blocks: unknown[]) => variant({ structured: { jsonLd: blocks, microdata: [], rdfa: [], parseErrors: [] } });
+  const prod = (price: string, extra: Record<string, unknown> = {}) => ({ "@context": "https://schema.org", "@type": "Product", name: "Acme", offers: { "@type": "Offer", price }, ...extra });
+  it("STORY-051 AUX-R-027 · the same @id with a price filled in after hydration does not fire", async () => {
+    const doc = makeDoc({ raw: ldOf([prod("0", { "@id": "https://example.com/#p" })]), rendered: ldOf([prod("47", { "@id": "https://example.com/#p" })]) });
+    expect(await findings(doc, "AUX-R-027")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-027 · with no @id, the same @type and name matches", async () => {
+    expect(await findings(makeDoc({ raw: ldOf([prod("0")]), rendered: ldOf([prod("47")]) }), "AUX-R-027")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-027 · a block with a different identity is still an injection", async () => {
+    const doc = makeDoc({ raw: ldOf([prod("0")]), rendered: ldOf([prod("0"), { ...prod("47"), name: "Other" }]) });
+    const [f] = await findings(doc, "AUX-R-027");
+    expect(f).toMatchObject({ measured_value: 1, evidence: { locator: "rendered.jsonld[1]" } });
+  });
+  it("STORY-051 AUX-R-027 · a block with no identity at all that differs is still an injection", async () => {
+    expect(await findings(makeDoc({ raw: ldOf([{ "@context": "https://schema.org" }]), rendered: ldOf([{ "@context": "https://schema.org", extra: 1 }]) }), "AUX-R-027")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-027 · an @graph wrapper whose nodes keep their identities and change a value does not fire", async () => {
+    const g = (price: string) => ({ "@context": "https://schema.org", "@graph": [{ "@type": "Organization", "@id": "https://example.com/#o", name: "Acme" }, prod(price, { "@id": "https://example.com/#p" })] });
+    expect(await findings(makeDoc({ raw: ldOf([g("0")]), rendered: ldOf([g("47")]) }), "AUX-R-027")).toEqual([]);
+  });
+});
+
 describe("STORY-051 AUX-R-029 · slow first byte for bots", () => {
   const t = (ttfbMs: number | null, loadMs: number | null, bytes: number) => makeDoc({ timing: { ttfbMs, loadMs, bytes } });
   it("STORY-051 AUX-R-029 · 1,500 ms does not fire; 1,501 fires medium", async () => {

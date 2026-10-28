@@ -156,7 +156,7 @@ describe("STORY-051 AUX-R-012 · offer data absent", () => {
     expect(await findings(withApp({ offers: undefined }, { mainText: "Acme Widgets\nA product page with no figures." }), "AUX-R-012")).toEqual([]);
   });
   it("STORY-051 AUX-R-012 · pricing is recognised by symbol+digit, digit+code, and unit phrases", async () => {
-    for (const t of ["Plans from €29", "Only 29 USD", "Billed per user", "Pay 5/mo"]) {
+    for (const t of ["Plans from €29", "Price: 29 USD", "Billed per user", "Pay 5/mo"]) {
       expect(await findings(withApp({ offers: undefined }, { mainText: t }), "AUX-R-012"), t).toHaveLength(1);
     }
   });
@@ -341,7 +341,7 @@ describe("STORY-051 AUX-R-017 · FAQPage absent where warranted", () => {
 });
 
 describe("STORY-051 AUX-R-018 · duplicate conflicting entities", () => {
-  const prod = (name: string, extra: Record<string, unknown> = {}) => ({ "@context": "https://schema.org", "@type": "Product", name, ...extra });
+  const prod = (name: string, extra: Record<string, unknown> = {}) => ({ "@context": "https://schema.org", "@type": "SoftwareApplication", name, ...extra });
   it("STORY-051 AUX-R-018 · same type, same name and url in two blocks: no conflict", async () => {
     expect(await findings(withLd([prod("A"), prod("A")]), "AUX-R-018")).toEqual([]);
   });
@@ -372,5 +372,104 @@ describe("STORY-051 AUX-R-018 · duplicate conflicting entities", () => {
   });
   it("STORY-051 AUX-R-018 · two entities inside ONE block are not two JSON-LD blocks", async () => {
     expect(await findings(withLd([{ "@context": "https://schema.org", "@graph": [prod("A"), prod("B")] }]), "AUX-R-018")).toEqual([]);
+  });
+});
+
+describe("STORY-051 AUX-R-018 · distinct entities are not duplicates (round 3)", () => {
+  const typed = (type: string, name: string, extra: Record<string, unknown> = {}) => ({ "@context": "https://schema.org", "@type": type, name, ...extra });
+  it("STORY-051 AUX-R-018 · an author and a reviewer (two Person blocks) are two people, not one described twice", async () => {
+    expect(await findings(withLd([typed("Person", "Jane"), typed("Person", "Bob")]), "AUX-R-018")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-018 · per-card Product blocks and ImageObjects on a listing page do not fire", async () => {
+    expect(await findings(withLd([typed("Product", "A"), typed("Product", "B"), typed("ImageObject", "x"), typed("ImageObject", "y")]), "AUX-R-018")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-018 · two Organization blocks with different @id values are two organizations", async () => {
+    expect(await findings(withLd([typed("Organization", "Acme", { "@id": "https://a.example/#o" }), typed("Organization", "Acme Labs", { "@id": "https://b.example/#o" })]), "AUX-R-018")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-018 · two Organization blocks that give no @id, or the same @id, and differ still fire", async () => {
+    expect(await findings(withLd([typed("Organization", "Acme"), typed("Organization", "Acme Labs")]), "AUX-R-018")).toHaveLength(1);
+    expect(await findings(withLd([typed("Organization", "Acme", { "@id": "https://a.example/#o" }), typed("Organization", "Acme Labs", { "@id": "https://a.example/#o" })]), "AUX-R-018")).toHaveLength(1);
+    expect(await findings(withLd([typed("Organization", "Acme", { "@id": "https://a.example/#o" }), typed("Organization", "Acme Labs")]), "AUX-R-018")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-018 · the singleton types come from the catalog row", async () => {
+    const { withThresholds } = await import("../../../../test/support/aux-rules.js");
+    const cat = withThresholds("AUX-R-018", { singleton_types: ["Person"] });
+    expect(await findings(withLd([typed("Person", "Jane"), typed("Person", "Bob")]), "AUX-R-018", cat)).toHaveLength(1);
+  });
+});
+
+describe("STORY-051 AUX-R-010 / 011 / 012 / 013 / 014 · schema.org subtypes (round 3)", () => {
+  const typed = (type: string, extra: Record<string, unknown> = {}) => ({ "@context": "https://schema.org", "@type": type, name: "Acme", ...extra });
+  it("STORY-051 AUX-R-010 · a BlogPosting, NewsArticle, TechArticle, LocalBusiness, Corporation or WebApplication IS a primary entity", async () => {
+    for (const t of ["BlogPosting", "NewsArticle", "TechArticle", "LocalBusiness", "Corporation", "WebApplication"]) {
+      expect(await findings(withLd([typed(t)]), "AUX-R-010"), t).toEqual([]);
+    }
+  });
+  it("STORY-051 AUX-R-010 · an unrelated type still fires", async () => {
+    expect(await findings(withLd([typed("Person")]), "AUX-R-010")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-011 · a Corporation or LocalBusiness missing two fields fires; one missing field does not", async () => {
+    expect(await findings(withLd([typed("Corporation", { url: "https://acme.com", logo: "l" })]), "AUX-R-011")).toHaveLength(1);
+    expect(await findings(withLd([typed("LocalBusiness", { url: "https://acme.com", logo: "l" })]), "AUX-R-011")).toHaveLength(1);
+    expect(await findings(withLd([typed("Corporation", { url: "https://acme.com", logo: "l", sameAs: ["https://x.example"] })]), "AUX-R-011")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-012 · a WebApplication with no offers on a page that talks pricing fires", async () => {
+    expect(await findings(withLd([typed("WebApplication")]), "AUX-R-012")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-014 · a WebApplication with no featureList fires", async () => {
+    expect(await findings(withLd([typed("WebApplication")]), "AUX-R-014")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-013 · a WebApplication whose name is not on the page fires", async () => {
+    const [f] = await findings(withLd([typed("WebApplication", { name: "Zed Gadget" })]), "AUX-R-013");
+    expect(f!.evidence.reason).toBe("name");
+  });
+});
+
+describe("STORY-051 AUX-R-012 · only an amount beside a pricing word is a pricing token (round 3)", () => {
+  const noOffers = (mainText: string) => withApp({ offers: undefined }, { mainText });
+  it("STORY-051 AUX-R-012 · '$2B processed' and 'Save $500' on a page with no offers do not fire", async () => {
+    expect(await findings(noOffers("Acme\nWe have processed $2B in payments."), "AUX-R-012")).toEqual([]);
+    expect(await findings(noOffers("Acme\nSave $500 on your first order of hardware."), "AUX-R-012")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-012 · an amount beside a pricing word still fires", async () => {
+    expect(await findings(noOffers("Acme\nPlans: price $29 for one seat."), "AUX-R-012")).toHaveLength(1);
+    expect(await findings(noOffers("Acme\nStarts at $29."), "AUX-R-012")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-012 · the context words come from the catalog row", async () => {
+    const { withThresholds } = await import("../../../../test/support/aux-rules.js");
+    const cat = withThresholds("AUX-R-012", { price_context_words: ["processed"] });
+    expect(await findings(noOffers("Acme\nWe have processed $2B in payments."), "AUX-R-012", cat)).toHaveLength(1);
+  });
+});
+
+describe("STORY-051 AUX-R-013 · a free tier written as a word agrees with a declared price of 0 (round 3)", () => {
+  const offer = (price: string) => ({ "@type": "Offer", price, priceCurrency: "USD" });
+  const tiers = (mainText: string, prices = ["0", "47"]) => withApp({ offers: prices.map(offer) }, { mainText });
+  it("STORY-051 AUX-R-013 · Offer 0 beside Offer 47 on a page saying 'Free forever ... Pro starts at $47 per month' does not fire", async () => {
+    expect(await findings(tiers("Acme Widgets\nFree forever. Pro starts at $47 per month."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · 'Free' as a tier name agrees too", async () => {
+    expect(await findings(tiers("Acme Widgets\nFree\nPro starts at $47 per month."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · Offer 0 with NO free word on a page that prices everything does fire", async () => {
+    const [f] = await findings(tiers("Acme Widgets\nEvery plan starts at $47 per month."), "AUX-R-013");
+    expect(f).toMatchObject({ severity: "critical" });
+    expect(f!.evidence).toMatchObject({ reason: "price" });
+    expect(f!.evidence.snippet).toContain("schema price 0");
+  });
+  it("STORY-051 AUX-R-013 · Offer 0 beside '$0/month' does not fire", async () => {
+    expect(await findings(tiers("Acme Widgets\nStarter $0/month. Pro starts at $47 per month."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a free word does not excuse a different non-zero price", async () => {
+    expect(await findings(tiers("Acme Widgets\nFree trial. Pro starts at $57 per month.", ["47"]), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-013 · 'free' inside another word (carefree) is not a free word", async () => {
+    expect(await findings(tiers("Acme Widgets\nA carefree plan. Every plan starts at $47 per month."), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-051 AUX-R-013 · the free words come from the catalog row", async () => {
+    const { withThresholds } = await import("../../../../test/support/aux-rules.js");
+    const cat = withThresholds("AUX-R-013", { free_words: ["gratis"] });
+    expect(await findings(tiers("Acme Widgets\nFree forever. Pro starts at $47 per month."), "AUX-R-013", cat)).toHaveLength(1);
+    expect(await findings(tiers("Acme Widgets\nGratis. Pro starts at $47 per month."), "AUX-R-013", cat)).toEqual([]);
   });
 });

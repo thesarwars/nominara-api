@@ -34,6 +34,9 @@ export class AuxRuleEvaluationError extends Error {
   }
 }
 
+// Code-unit order, which is code-point order for the ASCII codes and locators used here. localeCompare would depend on the host's ICU locale.
+const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
 export interface EvaluateContext {
   readonly projectId: string;
 }
@@ -74,7 +77,7 @@ export async function evaluateDocument(
   return tracer.startActiveSpan("aux.rules.evaluate", async (span) => {
     try {
       const batches = await Promise.all(rules.map((r) => runOne(r, document, catalog, ctx)));
-      const findings = batches.flat().sort((a, b) => (a.rule_code === b.rule_code ? a.evidence.locator.localeCompare(b.evidence.locator) : a.rule_code.localeCompare(b.rule_code)));
+      const findings = batches.flat().sort((a, b) => byCodePoint(a.rule_code, b.rule_code) || byCodePoint(a.evidence.locator, b.evidence.locator));
       for (const f of findings) incrementCounter("nominara_aux_rule_findings_total", { rule_code: f.rule_code, severity: f.severity });
       observeValue("nominara_aux_rules_evaluated_count", rules.length);
       span.setAttribute("nominara.aux.rules", rules.length);

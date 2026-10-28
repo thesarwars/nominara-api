@@ -3,7 +3,14 @@ import { RULE_EVIDENCE_SNIPPET_MAX } from "../../../../contracts/aux/index.js";
 
 // Shared reading of the document model. Nothing here fetches or measures a clock.
 
-export const clip = (s: string): string => (s.length > RULE_EVIDENCE_SNIPPET_MAX ? s.slice(0, RULE_EVIDENCE_SNIPPET_MAX) : s);
+/** At most RULE_EVIDENCE_SNIPPET_MAX UTF-16 units, never ending on the first half of a surrogate pair (jsonb rejects an unpaired \ud83d). */
+export function clip(s: string): string {
+  if (s.length <= RULE_EVIDENCE_SNIPPET_MAX) return s;
+  let end = RULE_EVIDENCE_SNIPPET_MAX;
+  const last = s.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return s.slice(0, end);
+}
 
 /** The rendered copy when there is one, else the plain copy (the document model's own choice for blocks and structured data). */
 export const variantOf = (d: AuxDocument): AuxVariant => d.rendered ?? d.raw;

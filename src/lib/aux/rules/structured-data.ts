@@ -73,10 +73,10 @@ export const organizationIncomplete = defineRule({
   code: "AUX-R-011",
   category: "structured_data",
   autoFixable: true,
-  thresholds: strict({ fields: z.array(z.string().min(1)).min(1), min_missing: z.number().int().positive() }),
+  thresholds: strict({ entity_types: z.array(z.string().min(1)).min(1), fields: z.array(z.string().min(1)).min(1), min_missing: z.number().int().positive() }),
   evaluate(doc, t) {
     let worst: { missing: string[]; locator: string } | null = null;
-    for (const e of entitiesOfType(entities(doc), ["Organization"])) {
+    for (const e of entitiesOfType(entities(doc), t.entity_types)) {
       const missing = t.fields.filter((f) => !present(e.node[f]));
       if (missing.length >= t.min_missing && (worst === null || missing.length > worst.missing.length)) worst = { missing, locator: e.locator };
     }
@@ -140,13 +140,16 @@ function amountMatches(body: string, symbols: string, codes: readonly string[]):
   if (codes.length > 0) for (const m of body.matchAll(new RegExp(`(${AMOUNT})\\s?(?:${codes.map(escapeRegExp).join("|")})\\b`, "giu"))) push(m);
   return out;
 }
-const amountsIn = (body: string, symbols: string, codes: readonly string[]): number[] => amountMatches(body, symbols, codes).map((f) => f.value);
 
 /** Whether any of `words` appears, as a whole word or phrase, within `window` characters before or after the match ("starts" is not "star"). */
 function nearWord(body: string, f: Found, words: readonly string[], window: number): boolean {
   const around = body.slice(Math.max(0, f.at - window), f.end + window);
   return words.some((w) => new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(w)}(?![\\p{L}\\p{N}])`, "iu").test(around));
 }
+
+/** A free word as a whole word or phrase; "$0" is not "$0.99" and "free" is not "carefree". `text` is already normalised. */
+const containsFreeWord = (text: string, word: string): boolean =>
+  new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(normaliseText(word))}(?![\\p{L}\\p{N}]|[.,]\\d)`, "u").test(text);
 
 const offersOf = (node: Record<string, unknown>): unknown[] => asArray(node["offers"]);
 // An AggregateOffer states its price as a range (lowPrice / highPrice); its lowPrice is the price a visitor starts from.
@@ -164,12 +167,16 @@ export const offerDataAbsent = defineRule({
     currency_symbols: z.string().min(1),
     currency_codes: z.array(z.string().min(1)),
     price_units: z.array(z.string().min(1)),
+    price_context_words: z.array(z.string().min(1)).min(1),
+    context_window_chars: z.number().int().positive(),
   }),
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
     const lower = body.toLowerCase();
+    // Only an amount beside a pricing word is a pricing token ("$2B processed", "Save $500" are not).
     const talksPricing =
-      amountsIn(body, t.currency_symbols, t.currency_codes).length > 0 || t.price_units.some((u) => lower.includes(u.toLowerCase()));
+      amountMatches(body, t.currency_symbols, t.currency_codes).some((f) => nearWord(body, f, t.price_context_words, t.context_window_chars)) ||
+      t.price_units.some((u) => lower.includes(u.toLowerCase()));
     if (!talksPricing) return [];
     const bad = entitiesOfType(entities(doc), t.entity_types).filter((e) => {
       const offers = offersOf(e.node);
@@ -195,6 +202,7 @@ export const schemaTextContradiction = defineRule({
     rating_scales: z.array(z.number().int().positive()).min(1),
     rating_context_words: z.array(z.string().min(1)).min(1),
     context_window_chars: z.number().int().positive(),
+    free_words: z.array(z.string().min(1)).min(1),
   }),
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
@@ -210,6 +218,8 @@ export const schemaTextContradiction = defineRule({
       asArray(e.node["offers"]).forEach((o, i) => {
         if (!isRecord(o) || !present(o["price"])) return;
         const declared = toNumber(String(o["price"]));
+        // A free tier is usually written as a word ("Free forever"), not as an amount: a declared 0 agrees with that.
+        if (declared === 0 && t.free_words.some((w) => containsFreeWord(flat, w))) return;
         if (Number.isFinite(declared) && prices.length > 0 && !prices.some((rs) => rs.some((p) => Math.abs(p - declared) < t.price_tolerance))) {
           hits.push({ reason: "price", snippet: `schema price ${String(o["price"])}; page prices ${[...new Set(prices.map((rs) => rs[0]!))].slice(0, 5).join(", ")}`, locator: `${e.locator}.offers${Array.isArray(e.node["offers"]) ? `[${String(i)}]` : ""}.price` });
         }
@@ -360,7 +370,8 @@ export const faqMarkupAbsent = defineRule({
 
 // --- AUX-R-018 ----------------------------------------------------------------------------------------------------------------
 
-// Two descriptions disagree when both state a field and the values differ. A description that leaves a field out has not
+// Only a type a page describes ONCE can be described twice (catalog `singleton_types`). Two entities that both carry an @id and differ
+// in it are two entities, not one described two ways. Two descriptions disagree when both state a field and the values differ. A description that leaves a field out has not
 // contradicted the one that states it, and `https://acme.com/` is `https://acme.com`.
 const nameKey = (n: string | undefined): string | undefined => (n === undefined ? undefined : normaliseText(n));
 function urlKey(u: string | undefined): string | undefined {
@@ -378,23 +389,24 @@ export const duplicateConflictingEntities = defineRule({
   code: "AUX-R-018",
   category: "structured_data",
   autoFixable: true,
-  thresholds: strict({ min_conflicts: z.number().int().positive() }),
+  thresholds: strict({ min_conflicts: z.number().int().positive(), singleton_types: z.array(z.string().min(1)).min(1) }),
   evaluate(doc, t) {
-    const byType = new Map<string, { block: number; name: string | undefined; url: string | undefined; label: string; locator: string }[]>();
+    const byType = new Map<string, { block: number; id: string | undefined; name: string | undefined; url: string | undefined; label: string; locator: string }[]>();
     for (const e of entities(doc)) {
       const name = text(e.node["name"]);
       const url = text(e.node["url"]);
       if (name === undefined && url === undefined) continue;
-      for (const type of typesOf(e.node)) {
+      const id = text(e.node["@id"]);
+      for (const type of typesOf(e.node).filter((x) => t.singleton_types.includes(x))) {
         const list = byType.get(type) ?? [];
-        list.push({ block: e.block, name: nameKey(name), url: urlKey(url), label: name ?? url ?? "", locator: e.locator });
+        list.push({ block: e.block, id, name: nameKey(name), url: urlKey(url), label: name ?? url ?? "", locator: e.locator });
         byType.set(type, list);
       }
     }
     const conflicts: { type: string; a: string; b: string; locator: string }[] = [];
     for (const [type, list] of [...byType.entries()].sort(([x], [y]) => x.localeCompare(y))) {
       for (const x of list) {
-        const y = list.find((o) => o.block !== x.block && (differs(o.name, x.name) || differs(o.url, x.url)));
+        const y = list.find((o) => o.block !== x.block && !differs(o.id, x.id) && (differs(o.name, x.name) || differs(o.url, x.url)));
         if (y !== undefined) {
           conflicts.push({ type, a: x.label, b: y.label, locator: y.locator });
           break;

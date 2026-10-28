@@ -5,6 +5,7 @@ import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateD
 import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "./index.js";
 import { CATALOG, CATALOG_ROWS, PROJECT_ID, findings, runAll } from "../../../../test/support/aux-rules.js";
 import { block, makeDoc, variant } from "../../../../test/support/aux-document.js";
+import type { AuxRule } from "./types.js";
 
 const broken = () => makeDoc({ raw: variant({ tokenCount: 30_000, mainTokenCount: 100 }), blocks: [block({ tokens: 4000 })], timing: { ttfbMs: 5000, loadMs: 9000, bytes: 1 } });
 
@@ -123,5 +124,35 @@ describe("STORY-051 · the rule engine", () => {
       expect(r.rationale, r.code).toMatch(/\b(AI|engines?|crawlers?|citations?|cite[sd]?|chatbots?)\b/iu);
       expect(r.rationale, r.code).toMatch(/\b(cannot|can not|never|skip|skipped|ignore|ignored|miss|missing|lose|loses|guess|guesses|trust|credit|not|without|favour|favours|exclud\w*|read|quote|cited?|passed)\b/iu);
     }
+  });
+});
+
+// Round 3 — the order and the evidence are properties of the bytes, not of the host.
+const fake = (code: string, hits: { locator: string; snippet?: string }[]): AuxRule => ({
+  code,
+  category: "structured_data",
+  autoFixable: true,
+  run: () => hits.map((h) => ({ severity: "medium" as const, measured: 1, threshold: 1, reason: "fake", snippet: h.snippet ?? null, locator: h.locator })),
+});
+
+describe("STORY-051 AC2 · order is by code point, not by the host's locale", () => {
+  it("STORY-051 AC2 · locators sort by code point (uppercase before lowercase), whatever the ICU locale says", async () => {
+    const fs = await evaluateDocument(makeDoc(), CATALOG, [fake("AUX-R-008", [{ locator: "a" }, { locator: "B" }, { locator: "_" }])], { projectId: PROJECT_ID });
+    expect(fs.map((f) => f.evidence.locator)).toEqual(["B", "_", "a"]);
+  });
+});
+
+describe("STORY-051 AC3 · a clipped snippet is well-formed text", () => {
+  it("STORY-051 AC3 · a snippet cut inside a surrogate pair does not leave an unpaired surrogate (jsonb would reject it)", async () => {
+    const snippet = `${"x".repeat(199)}\u{1F600}tail`;
+    const [f] = await evaluateDocument(makeDoc(), CATALOG, [fake("AUX-R-008", [{ locator: "l", snippet }])], { projectId: PROJECT_ID });
+    expect(f!.evidence.snippet!).not.toMatch(/\p{Surrogate}/u);
+    expect(f!.evidence.snippet!.length).toBeLessThanOrEqual(200);
+    expect(f!.evidence.snippet!.startsWith("x".repeat(199))).toBe(true);
+  });
+  it("STORY-051 AC3 · a snippet of exactly 200 units, or an emoji that ends exactly at 200, is kept whole", async () => {
+    const exact = `${"x".repeat(198)}\u{1F600}`;
+    const [f] = await evaluateDocument(makeDoc(), CATALOG, [fake("AUX-R-008", [{ locator: "l", snippet: exact }])], { projectId: PROJECT_ID });
+    expect(f!.evidence.snippet).toBe(exact);
   });
 });

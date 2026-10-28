@@ -12,6 +12,9 @@
 -- reported as not evaluated rather than silently passing.
 --
 -- AUX-R-006 is re-stated with the directive list it matches (it carried '{}' in 0070), under the new rule_version.
+-- AUX-R-029 max_bytes is 3 MiB (3 * 1024 * 1024 = 3145728): the reference's "3 MB" is read as binary megabytes, as a browser or `ls -h`
+-- reports a page size. DECISION TO CONFIRM in the reference; a page of 3,000,000 to 3,145,728 bytes passes under this reading.
+-- Subtype membership (a BlogPosting is an Article, a LocalBusiness an Organization) is DATA: the type lists in AUX-R-010..014 and -018.
 -- aux_rule_catalog is GLOBAL (no workspace_id): no RLS. ON CONFLICT takes over any row the demo seed inserted first.
 INSERT INTO aux_rule_catalog
   (code, category, title, description, rationale, severity_default, weight, auto_fixable, thresholds, task_threshold, rule_version)
@@ -31,23 +34,23 @@ VALUES
   ('AUX-R-010', 'structured_data', 'No structured description of what this page is about',
    'The page declares none of Organization, Product, SoftwareApplication, Service or Article.',
    'Without a declared entity, AI engines have to guess what the page is about and whose it is, and they guess less often in your favour.',
-   'high', 0.12, true, '{"primary_types":["Organization","Product","SoftwareApplication","Service","Article"]}'::jsonb, 'high', '2026.10.2'),
+   'high', 0.12, true, '{"primary_types":["Organization","Corporation","LocalBusiness","NGO","EducationalOrganization","GovernmentOrganization","NewsMediaOrganization","OnlineBusiness","OnlineStore","Store","Restaurant","ProfessionalService","FinancialService","LegalService","MedicalBusiness","SportsOrganization","Product","ProductGroup","ProductModel","SoftwareApplication","WebApplication","MobileApplication","VideoGame","Service","FinancialProduct","Article","BlogPosting","NewsArticle","TechArticle","Report","ScholarlyArticle","SocialMediaPosting","LiveBlogPosting"]}'::jsonb, 'high', '2026.10.3'),
   ('AUX-R-011', 'structured_data', 'Your organization description is thin',
    'The Organization markup is missing two or more of name, url, logo, sameAs and description.',
    'AI engines build their picture of your company from these fields, so a missing one is a fact they state without you or leave out.',
-   'medium', 0.07, true, '{"fields":["name","url","logo","sameAs","description"],"min_missing":2}'::jsonb, 'medium', '2026.10.2'),
+   'medium', 0.07, true, '{"entity_types":["Organization","Corporation","LocalBusiness","NGO","EducationalOrganization","GovernmentOrganization","NewsMediaOrganization","OnlineBusiness","OnlineStore","Store","Restaurant","ProfessionalService","FinancialService","LegalService","MedicalBusiness","SportsOrganization"],"fields":["name","url","logo","sameAs","description"],"min_missing":2}'::jsonb, 'medium', '2026.10.3'),
   ('AUX-R-012', 'structured_data', 'Engines can name your product but cannot show its price',
    'The product or service markup has no offers, or the offers lack price and priceCurrency, on a page that talks about pricing.',
    'AI engines asked what you cost cannot quote a price they cannot read from your data, so they quote a competitor or a guess.',
-   'high', 0.09, true, '{"entity_types":["Product","SoftwareApplication","Service"],"currency_symbols":"$€£¥₹","currency_codes":["USD","EUR","GBP","JPY","INR","CAD","AUD"],"price_units":["per month","per year","per user","per seat","/mo","/month","/year"]}'::jsonb, 'high', '2026.10.2'),
+   'high', 0.09, true, '{"entity_types":["Product","SoftwareApplication","WebApplication","MobileApplication","VideoGame","Service","ProfessionalService","FinancialProduct"],"currency_symbols":"$€£¥₹","currency_codes":["USD","EUR","GBP","JPY","INR","CAD","AUD"],"price_context_words":["price","prices","pricing","plan","plans","cost","costs","per month","per year","per user","per seat","/mo","/month","/year","monthly","annually","starts at","starting at","from"],"context_window_chars":40,"price_units":["per month","per year","per user","per seat","/mo","/month","/year"]}'::jsonb, 'high', '2026.10.3'),
   ('AUX-R-013', 'structured_data', 'Your structured data contradicts your page',
    'The price, name or rating in the structured data disagrees with the text visitors see.',
    'AI engines that find two different answers lose trust in both, and may stop citing the page or cite the wrong figure.',
-   'critical', 0.11, false, '{"name_entity_types":["Product","SoftwareApplication","Service"],"currency_symbols":"$€£¥₹","currency_codes":["USD","EUR","GBP","JPY","INR","CAD","AUD"],"min_disagreements":1,"price_tolerance":0.005,"rating_tolerance":0.005,"price_context_words":["price","pricing","per month","per year","per user","per seat","/mo","/month","/year","monthly","annually","starts at","starting at"],"rating_scales":[5,10],"rating_context_words":["rated","rating","ratings","stars","star","review","reviews"],"context_window_chars":40}'::jsonb, 'critical', '2026.10.2'),
+   'critical', 0.11, false, '{"name_entity_types":["Product","SoftwareApplication","WebApplication","MobileApplication","VideoGame","Service","ProfessionalService","FinancialProduct"],"currency_symbols":"$€£¥₹","currency_codes":["USD","EUR","GBP","JPY","INR","CAD","AUD"],"min_disagreements":1,"price_tolerance":0.005,"rating_tolerance":0.005,"price_context_words":["price","pricing","per month","per year","per user","per seat","/mo","/month","/year","monthly","annually","starts at","starting at"],"rating_scales":[5,10],"rating_context_words":["rated","rating","ratings","stars","star","review","reviews"],"context_window_chars":40,"free_words":["free","free forever","$0"]}'::jsonb, 'critical', '2026.10.3'),
   ('AUX-R-014', 'structured_data', 'Your feature list is missing or covers too little',
    'A software or product page has no featureList, or the featureList covers fewer than half of the page capability headings.',
    'AI engines answering what your product can do read the feature list, so a capability missing from it is one they do not credit you with.',
-   'high', 0.09, true, '{"entity_types":["SoftwareApplication","Product"],"min_coverage":0.5,"heading_levels":[2,3],"non_capability_headings":["pricing","faq","frequently asked questions","contact","about","reviews","testimonials","blog","careers"]}'::jsonb, 'high', '2026.10.2'),
+   'high', 0.09, true, '{"entity_types":["Product","SoftwareApplication","WebApplication","MobileApplication","VideoGame"],"min_coverage":0.5,"heading_levels":[2,3],"non_capability_headings":["pricing","faq","frequently asked questions","contact","about","reviews","testimonials","blog","careers"]}'::jsonb, 'high', '2026.10.3'),
   ('AUX-R-015', 'structured_data', 'A star rating with nothing behind it',
    'The structured data asserts a rating with no review count and no source.',
    'AI engines discount a rating they cannot trace to reviews, and an unbacked one can make the rest of your data look unreliable.',
@@ -63,7 +66,7 @@ VALUES
   ('AUX-R-018', 'structured_data', 'Your structured data describes you two different ways',
    'Two JSON-LD blocks declare the same type with different names or URLs.',
    'AI engines that see two conflicting descriptions of one thing may merge them wrongly or trust neither.',
-   'medium', 0.08, true, '{"min_conflicts":1}'::jsonb, 'medium', '2026.10.2'),
+   'medium', 0.08, true, '{"min_conflicts":1,"singleton_types":["Organization","Corporation","LocalBusiness","WebSite","SoftwareApplication","WebApplication","MobileApplication","Service","Article","BlogPosting","NewsArticle","TechArticle"]}'::jsonb, 'medium', '2026.10.3'),
   ('AUX-R-019', 'context_fitness', 'The page is too long for an engine to read whole',
    'The rendered page is more than 12,000 tokens (critical above 25,000).',
    'AI engines read a limited amount of a page, so on a very long one the part they cut may be the part you wanted cited.',
