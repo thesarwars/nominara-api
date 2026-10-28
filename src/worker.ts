@@ -18,7 +18,7 @@ import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
 import { poolTenantWrite, runSuppressionFanout } from "./lib/email/suppression-fanout.js";
 import { ReportSweepRuntime } from "./lib/reports/report-sweep.js";
-import { runTopicClusterSweep } from "./lib/topics/sweep.js";
+import { runTopicClusterSweepIsolated } from "./lib/topics/sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
 import { DegradationRuntime } from "./lib/engines/degradation-runtime.js";
@@ -548,18 +548,17 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       // group). Independent of the fan-out: each runs even if the other fails, and the first failure is the one the runtime logs.
       after: async (client) => {
         // Sequential on purpose: one pg client, and neither step may interleave its statements with the other's.
-        const failures: unknown[] = [];
+        // The topic sweep reports its own failure (counter + log) and never throws, so it is not counted as a report-sweep failure.
+        let fanoutFailure: unknown;
+        let fanoutFailed = false;
         try {
           await runSuppressionFanout(client, poolTenantWrite(pool), env.OTP_EMAIL_HASH_PEPPER);
         } catch (error) {
-          failures.push(error);
+          fanoutFailed = true;
+          fanoutFailure = error;
         }
-        try {
-          await runTopicClusterSweep(client, (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options), new Date());
-        } catch (error) {
-          failures.push(error);
-        }
-        if (failures.length > 0) throw failures[0];
+        await runTopicClusterSweepIsolated(client, (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options), new Date());
+        if (fanoutFailed) throw fanoutFailure;
       },
     });
     reportSweep.start();

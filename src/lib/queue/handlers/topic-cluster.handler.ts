@@ -132,6 +132,7 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
           let matched = prepared.matched;
           let labels: ReadonlyMap<number, ChosenLabel> = fetched.labels;
           let clusterable = snapshot.clusterable;
+          let droppedByCap = snapshot.droppedByCap;
           if ((await clusterStateHash(tx, payload.projectId)) !== snapshot.clusterStateHash) {
             const again = await snapshotClusters(tx, payload.projectId);
             if (again.promptSetHash !== snapshot.promptSetHash) {
@@ -142,6 +143,7 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
             logger.log({ event: "topic.cluster.replanned", workspace_id: payload.workspaceId, project_id: payload.projectId });
             plannedGroups = again.groups;
             clusterable = again.clusterable;
+            droppedByCap = again.droppedByCap;
             matched = matchGroupsToClusters(
               again.groups.map((group) => ({ index: group.index, memberCount: group.memberIds.length, overlaps: group.overlaps })),
               again.olds,
@@ -180,6 +182,7 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
           incrementCounter("nominara_topic_cluster_runs_total", { outcome: "clustered" });
           observeValue("nominara_topic_cluster_clusters_written", plan.length, { reason: payload.reason });
           observeValue("nominara_topic_cluster_outlier_prompts", outliers);
+          observeValue("nominara_topic_cluster_prompts_dropped_by_cap", droppedByCap);
           for (let i = 0; i < sources.model; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "model" });
           for (let i = 0; i < sources.template; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "template" });
           span.setAttributes({ "nominara.topic_cluster.clusters": plan.length, "nominara.topic_cluster.outliers": outliers });
@@ -194,6 +197,7 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
             removed: written.deleted,
             members,
             outliers,
+            dropped_by_cap: droppedByCap,
             model_labels: sources.model,
             template_labels: sources.template,
           });

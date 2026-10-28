@@ -23,7 +23,15 @@ export function clusterableBaseSql(alias: string): string {
 }
 export const CLUSTERABLE_BASE_SQL = clusterableBaseSql("p");
 
-/** sha256 over the model and the sorted ids of the clusterable set. `$model` and the id list are SQL fragments the caller supplies. */
+/**
+ * One member's contribution to the prompt-set hash: its id AND its funnel stage, so an in-place funnel edit (an input to
+ * commercial_intent) changes the hash and the commit-phase stale check sees it.
+ */
+export function promptSetMemberSql(alias: string): string {
+  return `${alias}.id::text || ':' || coalesce(${alias}.funnel_stage, '')`;
+}
+
+/** sha256 over the model and the sorted members (id + funnel stage) of the clusterable set. `$model` and the id list are SQL fragments the caller supplies. */
 export function promptSetHashSql(modelExpr: string, idsExpr: string): string {
   return `encode(sha256(convert_to(coalesce(${modelExpr}, '') || '|' || coalesce(${idsExpr}, ''), 'UTF8')), 'hex')`;
 }
@@ -53,6 +61,8 @@ export interface ClusterSnapshot {
   readonly promptSetHash: string;
   readonly clusterStateHash: string;
   readonly clusterable: number;
+  /** Prompts that have a free neighbour at the floor but were left out only because the per-project cap was reached. 0 when not capped. */
+  readonly droppedByCap: number;
   readonly groups: readonly PromptGroup[];
   readonly olds: readonly (OldCluster & { readonly label: string })[];
 }
@@ -70,7 +80,7 @@ async function dominantModel(tx: ClientBase, projectId: string): Promise<string 
 
 export async function promptSetHash(tx: ClientBase, projectId: string, model: string | undefined): Promise<{ hash: string; clusterable: number }> {
   const r = await tx.query<{ hash: string; n: string }>(
-    `SELECT ${promptSetHashSql("$2::text", "string_agg(p.id::text, ',' ORDER BY p.id)")} AS hash, count(*)::text AS n
+    `SELECT ${promptSetHashSql("$2::text", `string_agg(${promptSetMemberSql("p")}, ',' ORDER BY p.id)`)} AS hash, count(*)::text AS n
        FROM tracked_prompts p
       WHERE p.project_id = $1 AND ${CLUSTERABLE_BASE_SQL} AND p.embedding_model = $2::text`,
     [projectId, model ?? ""],
@@ -91,7 +101,7 @@ export async function clusterStateHash(tx: ClientBase, projectId: string): Promi
 }
 
 /** Read-only. Finds the groups; writes nothing. */
-export async function snapshotClusters(tx: ClientBase, projectId: string): Promise<ClusterSnapshot> {
+export async function snapshotClusters(tx: ClientBase, projectId: string, maxClusters: number = MAX_CLUSTERS_PER_PROJECT): Promise<ClusterSnapshot> {
   const model = await dominantModel(tx, projectId);
   const { hash, clusterable } = await promptSetHash(tx, projectId, model);
   const state = await clusterStateHash(tx, projectId);
@@ -111,9 +121,10 @@ export async function snapshotClusters(tx: ClientBase, projectId: string): Promi
   );
 
   const raw: { memberIds: string[] }[] = [];
+  let droppedByCap = 0;
   if (model !== undefined) {
     const taken: string[] = [];
-    while (raw.length < MAX_CLUSTERS_PER_PROJECT) {
+    while (raw.length < maxClusters) {
       // The best seed among the still-free prompts: the one with the most free neighbours at or above the floor (itself included).
       const best = await tx.query<{ members: string[] }>(
         `SELECT array_agg(b.id ORDER BY b.id) AS members
@@ -131,6 +142,22 @@ export async function snapshotClusters(tx: ClientBase, projectId: string): Promi
       if (members === undefined) break;
       raw.push({ memberIds: members });
       taken.push(...members);
+    }
+    if (raw.length >= maxClusters) {
+      // The cap, not the data, ended the loop. Count the still-free prompts that DO have a free neighbour at the floor, so they are
+      // reported as casualties of the cap and not read as outliers.
+      const left = await tx.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM (
+           SELECT a.id
+             FROM tracked_prompts a
+             JOIN tracked_prompts b ON b.project_id = a.project_id AND 1 - (a.embedding <=> b.embedding) >= $4::float8
+            WHERE a.project_id = $1 AND ${clusterableBaseSql("a")} AND a.embedding_model = $2 AND NOT (a.id = ANY($3::uuid[]))
+              AND ${clusterableBaseSql("b")} AND b.embedding_model = $2 AND NOT (b.id = ANY($3::uuid[]))
+            GROUP BY a.id
+           HAVING count(*) >= $5) t`,
+        [projectId, model, taken, CLUSTER_SIMILARITY_FLOOR, MIN_CLUSTER_SIZE],
+      );
+      droppedByCap = Number(left.rows[0]!.n);
     }
   }
 
@@ -164,6 +191,7 @@ export async function snapshotClusters(tx: ClientBase, projectId: string): Promi
     promptSetHash: hash,
     clusterStateHash: state,
     clusterable,
+    droppedByCap,
     groups,
     olds: olds.rows.map((row) => ({ id: row.id, label: row.label, labelSource: row.label_source, memberCount: Number(row.n) })),
   };

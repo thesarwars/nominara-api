@@ -9,8 +9,6 @@ import { AUTO_LABEL_MAX } from "./constants.js";
 // A label a model returns is checked (`isReadableLabel`) and replaced by the template when it fails, so a bad model response is a
 // worse label, never a bad row. A model that throws, or does not answer within LABEL_TIMEOUT_MS, falls back too.
 
-export const TOPIC_LABELLER = Symbol("TOPIC_LABELLER");
-
 export interface TopicLabelRequest {
   /** Member prompt texts, most representative (nearest the group's centre) first. Customer text: never logged. */
   readonly prompts: readonly string[];

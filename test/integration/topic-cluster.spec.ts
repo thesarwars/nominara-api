@@ -13,7 +13,7 @@ import { createTopicClusterHandler } from "../../src/lib/queue/handlers/topic-cl
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
-import { writeClusters } from "../../src/lib/topics/cluster.js";
+import { promptSetHash, snapshotClusters, writeClusters } from "../../src/lib/topics/cluster.js";
 import { isReadableLabel, type TopicLabeller } from "../../src/lib/topics/labeller.js";
 import { findProjectsDueForClustering, runTopicClusterSweep } from "../../src/lib/topics/sweep.js";
 import { StandInEmbeddingProvider, STAND_IN_EMBEDDING_MODEL } from "../../src/modules/prompts/adapters/stand-in-embedding-provider.js";
@@ -598,6 +598,29 @@ describe("STORY-047 - topic.cluster", () => {
     expect(byLabel.get("Enterprise CRM")).toBeCloseTo((1 + 1 + 0.4) / 3, 5);
     expect(byLabel.get("Pricing comparison")).toBeCloseTo(0.4, 5);
     expect(byLabel.get("Security & compliance")).toBeCloseTo(0.7, 5);
+  });
+
+  // ---- review round 1 ---------------------------------------------------------------------------------------------------
+
+  it("AC1 review - prompts that fit a cluster but fall past the per-project cap are COUNTED as dropped, not mistaken for outliers", async () => {
+    await seedGroups(3, 3); // three real groups of 3
+    await addPrompt("a lone outlier", vec({ 400: 1 }));
+    // The owner connection: this reads the snapshot directly, so RLS has no tenant context to scope it by.
+    const under = await snapshotClusters(db, projectId, 2);
+    expect(under.groups).toHaveLength(2);
+    expect(under.droppedByCap).toBe(3); // the third group's three members: groupable, left out by the cap alone
+    const roomy = await snapshotClusters(db, projectId);
+    expect(roomy.groups).toHaveLength(3);
+    expect(roomy.droppedByCap).toBe(0); // the outlier has no neighbour, so it is an outlier, not a casualty of the cap
+  });
+
+  it("AC5 review - editing a member's funnel stage in place changes the prompt-set hash (commercial_intent cannot silently go stale)", async () => {
+    const [ids] = await seedGroups(1, 3, "consideration");
+    const before = await promptSetHash(db, projectId, MODEL);
+    await db.query("UPDATE tracked_prompts SET funnel_stage = 'decision' WHERE id = $1", [ids![0]]);
+    const after = await promptSetHash(db, projectId, MODEL);
+    expect(after.hash).not.toBe(before.hash);
+    expect(after.clusterable).toBe(before.clusterable);
   });
 
   // ---- AC7, scenario 6 -----------------------------------------------------------------------------------------------

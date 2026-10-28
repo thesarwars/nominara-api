@@ -20,8 +20,11 @@ export const WEEKLY_RECOMPUTE_DAYS = 7;
 /** scoring-models.md section on commercial intent: `decision` 1.00 - `consideration` 0.70 - `awareness` 0.40. Mirrored in SQL by `FUNNEL_WEIGHT_SQL`. */
 export const FUNNEL_WEIGHTS = { decision: 1.0, consideration: 0.7, awareness: 0.4 } as const;
 
-/** The same weights as a SQL expression over `funnel_stage`; a spec pins it equal to `FUNNEL_WEIGHTS`. */
-export const FUNNEL_WEIGHT_SQL = "CASE funnel_stage WHEN 'decision' THEN 1.0 WHEN 'consideration' THEN 0.7 ELSE 0.4 END";
+/**
+ * The same weights as a SQL expression over `funnel_stage`; a spec pins it equal to `FUNNEL_WEIGHTS`. Exhaustive on purpose: no ELSE, so
+ * a stage this list does not know scores NULL (ignored by avg) instead of passing silently as awareness.
+ */
+export const FUNNEL_WEIGHT_SQL = "CASE funnel_stage WHEN 'decision' THEN 1.0 WHEN 'consideration' THEN 0.7 WHEN 'awareness' THEN 0.4 END";
 
 /** A bound on one project's clusters, so a pathological set cannot loop the grouping statement without end. */
 export const MAX_CLUSTERS_PER_PROJECT = 200;

@@ -23,7 +23,10 @@ describe("STORY-047 · constants come from the reference exactly", () => {
   it("AC6 - the SQL weights are the same numbers as FUNNEL_WEIGHTS", () => {
     expect(FUNNEL_WEIGHT_SQL).toContain(`'decision' THEN ${FUNNEL_WEIGHTS.decision.toFixed(1)}`);
     expect(FUNNEL_WEIGHT_SQL).toContain(`'consideration' THEN ${FUNNEL_WEIGHTS.consideration.toFixed(1)}`);
-    expect(FUNNEL_WEIGHT_SQL).toContain(`ELSE ${FUNNEL_WEIGHTS.awareness.toFixed(1)}`);
+    expect(FUNNEL_WEIGHT_SQL).toContain(`'awareness' THEN ${FUNNEL_WEIGHTS.awareness.toFixed(1)}`);
+  });
+  it("AC6 review - the weight CASE is exhaustive: no ELSE, so a fourth funnel stage scores NULL and cannot pass as awareness", () => {
+    expect(FUNNEL_WEIGHT_SQL).not.toMatch(/\bELSE\b/u);
   });
   it("AC8 - a cluster needs at least two members, so a lone prompt is an outlier", () => {
     expect(MIN_CLUSTER_SIZE).toBe(2);
@@ -174,5 +177,18 @@ describe("STORY-047 AC4 - the trigger rules at their boundaries", () => {
   });
   it("an empty set is never a division by zero", () => {
     expect(decideTrigger({ ...base, clusterable: 0, departed: 0, arrived: 0 }, now)).toBeNull();
+  });
+});
+
+describe("STORY-047 review - the topic sweep's failure is its own signal", () => {
+  it("a sweep that throws is counted and logged as a topic-sweep failure, and does not surface as a report-sweep failure", async () => {
+    vi.resetModules();
+    const counter = vi.fn();
+    vi.doMock("../telemetry/metrics.js", () => ({ incrementCounter: counter }));
+    const { runTopicClusterSweepIsolated } = await import("./sweep.js");
+    const client = { query: () => Promise.reject(new Error("db down")) };
+    await expect(runTopicClusterSweepIsolated(client as never, () => Promise.resolve(), new Date())).resolves.toBeUndefined();
+    expect(counter).toHaveBeenCalledWith("nominara_topic_cluster_sweep_failures_total");
+    vi.doUnmock("../telemetry/metrics.js");
   });
 });

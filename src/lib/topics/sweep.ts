@@ -3,7 +3,7 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { TopicClusterJobPayload } from "../../../contracts/projects/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { CLUSTERABLE_BASE_SQL, promptSetHashSql } from "./cluster.js";
+import { CLUSTERABLE_BASE_SQL, promptSetHashSql, promptSetMemberSql } from "./cluster.js";
 import { MATERIAL_CHANGE_FRACTION, MIN_CLUSTER_SIZE, TOPIC_CLUSTER_QUEUE, WEEKLY_RECOMPUTE_DAYS } from "./constants.js";
 
 // STORY-047 AC4 - the producer of `topic.cluster`.
@@ -85,7 +85,7 @@ export async function findProjectsDueForClustering(client: ClientBase, now: Date
      SELECT pr.id AS project_id, pr.workspace_id,
             ${promptSetHashSql(
               "d.embedding_model",
-              "(SELECT string_agg(p.id::text, ',' ORDER BY p.id) FROM tracked_prompts p WHERE p.project_id = pr.id AND " + CLUSTERABLE_BASE_SQL + " AND p.embedding_model = d.embedding_model)",
+              "(SELECT string_agg(" + promptSetMemberSql("p") + ", ',' ORDER BY p.id) FROM tracked_prompts p WHERE p.project_id = pr.id AND " + CLUSTERABLE_BASE_SQL + " AND p.embedding_model = d.embedding_model)",
             )} AS hash,
             COALESCE(d.n, 0)::text AS clusterable,
             COALESCE(c.clusters, 0)::text AS clusters,
@@ -185,4 +185,17 @@ export async function runTopicClusterSweep(client: ClientBase, enqueue: EnqueueT
       span.end();
     }
   });
+}
+
+/**
+ * The sweep as the worker runs it: its failure is its OWN signal (`nominara_topic_cluster_sweep_failures_total`, `topic.cluster.sweep.failed`),
+ * not folded into the report sweep's `after` failure counter. Counted and logged, never silent; the next tick retries.
+ */
+export async function runTopicClusterSweepIsolated(client: ClientBase, enqueue: EnqueueTopicCluster, now: Date): Promise<void> {
+  try {
+    await runTopicClusterSweep(client, enqueue, now);
+  } catch (error) {
+    incrementCounter("nominara_topic_cluster_sweep_failures_total");
+    logger.error({ event: "topic.cluster.sweep.failed", error: error instanceof Error ? error.name : "unknown" });
+  }
 }
