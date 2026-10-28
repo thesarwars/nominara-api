@@ -29,7 +29,8 @@ export interface StoredAnalysis {
 }
 
 export type TaskLink = { task_id: string; label: string; href: string };
-export type TaskLookup = (ruleCode: string) => TaskLink | null;
+/** The OPEN task for a finding's rule on the analysis it came from, or null. The analysis is asked for too: a rule code must never cross-link two analyses. */
+export type TaskLookup = (ruleCode: string, analysis: GeoSlug) => TaskLink | null;
 
 interface CatalogueEntry {
   code: GeoAnalysisSummary["code"];
@@ -168,7 +169,7 @@ export function composeDigest(rows: StoredAnalysis[], windowDays: number, taskFo
   const levers: Lever[] = candidates.map((a, i) => {
     const row = bySlug.get(a.slug)!;
     const finding = headlineFinding(validFindings(row));
-    const task = finding?.task_rule_code !== undefined ? taskFor(finding.task_rule_code) : null;
+    const task = finding?.task_rule_code !== undefined ? taskFor(finding.task_rule_code, a.slug) : null;
     return {
       rank: (i + 1) as 1 | 2 | 3,
       headline: a.headline!,

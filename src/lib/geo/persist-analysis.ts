@@ -31,13 +31,13 @@ export async function writeGeoAnalysis(tx: ClientBase, projectId: string, input:
        (workspace_id, project_id, analysis, window_start, window_days, score, score_label,
         evidence_cells, evidence_passages, sufficient, suppression_reason, findings, lever_rank,
         scoring_version, computed_at)
-     SELECT p.workspace_id, p.id, $2, $3::date, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, now()
+     SELECT p.workspace_id, p.id, $2, $3::date, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, clock_timestamp()
        FROM projects p WHERE p.id = $1 AND p.deleted_at IS NULL
      ON CONFLICT (project_id, analysis, window_start, window_days, scoring_version) DO UPDATE SET
        score = EXCLUDED.score, score_label = EXCLUDED.score_label,
        evidence_cells = EXCLUDED.evidence_cells, evidence_passages = EXCLUDED.evidence_passages,
        sufficient = EXCLUDED.sufficient, suppression_reason = EXCLUDED.suppression_reason,
-       findings = EXCLUDED.findings, lever_rank = EXCLUDED.lever_rank, computed_at = now()`,
+       findings = EXCLUDED.findings, lever_rank = EXCLUDED.lever_rank, computed_at = clock_timestamp()`,
     [
       projectId, a.analysis, a.window_start, a.window_days, a.score, a.score_label,
       a.evidence_cells, a.evidence_passages, a.sufficient, a.suppression_reason,

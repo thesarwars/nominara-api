@@ -18,7 +18,7 @@ export function incrementCounter(name: string, labels: Record<string, string> = 
  * `incrementCounter`; the backend that buckets it is a later story). A non-finite value is not an observation and is
  * refused rather than logged as 0 — `0` is a real measurement and stays distinct from "nothing measured".
  */
-export function observeValue(name: string, value: number, labels: Record<string, string> = {}): void {
+export function observeValue(name: string, value: number, labels: Record<string, string | number> = {}): void {
   if (!Number.isFinite(value)) return;
   logger.log({ metric: name, value, ...labels });
 }

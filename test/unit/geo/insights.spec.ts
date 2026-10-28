@@ -178,6 +178,15 @@ describe("STORY-062 · digest", () => {
     expect(unlinked.task).toBeNull();
   });
 
+  it("S9 · the lookup is asked for the finding's rule AND the analysis it came from, so a rule shared across analyses cannot cross-link", () => {
+    const asked: [string, string][] = [];
+    composeDigest([stored("structure", { leverRank: 1 })], 30, (rule, slug) => {
+      asked.push([rule, slug]);
+      return null;
+    });
+    expect(asked).toEqual([["GEO-R-001", "structure"]]);
+  });
+
   it("lists all seven slugs, none of them a fan-out, with a reason for every one without data", () => {
     const d = composeDigest([], 30, taskFor);
     expect(d.analyses.map((a) => a.slug)).toEqual(["alignment", "entity", "structure", "divergence", "topics", "sentiment", "freshness"]);

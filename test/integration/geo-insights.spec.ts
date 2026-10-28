@@ -2,10 +2,15 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { geoAnalysisSchema, geoDigestSchema } from "../../contracts/analytics/index.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { GeoService } from "../../src/modules/geo/geo.service.js";
+import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-062 — persistence, replacement, rejection and the persisted-only read,
@@ -73,7 +78,7 @@ describe("STORY-062 · GEO insights persistence and read", () => {
   });
 
   const ctx = <T>(fn: (s: GeoService) => Promise<T>) =>
-    withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => fn(new GeoService())) as Promise<T>;
+    withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => fn(new GeoService(new TasksService(new NoopRealtimePublisher())))) as Promise<T>;
   const count = async () => Number((await db.query("SELECT count(*) FROM geo_analyses")).rows[0].count);
 
   it("S1 · persists score, findings and evidence base", async () => {
@@ -147,6 +152,53 @@ describe("STORY-062 · GEO insights persistence and read", () => {
     expect(await count()).toBe(1);
   });
 
+  it("S10 · STORY-062 AC11 · the digest and an analysis read inside their render budget from persisted rows, with no recomputation", async () => {
+    // The reference's page-render objective (edge-cases-and-slos #29) is p95 <= 400 ms; a server read on a fixture must fit well
+    // inside it. The bound is the objective itself, generous for a local Postgres. The production p95 is observed on
+    // `nominara_geo_digest_read_duration_ms`, not proven by this test.
+    for (const [i, slug] of (["structure", "divergence", "sentiment", "topics", "entity"] as const).entries()) {
+      await ctx((s) => s.persistAnalysis(projectId, write(slug, { lever_rank: (i % 3) + 1 })));
+    }
+    const stamp = async () => (await db.query("SELECT analysis, computed_at, xmin::text AS xmin FROM geo_analyses ORDER BY analysis")).rows;
+    const before = await stamp();
+    const durations: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      const started = performance.now();
+      await ctx((s) => s.digest(projectId, { timeframe: "30d" }));
+      await ctx((s) => s.analysis(projectId, "sentiment", { timeframe: "30d" }));
+      durations.push(performance.now() - started);
+    }
+    durations.sort((a, b) => a - b);
+    const p95 = durations[Math.ceil(durations.length * 0.95) - 1]!;
+    expect(p95).toBeLessThanOrEqual(400);
+    // Never recomputed: not a row touched (same xmin and computed_at) and not a row added.
+    expect(await stamp()).toEqual(before);
+  });
+
+  it("S10 · observability · a geo.digest.read span, the duration measure, and a log line with no row content", async () => {
+    const exporter = new InMemorySpanExporter();
+    trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+    await ctx((s) => s.persistAnalysis(projectId, write("structure", { lever_rank: 1, findings: [finding("s", { headline: "SECRET HEADLINE" })] })));
+    const spy = vi.spyOn(Logger.prototype, "log");
+    try {
+      await ctx((s) => s.digest(projectId, { timeframe: "30d" }));
+      await ctx((s) => s.analysis(projectId, "structure", { timeframe: "30d" }));
+      const lines = spy.mock.calls.map((c) => c[0] as Record<string, unknown>);
+      for (const metric of ["nominara_geo_digest_read_duration_ms", "nominara_geo_analysis_read_duration_ms"]) {
+        const line = lines.find((l) => l.metric === metric);
+        expect(line, metric).toBeDefined();
+        expect(line!.value).toBeGreaterThanOrEqual(0);
+        expect(line!.workspace_id, metric).toBe(workspaceId);
+      }
+      expect(JSON.stringify(spy.mock.calls)).not.toContain("SECRET HEADLINE");
+    } finally {
+      spy.mockRestore();
+    }
+    const names = exporter.getFinishedSpans().map((s) => s.name);
+    expect(names).toContain("geo.digest.read");
+    expect(names).toContain("geo.analysis.read");
+  });
+
   it("an empty project reads as unbuilt-with-reasons, never an empty panel", async () => {
     const d = await ctx((s) => s.digest(projectId, { timeframe: "30d" }));
     expect(d.sufficient).toBe(false);
@@ -168,7 +220,7 @@ describe("STORY-062 · GEO insights persistence and read", () => {
     const other = randomUUID();
     await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'W2',$2,'growth','UTC')", [other, `w-${randomUUID().slice(0, 8)}`]);
     const as = <T>(workspace: string, fn: (s: GeoService) => Promise<T>) =>
-      withTenantContext(db, { workspaceId: workspace, actorId: randomUUID() }, () => fn(new GeoService())) as Promise<T>;
+      withTenantContext(db, { workspaceId: workspace, actorId: randomUUID() }, () => fn(new GeoService(new TasksService(new NoopRealtimePublisher())))) as Promise<T>;
     // The owning role bypasses RLS and would pass this for the wrong reason.
     await db.query("SET ROLE nominara_app");
     try {

@@ -1,4 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import {
   type GeoAnalysis,
@@ -9,17 +10,20 @@ import {
   geoSentimentDetailSchema,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
-import { composeDigest, summarize, validFindings, type StoredAnalysis } from "../../lib/geo/insights.js";
+import { composeDigest, summarize, validFindings, type StoredAnalysis, type TaskLookup } from "../../lib/geo/insights.js";
 import { writeGeoAnalysis } from "../../lib/geo/persist-analysis.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
-import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { incrementCounter, observeValue } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { TasksService } from "../tasks/tasks.service.js";
 
 // STORY-062 — the single owner of `geo_analyses`.
 //
 // READS ARE PERSISTED ROWS ONLY. Nothing here computes an analysis, calls an
 // engine or embedding provider, or holds a transaction across an await on
 // anything but Postgres. Free and unmetered: no credit guard, no meter.
+
+const tracer = trace.getTracer("nominara.geo-insights");
 
 const WINDOW_DAYS: Readonly<Record<GeoInsightsQuery["timeframe"], number>> = Object.freeze({ "7d": 7, "30d": 30, "90d": 90 });
 
@@ -40,6 +44,9 @@ interface Row {
 export class GeoService {
   private readonly logger = new Logger("geo.insights");
 
+  // `tasks` is TasksService's table: the digest asks it for the open task behind a lever, it never queries `tasks` itself.
+  constructor(private readonly tasks: TasksService) {}
+
   /**
    * The ONE write path every analysis persists through. Validates against the
    * write contract (seven slugs — the fan-out analysis is unwritable; every
@@ -55,30 +62,67 @@ export class GeoService {
   }
 
   async digest(projectId: string, query: GeoInsightsQuery): Promise<GeoDigest> {
-    const days = WINDOW_DAYS[query.timeframe];
-    const rows = await this.latestRows(projectId, days);
-    incrementCounter("nominara_geo_digest_read_total", { sufficient: String(rows.some((r) => r.sufficient)) });
-    // Levers' tasks are null until the task engine can resolve a rule code to
-    // an open task: STORY-062 says a lever links to one; the contract allows null.
-    return composeDigest(rows, days, () => null);
+    return this.timed("geo.digest.read", "nominara_geo_digest_read_duration_ms", async () => {
+      const days = WINDOW_DAYS[query.timeframe];
+      const rows = await this.latestRows(projectId, days);
+      incrementCounter("nominara_geo_digest_read_total", { sufficient: String(rows.some((r) => r.sufficient)) });
+      // STORY-062 AC10: a lever links the OPEN task (todo / in_progress) behind its finding's rule on that analysis, within the
+      // caller's scope; none open (or only dismissed / done ones) means null, never a stale task offered as the action.
+      return composeDigest(rows, days, await this.openTaskLookup(projectId, rows));
+    });
   }
 
   async analysis(projectId: string, slug: GeoSlug, query: GeoInsightsQuery): Promise<GeoAnalysis> {
-    const days = WINDOW_DAYS[query.timeframe];
-    const row = (await this.latestRows(projectId, days, slug))[0] ?? null;
-    incrementCounter("nominara_geo_analysis_read_total", { analysis: slug });
-    const detail = this.detailFor(slug, row);
-    const sentiment = slug === "sentiment" ? geoSentimentDetailSchema.safeParse(detail) : null;
-    const actions =
-      sentiment?.success === true
-        ? // One action per distinct reason class: a title, and no task id until the task engine exists.
-          sentiment.data.reason_classes.map((rc) => ({ label: rc.task_title, task_title: rc.task_title, task_id: null, href: null, engines: [] as string[] }))
-        : row !== null && row.sufficient
-        ? validFindings(row)
-            .filter((f) => f.task_rule_code !== undefined)
-            .map((f) => ({ label: f.headline, task_title: null, task_id: null, href: null, engines: [] as string[] }))
-        : [];
-    return { summary: summarize(slug, row, days), detail, actions };
+    return this.timed("geo.analysis.read", "nominara_geo_analysis_read_duration_ms", async () => {
+      const days = WINDOW_DAYS[query.timeframe];
+      const row = (await this.latestRows(projectId, days, slug))[0] ?? null;
+      incrementCounter("nominara_geo_analysis_read_total", { analysis: slug });
+      const detail = this.detailFor(slug, row);
+      const sentiment = slug === "sentiment" ? geoSentimentDetailSchema.safeParse(detail) : null;
+      const actions =
+        sentiment?.success === true
+          ? // One action per distinct reason class: a title, and no task id yet. The digest levers resolve an open task (`openTaskLookup`); reuse it here once GEO-rule tasks are produced (STORY-063 follow-up), or the two surfaces will disagree.
+            sentiment.data.reason_classes.map((rc) => ({ label: rc.task_title, task_title: rc.task_title, task_id: null, href: null, engines: [] as string[] }))
+          : row !== null && row.sufficient
+          ? validFindings(row)
+              .filter((f) => f.task_rule_code !== undefined)
+              .map((f) => ({ label: f.headline, task_title: null, task_id: null, href: null, engines: [] as string[] }))
+          : [];
+      return { summary: summarize(slug, row, days), detail, actions };
+    }, { analysis: slug });
+  }
+
+  /**
+   * A read's span and duration. The duration is the measure the render-budget objective (edge-cases-and-slos #29, p95 <= 400 ms)
+   * is observed on in production; the integration spec only proves a fixture read fits. The line carries the metric and the
+   * labels, never a row's content and never the workspace.
+   */
+  private async timed<T>(span: string, metric: string, read: () => Promise<T>, labels: Record<string, string> = {}): Promise<T> {
+    return tracer.startActiveSpan(span, async (active) => {
+      const started = performance.now();
+      try {
+        return await read();
+      } catch (error) {
+        active.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        observeValue(metric, Math.round(performance.now() - started), { workspace_id: currentTenantStore()?.context.workspaceId ?? "none", ...labels });
+        active.end();
+      }
+    });
+  }
+
+  /** One query for the rules the ranked levers may need; the lookup the pure digest composer calls is then a map read. */
+  private async openTaskLookup(projectId: string, rows: StoredAnalysis[]): Promise<TaskLookup> {
+    const ranked = rows.filter((r) => r.sufficient && r.leverRank !== null);
+    const rules = [...new Set(ranked.flatMap((r) => validFindings(r).flatMap((f) => (f.task_rule_code === undefined ? [] : [f.task_rule_code]))))];
+    const open = await this.tasks.openGeoTasks(projectId, rules);
+    const byKey = new Map(open.map((t) => [`${t.analysis}\u0000${t.rule_code}`, t]));
+    return (ruleCode, analysis) => {
+      const t = byKey.get(`${analysis}\u0000${ruleCode}`);
+      // Relative like `analysis_href`: the client prefixes the workspace/project base.
+      return t === undefined ? null : { task_id: t.task_id, label: t.title, href: `plan?task=${t.task_id}` };
+    };
   }
 
   /**

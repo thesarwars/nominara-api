@@ -9,7 +9,9 @@ import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { GeoService } from "../../src/modules/geo/geo.service.js";
+import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { testCacheRedisUrl } from "../support/test-valkey.js";
 
@@ -113,7 +115,7 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
     expect(thirty.evidence_cells).toBe(31);
 
     const a = await withTenantContext(db, { workspaceId, actorId: randomUUID() }, () =>
-      new GeoService().analysis(projectId, "structure", { timeframe: "30d" }),
+      new GeoService(new TasksService(new NoopRealtimePublisher())).analysis(projectId, "structure", { timeframe: "30d" }),
     );
     const detail = geoStructureDetailSchema.parse(a.detail);
     expect(detail.total).toBe(31);
@@ -140,7 +142,7 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
     for (let i = 0; i < 31; i++) await parse("gemini", await capture("gemini", ANSWER));
     await rollup();
     const read = () =>
-      withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService().analysis(projectId, "structure", { timeframe: "30d" }));
+      withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService(new TasksService(new NoopRealtimePublisher())).analysis(projectId, "structure", { timeframe: "30d" }));
     const before = await read();
     expect(geoStructureDetailSchema.parse(before.detail).total).toBe(31);
 

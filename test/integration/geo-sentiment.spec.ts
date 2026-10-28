@@ -5,7 +5,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { geoAnalysisSchema, geoSentimentDetailSchema } from "../../contracts/analytics/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { refreshProjectGeo } from "../../src/lib/rollup/refresh-project-geo.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { GeoService } from "../../src/modules/geo/geo.service.js";
+import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-061 — A6 sentiment drivers over stored mention_facts + citation_facts,
@@ -91,7 +93,7 @@ describe("STORY-061 · A6 sentiment drivers (persisted, read)", () => {
   };
 
   const ctx = <T>(fn: (s: GeoService) => Promise<T>) =>
-    withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => fn(new GeoService())) as Promise<T>;
+    withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => fn(new GeoService(new TasksService(new NoopRealtimePublisher())))) as Promise<T>;
   const refresh = () => withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => refreshProjectGeo(tx, projectId, { asOf: AS_OF }));
   const rows = async () => (await db.query("SELECT * FROM geo_analyses WHERE analysis = 'sentiment' ORDER BY window_days")).rows;
   const read = () => ctx((s) => s.analysis(projectId, "sentiment", { timeframe: "30d" }));
