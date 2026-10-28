@@ -147,9 +147,12 @@ services:
   # Two one-shot services run before the app, in order, each waiting for the
   # previous to EXIT SUCCESSFULLY rather than merely to start.
 
+  # STORY-004 — the image tag is overridable (NOMINARA_API_IMAGE, default unchanged) for the same reason the host
+  # ports are: a second stack on one machine (`COMPOSE_PROJECT_NAME=other pnpm dev:up`) would otherwise rebuild and
+  # retag the FIRST stack's `nominara-api` image from its own working tree, and that stack's next `up` would run it.
   migrate:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       postgres:
         condition: service_healthy
@@ -165,7 +168,7 @@ services:
 
   dev-credentials:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -183,7 +186,7 @@ services:
 
   api:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully
@@ -279,7 +282,7 @@ services:
   # make three things to misread during an incident.
   worker-crawl:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully
@@ -321,7 +324,7 @@ services:
   # block describes for the crawl group.
   worker-capture:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully
@@ -356,7 +359,7 @@ services:
   # redirect-heavy answers starve the captures behind them.
   worker-parse:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully
@@ -387,7 +390,7 @@ services:
   # also competing for the workers a capture needs.
   worker-rollup:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully
@@ -418,7 +421,7 @@ services:
   # Resend settings), so it needs the same environment as worker-rollup.
   worker-report:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully
@@ -443,7 +446,7 @@ services:
 
   gateway:
     build: .
-    image: nominara-api
+    image: ${NOMINARA_API_IMAGE:-nominara-api}
     depends_on:
       dev-credentials:
         condition: service_completed_successfully

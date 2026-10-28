@@ -8,11 +8,70 @@ without an ADR.
 
 ## Local setup
 
+**One command (STORY-004):** from a clean clone, with Docker running and Node 24 + pnpm 11 (corepack):
+
+```bash
+pnpm dev:up
+```
+
+It installs dependencies when `node_modules` is absent, writes `.env` from `.env.example` with secrets
+generated on your machine (never overwriting an existing `.env`, and setting **no vendor credential** —
+fixture adapters cover every engine), runs `docker compose up -d --build` (Postgres + pgvector, pgBouncer,
+both Valkeys, the one-shot `migrate` and `dev-credentials` services, then the API on `localhost:4000`, the
+gateway on `localhost:3001` and the workers), waits on the API's `/health/ready` with
+`docker compose up -d --wait api` (the gateway and workers have no healthcheck to wait on), and finally
+`pnpm db:seed`. `pnpm dev:api` is an alias. Flags: `--no-seed`, `--no-build`, `--reset`. The app repository's
+`pnpm dev:stack` calls this and then starts the app against it.
+
+`pnpm db:seed` writes three synthetic tenants with deliberately awkward shapes (testing-strategy.md §12),
+one per paid tier, each set through `pnpm plan:set` and given one 500-credit grant through the ledger
+(re-seeding never grants twice). It is idempotent. Sign in with email OTP; the code is in
+`docker compose logs api` (`OTP_DEV_LOG_CODES=true` is set in the generated `.env`):
+
+| Owner | Workspace | Plan | Shape |
+|---|---|---|---|
+| `owner-starter@nominara.test` | Synthetic Starter Co | starter | "Acme Single" — a project with a single prompt (always low confidence) |
+| `owner-growth@nominara.test` | Synthetic Growth Co | growth | "Apple" — a common-word brand; "Blue Ocean Roasters" — a multi-word brand |
+| `owner-business@nominara.test` | Synthetic Business Co | business | "Nimbus Hosting" — competitors "Cloud" / "Cloudflare Systems", a substring-colliding pair |
+
+`pnpm db:seed` runs on the host and refuses unless `NODE_ENV` is not production, `DATABASE_URL` and
+`DATABASE_URL_POOLED` both name a local host, and `NOMINARA_SYNTHETIC_SEED=1` (`dev:up` sets all of this
+from the stack's published ports). Every write goes through `DATABASE_URL_POOLED` as `nominara_app`.
+**Nothing loads `.env`**: run it through `pnpm dev:up`, or standalone with the whole environment exported
+(`set -a; . ./.env; set +a; NOMINARA_SYNTHETIC_SEED=1 pnpm db:seed`, plus the four connection URLs if you
+moved a host port). For the host-side steps `dev:up` takes `.env` over an exported shell variable, as the
+containers' `env_file` does, except for what compose interpolates (host ports, `NOMINARA_API_IMAGE`) and
+`COMPOSE_*`; it names any exported variable it ignored.
+
+**Starting over (AC7):** `pnpm dev:up --reset` stops the API, gateway and workers, flushes **both**
+Valkeys (queue and cache: the seeded workspace and project ids are fixed, so a job or cache entry from
+before would otherwise attach to the rebuilt rows), runs `pnpm db:reset --seed` with the same derived
+environment (drops everything this project owns, re-applies every migration, re-applies the role passwords
+and re-seeds; the seed guard is checked before anything is dropped), then starts the services again.
+`pnpm db:reset --seed` on its own resets Postgres only. To discard the volumes as well:
+`docker compose down -v && pnpm dev:up`.
+
+**Object storage:** `dev:up` does not start the LocalStack emulator (compose profile `storage`, opt-in
+since nothing writes to it yet; STORY-181 switches it on). Until then: `COMPOSE_PROFILES=storage pnpm dev:up`,
+with the `STORAGE_*` keys set in `.env` as `.env.example` describes.
+
+**A second stack on one machine** (another worktree, a verification run): every host port and the image
+tag are overridable, and the seed follows the ports.
+
+```bash
+COMPOSE_PROJECT_NAME=nominara-b NOMINARA_API_IMAGE=nominara-api-b \
+POSTGRES_PORT=15432 PGBOUNCER_PORT=16432 VALKEY_PORT=16379 VALKEY_QUEUE_PORT=16380 \
+API_PORT=14000 GATEWAY_HOST_PORT=13001 pnpm dev:up
+docker compose -p nominara-b down -v      # remove it again
+```
+
+**By hand**, the steps `dev:up` automates:
+
 ```bash
 pnpm install
 docker compose up -d          # Postgres 18 + pgvector on localhost:5432, pgBouncer on localhost:6432,
                               # Valkey cache on localhost:6379 (STORY-025 — required outside NODE_ENV=test)
-cp .env.example .env
+cp .env.example .env          # then fill every REPLACE_ value
 pnpm db:migrate
 pnpm db:dev-credentials        # local-dev passwords for the runtime + break-glass roles (STORY-010)
 ```
@@ -38,7 +97,8 @@ users don't need either.
 | `pnpm db:migrate` | Applies every migration not yet recorded, in filename order. |
 | `pnpm db:rollback` | Rolls back the most recently applied migration using its `.down.sql`. |
 | `pnpm db:drift-check` | Applies every committed migration to a disposable shadow database and fails if the result doesn't match `src/db/conventions.ts`. |
-| `pnpm db:reset` | Drops everything this project owns (`public`, `app`, `_migrations`) and rebuilds from empty. |
+| `pnpm db:reset` | Drops everything this project owns (`public`, `app`, `_migrations`) and rebuilds from empty. `--seed` then re-applies the role passwords and runs `pnpm db:seed` (STORY-004). |
+| `pnpm db:seed` | Writes the three synthetic tenants (see "Local setup"). Idempotent; dev-only, behind its own guard (STORY-004). |
 | `pnpm db:role-check` | Inspects the role the current `DATABASE_URL` connection is actually authenticated as, and fails if it's the migration owner (STORY-010). |
 | `pnpm db:dev-credentials` | Sets local-development passwords on the runtime + break-glass roles created by migration `0005` (never done by a migration itself — STORY-010). |
 | `pnpm db:rls-generate` | Regenerates `0006_generated_rls_policies.up.sql` **and** `src/db/rls/tenant-tables.generated.ts` (the `TENANT_TABLES` set — fix pass item 11) from `src/db/rls/generate.ts` against a disposable shadow database. `--check` fails instead of writing, if either committed file would differ (STORY-011). |
