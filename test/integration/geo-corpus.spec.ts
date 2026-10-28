@@ -471,6 +471,149 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(ok.lowConfidence).toBe(false);
   }, 120_000);
 
+  // ---- the corpus follows the CURRENT selection (round-1 review) --------------------------------------------------------
+
+  it("review - AC1/AC10 - a URL that falls out of the top 25 on a later build no longer contributes to the centroid, its count or its domains", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    for (let i = 0; i < 25; i += 1) {
+      const url = `https://top${String(i).padStart(2, "0")}.example/p`;
+      await cite(prompt, url, { weight: i === 24 ? 0.4 : 0.5 });
+      pages.set(url, { kind: "html", html: articleHtml(`topic${String(i)}`) });
+    }
+    await build();
+    await drainEmbedQueue(new CountingProvider(STAND_IN_EMBEDDING_MODEL));
+    expect((await centroidOf(await addSession())).sourceCount).toBe(25);
+
+    await cite(prompt, "https://newcomer.example/p", { weight: 0.9 });
+    pages.set("https://newcomer.example/p", { kind: "html", html: articleHtml("newcomer") });
+    await build();
+    await drainEmbedQueue(new CountingProvider(STAND_IN_EMBEDDING_MODEL));
+    const result = await centroidOf(await addSession());
+    expect(result.sourceCount).toBe(25);
+    expect(result.domains).not.toContain("top24.example");
+    expect(result.domains).toContain("newcomer.example");
+    expect((await passageRows("url = 'https://top24.example/p'"))).toEqual([]);
+  }, 120_000);
+
+  it("review - AC2 - a URL flagged owned after the first build is gone from the corpus and the centroid on the next build", async () => {
+    await seedPages(3);
+    await build();
+    await drainEmbedQueue(new CountingProvider(STAND_IN_EMBEDDING_MODEL));
+    expect((await centroidOf(await addSession())).domains).toContain("site0.example");
+
+    await db.query("UPDATE citation_facts SET is_owned = true WHERE domain = 'site0.example'");
+    await build();
+    await drainEmbedQueue(new CountingProvider(STAND_IN_EMBEDDING_MODEL));
+    const result = await centroidOf(await addSession());
+    expect(result.domains).toEqual(["site1.example", "site2.example"]);
+    expect(result.sourceCount).toBe(2);
+    expect(await passageRows("url = 'https://site0.example/page'")).toEqual([]);
+  }, 120_000);
+
+  it("review - a URL leaving the selection frees its text for another URL in the same build (no skipped upsert)", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://first.example/p", { weight: 1 });
+    pages.set("https://first.example/p", { kind: "html", html: articleHtml("shared words") });
+    await build();
+    await db.query("DELETE FROM citation_facts WHERE domain = 'first.example'");
+    await cite(prompt, "https://second.example/p", { weight: 1 });
+    pages.set("https://second.example/p", { kind: "html", html: articleHtml("shared words") });
+    const again = await build();
+    expect((await passageRows()).map((r) => r.url)).toEqual(["https://second.example/p"]);
+    expect(again.passagesConflictSkipped).toBe(0);
+    expect(again.status).toBe("complete");
+  }, 60_000);
+
+  // ---- a passage held by another cluster / project (the schema key has neither) -----------------------------------------
+
+  it("review - one page cited for two clusters of one project: the second build does not refetch it, says so, and is partial", async () => {
+    const clusterB = randomUUID();
+    const promptA = await addPrompt(PROMPT_TEXTS[0]!);
+    const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
+    for (const prompt of [promptA, promptB]) await cite(prompt, "https://g2.example/compare");
+    pages.set("https://g2.example/compare", { kind: "html", html: articleHtml("compare") });
+    const first = await build();
+    expect(first.status).toBe("complete");
+    expect(fetchCalls).toHaveLength(1);
+
+    const second = await buildCorpus(deps(), { projectId, clusterId: clusterB });
+    expect(second.heldElsewhere).toBe(1);
+    expect(second.status).toBe("partial");
+    expect(second.passagesWritten).toBe(0);
+    expect(fetchCalls).toHaveLength(1);
+    const again = await buildCorpus(deps(), { projectId, clusterId: clusterB });
+    expect(again.heldElsewhere).toBe(1);
+    expect(fetchCalls).toHaveLength(1);
+  }, 60_000);
+
+  it("review - identical text under two URLs of two clusters: the passage the second cluster could not store is counted, and the build is partial", async () => {
+    const clusterB = randomUUID();
+    const promptA = await addPrompt(PROMPT_TEXTS[0]!);
+    const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
+    await cite(promptA, "https://x.example/p");
+    await cite(promptB, "https://y.example/p");
+    const same = { kind: "html", html: articleHtml("identical") } as const;
+    pages.set("https://x.example/p", same);
+    pages.set("https://y.example/p", same);
+    expect((await build()).status).toBe("complete");
+    const second = await buildCorpus(deps(), { projectId, clusterId: clusterB });
+    expect(second.passagesWritten).toBe(0);
+    expect(second.passagesConflictSkipped).toBe(1);
+    expect(second.status).toBe("partial");
+  }, 60_000);
+
+  it("review - AC9/AC10 - a session's centroid reads only its own cluster's passages, not a sibling cluster of the same project", async () => {
+    const clusterB = randomUUID();
+    const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
+    await seedPages(2);
+    await cite(promptB, "https://sibling.example/p");
+    pages.set("https://sibling.example/p", { kind: "html", html: articleHtml("sibling topic") });
+    await build();
+    await buildCorpus(deps(), { projectId, clusterId: clusterB });
+    await drainEmbedQueue(new CountingProvider(STAND_IN_EMBEDDING_MODEL));
+    const result = await centroidOf(await addSession());
+    expect(result.sourceCount).toBe(2);
+    expect(result.domains).toEqual(["site0.example", "site1.example"]);
+  }, 120_000);
+
+  // ---- a zero-weight passage is not a source -----------------------------------------------------------------------------
+
+  it("review - AC10/AC11 - a passage with centroid_weight 0 is neither counted nor listed; all-zero is no centroid and low-confidence", async () => {
+    await seedPages(2);
+    await build();
+    await drainEmbedQueue(new CountingProvider(STAND_IN_EMBEDDING_MODEL));
+    await db.query("UPDATE corpus_passages SET centroid_weight = 0 WHERE domain = 'site0.example'");
+    const one = await centroidOf(await addSession());
+    expect(one.sourceCount).toBe(1);
+    expect(one.domains).toEqual(["site1.example"]);
+    expect(one.hasCentroid).toBe(true);
+
+    await db.query("UPDATE corpus_passages SET centroid_weight = 0");
+    const none = await centroidOf(await addSession());
+    expect(none.sourceCount).toBe(0);
+    expect(none.hasCentroid).toBe(false);
+    expect(none.lowConfidence).toBe(true);
+  }, 120_000);
+
+  // ---- concurrent redelivery ---------------------------------------------------------------------------------------------
+
+  it("review - two builds of one cluster racing converge: the same rows as one build, and one embed key", async () => {
+    await seedPages(3);
+    const second = new Client({ host: container.getHost(), port: container.getMappedPort(5432), database: container.getDatabase(), user: "nominara_app", password: resolvePassword("nominara_app", {}) });
+    await second.connect();
+    try {
+      const other = { ...deps(), runInTx: <T,>(fn: (tx: ClientBase) => Promise<T>) => withTenantContext(second, { workspaceId, actorId: SYSTEM_ACTOR_ID }, fn) };
+      const results = await Promise.all([buildCorpus(deps(), { projectId, clusterId }), buildCorpus(other, { projectId, clusterId })]);
+      expect(results.map((r) => r.status)).toEqual(["complete", "complete"]);
+    } finally {
+      await second.end();
+    }
+    const rows = await passageRows();
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((r) => r.text)).size).toBe(3);
+    expect(new Set(enqueued.map((e) => e.key)).size).toBe(1);
+  }, 60_000);
+
   // ---- expiry and model -------------------------------------------------------------------------------------------------
 
   it("scenario 11 - AC12 - passages carry a 30-day expiry, expired ones leave the centroid, and the URL is re-fetched", async () => {
@@ -491,8 +634,11 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(fetchCalls.sort()).toEqual([...urls].sort());
     expect(result.cached).toBe(0);
     // stale rows that the new fetch superseded are gone, not left beside the fresh ones
-    const stale = await passageRows("expires_at <= now()");
-    expect(stale.every((r) => r.url === urls[1])).toBe(true);
+    expect(await passageRows("expires_at <= now()")).toEqual([]);
+    const live = await passageRows();
+    expect([...new Set(live.map((r) => r.url))].sort()).toEqual([...urls].sort());
+    expect(live.filter((r) => r.url === urls[0]).every((r) => r.text.includes("fresher content entirely"))).toBe(true);
+    expect(live.every((r) => r.expires_at.getTime() > Date.now())).toBe(true);
   }, 120_000);
 
   it("scenario 12 - AC7 - a new model makes NEW rows, and a session pinned to one model never sees the other's vectors", async () => {

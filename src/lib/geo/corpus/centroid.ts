@@ -12,7 +12,7 @@ import { isLowConfidence } from "./weights.js";
 //
 // WHAT CONTRIBUTES. Only passages of THIS session's project and cluster, embedded under THIS session's pinned model (EC-23: a vector
 // from another model is not queryable from here at all), embedded already, and not expired (NFR-OPT-04). A passage still waiting for
-// its vector is neither averaged nor counted - the disclosed source count is the number of passages the centroid is actually made of.
+// its vector, or whose weight is 0 (it adds nothing to the vector, so it must not add to the count either), is neither averaged nor counted - the disclosed source count is the number of passages the centroid is actually made of.
 //
 // The result is written onto the session (centroid, centroid_source_count, centroid_domains) in the same statement, so the figure
 // disclosed to the user can never disagree with the vector it describes. "Low confidence" has no column: it is derived from the
@@ -48,6 +48,7 @@ export async function computeCentroid(tx: ClientBase, sessionId: string): Promis
                AND cp.prompt_cluster_id IS NOT DISTINCT FROM s.prompt_cluster_id
                AND cp.embedding_model = s.embedding_model
                AND cp.embedding IS NOT NULL
+               AND cp.centroid_weight > 0
                AND cp.expires_at > now()
         GROUP BY s.id
      )

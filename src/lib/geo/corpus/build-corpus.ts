@@ -65,6 +65,13 @@ export interface CorpusBuildResult {
   readonly failed: number;
   /** Fetched fine but no chunk shared a term with the cluster's prompts. */
   readonly empty: number;
+  /**
+   * The URL's passages are live under ANOTHER cluster or project of this workspace. ux_corpus_passages has neither in its key, so this
+   * corpus cannot hold them (a schema decision is open - see the story report): the URL is not fetched again, and the build is partial.
+   */
+  readonly heldElsewhere: number;
+  /** Passages fetched fine but not stored: identical text is already held by another cluster or project. Never silent: build is partial. */
+  readonly passagesConflictSkipped: number;
   readonly passagesWritten: number;
   readonly passagesRefreshed: number;
   readonly embedJobs: number;
@@ -119,11 +126,24 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
           AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
       [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
     );
-    return { candidates, terms: queryTermsOf(prompts.rows.map((row) => row.text)), liveHashes: new Set(live.rows.map((row) => row.h)) };
+    // Live under some OTHER project/cluster of this workspace: this corpus can never store them (unique key), so do not fetch them.
+    const elsewhere = await tx.query<{ h: string }>(
+      `SELECT DISTINCT encode(citation_url_hash, 'hex') AS h
+         FROM corpus_passages
+        WHERE workspace_id = app.current_workspace() AND NOT (project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2)
+          AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
+      [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
+    );
+    return {
+      candidates,
+      terms: queryTermsOf(prompts.rows.map((row) => row.text)),
+      liveHashes: new Set(live.rows.map((row) => row.h)),
+      elsewhereHashes: new Set(elsewhere.rows.map((row) => row.h)),
+    };
   });
 
   // ---- 2. fetch and select (no transaction) ----------------------------------------------------------------------------
-  const counts = { cached: 0, fromFragment: 0, fetched: 0, refused: 0, failed: 0, empty: 0 };
+  const counts = { cached: 0, fromFragment: 0, fetched: 0, refused: 0, failed: 0, empty: 0, heldElsewhere: 0 };
   const drafts: PassageDraft[] = [];
   const processed: Candidate[] = [];
   const cachedCandidates: Candidate[] = [];
@@ -132,6 +152,10 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     if (read.liveHashes.has(candidate.urlHashHex)) {
       counts.cached += 1;
       cachedCandidates.push(candidate);
+      continue;
+    }
+    if (read.elsewhereHashes.has(candidate.urlHashHex)) {
+      counts.heldElsewhere += 1;
       continue;
     }
     const directive = candidate.textFragment === null ? null : passageFromTextFragment(candidate.textFragment);
@@ -171,6 +195,18 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   const written = await deps.runInTx(async (tx) => {
     let inserted = 0;
     let refreshed = 0;
+    let conflictSkipped = 0;
+
+    // The corpus is THIS build's selection (reference section 6: top K, owned excluded). A URL that fell out of the top set, or
+    // became owned, must stop contributing now, not at its 30-day expiry. Done BEFORE the upsert so the text of a departed URL is
+    // free for the URL that replaces it.
+    await tx.query(
+      `DELETE FROM corpus_passages
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
+          AND embedding_model = $3 AND NOT (encode(citation_url_hash, 'hex') = ANY($4::text[]))`,
+      [projectId, clusterId, deps.embeddingModel, read.candidates.map((c) => c.urlHashHex)],
+    );
+
     if (unique.length > 0) {
       const upsert = await tx.query<{ inserted: boolean }>(
         `INSERT INTO corpus_passages
@@ -185,7 +221,8 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
                 citation_frequency = EXCLUDED.citation_frequency, avg_position_weight = EXCLUDED.avg_position_weight,
                 centroid_weight = EXCLUDED.centroid_weight
           -- Only this project's own row for this URL and cluster. The unique key has no project in it, so a hash held by another
-          -- project or cluster is theirs: it is left alone (and this corpus does not get that passage - see the story report).
+          -- project or cluster is theirs: it is left alone, and the draft is COUNTED as conflict-skipped (never silent; the build is
+          -- partial). The schema decision that would let both corpora hold it is open - see the story report.
           WHERE corpus_passages.project_id = EXCLUDED.project_id
             AND corpus_passages.prompt_cluster_id IS NOT DISTINCT FROM EXCLUDED.prompt_cluster_id
             AND corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash
@@ -203,6 +240,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
         if (row.inserted) inserted += 1;
         else refreshed += 1;
       }
+      conflictSkipped = unique.length - upsert.rows.length;
     }
 
     // A cached URL keeps its text but its citations moved on: refresh the weights the centroid reads.
@@ -240,7 +278,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
         ORDER BY id`,
       [projectId, clusterId, deps.embeddingModel],
     );
-    return { inserted, refreshed, pendingIds: pending.rows.map((row) => row.id) };
+    return { inserted, refreshed, conflictSkipped, pendingIds: pending.rows.map((row) => row.id) };
   });
 
   // ---- after commit: ask for the vectors -------------------------------------------------------------------------------
@@ -260,12 +298,13 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     }
   }
 
-  const status = counts.refused + counts.failed > 0 ? "partial" : "complete";
+  const status = counts.refused + counts.failed + counts.heldElsewhere + written.conflictSkipped > 0 ? "partial" : "complete";
   const result: CorpusBuildResult = {
     status,
     candidates: read.candidates.length,
     ...counts,
     passagesWritten: written.inserted,
+    passagesConflictSkipped: written.conflictSkipped,
     passagesRefreshed: written.refreshed,
     embedJobs,
     embedEnqueueFailures,
@@ -274,6 +313,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   for (const [outcome, count] of Object.entries(counts)) {
     for (let i = 0; i < count; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome });
   }
+  for (let i = 0; i < written.conflictSkipped; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome: "passage_conflict_skipped" });
   observeValue("nominara_geo_corpus_passages_written", written.inserted, { status });
   // Workspace ID only; no URL, no passage text, no domain (competitor content is not ours to log).
   logger.log({
@@ -288,6 +328,8 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     refused: counts.refused,
     failed: counts.failed,
     empty: counts.empty,
+    held_elsewhere: counts.heldElsewhere,
+    passages_conflict_skipped: written.conflictSkipped,
     passages_written: written.inserted,
     embed_jobs: embedJobs,
   });
