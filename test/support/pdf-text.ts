@@ -9,8 +9,10 @@ import { inflateSync } from "node:zlib";
 // Whitespace is collapsed so a wrapped line reads as one.
 
 /** The file as text, with every FlateDecode stream inflated IN PLACE, so a COMPRESSED export reads like a plain one. */
+// The data ends at the LF before `endstream` and no earlier: a Flate stream's last byte (the adler32 checksum) can itself be 0x0D,
+// and treating it as part of a CRLF drops it, the stream fails to inflate, and the page reads as empty.
 export function inflatedSource(pdf: Buffer): string {
-  return pdf.toString("latin1").replace(/stream\r?\n([\s\S]*?)\r?\nendstream/g, (whole, data: string) => {
+  return pdf.toString("latin1").replace(/stream\r?\n([\s\S]*?)\nendstream/g, (whole, data: string) => {
     try {
       return `stream\n${inflateSync(Buffer.from(data, "latin1")).toString("latin1")}\nendstream`;
     } catch {
