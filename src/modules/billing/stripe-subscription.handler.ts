@@ -16,6 +16,7 @@ import { keepChoiceForAdoption } from "../../lib/billing/downgrade-keep.js";
 import type { KeepChoice } from "../../lib/billing/downgrade-pause.js";
 import { enqueueDowngradeNotices } from "../../lib/billing/downgrade-notice-outbox.js";
 import { reconcileAndRecordDowngradePause } from "../../lib/billing/downgrade-pause-record.js";
+import { recordRetentionShortening } from "../../lib/billing/retention-shortening.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 
 // STORY-075a / STORY-075 AC4 — the ONLY customer-reachable path to
@@ -200,6 +201,10 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     if (outcome.changed || addonOutcome.changed) {
       const keep = await keepChoiceForAdoption(tx, workspaceId, desired.state.providerSubscriptionId, object.metadata.plan_change_intent_id ?? "", desired.state.planKey);
       await this.reconcilePause(tx, workspaceId, event.id, { planChanged: outcome.changed && outcome.from !== outcome.to, addonsChanged: addonOutcome.changed }, afterCommit, keep);
+      // STORY-077 slice B (EC-41): a plan that shortens retention is announced and its first purge deferred, in this same transaction.
+      if (outcome.changed && outcome.from !== outcome.to) {
+        await this.recordRetentionNotice(tx, workspaceId, event.id, outcome.from, outcome.to, afterCommit);
+      }
     }
 
     // The charge this subscription was verified at is frozen on the row, so a
@@ -290,6 +295,26 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
     keep?: KeepChoice,
   ): Promise<void> {
     const notices = await reconcileAndRecordDowngradePause(tx, workspaceId, { requestId: eventId, operator: WEBHOOK_OPERATOR, ...moved }, keep);
+    if (notices.length > 0) {
+      const producer = this.producer;
+      const enqueue = producer === undefined ? undefined : (...args: Parameters<QueueProducer["enqueueTenantJob"]>) => producer.enqueueTenantJob(...args);
+      afterCommit.push(async () => await enqueueDowngradeNotices(enqueue, workspaceId, eventId, notices, this.logger));
+    }
+  }
+
+  /**
+   * STORY-077 slice B — records the retention-shortening notice (when the new plan keeps data for less time) and defers the
+   * first purge, keyed by this event id; AFTER the commit the same `billing.downgrade_notice` job sends it (retention-shortening.ts).
+   */
+  private async recordRetentionNotice(
+    tx: StripeEventContext["tx"],
+    workspaceId: string,
+    eventId: string,
+    fromPlanKey: string,
+    toPlanKey: string,
+    afterCommit: StripeEventContext["afterCommit"],
+  ): Promise<void> {
+    const notices = await recordRetentionShortening(tx, workspaceId, { fromPlanKey, toPlanKey, requestId: eventId, actorUa: `operator:${WEBHOOK_OPERATOR}` });
     if (notices.length > 0) {
       const producer = this.producer;
       const enqueue = producer === undefined ? undefined : (...args: Parameters<QueueProducer["enqueueTenantJob"]>) => producer.enqueueTenantJob(...args);

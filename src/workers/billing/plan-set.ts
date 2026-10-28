@@ -5,6 +5,7 @@ import { createPgPool } from "../../db/pg-pool.js";
 import { applyPlanChange, planKeyOnly, type BillingInterval, type PlanChangeOutcome } from "../../lib/billing/apply-plan.js";
 import { enqueueDowngradeNotices, type RecordedNotice } from "../../lib/billing/downgrade-notice-outbox.js";
 import { reconcileAndRecordDowngradePause } from "../../lib/billing/downgrade-pause-record.js";
+import { recordRetentionShortening } from "../../lib/billing/retention-shortening.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { createQueueReaderConnection, queueKeyPrefix } from "../../lib/queue/connection.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
@@ -162,7 +163,8 @@ async function activeMemberCount(client: PoolClient, workspaceId: string): Promi
 /**
  * Everything `plan:set` writes, inside the CALLER's tenant-context transaction (exported so it is testable against a
  * real database without the CLI's own pool): the Stripe-tracked refusal under the workspace lock, then the plan write,
- * then STORY-077's downgrade-pause reconcile (a comp after a cancellation to Free resumes what the cut-over paused).
+ * then STORY-077's downgrade-pause reconcile (a comp after a cancellation to Free resumes what the cut-over paused), then the
+ * retention-shortening notice (slice B).
  * Returns the notices it RECORDED, keyed by THIS change (`planSetNoticeRequestId`), for the caller to enqueue AFTER its
  * transaction commits under the same key.
  */
@@ -176,7 +178,7 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
     { allowNegotiatedTier: args.allowNegotiatedTier },
   );
   const noticeRequestId = planSetNoticeRequestId(args.ticket, outcome.entitlementVersion);
-  const notices = outcome.changed
+  const notices: RecordedNotice[] = outcome.changed
     ? await reconcileAndRecordDowngradePause(tx, args.workspaceId, {
         requestId: args.ticket,
         noticeRequestId,
@@ -185,6 +187,12 @@ export async function planSetInTransaction(tx: ClientBase, args: PlanSetArgs): P
         addonsChanged: false,
       })
     : [];
+  // STORY-077 slice B (EC-41): every plan writer runs the retention-shortening notice. With the seeded catalog plan:set cannot
+  // shorten a window (it refuses downgrades, and no upgrade has a shorter one), but plans are data, so the same step the Stripe
+  // webhook runs sits here: a shortening records its notice and defers the first purge instead of purging at the next sweep.
+  if (outcome.changed && outcome.from !== outcome.to) {
+    notices.push(...(await recordRetentionShortening(tx, args.workspaceId, { fromPlanKey: outcome.from, toPlanKey: outcome.to, requestId: noticeRequestId, actorUa: `operator:plan-set:${args.operator}` })));
+  }
   return { outcome, notices, noticeRequestId };
 }
 
@@ -247,7 +255,7 @@ export async function runPlanSet(args: PlanSetArgs, log: (line: string) => void 
       // Committed: only now may the downgrade-pause notices be queued (a rolled-back change never emails). The worker
       // sends them and retries a failed send (STORY-077, owner decision 2026-10-23).
       if (notices.length > 0) {
-        log(`downgrade-pause notice(s) recorded: ${String(notices.length)} (${notices.map((n) => n.id).join(", ")})`);
+        log(`downgrade/retention notice(s) recorded: ${String(notices.length)} (${notices.map((n) => n.id).join(", ")})`);
         await enqueueRecordedNotices(env, args, noticeRequestId, notices, log);
       }
       log(`entitlement_version now ${String(outcome.entitlementVersion)}`);

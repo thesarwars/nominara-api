@@ -175,4 +175,31 @@ describe("STORY-077 · plan:set resumes what a downgrade paused", () => {
     await planSet(ws, "business");
     await expect(planSet(ws, "starter")).rejects.toBeInstanceOf(DowngradeNotSupportedError);
   });
+  // STORY-077 slice B review round 1 (EC-41 / R1): every plan writer runs the retention-shortening notice, plan:set included.
+  // With the seeded catalog no UPGRADE shortens a window and plan:set refuses downgrades (the test above), so the path is
+  // reachable only when plans are data that was reseeded out of order. This one does exactly that, and restores the catalog.
+  it("a plan:set whose new plan keeps data for LESS time records the retention notice and defers the first purge to day 15", async () => {
+    const original = (await db.query<{ entitlements: Record<string, unknown> }>("SELECT entitlements FROM plans WHERE key = 'growth'")).rows[0]!.entitlements;
+    const reseeded = { ...original, "retention.raw_captures_days": { ...(original["retention.raw_captures_days"] as object), value: 60 } };
+    try {
+      const ws = await cancelledToFree("operator");
+      await planSet(ws, "starter"); // free (raw 30) -> starter (raw 90): not a shortening
+      expect((await db.query("SELECT 1 FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'retention_shortened'", [ws])).rowCount).toBe(0);
+
+      await db.query("UPDATE plans SET entitlements = $1 WHERE key = 'growth'", [JSON.stringify(reseeded)]);
+      const result = await planSet(ws, "growth"); // starter (raw 90) -> growth (raw 60 after the reseed)
+      expect(result.outcome).toMatchObject({ changed: true, from: "starter", to: "growth" });
+
+      expect(result.notices.map((n) => n.kind)).toEqual(["retention_shortened"]);
+      const rows = await db.query<{ request_id: string; kind: string; sent_at: Date | null }>("SELECT request_id, kind, sent_at FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'retention_shortened'", [ws]);
+      expect(rows.rows).toEqual([{ request_id: result.noticeRequestId, kind: "retention_shortened", sent_at: null }]);
+      const deferred = (await db.query<{ d: Date; r: number | null }>("SELECT retention_purge_not_before AS d, retention_deferred_raw_days AS r FROM workspaces WHERE id = $1", [ws])).rows[0]!;
+      const days = (deferred.d.getTime() - Date.now()) / 86_400_000;
+      expect(days).toBeGreaterThan(14.9);
+      expect(days).toBeLessThanOrEqual(15);
+      expect(deferred.r, "the window being replaced is kept meanwhile").toBe(90);
+    } finally {
+      await db.query("UPDATE plans SET entitlements = $1 WHERE key = 'growth'", [JSON.stringify(original)]);
+    }
+  });
 });

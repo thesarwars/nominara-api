@@ -442,6 +442,28 @@ describe("STORY-075a · subscriptions", () => {
     expect(audits.at(-1)!.after_state.credits_topped_up).toBe(0);
   });
 
+  it("STORY-077 scenario 6 · a downgrade that shortens retention records the notice (keyed by the event), defers the first purge to day 15, and a redelivery changes neither", async () => {
+    const { workspaceId } = await newWorkspace();
+    await deliver(eventBody("evt_r1", "customer.subscription.created", stripeSubscription(workspaceId, { plan: "business" })));
+    expect((await harness.db().query("SELECT retention_purge_not_before FROM workspaces WHERE id = $1", [workspaceId])).rows[0].retention_purge_not_before, "an upgrade defers nothing").toBeNull();
+
+    stripeSubscription(workspaceId, { plan: "starter" });
+    await withPlanChangeIntent(workspaceId, "business", "starter", 4_900);
+    const before = Date.now();
+    expect((await deliver(eventBody("evt_r2", "customer.subscription.updated", "sub_1"))).statusCode).toBe(200);
+
+    const deferred = (await harness.db().query<{ retention_purge_not_before: Date }>("SELECT retention_purge_not_before FROM workspaces WHERE id = $1", [workspaceId])).rows[0]!.retention_purge_not_before;
+    expect(deferred.getTime()).toBeGreaterThanOrEqual(before + 15 * 86_400_000);
+    expect(deferred.getTime()).toBeLessThanOrEqual(Date.now() + 15 * 86_400_000);
+    const notices = await harness.db().query("SELECT request_id, kind, sent_at FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'retention_shortened'", [workspaceId]);
+    expect(notices.rows).toEqual([{ request_id: "evt_r2", kind: "retention_shortened", sent_at: null }]);
+
+    // Stripe redelivers the same event: nothing more is recorded and the deferral does not move.
+    await deliver(eventBody("evt_r2", "customer.subscription.updated", "sub_1"));
+    expect((await harness.db().query("SELECT 1 FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'retention_shortened'", [workspaceId])).rowCount).toBe(1);
+    expect((await harness.db().query("SELECT retention_purge_not_before FROM workspaces WHERE id = $1", [workspaceId])).rows[0].retention_purge_not_before).toEqual(deferred);
+  });
+
   it("scenario 8 · cancellation at period end only sets the flag; the plan holds until Stripe deletes the subscription", async () => {
     const { workspaceId } = await newWorkspace();
     await deliver(eventBody("evt_c1", "customer.subscription.created", stripeSubscription(workspaceId)));
