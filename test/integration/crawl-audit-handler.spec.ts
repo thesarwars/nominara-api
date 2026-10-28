@@ -15,6 +15,8 @@ import { gunzipSync } from "node:zlib";
 import { createCrawlAuditHandler, type CrawlAuditDeps } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
 import { NOMINARA_USER_AGENT } from "../../src/lib/aux/page-crawl.js";
 import { unavailableRenderer } from "../../src/lib/aux/renderer.js";
+import { cl100kTokenizer } from "../../src/lib/aux/tokenizer-cl100k.js";
+import { tokenizerLabel } from "../../src/lib/aux/tokenizer.js";
 import { createHash } from "node:crypto";
 import { crawlManifestSchema, type AuxFinding, type AuxPatch } from "../../contracts/aux/index.js";
 import { AuxService } from "../../src/modules/aux/aux.service.js";
@@ -179,6 +181,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     const [a] = await audits();
     expect(a).toMatchObject({ trigger: "scheduled", scope: "public_surface", status: "completed", llms_txt_present: true, sitemap_url_count: 1, pages_crawled: 1, pages_failed: 0 });
     expect(a.robots_snapshot).toBe(OPEN);
+    // STORY-050 #5 — the audit records the tokenizer its token-count thresholds are measured with, never a placeholder.
+    expect(a.tokenizer).toBe(tokenizerLabel(cl100kTokenizer.identity));
     expect(Buffer.isBuffer(a.robots_hash) && a.robots_hash.length === 32).toBe(true);
     expect(a.started_at).not.toBeNull();
     expect(a.finished_at).not.toBeNull();

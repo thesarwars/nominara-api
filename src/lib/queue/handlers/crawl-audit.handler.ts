@@ -32,6 +32,8 @@ import { pageCapForPlan, selectPages, type SelectionScope } from "../../aux/page
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../../aux/politeness.js";
 import { unavailableRenderer, type Renderer } from "../../aux/renderer.js";
 import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../../aux/robots.js";
+import { cl100kTokenizer } from "../../aux/tokenizer-cl100k.js";
+import { tokenizerLabel } from "../../aux/tokenizer.js";
 import { sanitiseText } from "../../aux/sanitise.js";
 import { AI_CRAWLER_AGENTS, evaluateSiteFiles, type SiteFile } from "../../aux/site-files.js";
 import { collectSitemap, MAX_SITEMAP_FILES, SitemapFetchSkipped, type SitemapResult } from "../../aux/sitemap.js";
@@ -100,7 +102,8 @@ export const FETCH_TIMEOUT_MS = 10_000;
 export const CRAWL_WALL_CLOCK_BUDGET_MS = 10 * 60 * 1000;
 /** aux-and-geo-analysis.md §1: a 500 ms minimum interval between requests to one host. */
 export { MIN_INTERVAL_MS as POLITENESS_INTERVAL_MS } from "../../aux/politeness.js";
-const TOKENIZER = "none"; // aux_audits.tokenizer is NOT NULL; no text is tokenised in this stage.
+// STORY-050 AC3: the tokenizer the audit's token-count thresholds are measured with (the embedding model's own), so a future change is visible.
+const TOKENIZER = tokenizerLabel(cl100kTokenizer.identity);
 /** The one path every audit can speak for is the root. The same list is judged by evaluateRobotsTxt and used by the robots patch. */
 const AUDIT_TRACKED_PATHS: readonly string[] = ["/"];
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
