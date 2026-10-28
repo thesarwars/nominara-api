@@ -249,6 +249,18 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect((await passageRows()).map((row) => row.url)).toEqual(["https://theirs.example/p"]);
   }, 60_000);
 
+  it("scenario 2 - AC2 - a page on one of the project's owned_domains that the parser did not flag is still excluded", async () => {
+    await db.query("UPDATE projects SET owned_domains = ARRAY['mybrand-docs.test'] WHERE id = $1", [projectId]);
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://theirs.example/p");
+    await cite(prompt, "https://mybrand-docs.test/p", { owned: false });
+    await cite(prompt, "https://www.docs.mybrand-docs.test/p", { owned: false });
+    await cite(prompt, "https://notmybrand-docs.test/p", { owned: false });
+    for (const url of ["https://theirs.example/p", "https://mybrand-docs.test/p", "https://www.docs.mybrand-docs.test/p", "https://notmybrand-docs.test/p"]) pages.set(url, { kind: "html", html: articleHtml("reporting") });
+    await build();
+    expect(fetchCalls.sort()).toEqual(["https://notmybrand-docs.test/p", "https://theirs.example/p"]);
+  }, 60_000);
+
   // ---- sourcing ---------------------------------------------------------------------------------------------------------
 
   it("scenario 3 - AC3 - a text directive is the passage, with NO page fetch", async () => {
@@ -338,6 +350,77 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(rows[0]!.has_vector).toBe(true);
     expect(provider.sent).toHaveLength(1);
     expect(result.passagesWritten).toBe(1);
+  }, 60_000);
+
+  it("scenario 7 - AC13 - syndicated text on two URLs of ONE cluster is deduplicated, not a conflict: a rebuild is complete", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://one.example/p");
+    await cite(prompt, "https://two.example/p");
+    const same = { kind: "html", html: articleHtml("identical") } as const;
+    pages.set("https://one.example/p", same);
+    pages.set("https://two.example/p", same);
+    const first = await build();
+    expect(first.status).toBe("complete");
+    const again = await build();
+    expect(again.passagesConflictSkipped).toBe(0);
+    expect(again.status).toBe("complete");
+    expect(again.passagesDeduplicated).toBe(1);
+    expect(await passageRows()).toHaveLength(1);
+  }, 60_000);
+
+  // Known until the owner decides the ux_corpus_passages key (stopped_for_owner): the duplicate URL has no row of its own, so it is
+  // re-fetched on every build. Option (a) of the decision (a per-URL key) gives it one and closes this.
+  it.todo("scenario 7 - AC4 - a URL whose text is a same-cluster duplicate is not re-fetched while the 30-day cache is live");
+
+  it("scenario 7 - AC12 - a higher-scoring duplicate whose twin row has EXPIRED adopts that row: the passage survives the stale-row delete", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://one.example/p");
+    pages.set("https://one.example/p", { kind: "html", html: articleHtml("identical") });
+    await build();
+    await db.query("UPDATE corpus_passages SET expires_at = now() - interval '1 minute'");
+    // two.example now outranks one.example and carries the same text, so ITS draft is the one kept; one.example's row is expired.
+    await cite(prompt, "https://two.example/p", { weight: 5 });
+    pages.set("https://two.example/p", { kind: "html", html: articleHtml("identical") });
+    const result = await build();
+    expect(result.status).toBe("complete");
+    const rows = await passageRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.url).toBe("https://two.example/p");
+    expect(rows[0]!.expires_at.getTime()).toBeGreaterThan(Date.now());
+  }, 60_000);
+
+  it("AC12 - expired rows of a URL that is refused or fails on re-fetch are removed, not kept as clutter", async () => {
+    const urls = await seedPages(2);
+    await build();
+    expect(await passageRows()).toHaveLength(2);
+    await db.query("UPDATE corpus_passages SET expires_at = now() - interval '1 minute'");
+    pages.set(urls[0]!, { kind: "refused", reason: "address_not_global" });
+    pages.set(urls[1]!, { kind: "failed", reason: "http_503" });
+    const result = await build();
+    expect(result.status).toBe("partial");
+    expect(await passageRows()).toEqual([]);
+  }, 60_000);
+
+  it("AC13 - concurrency - the upsert writes in content-hash order, so concurrent builds lock index entries in one order", async () => {
+    await seedPages(6);
+    const inserts: string[][] = [];
+    await build(STAND_IN_EMBEDDING_MODEL, {
+      runInTx: (fn) =>
+        deps().runInTx((tx) =>
+          fn(new Proxy(tx, {
+            get: (target, prop) => {
+              if (prop !== "query") return Reflect.get(target, prop) as unknown;
+              return (text: string, values?: unknown[]) => {
+                if (typeof text === "string" && text.includes("INSERT INTO corpus_passages") && values !== undefined) inserts.push(values[13] as string[]);
+                return (target.query as (...a: unknown[]) => unknown)(text, values);
+              };
+            },
+          })),
+        ),
+    });
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.length).toBeGreaterThan(1);
+    expect(inserts[0]).toEqual([...inserts[0]!].sort());
   }, 60_000);
 
   it("scenario 7 - AC13 - rebuilding unchanged content writes no new rows and sends nothing to the provider", async () => {

@@ -70,8 +70,13 @@ export interface CorpusBuildResult {
    * corpus cannot hold them (a schema decision is open - see the story report): the URL is not fetched again, and the build is partial.
    */
   readonly heldElsewhere: number;
-  /** Passages fetched fine but not stored: identical text is already held by another cluster or project. Never silent: build is partial. */
+  /**
+   * Passages fetched fine but not stored because identical text is held by ANOTHER cluster or project (the unique key has neither in
+   * it - open owner decision). Never silent: the build is partial.
+   */
   readonly passagesConflictSkipped: number;
+  /** Passages whose text this corpus already holds under another of its own URLs (syndicated copies). Dedupe working; NOT partial. */
+  readonly passagesDeduplicated: number;
   readonly passagesWritten: number;
   readonly passagesRefreshed: number;
   readonly embedJobs: number;
@@ -145,7 +150,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   // ---- 2. fetch and select (no transaction) ----------------------------------------------------------------------------
   const counts = { cached: 0, fromFragment: 0, fetched: 0, refused: 0, failed: 0, empty: 0, heldElsewhere: 0 };
   const drafts: PassageDraft[] = [];
-  const processed: Candidate[] = [];
   const cachedCandidates: Candidate[] = [];
 
   for (const candidate of read.candidates) {
@@ -161,7 +165,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     const directive = candidate.textFragment === null ? null : passageFromTextFragment(candidate.textFragment);
     if (directive !== null) {
       counts.fromFragment += 1;
-      processed.push(candidate);
       let index = 0;
       for (const chunk of chunkDocument(directive, deps.tokenizer)) {
         drafts.push(draftOf(candidate, index, chunk.text, chunk.tokenCount, true));
@@ -179,7 +182,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
       continue;
     }
     counts.fetched += 1;
-    processed.push(candidate);
     const kept = selectTopChunks(chunkDocument(extractReadable(page.html), deps.tokenizer), read.terms);
     if (kept.length === 0) counts.empty += 1;
     for (const chunk of kept) drafts.push(draftOf(candidate, chunk.index, chunk.text, chunk.tokenCount, false));
@@ -187,7 +189,11 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
 
   // The same text under two URLs is ONE passage: the first (highest-scoring) URL keeps it.
   const seen = new Set<string>();
-  const unique = drafts.filter((draft) => (seen.has(draft.contentHashHex) ? false : (seen.add(draft.contentHashHex), true)));
+  // Written in content-hash order: two concurrent builds of sibling clusters that share several texts then take the unique-index
+  // entries in the same order and cannot deadlock on each other.
+  const unique = drafts
+    .filter((draft) => (seen.has(draft.contentHashHex) ? false : (seen.add(draft.contentHashHex), true)))
+    .sort((a, b) => (a.contentHashHex < b.contentHashHex ? -1 : a.contentHashHex > b.contentHashHex ? 1 : 0));
 
   // ---- 3. write (one transaction) --------------------------------------------------------------------------------------
   const fetchedAt = (deps.now ?? (() => new Date()))();
@@ -196,6 +202,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     let inserted = 0;
     let refreshed = 0;
     let conflictSkipped = 0;
+    let deduplicated = 0;
 
     // The corpus is THIS build's selection (reference section 6: top K, owned excluded). A URL that fell out of the top set, or
     // became owned, must stop contributing now, not at its 30-day expiry. Done BEFORE the upsert so the text of a departed URL is
@@ -208,7 +215,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     );
 
     if (unique.length > 0) {
-      const upsert = await tx.query<{ inserted: boolean }>(
+      const upsert = await tx.query<{ inserted: boolean; ch: string }>(
         `INSERT INTO corpus_passages
            (workspace_id, project_id, citation_url_hash, url, domain, prompt_cluster_id, engine_keys, passage_index, text, from_text_fragment,
             token_count, content_hash, embedding_model, citation_frequency, avg_position_weight, centroid_weight, fetched_at, expires_at)
@@ -217,16 +224,21 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::int[], $11::text[], $12::boolean[], $13::int[], $14::text[], $15::int[], $16::real[], $17::real[])
                 AS v(uh, url, domain, ek, idx, text, ff, tc, ch, freq, aw, cw)
          ON CONFLICT (workspace_id, content_hash, embedding_model) DO UPDATE
-            SET fetched_at = EXCLUDED.fetched_at, expires_at = EXCLUDED.expires_at, engine_keys = EXCLUDED.engine_keys,
+            SET citation_url_hash = EXCLUDED.citation_url_hash, url = EXCLUDED.url, domain = EXCLUDED.domain,
+                passage_index = EXCLUDED.passage_index, from_text_fragment = EXCLUDED.from_text_fragment, token_count = EXCLUDED.token_count,
+                fetched_at = EXCLUDED.fetched_at, expires_at = EXCLUDED.expires_at, engine_keys = EXCLUDED.engine_keys,
                 citation_frequency = EXCLUDED.citation_frequency, avg_position_weight = EXCLUDED.avg_position_weight,
                 centroid_weight = EXCLUDED.centroid_weight
-          -- Only this project's own row for this URL and cluster. The unique key has no project in it, so a hash held by another
-          -- project or cluster is theirs: it is left alone, and the draft is COUNTED as conflict-skipped (never silent; the build is
-          -- partial). The schema decision that would let both corpora hold it is open - see the story report.
+          -- Only this project's own row in this cluster, and only when it is the same URL's row or an EXPIRED one (a row that is
+          -- about to be superseded: the new URL adopts it, so the stale-row delete below cannot take the passage with it). The unique
+          -- key has no project in it, so a hash held by another project or cluster is theirs: it is left alone and the draft is
+          -- COUNTED as conflict-skipped (never silent; the build is partial). A live row of another URL of THIS corpus is the same
+          -- text under a second URL: left alone and counted as deduplicated below. The schema decision that would let both corpora hold
+          -- a hash is open - see the story report.
           WHERE corpus_passages.project_id = EXCLUDED.project_id
             AND corpus_passages.prompt_cluster_id IS NOT DISTINCT FROM EXCLUDED.prompt_cluster_id
-            AND corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash
-         RETURNING (xmax = 0) AS inserted`,
+            AND (corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash OR corpus_passages.expires_at <= now())
+         RETURNING (xmax = 0) AS inserted, encode(corpus_passages.content_hash, 'hex') AS ch`,
         [
           projectId, clusterId, deps.embeddingModel, fetchedAt.toISOString(), expiresAt.toISOString(),
           unique.map((d) => d.candidate.urlHashHex), unique.map((d) => d.candidate.url), unique.map((d) => d.candidate.domain),
@@ -240,7 +252,21 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
         if (row.inserted) inserted += 1;
         else refreshed += 1;
       }
-      conflictSkipped = unique.length - upsert.rows.length;
+      // A rejected draft is either a copy of text this corpus already holds (deduplicated) or text another cluster/project holds.
+      const stored = new Set(upsert.rows.map((row) => row.ch));
+      const rejected = unique.filter((draft) => !stored.has(draft.contentHashHex));
+      if (rejected.length > 0) {
+        const own = await tx.query<{ ch: string }>(
+          `SELECT DISTINCT encode(content_hash, 'hex') AS ch
+             FROM corpus_passages
+            WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
+              AND embedding_model = $3 AND encode(content_hash, 'hex') = ANY($4::text[])`,
+          [projectId, clusterId, deps.embeddingModel, rejected.map((draft) => draft.contentHashHex)],
+        );
+        const heldHere = new Set(own.rows.map((row) => row.ch));
+        deduplicated = rejected.filter((draft) => heldHere.has(draft.contentHashHex)).length;
+        conflictSkipped = rejected.length - deduplicated;
+      }
     }
 
     // A cached URL keeps its text but its citations moved on: refresh the weights the centroid reads.
@@ -260,13 +286,14 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
       );
     }
 
-    // Stale rows of the URLs just re-sourced: whatever was NOT refreshed above is superseded content (NFR-OPT-04).
-    if (processed.length > 0) {
+    // Expired rows of every candidate that was not served from cache: re-sourced URLs (whatever was NOT refreshed above is superseded
+    // content, NFR-OPT-04) AND URLs the guard refused or that failed - their expired text can no longer be used, so it is not kept.
+    if (read.candidates.length > 0) {
       await tx.query(
         `DELETE FROM corpus_passages
           WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
             AND embedding_model = $3 AND expires_at <= now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
-        [projectId, clusterId, deps.embeddingModel, processed.map((c) => c.urlHashHex)],
+        [projectId, clusterId, deps.embeddingModel, read.candidates.map((c) => c.urlHashHex)],
       );
     }
 
@@ -278,7 +305,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
         ORDER BY id`,
       [projectId, clusterId, deps.embeddingModel],
     );
-    return { inserted, refreshed, conflictSkipped, pendingIds: pending.rows.map((row) => row.id) };
+    return { inserted, refreshed, conflictSkipped, deduplicated, pendingIds: pending.rows.map((row) => row.id) };
   });
 
   // ---- after commit: ask for the vectors -------------------------------------------------------------------------------
@@ -305,11 +332,13 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     ...counts,
     passagesWritten: written.inserted,
     passagesConflictSkipped: written.conflictSkipped,
+    passagesDeduplicated: written.deduplicated,
     passagesRefreshed: written.refreshed,
     embedJobs,
     embedEnqueueFailures,
   };
 
+  for (let i = 0; i < written.deduplicated; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome: "passage_deduplicated" });
   for (const [outcome, count] of Object.entries(counts)) {
     for (let i = 0; i < count; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome });
   }
@@ -330,6 +359,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     empty: counts.empty,
     held_elsewhere: counts.heldElsewhere,
     passages_conflict_skipped: written.conflictSkipped,
+    passages_deduplicated: written.deduplicated,
     passages_written: written.inserted,
     embed_jobs: embedJobs,
   });

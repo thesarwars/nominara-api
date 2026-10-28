@@ -10,7 +10,7 @@ import { CORPUS } from "./constants.js";
 // The directive is cut at '#', and the page's score, frequency and average position weight are summed over every way it was cited.
 //
 // OWNED URLS ARE EXCLUDED HERE, at selection (the story's key decision): by the parser's `is_owned` on ANY citation of the page, and
-// again by the project's own registrable domain, so a page the parser has not (yet) flagged but which lives on the brand's domain
+// again by the project's own domains (root_domain and owned_domains, the set the parser's isOwnedHost uses, at a dot boundary), so a page the parser has not (yet) flagged but which lives on the brand's domain
 // can still never enter the corpus. Excluding after the fact would let an owned page spend one of the 25 slots.
 //
 // The window and the cap are the reference's (CORPUS.windowDays, CORPUS.topUrls). RLS bounds every table read to the workspace; the
@@ -45,7 +45,9 @@ export async function selectCandidates(tx: ClientBase, input: { readonly project
         WHERE workspace_id = app.current_workspace() AND project_id = $1 AND cluster_id = $2 AND deleted_at IS NULL
      ), facts AS (
        SELECT split_part(cf.normalized_url, '#', 1) AS base_url, cf.domain, cf.engine_key, cf.is_owned,
-              (cf.domain = pr.root_domain OR right(cf.domain, length(pr.root_domain) + 1) = '.' || pr.root_domain) AS on_brand_domain,
+              EXISTS (SELECT 1
+                        FROM (SELECT lower(regexp_replace(d, '^www\\.', '')) AS d FROM unnest(pr.owned_domains || pr.root_domain) AS u(d)) od
+                       WHERE od.d <> '' AND (cf.domain = od.d OR right(cf.domain, length(od.d) + 1) = '.' || od.d)) AS on_brand_domain,
               cf.position_weight::double precision AS position_weight, cf.captured_at, cf.text_fragment,
               COALESCE(pe.weight, 1.0)::double precision AS engine_weight
          FROM citation_facts cf
