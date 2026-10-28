@@ -146,6 +146,37 @@ describe("STORY-046 · PromptActivationService.activate", () => {
     expect(updates[0]?.sql).toContain("prompts_active");
   });
 
+  it("STORY-133 scenario 16 - the activated prompts are queued for embedding AFTER the active-count update, and enqueued only after COMMIT", async () => {
+    // the producer-edge decision (D3): the request is made in the activation's own transaction (so a rollback queues nothing); the job itself is
+    // enqueued by afterCommit, never inline.
+    calls = [];
+    const client = clientAnsweringWith(calls, [
+      { match: "FROM projects", rows: [{ prompts_cap: 40 }] },
+      { match: "status <> 'archived'", rows: [{ n: 0 }] },
+      { match: "generation_source = 'generated'", rows: [{ generated: 15, activated: 1 }] },
+      { match: "WHERE id = ANY", rows: promptRows([{ id: P1, status: "archived" }]) },
+      { match: "embedding IS NULL", rows: [{ id: P1 }] },
+    ]);
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client, context: { workspaceId: WS } } as never);
+    const deferred: (() => void)[] = [];
+    vi.spyOn(tenantContext, "afterCommit").mockImplementation((task) => void deferred.push(task));
+    const enqueueTenantJob = vi.fn(async () => ({}));
+    const service = new PromptActivationService(resolverReturning(40), { enqueueTenantJob } as never);
+
+    await service.activate(PROJECT, { prompt_ids: [P1] });
+
+    const order = calls.map((call) => call.sql);
+    const countUpdate = order.findIndex((sql) => sql.includes("UPDATE projects") && sql.includes("prompts_active"));
+    const embedRequest = order.findIndex((sql) => sql.includes("embedding IS NULL"));
+    expect(embedRequest, "the embedding request is made in the activation's transaction").toBeGreaterThan(countUpdate);
+    expect(enqueueTenantJob, "nothing is enqueued before COMMIT").not.toHaveBeenCalled();
+
+    expect(deferred).toHaveLength(1);
+    deferred[0]!();
+    await Promise.resolve();
+    expect(enqueueTenantJob).toHaveBeenCalledWith("embed.batch", WS, { table: "tracked_prompts", ids: [P1] }, { idempotencyKey: expect.stringMatching(/^emb:[0-9a-f]{64}$/) });
+  });
+
   it("updates the prompts to active in one statement, not one per id", async () => {
     // Fifteen round trips inside a transaction to set fifteen rows to the
     // same value, on the request path, for no benefit.

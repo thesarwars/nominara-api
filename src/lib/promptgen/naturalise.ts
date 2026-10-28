@@ -1,4 +1,5 @@
 import type { NaturaliseRequest, PromptNaturaliser } from "../../modules/prompts/ports/naturaliser.js";
+import { CircuitOpenError } from "../resilience/circuit-breaker.js";
 import type { Candidate } from "./emit.js";
 
 // STORY-045 — §4 step 4 NATURALIZE, and its fallback.
@@ -54,7 +55,7 @@ export function sanitiseForModel(line: string): string {
     .slice(0, MAX_PROMPT_CHARS);
 }
 
-export type NaturaliseFailure = "disabled" | "unavailable" | "schema_invalid";
+export type NaturaliseFailure = "disabled" | "unavailable" | "circuit_open" | "schema_invalid";
 
 export interface NaturaliseOptions {
   /** `null` is §4's `template_only` path — no call is made at all. */
@@ -121,17 +122,43 @@ export async function naturaliseCandidates(
   let response: unknown;
   try {
     response = await options.naturaliser.naturalise(request);
-  } catch {
+  } catch (error) {
     // A model outage must not stop a customer adding prompts. The reason is
-    // recorded rather than surfaced, so the pass still succeeds.
-    return asTemplateText("unavailable");
+    // recorded rather than surfaced, so the pass still succeeds. An OPEN
+    // circuit is told apart from an outage: it is the documented template-only
+    // trigger, and it means no call was made at all.
+    return asTemplateText(error instanceof CircuitOpenError ? "circuit_open" : "unavailable");
   }
 
   const lines = validate(response, candidates.length);
   if (lines === null) return asTemplateText("schema_invalid");
 
+  // "Preserve every slot value" is §4's instruction to the model, and an instruction is not a guarantee. A line that lost its brand or
+  // category no longer measures what its flags (`brand_named`, `brand_anonymous`) say it does, so THAT line keeps its template text.
+  // Per line rather than all-or-nothing: the array is still index-aligned, so a survivor is paired with the right archetype.
+  const kept = candidates.map((candidate, index) => keepsSlotValues(candidate, lines[index]!));
   return {
-    candidates: candidates.map((candidate, index) => ({ ...candidate, text: lines[index]!, naturalized: true })),
-    naturalized: true,
+    candidates: candidates.map((candidate, index) =>
+      kept[index] === true ? { ...candidate, text: lines[index]!, naturalized: true } : { ...candidate, naturalized: false },
+    ),
+    naturalized: kept.every(Boolean),
   };
+}
+
+/**
+ * Slots whose value is a NAME the buyer would type, and which the flags and coverage depend on. The derived composites
+ * (`segment`, `size_band`, `headcount`) are phrases we built from several inputs; re-wording them is the point of naturalising.
+ */
+const PRESERVED_SLOTS = ["brand", "competitor", "category", "integration", "compliance_term", "capability", "vertical", "persona", "use_case"] as const;
+
+function comparable(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function keepsSlotValues(candidate: Candidate, rewritten: string): boolean {
+  const haystack = ` ${comparable(rewritten)} `;
+  return PRESERVED_SLOTS.every((key) => {
+    const value = candidate.slots[key];
+    return value === undefined || haystack.includes(` ${comparable(value)} `);
+  });
 }

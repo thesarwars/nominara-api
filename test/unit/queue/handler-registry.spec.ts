@@ -72,6 +72,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "credit.housekeeping",
       "credit.reconcile",
       "domain.reverify",
+      "embed.batch",
       "identity.sweep_unverified",
       "maintenance.partition",
       "notify.dispatch",
@@ -92,6 +93,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "crawl.discover",
       // NEW-C-9 — after crawl.fingerprint (inert), before the embed group.
       "crawl.audit",
+      // STORY-133 - the embed group's first handler, declared after crawl.audit and before rollup.metric_daily in topology.ts.
+      "embed.batch",
       "rollup.metric_daily",
       // STORY-063 — declared after topic.cluster in topology.ts, i.e. between the rollup and credit entries.
       "task.generate",

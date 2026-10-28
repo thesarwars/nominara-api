@@ -25,6 +25,8 @@ function tenantClientRecording(calls: Recorded[], rows: unknown[] = []) {
   return {
     query: vi.fn(async (sql: string, params: unknown[]) => {
       calls.push({ sql, params });
+      // The embedding request (STORY-133) asks which of the new prompts still lack a vector; this stub's catch-all row has no id.
+      if (sql.includes("embedding IS NULL")) return { rows: [] };
       return { rows };
     }),
   };
@@ -274,6 +276,36 @@ describe("STORY-043 · ProjectsService.create", () => {
     for (const column of ["text_hash", "intent_archetype", "funnel_stage"]) {
       expect(promptInsert?.sql, column).toContain(column);
     }
+  });
+
+  it("STORY-133 AC10 - supplied prompts (inserted active) are requested for embedding in the creation, and enqueued only after COMMIT", async () => {
+    calls.length = 0;
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          if (sql.includes("embedding IS NULL")) return { rows: (params[0] as string[]).map((id) => ({ id })) };
+          return { rows: [{ "?column?": 1 }] };
+        }),
+      },
+    } as never);
+    await service().create(WS, ACTOR, { root_url: "https://hubspot.com", prompts: [{ text: "best crm" }, { text: "cheap crm" }] }, 1);
+
+    const order = calls.map((c) => c.sql);
+    const lastInsert = order.map((sql, i) => (sql.includes("INSERT INTO tracked_prompts") ? i : -1)).reduce((a, b) => Math.max(a, b));
+    const request = order.findIndex((sql) => sql.includes("embedding IS NULL"));
+    expect(request, "requested after the prompts are written").toBeGreaterThan(lastInsert);
+    const embedCalls = () => (queues.enqueueTenantJob as ReturnType<typeof vi.fn>).mock.calls.filter((c) => c[0] === "embed.batch");
+    expect(embedCalls(), "nothing is enqueued before COMMIT").toHaveLength(0);
+    for (const task of deferred) task();
+    await Promise.resolve();
+    expect(embedCalls()).toHaveLength(1);
+    expect((embedCalls()[0]![2] as { ids: string[] }).ids).toHaveLength(2);
+  });
+
+  it("STORY-133 AC10 - a creation with no prompts requests no embedding", async () => {
+    await service().create(WS, ACTOR, { root_url: "https://hubspot.com" }, 1);
+    expect(calls.some((c) => c.sql.includes("embedding IS NULL"))).toBe(false);
   });
 
   it("scenario 15 — creation touches no wallet or ledger table", async () => {

@@ -54,6 +54,9 @@ interface Scenario {
   readonly missing?: boolean;
   /** The member's project scope covers the prompt's project. Default true (unrestricted). */
   readonly inScope?: boolean;
+  /** STORY-133 - the ids `requestPromptEmbeddings` finds active and not yet embedded. */
+  readonly embedPending?: { id: string }[];
+  readonly producer?: { enqueueTenantJob: ReturnType<typeof vi.fn> };
 }
 
 describe("STORY-046 · PromptLifecycleService.update", () => {
@@ -88,11 +91,12 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
         { match: "count(*) FILTER (WHERE is_priority", rows: [{ n: scenario.priorityCount ?? 0 }] },
         { match: "status <> 'archived'", rows: [{ n: scenario.activeCount ?? 10 }] },
         { match: "prompts_cap", rows: [{ prompts_active: scenario.activeCount ?? 10, prompts_cap: 40 }] },
+        { match: "embedding IS NULL", rows: scenario.embedPending ?? [] },
       ],
       scenario.failOn,
     );
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client, context: { workspaceId: WS } } as never);
-    return new PromptLifecycleService(resolverReturning(scenario.entitlements ?? GENEROUS));
+    return new PromptLifecycleService(resolverReturning(scenario.entitlements ?? GENEROUS), scenario.producer as never);
   }
 
   beforeEach(() => {
@@ -104,6 +108,22 @@ describe("STORY-046 · PromptLifecycleService.update", () => {
   it("REQ-019-scope-out: refuses a prompt outside the member's project scope and writes nothing", async () => {
     await expect(setup({ inScope: false }).update(PROMPT, { status: "paused" })).rejects.toBeInstanceOf(ProjectOutOfScopeException);
     expect(calls.some((call) => /UPDATE|INSERT/.test(call.sql))).toBe(false);
+  });
+
+  it("STORY-133 - resuming a prompt to active queues its embedding after commit; pausing queues nothing", async () => {
+    const deferred: (() => void)[] = [];
+    vi.spyOn(tenantContext, "afterCommit").mockImplementation((task) => void deferred.push(task));
+    const producer = { enqueueTenantJob: vi.fn(async () => ({})) };
+
+    await setup({ status: "paused", embedPending: [{ id: PROMPT }], producer }).update(PROMPT, { status: "active" });
+    expect(producer.enqueueTenantJob, "nothing before COMMIT").not.toHaveBeenCalled();
+    deferred[0]!();
+    await Promise.resolve();
+    expect(producer.enqueueTenantJob).toHaveBeenCalledWith("embed.batch", WS, { table: "tracked_prompts", ids: [PROMPT] }, { idempotencyKey: expect.stringMatching(/^emb:/) });
+
+    deferred.length = 0;
+    await setup({ status: "active", embedPending: [{ id: PROMPT }], producer }).update(PROMPT, { status: "paused" });
+    expect(deferred).toHaveLength(0);
   });
 
   // STORY-077 review round 3 — ONE LOCK ORDER ON EVERY PATH: workspace, then project, then wallet. The cut-over locks
