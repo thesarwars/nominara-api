@@ -73,6 +73,25 @@ const storedCopySchema = z
   .strict();
 
 /**
+ * STORY-050 AC7 / AC8 / AC10 — what the plain fetch of a page answered, beside the stored bytes, so the document model can be
+ * rebuilt from storage alone: where the chain ended, every redirect hop, the status, and the response headers the model reads
+ * (an allow-list: `x-robots-tag`, `content-type`; never cookies or anything a server could use to plant data). Timing is whole
+ * milliseconds measured by the guarded fetch; null = not measured, which is not 0. Optional: a manifest written before this
+ * field existed has none, and its pages cannot be rebuilt into a model.
+ */
+export const crawlPageFetchSchema = z
+  .object({
+    final_url: z.string().max(2048),
+    redirect_chain: z.array(z.string().max(2048)).max(20),
+    http_status: z.number().int(),
+    headers: z.record(z.string(), z.string().max(2000)),
+    ttfb_ms: z.number().int().min(0).nullable(),
+    load_ms: z.number().int().min(0).nullable(),
+  })
+  .strict();
+export type CrawlPageFetch = z.infer<typeof crawlPageFetchSchema>;
+
+/**
  * What robots.txt says about ONE AI crawler token for the crawl's root path (STORY-049 AC8, owner decision 2026-10-22).
  * Nominara sends no request under any other crawler's name, so a firewall or CDN rule that blocks by user agent cannot be
  * observed here: AUX-R-005 stays unevaluated and is named in `excluded_rules`. Only what the site PUBLISHED is judged.
@@ -92,6 +111,7 @@ export const crawlManifestSchema = z
           outcome: z.enum(["ok", "partial", "failed", "skipped"]),
           raw: storedCopySchema.optional(),
           rendered: storedCopySchema.optional(),
+          fetch: crawlPageFetchSchema.optional(),
           failures: z.array(crawlPageFailureSchema),
           skipped_reason: z.string().optional(),
         })

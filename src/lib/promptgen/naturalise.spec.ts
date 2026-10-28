@@ -190,3 +190,46 @@ describe("STORY-045 · scenario 11 — FR-FAN-01e, what the naturaliser may see"
     expect(sanitiseForModel(text)).toBe(text);
   });
 });
+
+describe("STORY-045 AC3 · naturaliseCandidates — 'preserve every slot value' is checked, not trusted", () => {
+  it("a rewritten line that drops its brand falls back to ITS template text and the rest keep the rewrite", async () => {
+    const candidates = candidatesFor();
+    const victim = candidates.findIndex((c) => c.brandNamed);
+    const naturaliser = {
+      naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l, i) => (i === victim ? "which tool is best overall?" : `real: ${l}`))),
+    };
+
+    const result = await naturaliseCandidates(candidates, { naturaliser, temperature: 0.35 });
+
+    expect(result.candidates[victim]?.text).toBe(candidates[victim]?.text);
+    expect(result.candidates[victim]?.naturalized).toBe(false);
+    const others = result.candidates.filter((_, i) => i !== victim);
+    expect(others.every((c) => c.naturalized && c.text.startsWith("real: "))).toBe(true);
+    // The set is still not "fully naturalised", so it is not cached as if it were.
+    expect(result.naturalized).toBe(false);
+  });
+
+  it("matching ignores case, punctuation and spacing, so a stylistic rewrite of a value is not a failure", async () => {
+    const candidates = candidatesFor();
+    const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l) => `${l.toUpperCase().replace(/ /g, "  ")}!!`)) };
+    const result = await naturaliseCandidates(candidates, { naturaliser, temperature: 0.35 });
+    expect(result.candidates.every((c) => c.naturalized)).toBe(true);
+    expect(result.naturalized).toBe(true);
+  });
+
+  it("a derived composite slot (segment, size band, headcount) may be re-worded", async () => {
+    const candidates = candidatesFor();
+    const naturaliser = { naturalise: vi.fn(async (r: { lines: readonly string[] }) => r.lines.map((l) => l.replace(/mid market/gu, "midmarket"))) };
+    const result = await naturaliseCandidates(candidates, { naturaliser, temperature: 0.35 });
+    expect(result.candidates.every((c) => c.naturalized)).toBe(true);
+  });
+
+  it("a failure reason distinguishes an open circuit from any other outage", async () => {
+    const { CircuitOpenError } = await import("../resilience/circuit-breaker.js");
+    const naturaliser = { naturalise: vi.fn(async () => { throw new CircuitOpenError("prompt-naturaliser"); }) };
+    const result = await naturaliseCandidates(candidatesFor(), { naturaliser, temperature: 0.35 });
+    expect(result.failure).toBe("circuit_open");
+    expect(result.candidates).toHaveLength(15);
+    expect(result.candidates.every((c) => !c.naturalized)).toBe(true);
+  });
+});

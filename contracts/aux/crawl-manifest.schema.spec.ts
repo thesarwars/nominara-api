@@ -92,3 +92,38 @@ describe("STORY-049 AC6 · the crawl manifest under dom_object_prefix", () => {
     expect(crawlManifestSchema.safeParse({ ...manifest, extra: 1 }).success).toBe(false);
   });
 });
+
+describe("STORY-050 AC7 / AC8 / AC10 · the fetch record a page's snapshot is rebuilt from", () => {
+  const manifest = (page: Record<string, unknown>) => ({
+    version: 1,
+    audit_id: "0197a0a0-0000-7000-8000-000000000001",
+    scope: "key_pages",
+    root_url: "https://acme.com/",
+    pages: [{ url: "https://acme.com/a", outcome: "ok", failures: [], ...page }],
+    pages_over_cap: 0,
+    stopped_at_cap: false,
+    selection_skipped: [],
+    sitemap: null,
+    ai_bot_access: null,
+  });
+  const fetchRecord = { final_url: "https://acme.com/b", redirect_chain: ["https://acme.com/a"], http_status: 200, headers: { "x-robots-tag": "nosnippet" }, ttfb_ms: 0, load_ms: 12 };
+
+  it("a page records its final URL, redirect chain, status, the headers the model reads, and timing", () => {
+    const parsed = crawlManifestSchema.parse(manifest({ fetch: fetchRecord }));
+    expect(parsed.pages[0]?.fetch).toEqual(fetchRecord);
+  });
+
+  it("a measured 0 stays 0 and an unmeasured timing is null, never 0", () => {
+    expect(crawlManifestSchema.parse(manifest({ fetch: fetchRecord })).pages[0]?.fetch?.ttfb_ms).toBe(0);
+    expect(crawlManifestSchema.parse(manifest({ fetch: { ...fetchRecord, ttfb_ms: null, load_ms: null } })).pages[0]?.fetch?.load_ms).toBeNull();
+  });
+
+  it("a manifest written before the record existed still parses (no fetch)", () => {
+    expect(crawlManifestSchema.safeParse(manifest({})).success).toBe(true);
+  });
+
+  it("refuses an unknown key and a negative timing", () => {
+    expect(crawlManifestSchema.safeParse(manifest({ fetch: { ...fetchRecord, cookies: "x" } })).success).toBe(false);
+    expect(crawlManifestSchema.safeParse(manifest({ fetch: { ...fetchRecord, ttfb_ms: -1 } })).success).toBe(false);
+  });
+});
