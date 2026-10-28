@@ -368,8 +368,8 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(await passageRows()).toHaveLength(1);
   }, 60_000);
 
-  // Known until the owner decides the ux_corpus_passages key (stopped_for_owner): the duplicate URL has no row of its own, so it is
-  // re-fetched on every build. Option (a) of the decision (a per-URL key) gives it one and closes this.
+  // Open: the duplicate URL has no row of its own, so it is re-fetched on every build (a fetch cost only). Needs a per-URL record
+  // (a negative-cache row or a widened key) - see the key question in plans-7day/questions-058-corpus-key.md.
   it.todo("scenario 7 - AC4 - a URL whose text is a same-cluster duplicate is not re-fetched while the 30-day cache is live");
 
   it("scenario 7 - AC12 - a higher-scoring duplicate whose twin row has EXPIRED adopts that row: the passage survives the stale-row delete", async () => {
@@ -609,24 +609,80 @@ describe("STORY-058 - corpus passages and centroid", () => {
 
   // ---- a passage held by another cluster / project (the schema key has neither) -----------------------------------------
 
-  it("review - one page cited for two clusters of one project: the second build does not refetch it, says so, and is partial", async () => {
+  it("review - one page cited for two clusters of one project: the second cluster is fetched too and keeps every passage the first did not store", async () => {
     const clusterB = randomUUID();
     const promptA = await addPrompt(PROMPT_TEXTS[0]!);
-    const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
+    const promptB = await addPrompt("pricing plans for agencies", clusterB);
     for (const prompt of [promptA, promptB]) await cite(prompt, "https://g2.example/compare");
-    pages.set("https://g2.example/compare", { kind: "html", html: articleHtml("compare") });
+    const section = (title: string, body: string): string => `<h2>${title}</h2><p>${body} ${"filler ".repeat(8)}</p>`;
+    pages.set("https://g2.example/compare", {
+      kind: "html",
+      html: `<html><body><main>${section("A1", "teams compare reporting tools")}${section("A2", "reporting tools for teams compare")}${section("Both", "reporting tools pricing plans")}${section("B1", "pricing plans agencies")}${section("B2", "agencies pricing plans compared")}</main></body></html>`,
+    });
     const first = await build();
     expect(first.status).toBe("complete");
     expect(fetchCalls).toHaveLength(1);
 
     const second = await buildCorpus(deps(), { projectId, clusterId: clusterB });
-    expect(second.heldElsewhere).toBe(1);
+    expect(fetchCalls).toHaveLength(2); // not skipped because another cluster holds the page
+    expect(second.passagesWritten).toBe(2); // B1 and B2; the text both clusters selected ("Both") is held by the first
+    expect(second.passagesConflictSkipped).toBe(1);
     expect(second.status).toBe("partial");
-    expect(second.passagesWritten).toBe(0);
-    expect(fetchCalls).toHaveLength(1);
-    const again = await buildCorpus(deps(), { projectId, clusterId: clusterB });
-    expect(again.heldElsewhere).toBe(1);
-    expect(fetchCalls).toHaveLength(1);
+    const stored = await passageRows(`prompt_cluster_id = '${clusterB}'`);
+    expect(stored).toHaveLength(2);
+    expect(stored.every((r) => /\bB[12]\b/.test(r.text))).toBe(true);
+    // B now has live rows for the page: it is cached for the next build
+    await buildCorpus(deps(), { projectId, clusterId: clusterB });
+    expect(fetchCalls).toHaveLength(2);
+  }, 60_000);
+
+  it("review - a text held only by an EXPIRED row of another cluster is adopted, not blocked forever", async () => {
+    const clusterB = randomUUID();
+    const promptA = await addPrompt(PROMPT_TEXTS[0]!);
+    const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
+    await cite(promptB, "https://old.example/p");
+    pages.set("https://old.example/p", { kind: "html", html: articleHtml("shared") });
+    await buildCorpus(deps(), { projectId, clusterId: clusterB });
+    await db.query("UPDATE corpus_passages SET expires_at = now() - interval '1 minute'");
+    await cite(promptA, "https://new.example/p");
+    pages.set("https://new.example/p", { kind: "html", html: articleHtml("shared") });
+    const result = await build();
+    expect(result.passagesConflictSkipped).toBe(0);
+    expect(result.status).toBe("complete");
+    const rows = await passageRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.url).toBe("https://new.example/p");
+    expect(await passageRows(`prompt_cluster_id = '${clusterId}'`)).toHaveLength(1);
+  }, 60_000);
+
+  it("review - a URL's cached rows that cross expiry during the fetch phase are not deleted by the superseded-row cleanup", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://cached.example/p", { weight: 5 });
+    pages.set("https://cached.example/p", { kind: "html", html: articleHtml("cached") });
+    await build();
+    await cite(prompt, "https://fresh.example/p");
+    pages.set("https://fresh.example/p", { kind: "html", html: articleHtml("fresh") });
+    const expiring: PageFetcher = async (url) => {
+      await db.query("UPDATE corpus_passages SET expires_at = now() - interval '1 minute' WHERE url = 'https://cached.example/p'");
+      return fetchPage(url);
+    };
+    await build(STAND_IN_EMBEDDING_MODEL, { fetchPage: expiring });
+    expect(await passageRows("url = 'https://cached.example/p'")).toHaveLength(1);
+  }, 60_000);
+
+  it("review - a directive containing %00 yields a passage without the NUL, and the rest of the build still writes", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://nul.example/p", { fragment: "quote%00here%20now" });
+    await cite(prompt, "https://fine.example/p");
+    pages.set("https://fine.example/p", { kind: "html", html: articleHtml("fine") });
+    const result = await build();
+    expect(result.fromFragment).toBe(1);
+    const rows = await passageRows();
+    expect(rows.find((r) => r.url === "https://nul.example/p")!.text).toBe("quotehere now");
+    expect(rows.some((r) => r.url === "https://fine.example/p")).toBe(true);
+    for (const row of rows) expect(row.text).not.toContain("\u0000");
+    const again = await build();
+    expect(again.status).toBe("complete");
   }, 60_000);
 
   it("review - identical text under two URLs of two clusters: the passage the second cluster could not store is counted, and the build is partial", async () => {
@@ -765,8 +821,22 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(result.sourceCount).toBe((await passageRows(`workspace_id = '${workspaceId}'`)).length);
   }, 60_000);
 
-  it("computeCentroid on another workspace's or a missing session changes nothing and says so", async () => {
+  it("computeCentroid on a missing session changes nothing and says so", async () => {
     await expect(centroidOf(randomUUID())).resolves.toMatchObject({ found: false });
+  }, 60_000);
+
+  it("computeCentroid on workspace B's REAL session, under A's context, is found=false and B's row is untouched", async () => {
+    const bProject = randomUUID();
+    await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'P',$3,'https://b.test','b.test')`, [bProject, otherWorkspaceId, `p-${randomUUID().slice(0, 8)}`]);
+    const bSession = randomUUID();
+    await db.query(
+      `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, centroid_source_count, centroid_domains)
+       VALUES ($1,$2,$3,'https://b.test/p',$4,'{chatgpt}',$5, 42, '{keep.example}')`,
+      [bSession, otherWorkspaceId, bProject, clusterId, STAND_IN_EMBEDDING_MODEL],
+    );
+    await expect(centroidOf(bSession)).resolves.toMatchObject({ found: false });
+    const row = (await db.query("SELECT centroid_source_count, centroid_domains, centroid IS NULL AS no_centroid FROM geo_alignments WHERE id = $1", [bSession])).rows[0];
+    expect(row).toEqual({ centroid_source_count: 42, centroid_domains: ["keep.example"], no_centroid: true });
   }, 60_000);
 
   it("observability - a span per build, a metric per URL outcome, and ONE redacted log line (workspace ID; no URL, domain or passage text)", async () => {

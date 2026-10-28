@@ -4,6 +4,10 @@
 // further `&text=` directives. The prefix and suffix are only context for the browser to find the quote; the quote is `start` (to
 // `end`). The text BETWEEN start and end is not in the directive, so a start,end pair is joined as the two quoted ends and never
 // padded with invented text.
+// CHOSEN APPROXIMATION (recorded in the story): the joined ends are not a substring of the page; only the most recent directive of a page,
+// and its first `&text=`, is kept (candidates.ts).
+
+import { sanitiseText } from "../../aux/sanitise.js";
 
 const MAX_PASSAGE_CHARS = 4000;
 
@@ -20,7 +24,8 @@ export function passageFromTextFragment(fragment: string): string | null {
     } catch {
       return null;
     }
-    text = text.replace(/\s+/g, " ").trim();
+    // A NUL would fail the Postgres insert and abort the build's whole write transaction (the readable path sanitises the same way).
+    text = sanitiseText(text).replace(/\s+/g, " ").trim();
     if (text !== "") decoded.push(text);
   }
   // A lone "-" left by a directive that was only context carries no quote.

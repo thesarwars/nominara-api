@@ -25,4 +25,8 @@ describe("passageFromTextFragment", () => {
   it("AC3 - a literal comma inside the quote is percent-encoded and survives", () => {
     expect(passageFromTextFragment("one%2C%20two")).toBe("one, two");
   });
+  it("AC3 - control characters (a NUL would fail the Postgres insert) are stripped; a directive that is only control characters is null", () => {
+    expect(passageFromTextFragment("a%00b")).toBe("ab");
+    expect(passageFromTextFragment("%00%01")).toBeNull();
+  });
 });

@@ -6,7 +6,8 @@ import { CORPUS } from "./constants.js";
 //  - A heading line (`#`...) always opens a new chunk: a chunk never spans two sections, so a passage is about one thing.
 //  - Whole paragraphs are packed into a chunk while they fit.
 //  - Overlap is applied only where a chunk boundary falls INSIDE one section (a long section carried over); a heading boundary is a
-//    change of subject, and repeating the previous section's tail under the new heading would blur it.
+//    change of subject, and repeating the previous section's tail under the new heading would blur it. The tail is also left out
+//    when tail + the next unit would not fit `size` (a unit between size-overlap and size): a chunk never exceeds the size.
 //  - The counter is a PORT. The real one is the embedding model's tokenizer (STORY-050's cl100k); every chunk's tokenCount is what
 //    that counter said, and no chunk exceeds the size by that same counter.
 
@@ -91,15 +92,13 @@ export function chunkDocument(document: string, counter: TokenCounter, options: 
     // the previous piece still fits beside it.
     const units = section.flatMap((block) => (counter.count(block) <= size ? [block] : splitToFit(block, size - overlap, counter)));
     let current = "";
-    let carried = false; // current is nothing but overlap
     for (const unit of units) {
       const joined = current === "" ? unit : `${current}\n\n${unit}`;
       if (counter.count(joined) <= size) {
         current = joined;
-        carried = false;
         continue;
       }
-      if (current !== "" && !carried) push(current);
+      if (current !== "") push(current);
       const tail = current === "" ? "" : overlapTail(current, overlap, counter);
       const withTail = tail === "" ? unit : `${tail}\n\n${unit}`;
       if (tail !== "" && counter.count(withTail) <= size) {
@@ -107,7 +106,6 @@ export function chunkDocument(document: string, counter: TokenCounter, options: 
       } else {
         current = unit;
       }
-      carried = false;
     }
     if (current !== "") push(current);
   }

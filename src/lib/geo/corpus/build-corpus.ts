@@ -66,13 +66,9 @@ export interface CorpusBuildResult {
   /** Fetched fine but no chunk shared a term with the cluster's prompts. */
   readonly empty: number;
   /**
-   * The URL's passages are live under ANOTHER cluster or project of this workspace. ux_corpus_passages has neither in its key, so this
-   * corpus cannot hold them (a schema decision is open - see the story report): the URL is not fetched again, and the build is partial.
-   */
-  readonly heldElsewhere: number;
-  /**
-   * Passages fetched fine but not stored because identical text is held by ANOTHER cluster or project (the unique key has neither in
-   * it - open owner decision). Never silent: the build is partial.
+   * Passages fetched fine but not stored because IDENTICAL text is held, live, by ANOTHER cluster or project (ux_corpus_passages is
+   * (workspace, content_hash, model): neither is in the key - open owner question, plans-7day/questions-058-corpus-key.md). Only
+   * identical text is lost; the URL's other passages are stored. Never silent: the build is partial.
    */
   readonly passagesConflictSkipped: number;
   /** Passages whose text this corpus already holds under another of its own URLs (syndicated copies). Dedupe working; NOT partial. */
@@ -131,24 +127,15 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
           AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
       [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
     );
-    // Live under some OTHER project/cluster of this workspace: this corpus can never store them (unique key), so do not fetch them.
-    const elsewhere = await tx.query<{ h: string }>(
-      `SELECT DISTINCT encode(citation_url_hash, 'hex') AS h
-         FROM corpus_passages
-        WHERE workspace_id = app.current_workspace() AND NOT (project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2)
-          AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
-      [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
-    );
     return {
       candidates,
       terms: queryTermsOf(prompts.rows.map((row) => row.text)),
       liveHashes: new Set(live.rows.map((row) => row.h)),
-      elsewhereHashes: new Set(elsewhere.rows.map((row) => row.h)),
     };
   });
 
   // ---- 2. fetch and select (no transaction) ----------------------------------------------------------------------------
-  const counts = { cached: 0, fromFragment: 0, fetched: 0, refused: 0, failed: 0, empty: 0, heldElsewhere: 0 };
+  const counts = { cached: 0, fromFragment: 0, fetched: 0, refused: 0, failed: 0, empty: 0 };
   const drafts: PassageDraft[] = [];
   const cachedCandidates: Candidate[] = [];
 
@@ -156,10 +143,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     if (read.liveHashes.has(candidate.urlHashHex)) {
       counts.cached += 1;
       cachedCandidates.push(candidate);
-      continue;
-    }
-    if (read.elsewhereHashes.has(candidate.urlHashHex)) {
-      counts.heldElsewhere += 1;
       continue;
     }
     const directive = candidate.textFragment === null ? null : passageFromTextFragment(candidate.textFragment);
@@ -224,20 +207,22 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::int[], $11::text[], $12::boolean[], $13::int[], $14::text[], $15::int[], $16::real[], $17::real[])
                 AS v(uh, url, domain, ek, idx, text, ff, tc, ch, freq, aw, cw)
          ON CONFLICT (workspace_id, content_hash, embedding_model) DO UPDATE
-            SET citation_url_hash = EXCLUDED.citation_url_hash, url = EXCLUDED.url, domain = EXCLUDED.domain,
+            SET project_id = EXCLUDED.project_id, prompt_cluster_id = EXCLUDED.prompt_cluster_id, citation_url_hash = EXCLUDED.citation_url_hash, url = EXCLUDED.url, domain = EXCLUDED.domain,
                 passage_index = EXCLUDED.passage_index, from_text_fragment = EXCLUDED.from_text_fragment, token_count = EXCLUDED.token_count,
                 fetched_at = EXCLUDED.fetched_at, expires_at = EXCLUDED.expires_at, engine_keys = EXCLUDED.engine_keys,
                 citation_frequency = EXCLUDED.citation_frequency, avg_position_weight = EXCLUDED.avg_position_weight,
                 centroid_weight = EXCLUDED.centroid_weight
-          -- Only this project's own row in this cluster, and only when it is the same URL's row or an EXPIRED one (a row that is
-          -- about to be superseded: the new URL adopts it, so the stale-row delete below cannot take the passage with it). The unique
-          -- key has no project in it, so a hash held by another project or cluster is theirs: it is left alone and the draft is
-          -- COUNTED as conflict-skipped (never silent; the build is partial). A live row of another URL of THIS corpus is the same
-          -- text under a second URL: left alone and counted as deduplicated below. The schema decision that would let both corpora hold
-          -- a hash is open - see the story report.
-          WHERE corpus_passages.project_id = EXCLUDED.project_id
-            AND corpus_passages.prompt_cluster_id IS NOT DISTINCT FROM EXCLUDED.prompt_cluster_id
-            AND (corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash OR corpus_passages.expires_at <= now())
+          -- An EXPIRED row is adopted whoever holds it: it no longer contributes to any centroid, and its owner cluster may never
+          -- rebuild, so it must not block the text forever (the row moves to this project and cluster). A LIVE row is adopted only
+          -- when it is this corpus's row for the same URL. A live row of another URL of THIS corpus is the same text under a second
+          -- URL: left alone and counted as deduplicated below. A live row of another project or cluster is theirs: left alone and the
+          -- draft is COUNTED as conflict-skipped (never silent; the build is partial). Only identical TEXT collides - the key is
+          -- (workspace, content_hash, model) - so the URL's other passages are stored. Whether the key should carry the project and
+          -- cluster is an open owner question: plans-7day/questions-058-corpus-key.md.
+          WHERE corpus_passages.expires_at <= now()
+             OR (corpus_passages.project_id = EXCLUDED.project_id
+                 AND corpus_passages.prompt_cluster_id IS NOT DISTINCT FROM EXCLUDED.prompt_cluster_id
+                 AND corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash)
          RETURNING (xmax = 0) AS inserted, encode(corpus_passages.content_hash, 'hex') AS ch`,
         [
           projectId, clusterId, deps.embeddingModel, fetchedAt.toISOString(), expiresAt.toISOString(),
@@ -286,14 +271,17 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
       );
     }
 
-    // Expired rows of every candidate that was not served from cache: re-sourced URLs (whatever was NOT refreshed above is superseded
+    // Expired rows of every candidate that was NOT served from cache: re-sourced URLs (whatever was NOT refreshed above is superseded
     // content, NFR-OPT-04) AND URLs the guard refused or that failed - their expired text can no longer be used, so it is not kept.
-    if (read.candidates.length > 0) {
+    // A cached URL is left out: its rows may have crossed expiry during the fetch phase and got no weight refresh above, but they
+    // are not superseded by anything - the next build re-sources the URL.
+    const uncachedHashes = read.candidates.filter((c) => !read.liveHashes.has(c.urlHashHex)).map((c) => c.urlHashHex);
+    if (uncachedHashes.length > 0) {
       await tx.query(
         `DELETE FROM corpus_passages
           WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
             AND embedding_model = $3 AND expires_at <= now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
-        [projectId, clusterId, deps.embeddingModel, read.candidates.map((c) => c.urlHashHex)],
+        [projectId, clusterId, deps.embeddingModel, uncachedHashes],
       );
     }
 
@@ -325,7 +313,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     }
   }
 
-  const status = counts.refused + counts.failed + counts.heldElsewhere + written.conflictSkipped > 0 ? "partial" : "complete";
+  const status = counts.refused + counts.failed + written.conflictSkipped > 0 ? "partial" : "complete";
   const result: CorpusBuildResult = {
     status,
     candidates: read.candidates.length,
@@ -357,7 +345,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     refused: counts.refused,
     failed: counts.failed,
     empty: counts.empty,
-    held_elsewhere: counts.heldElsewhere,
     passages_conflict_skipped: written.conflictSkipped,
     passages_deduplicated: written.deduplicated,
     passages_written: written.inserted,

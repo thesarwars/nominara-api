@@ -52,8 +52,8 @@ export async function selectCandidates(tx: ClientBase, input: { readonly project
               COALESCE(pe.weight, 1.0)::double precision AS engine_weight
          FROM citation_facts cf
          JOIN cluster_prompts cp ON cp.id = cf.prompt_id
-         JOIN projects pr ON pr.id = cf.project_id
-         LEFT JOIN project_engines pe ON pe.project_id = cf.project_id AND pe.engine_key = cf.engine_key
+         JOIN projects pr ON pr.id = cf.project_id AND pr.workspace_id = app.current_workspace()
+         LEFT JOIN project_engines pe ON pe.project_id = cf.project_id AND pe.engine_key = cf.engine_key AND pe.workspace_id = app.current_workspace()
         WHERE cf.workspace_id = app.current_workspace() AND cf.project_id = $1
           AND cf.captured_at >= now() - make_interval(days => $3::int)
      )
