@@ -34,6 +34,16 @@ describe("STORY-051 · rules over a model built from HTML", () => {
     expect(codes(fs)).toContain("AUX-R-008");
   });
 
+  it("STORY-051 AUX-R-008 · an empty or whitespace-only ld+json script through the builder raises no finding (owner decision 9)", async () => {
+    const page = GOOD.replace("</head>", '<script type="application/ld+json">  \n </script><script type="application/ld+json"></script></head>');
+    expect(codes(await run(snap(page)))).not.toContain("AUX-R-008");
+  });
+
+  it("STORY-051 AUX-R-008 · an unparsable non-empty block still fires beside an empty one", async () => {
+    const page = GOOD.replace("</head>", '<script type="application/ld+json"> </script><script type="application/ld+json">{oops</script></head>');
+    expect(codes(await run(snap(page)))).toContain("AUX-R-008");
+  });
+
   it("STORY-051 #8 · JSON-LD present only in the rendered copy fires AUX-R-027 through the builder", async () => {
     const raw = GOOD.replace(/<script type="application\/ld\+json">[\s\S]*?<\/script>/u, "");
     const fs = await run(snap(raw, { renderedHtml: GOOD }));

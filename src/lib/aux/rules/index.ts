@@ -17,7 +17,7 @@ import type { AuxRule } from "./types.js";
 // STORY-051 — the document-model rules, in the reference's order. The five site-file rules (AUX-R-001, 002, 003, 004, 007) live in
 // ../site-files.ts and judge fetched files, not a page.
 
-export const AUX_RULES: readonly AuxRule[] = [
+const IMPLEMENTED_RULES: readonly AuxRule[] = [
   noAiDirective,
   jsonLdSyntaxError, missingContextOrType, noPrimaryEntity, organizationIncomplete, offerDataAbsent, schemaTextContradiction,
   featureListThin, ratingWithoutProvenance, invalidVocabulary, faqMarkupAbsent, duplicateConflictingEntities,
@@ -25,6 +25,25 @@ export const AUX_RULES: readonly AuxRule[] = [
   jsOnlyMainContent, structuredDataClientSideOnly, slowFirstByteForBots,
   dateModifiedAbsent,
 ];
+
+/**
+ * THE HOLD SWITCH. A rule listed here keeps its catalog row, its evaluator and its evaluator tests, but the engine does not run it:
+ * it is reported as not evaluated (AUX_RULES_NOT_EVALUATED), raises no finding and so adds no penalty, and the catalog weights are
+ * untouched (a rule that is not run contributes no penalty, as for every other rule in AUX_RULES_NOT_EVALUATED).
+ *
+ * AUX-R-013: owner decision 8 (plans-7day/decisions-2026-10-28.md). After 7 review rounds the rule still raised false criticals on
+ * pricing tiers, per-variant offers and site-wide product blocks on blog pages. The follow-up story rewrites it to judge name, price
+ * and rating only against the page's own subject. That story removes the entry below; nothing else needs to change.
+ */
+export const HELD_RULES: Readonly<Record<string, string>> = {
+  "AUX-R-013": "Held by owner decision 8: the schema-versus-text contradiction rule raised false criticals on pricing tiers, per-variant offers and site-wide product blocks on blog pages, so it is not run and adds no penalty. A follow-up story rewrites it to judge name, price and rating only against the page's own subject.",
+};
+
+/** Every implemented evaluator, held ones included: for the evaluators' own unit tests and the follow-up story. The engine runs AUX_RULES. */
+export const ALL_AUX_RULES: readonly AuxRule[] = IMPLEMENTED_RULES;
+
+/** The rules the engine runs: every implemented evaluator that is not held. */
+export const AUX_RULES: readonly AuxRule[] = IMPLEMENTED_RULES.filter((r) => !(r.code in HELD_RULES));
 
 /**
  * Catalog rules the audit does NOT evaluate, and why. Each is a gap in what the document model carries, or an owner decision —
@@ -38,6 +57,7 @@ export const AUX_RULES_NOT_EVALUATED: Readonly<Record<string, string>> = {
   "AUX-R-032": "Needs the project's brand aliases to compare with the title and H1; they are not in the document model.",
   "AUX-R-033": "Needs the product name to decide whether a capability sentence names it, and a definition of a capability sentence; neither is in the document model.",
   "AUX-R-034": "Needs the sameAs links of every page on the domain, not of one page; a single document cannot show their absence.",
+  ...HELD_RULES,
 };
 
 /**
@@ -45,7 +65,7 @@ export const AUX_RULES_NOT_EVALUATED: Readonly<Record<string, string>> = {
  * covers only part of its reference row, so the audit must not report them as fully checked: when the rules are wired into the audit,
  * surface this map next to AUX_RULES_NOT_EVALUATED. Closing a gap means a STORY-050 field, then the rule reads it.
  */
-export const AUX_RULES_PARTIAL: Readonly<Record<string, string>> = {
+const PARTIAL_READINGS: Readonly<Record<string, string>> = {
   "AUX-R-006": "Sees only directives for Googlebot or everyone: STORY-050 meta.directives drops directives scoped to an AI agent (X-Robots-Tag: GPTBot: noai). Needs the agent-scoped directives in the document model.",
   "AUX-R-013": "Compares the schema with the RAW copy while no renderer is installed (STORY-049 has none, so rendered is always null); the reference defines it on the rendered text. Closes when a renderer supplies the rendered copy.",
   "AUX-R-016": "Checks the @context host, the @type spelling and deprecated properties only. Whether a @type is valid for its property set needs a schema.org vocabulary data set (classes and their properties), which is not held.",
@@ -60,3 +80,6 @@ export const AUX_RULES_PARTIAL: Readonly<Record<string, string>> = {
   "AUX-R-027": "Undecidable without a rendered copy: with rendered null (STORY-049 has no renderer) it returns no finding, so it can never fire today. A page with no rendered copy keeps AUX-R-027 in excluded_rules for that audit; it is not a pass.",
   "AUX-R-029": "A page with no measured timing is skipped (null is not a slow response), so that page keeps AUX-R-029 in excluded_rules for the audit. The 3 MiB size bound reads the reference's '3 MB' as binary (an owner decision, the same open reading as AUX-R-003's 500 KiB), and timing.bytes counts the decoded string, not wire bytes (a STORY-050 limit).",
 };
+
+/** PARTIAL covers rules the engine runs; a held rule is reported as not evaluated instead. */
+export const AUX_RULES_PARTIAL: Readonly<Record<string, string>> = Object.fromEntries(Object.entries(PARTIAL_READINGS).filter(([code]) => !(code in HELD_RULES)));

@@ -81,6 +81,8 @@ export const slowFirstByteForBots = defineRule({
     const breaches: { reason: string; measured: number; threshold: number }[] = [];
     if (doc.timing.ttfbMs !== null && doc.timing.ttfbMs > t.max_ttfb_ms) breaches.push({ reason: "ttfb_ms", measured: doc.timing.ttfbMs, threshold: t.max_ttfb_ms });
     if (doc.timing.loadMs !== null && doc.timing.loadMs > t.max_load_ms) breaches.push({ reason: "load_ms", measured: doc.timing.loadMs, threshold: t.max_load_ms });
+    // "3 MB" is 3 MiB = 3,145,728 bytes (owner decision 10, plans-7day/decisions-2026-10-28.md), the same reading as AUX-R-003's 500 KiB;
+    // the number is the catalog row's max_bytes, a size above it fires.
     if (doc.timing.bytes > t.max_bytes) breaches.push({ reason: "bytes", measured: doc.timing.bytes, threshold: t.max_bytes });
     if (breaches.length === 0) return [];
     const first = breaches[0]!;

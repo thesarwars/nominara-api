@@ -93,6 +93,10 @@ describe("STORY-051 AUX-R-029 · slow first byte for bots", () => {
     expect(await findings(t(100, 1000, 3 * 1024 * 1024), "AUX-R-029")).toEqual([]);
     expect((await findings(t(100, 1000, 3 * 1024 * 1024 + 1), "AUX-R-029"))[0]).toMatchObject({ measured_value: 3 * 1024 * 1024 + 1, threshold_value: 3 * 1024 * 1024 });
   });
+  it("STORY-051 AUX-R-029 · 3 MB is 3 MiB (owner decision 10): 3,145,728 bytes does not fire, 3,145,729 fires", async () => {
+    expect(await findings(t(100, 1000, 3_145_728), "AUX-R-029")).toEqual([]);
+    expect((await findings(t(100, 1000, 3_145_729), "AUX-R-029"))[0]).toMatchObject({ measured_value: 3_145_729, threshold_value: 3_145_728 });
+  });
   it("STORY-051 AUX-R-029 · an unmeasured timing is null, not zero and not slow; a measured 0 is fine", async () => {
     expect(await findings(t(null, null, 1000), "AUX-R-029")).toEqual([]);
     expect(await findings(t(0, 0, 0), "AUX-R-029")).toEqual([]);

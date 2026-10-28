@@ -27,7 +27,9 @@ export const jsonLdSyntaxError = defineRule({
     // `parseErrors` holds the errors of both copies. A block that is broken in the plain copy and still broken after rendering is
     // ONE error, so the copies are folded by block index, position and quoted text; the locator names the copy it was first seen in.
     const seen = new Set<string>();
+    // An empty or whitespace-only block is not invalid JSON-LD (owner decision 9); the document model still records it as "empty".
     const errors = doc.structured.parseErrors.filter((e) => {
+      if (e.reason === "empty") return false;
       const key = `${String(e.index)}|${String(e.position)}|${e.snippet}`;
       if (seen.has(key)) return false;
       seen.add(key);

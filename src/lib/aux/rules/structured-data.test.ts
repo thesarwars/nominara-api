@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CLEAN_JSON_LD, CLEAN_TEXT, makeDoc, variant } from "../../../../test/support/aux-document.js";
-import { findings, withThresholds } from "../../../../test/support/aux-rules.js";
+import { evaluatorFindings as findings, withThresholds } from "../../../../test/support/aux-rules.js";
 
 // STORY-051 — the structured_data rules, AUX-R-008..018, and AUX-R-006 (crawler directive). Each rule is a threshold, so each is
 // tested at, below and above it (AC4), and from the hazard the rule exists for.
@@ -50,6 +50,21 @@ describe("STORY-051 AUX-R-008 · JSON-LD syntax error", () => {
     const rawOnly = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [] } }), rendered: variant() });
     const withError = { ...rawOnly, structured: { ...rawOnly.structured, parseErrors: [err(0)] } };
     expect(await findings(withError, "AUX-R-008")).toHaveLength(1);
+  });
+});
+
+describe("STORY-051 AUX-R-008 · an empty block is not a syntax error (owner decision 9)", () => {
+  const base = { format: "jsonld" as const, variant: "raw" as const, position: null };
+  const empty = (index: number) => ({ ...base, index, reason: "empty" as const, snippet: "" });
+  const docWith = (parseErrors: ReturnType<typeof empty>[]) => makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors } }) });
+  it("STORY-051 AUX-R-008 · an empty or whitespace-only ld+json script raises no finding", async () => {
+    expect(await findings(docWith([empty(0)]), "AUX-R-008")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-008 · an empty block beside a non-empty unparsable one still fires critical, counting only the unparsable one", async () => {
+    const bad = { ...base, index: 1, reason: "invalid_json" as const, position: 3, snippet: "{oops" };
+    const [f] = await findings(docWith([empty(0), bad as never]), "AUX-R-008");
+    expect(f).toMatchObject({ severity: "critical", measured_value: 1 });
+    expect(f!.evidence.locator).toBe("raw.jsonld[1]@3");
   });
 });
 
