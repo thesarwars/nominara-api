@@ -71,11 +71,11 @@ export function jsonLdEntities(jsonLd: readonly unknown[]): Entity[] {
  * Every entity, including those nested under a property of another (`WebPage.mainEntity`, `ItemPage.mainEntity`, `about`,
  * `itemReviewed`): each object value that has a `@type`, found by walking every property (not `@context`, not `@graph`, which
  * jsonLdEntities already lists). A nested entity is located by its property path, `jsonld[0].mainEntity`. A node reached twice
- * is listed once. Use it where a rule asks "does the page declare X" or checks the thing the page is about; the top-level view
+ * is listed once. Use it (with no `follow` set, every property) only where any declaration is a defect wherever it sits (AUX-R-016); where a rule asks "does the page declare X" or checks the thing the page is about; the top-level view
  * stays for the rules that compare two descriptions of one entity (AUX-R-018), and for completeness checks, where a nested
  * reference (a publisher, an author) is a partial entity by design (AUX-R-011).
  */
-export function jsonLdEntitiesDeep(jsonLd: readonly unknown[]): Entity[] {
+export function jsonLdEntitiesDeep(jsonLd: readonly unknown[], follow?: ReadonlySet<string>): Entity[] {
   const out: Entity[] = [];
   const seen = new Set<object>();
   const walk = (value: unknown, block: number, locator: string): void => {
@@ -86,15 +86,21 @@ export function jsonLdEntitiesDeep(jsonLd: readonly unknown[]): Entity[] {
     if (!isRecord(value) || seen.has(value)) return;
     seen.add(value);
     if (rawTypesOf(value).length > 0) out.push({ node: value, block, locator });
-    for (const [key, v] of Object.entries(value)) if (key !== "@context" && key !== "@graph") walk(v, block, `${locator}.${key}`);
+    for (const [key, v] of Object.entries(value)) if (key !== "@context" && key !== "@graph" && (follow === undefined || follow.has(key))) walk(v, block, `${locator}.${key}`);
   };
   for (const root of jsonLdEntities(jsonLd)) {
     seen.add(root.node);
     out.push(root);
-    for (const [key, v] of Object.entries(root.node)) if (key !== "@context" && key !== "@graph") walk(v, root.block, `${root.locator}.${key}`);
+    for (const [key, v] of Object.entries(root.node)) if (key !== "@context" && key !== "@graph" && (follow === undefined || follow.has(key))) walk(v, root.block, `${root.locator}.${key}`);
   }
   return out;
 }
+
+/** The properties through which a page names what it is about. Every other relation (hasVariant, isRelatedTo, isSimilarTo, isAccessoryOrSparePartFor, makesOffer, itemOffered) names another thing. */
+const SUBJECT_PROPERTIES: ReadonlySet<string> = new Set(["mainEntity", "mainEntityOfPage", "about", "itemListElement", "item"]);
+
+/** The entities a page is about: the top-level view plus those reached through subject properties only. A variant, a related or similar product, an accessory is not the page subject. */
+export const jsonLdSubjectEntities = (jsonLd: readonly unknown[]): Entity[] => jsonLdEntitiesDeep(jsonLd, SUBJECT_PROPERTIES);
 
 export const entitiesOfType = (entities: readonly Entity[], types: readonly string[]): Entity[] =>
   entities.filter((e) => typesOf(e.node).some((t) => types.includes(t)));

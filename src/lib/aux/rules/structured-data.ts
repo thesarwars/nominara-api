@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AuxDocument } from "../document-model.js";
-import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, jsonLdEntitiesDeep, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
+import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, jsonLdEntitiesDeep, jsonLdSubjectEntities, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
 import { defineRule, type RuleHit } from "./types.js";
 
 // structured_data — AUX-R-008..018 (aux-and-geo-analysis.md section 2). They read `doc.structured` (the rendered copy's data when
@@ -10,7 +10,10 @@ import { defineRule, type RuleHit } from "./types.js";
 const strict = <T extends z.ZodRawShape>(shape: T) => z.object(shape).strict();
 const entities = (d: AuxDocument): Entity[] => jsonLdEntities(d.structured.jsonLd);
 /** Entities at any depth: for the rules that ask what the page declares or checks the thing it is about. */
-const deepEntities = (d: AuxDocument): Entity[] => jsonLdEntitiesDeep(d.structured.jsonLd);
+/** What the page is about (subject properties only): variants, related products and accessories are other things, not the page's claims. */
+const deepEntities = (d: AuxDocument): Entity[] => jsonLdSubjectEntities(d.structured.jsonLd);
+/** Every typed object wherever it sits: a malformed vocabulary term is a defect on any entity. */
+const everyEntity = (d: AuxDocument): Entity[] => jsonLdEntitiesDeep(d.structured.jsonLd);
 
 // --- AUX-R-008 ----------------------------------------------------------------------------------------------------------------
 
@@ -357,7 +360,7 @@ export const invalidVocabulary = defineRule({
       }
     }
     // Nested entities (mainEntity, offers, author) are checked too; the @context check above is per block.
-    for (const e of deepEntities(doc)) {
+    for (const e of everyEntity(doc)) {
       for (const raw of rawTypesOf(e.node)) {
         const name = raw.replace(/^(?:https?:\/\/(?:www\.)?schema\.org\/|schema:)/iu, "");
         if (!CLASS_NAME.test(name)) hits.push({ reason: "invalid_type", snippet: raw, locator: `${e.locator}.@type` });

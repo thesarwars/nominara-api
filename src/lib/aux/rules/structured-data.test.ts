@@ -581,3 +581,39 @@ describe("STORY-051 AUX-R-016 · vocabulary on a nested entity (round 3)", () =>
     expect(await findings(withLd([org, page({ "@type": "Product", name: "Acme" })]), "AUX-R-016")).toEqual([]);
   });
 });
+
+describe("STORY-051 AUX-R-010 / 012 / 013 / 015 / 016 · a related or variant entity is not the page subject (round 5)", () => {
+  const priced = (price: string) => ({ offers: { "@type": "Offer", price, priceCurrency: "USD" } });
+  const shown = { mainText: "Wool coat\nPrice: $39.99" };
+  const group = {
+    "@context": "https://schema.org", "@type": "ProductGroup", name: "Wool coat",
+    hasVariant: [
+      { "@type": "Product", name: "Small green coat", ...priced("39.99") },
+      { "@type": "Product", name: "Large green coat", ...priced("44.99") },
+    ],
+  };
+  it("STORY-051 AUX-R-013 · a ProductGroup whose variants have other prices and names is not a contradiction", async () => {
+    expect(await findings(withLd([org, group], shown), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a Product with isRelatedTo / isSimilarTo / isAccessoryOrSparePartFor / makesOffer entities that are not shown does not fire", async () => {
+    const other = { "@type": "Product", name: "Unshown thing", ...priced("999"), aggregateRating: { "@type": "AggregateRating", ratingValue: "1", reviewCount: "3" } };
+    const product = { "@context": "https://schema.org", "@type": "Product", name: "Wool coat", ...priced("39.99"), isRelatedTo: other, isSimilarTo: [other], isAccessoryOrSparePartFor: other, makesOffer: { "@type": "Offer", itemOffered: other } };
+    expect(await findings(withLd([org, product], { mainText: "Wool coat\nPrice: $39.99\nRated 5/5 by customers" }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-012 · a related product with no offers does not make the page's offer data absent", async () => {
+    const product = { "@context": "https://schema.org", "@type": "Product", name: "Wool coat", ...priced("39.99"), isRelatedTo: { "@type": "Product", name: "Scarf" } };
+    expect(await findings(withLd([org, product], shown), "AUX-R-012")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-010 · a related product is not the page's primary entity", async () => {
+    const page = { "@context": "https://schema.org", "@type": "WebPage", name: "Acme", isRelatedTo: { "@type": "Product", name: "Scarf" } };
+    expect((await findings(withLd([page]), "AUX-R-010")).length).toBe(1);
+  });
+  it("STORY-051 AUX-R-015 · a related product's rating without provenance is not this page's rating", async () => {
+    const product = { "@context": "https://schema.org", "@type": "Product", name: "Wool coat", isRelatedTo: { "@type": "Product", name: "Scarf", aggregateRating: { "@type": "AggregateRating", ratingValue: "4" } } };
+    expect(await findings(withLd([org, product]), "AUX-R-015")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-016 · an invalid type on a related entity is still a vocabulary defect", async () => {
+    const product = { "@context": "https://schema.org", "@type": "Product", name: "Wool coat", isRelatedTo: { "@type": "not a class", name: "x" } };
+    expect((await findings(withLd([org, product]), "AUX-R-016")).length).toBe(1);
+  });
+});

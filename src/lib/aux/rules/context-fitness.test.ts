@@ -147,7 +147,7 @@ describe("STORY-051 AUX-R-024 · heading hierarchy broken", () => {
   it("STORY-051 AUX-R-024 · two H1s fires (one is the threshold, two is above it)", async () => {
     expect((await findings(doc(1, 2, 1), "AUX-R-024"))[0]!.evidence.reason).toBe("multiple_h1");
   });
-  it("STORY-051 AUX-R-024 · a skip from H2 to H4 fires; H3 to H2 then H3 does not", async () => {
+  it("STORY-051 AUX-R-024 · a skip from H2 to H4 fires, on the H4", async () => {
     const [f] = await findings(doc(1, 2, 4), "AUX-R-024");
     expect(f!.evidence).toMatchObject({ reason: "level_skip", snippet: "H4 #2" });
   });
