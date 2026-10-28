@@ -34,7 +34,9 @@ describe("STORY-050 AC11 · the model build inside its share of the latency budg
     const html = realisticPage();
     expect(html.length).toBeGreaterThan(1_000_000);
     expect(html.length).toBeLessThan(3_000_000);
-    const started = performance.now();
+    // CPU time of this process, not wall time: the unit suite runs many workers at once, and a bound on the work must not fail because
+    // another worker held the cores. (Measured: ~3 s alone; ~8 s of WALL time inside the full suite, which failed a wall-clock version of this bound.)
+    const started = process.cpuUsage();
     let blocks = 0;
     for (let n = 0; n < PAGES; n += 1) {
       const doc = buildAuxDocument(
@@ -43,7 +45,8 @@ describe("STORY-050 AC11 · the model build inside its share of the latency budg
       );
       blocks += doc.blocks.length;
     }
-    const elapsed = performance.now() - started;
+    const used = process.cpuUsage(started);
+    const elapsed = (used.user + used.system) / 1000;
     expect(blocks).toBeGreaterThan(PAGES);
     expect(elapsed).toBeLessThan((BUDGET_SHARE_MS / DOCUMENTED_PAGES) * PAGES);
   });

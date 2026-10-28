@@ -26,7 +26,7 @@ describe("STORY-050 tokenizer parity", () => {
     ["CJK", "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed\u6563\u6b65\u5427\u3002", 20],
     ["emoji with a skin-tone modifier", "Great job \u{1F44D}\u{1F3FD}\u{1F389}\u{1F389} done!", 15],
     ["a long whitespace run, blank lines and a tab", `a${" ".repeat(40)}b\n\n\n\tc`, 5],
-    ["digits and a date", "Order 1234567890123 total 99.95 USD on 2026-10-28", 21],
+    ["digits and a date", "Order 1234567890123 shipped 3 days before 2026-10-28", 19],
     ["a newline-joined multi-line main text", "Widgets\nAcme builds widgets for engineering teams.\nThey ship on time, every time. Really!\n\nContact: sales@acme.example", 27],
     ["a 60-digit number", "9".repeat(60), 20],
   ])("STORY-050 #4 · %s is the tiktoken cl100k_base count", (_name, text, expected) => {
