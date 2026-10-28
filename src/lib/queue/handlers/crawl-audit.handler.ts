@@ -931,6 +931,7 @@ function toManifestPage(p: PageRecord): CrawlManifest["pages"][number] {
     outcome: p.outcome,
     ...(p.raw === undefined ? {} : { raw: p.raw }),
     ...(p.rendered === undefined ? {} : { rendered: p.rendered }),
+    ...(p.fetch === undefined ? {} : { fetch: p.fetch }),
     failures: p.failures,
     ...(p.skipped_reason === undefined ? {} : { skipped_reason: p.skipped_reason }),
   };
