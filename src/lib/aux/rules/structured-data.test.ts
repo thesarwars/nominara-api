@@ -617,3 +617,61 @@ describe("STORY-051 AUX-R-010 / 012 / 013 / 015 / 016 · a related or variant en
     expect((await findings(withLd([org, product]), "AUX-R-016")).length).toBe(1);
   });
 });
+
+describe("STORY-051 AUX-R-010 / 013 / 017 / 030 · a declared entity under any relation but a variant or offer counts (round 6)", () => {
+  const ctx = "https://schema.org";
+  const qs3 = { headingTree: [{ level: 1, text: "Acme", children: [1, 2, 3].map((n) => ({ level: 2, text: `Question ${String(n)}?`, children: [] })) }] };
+  it("STORY-051 AUX-R-010 · a JobPosting with hiringOrganization Organization has an entity", async () => {
+    expect(await findings(withLd([{ "@context": ctx, "@type": "JobPosting", title: "Engineer", hiringOrganization: { "@type": "Organization", name: "Acme" } }]), "AUX-R-010")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-010 · an Event with organizer Organization has an entity", async () => {
+    expect(await findings(withLd([{ "@context": ctx, "@type": "Event", name: "Webinar", organizer: { "@type": "Organization", name: "Acme" } }]), "AUX-R-010")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-010 · a Review with itemReviewed SoftwareApplication has an entity", async () => {
+    expect(await findings(withLd([{ "@context": ctx, "@type": "Review", itemReviewed: { "@type": "SoftwareApplication", name: "Acme" } }]), "AUX-R-010")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-017 · a FAQPage nested under hasPart satisfies the question headings", async () => {
+    expect(await findings(withLd([org, { "@context": ctx, "@type": "WebPage", hasPart: { "@type": "FAQPage", mainEntity: [] } }], qs3), "AUX-R-017")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-030 · a dateModified on an entity under hasPart satisfies it", async () => {
+    const { dateModified: _m, ...noMeta } = makeDoc().meta;
+    const doc = makeDoc({ meta: noMeta, raw: variant({ mainText: "Acme Widgets\nNo dates here.", structured: { jsonLd: [{ "@context": ctx, "@type": "WebPage", hasPart: { "@type": "Article", dateModified: "2026-10-01" } }], microdata: [], rdfa: [], parseErrors: [] } }) });
+    expect(await findings(doc, "AUX-R-030")).toEqual([]);
+  });
+});
+
+describe("STORY-051 AUX-R-013 · an absent count or value is not a contradiction; variants and listings (round 6)", () => {
+  const rated = (rating: Record<string, unknown>, text: string) => withApp({ aggregateRating: { "@type": "AggregateRating", ...rating } }, { mainText: CLEAN_TEXT.replace("Rated 4.6/5 from 120 reviews.", text) });
+  it("STORY-051 AUX-R-013 · ratingCount alone with '120 ratings' on the page gives no finding", async () => {
+    expect(await findings(rated({ ratingValue: "4.6", ratingCount: "120" }, "Rated 4.6/5 from 120 ratings."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · ratingCount alone with '120 reviews' on the page gives no finding", async () => {
+    expect(await findings(rated({ ratingValue: "4.6", ratingCount: "120" }, "Rated 4.6/5 from 120 reviews."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · no ratingValue with '4.6/5 stars' on the page gives no finding", async () => {
+    expect(await findings(rated({ reviewCount: "120" }, "Rated 4.6/5 stars from 120 reviews."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a blank reviewCount is not stated either", async () => {
+    expect(await findings(rated({ ratingValue: "4.6", reviewCount: " " }, "Rated 4.6/5 from 87 reviews."), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · a present reviewCount that differs still fires critical", async () => {
+    const [f] = await findings(rated({ ratingValue: "4.6", reviewCount: "120" }, "Rated 4.6/5 from 87 reviews."), "AUX-R-013");
+    expect(f).toMatchObject({ severity: "critical" });
+    expect(f!.evidence.reason).toBe("review_count");
+  });
+  const priced = (price: string) => ({ offers: { "@type": "Offer", price, priceCurrency: "USD" } });
+  const group = (a: string, b: string) => ({ "@context": "https://schema.org", "@type": "ProductGroup", name: "Wool coat", hasVariant: [{ "@type": "Product", name: "Small", ...priced(a) }, { "@type": "Product", name: "Large", ...priced(b) }] });
+  it("STORY-051 AUX-R-013 · variants at 39.99 and 44.99 while the page shows 59.99 fires once, as a price", async () => {
+    const hits = await findings(withLd([org, group("39.99", "44.99")], { mainText: "Wool coat\nPrice: $59.99" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.evidence.reason).toBe("price");
+    expect(hits[0]!.measured_value).toBe(1);
+  });
+  it("STORY-051 AUX-R-013 · variants where one matches a shown price do not fire", async () => {
+    expect(await findings(withLd([org, group("39.99", "44.99")], { mainText: "Wool coat\nPrice: $44.99" }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-051 AUX-R-013 · an itemListElement price is not compared with a price filter on a listing page", async () => {
+    const list = { "@context": "https://schema.org", "@type": "ItemList", itemListElement: [{ "@type": "ListItem", position: 1, item: { "@type": "Product", name: "Alpha", ...priced("61") } }] };
+    expect(await findings(withLd([org, list], { mainText: "Alpha\nPrice $0 - $500" }), "AUX-R-013")).toEqual([]);
+  });
+});

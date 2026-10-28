@@ -67,17 +67,28 @@ export function jsonLdEntities(jsonLd: readonly unknown[]): Entity[] {
   return out;
 }
 
+/** Which properties a deep walk goes through: only `follow` when given, otherwise every property except `skip`. */
+export interface DeepView {
+  readonly follow?: ReadonlySet<string>;
+  readonly skip?: ReadonlySet<string>;
+}
+
 /**
- * Every entity, including those nested under a property of another (`WebPage.mainEntity`, `ItemPage.mainEntity`, `about`,
- * `itemReviewed`): each object value that has a `@type`, found by walking every property (not `@context`, not `@graph`, which
- * jsonLdEntities already lists). A nested entity is located by its property path, `jsonld[0].mainEntity`. A node reached twice
- * is listed once. Use it (with no `follow` set, every property) only where any declaration is a defect wherever it sits (AUX-R-016); where a rule asks "does the page declare X" or checks the thing the page is about; the top-level view
- * stays for the rules that compare two descriptions of one entity (AUX-R-018), and for completeness checks, where a nested
- * reference (a publisher, an author) is a partial entity by design (AUX-R-011).
+ * Every entity, including those nested under a property of another (`WebPage.mainEntity`, `about`, `itemReviewed`, `publisher`): each
+ * object value that has a `@type`, found by walking properties (never `@context`, nor `@graph`, which jsonLdEntities already lists).
+ * A nested entity is located by its property path, `jsonld[0].mainEntity`. A node reached twice is listed once. Three views:
+ *   - every entity (no view): where a defect is a defect wherever it sits (AUX-R-016);
+ *   - the declared view, `jsonLdDeclaredEntities`: every entity but those behind a relation to another thing (variants, related
+ *     products, offers), for "does the page declare X" (AUX-R-010, 017, 030);
+ *   - the subject view, `jsonLdSubjectEntities`: only the properties naming what the page is about, for the rules that compare the
+ *     page's own claims (AUX-R-012..015).
+ * The top-level view stays for the rules that compare two descriptions of one entity (AUX-R-018), and for completeness checks, where
+ * a nested reference (a publisher, an author) is a partial entity by design (AUX-R-011).
  */
-export function jsonLdEntitiesDeep(jsonLd: readonly unknown[], follow?: ReadonlySet<string>): Entity[] {
+export function jsonLdEntitiesDeep(jsonLd: readonly unknown[], view: DeepView = {}): Entity[] {
   const out: Entity[] = [];
   const seen = new Set<object>();
+  const goes = (key: string): boolean => key !== "@context" && key !== "@graph" && (view.follow === undefined || view.follow.has(key)) && !(view.skip?.has(key) ?? false);
   const walk = (value: unknown, block: number, locator: string): void => {
     if (Array.isArray(value)) {
       value.forEach((v, i) => walk(v, block, `${locator}[${String(i)}]`));
@@ -86,21 +97,27 @@ export function jsonLdEntitiesDeep(jsonLd: readonly unknown[], follow?: Readonly
     if (!isRecord(value) || seen.has(value)) return;
     seen.add(value);
     if (rawTypesOf(value).length > 0) out.push({ node: value, block, locator });
-    for (const [key, v] of Object.entries(value)) if (key !== "@context" && key !== "@graph" && (follow === undefined || follow.has(key))) walk(v, block, `${locator}.${key}`);
+    for (const [key, v] of Object.entries(value)) if (goes(key)) walk(v, block, `${locator}.${key}`);
   };
   for (const root of jsonLdEntities(jsonLd)) {
     seen.add(root.node);
     out.push(root);
-    for (const [key, v] of Object.entries(root.node)) if (key !== "@context" && key !== "@graph" && (follow === undefined || follow.has(key))) walk(v, root.block, `${root.locator}.${key}`);
+    for (const [key, v] of Object.entries(root.node)) if (goes(key)) walk(v, root.block, `${root.locator}.${key}`);
   }
   return out;
 }
 
-/** The properties through which a page names what it is about. Every other relation (hasVariant, isRelatedTo, isSimilarTo, isAccessoryOrSparePartFor, makesOffer, itemOffered) names another thing. */
+/** The properties through which a page names what it is about. */
 const SUBJECT_PROPERTIES: ReadonlySet<string> = new Set(["mainEntity", "mainEntityOfPage", "about", "itemListElement", "item"]);
 
-/** The entities a page is about: the top-level view plus those reached through subject properties only. A variant, a related or similar product, an accessory is not the page subject. */
-export const jsonLdSubjectEntities = (jsonLd: readonly unknown[]): Entity[] => jsonLdEntitiesDeep(jsonLd, SUBJECT_PROPERTIES);
+/** The relations to another thing, not to the page's own description: a variant, a related or similar product, an accessory, an offer and what it offers. */
+const OTHER_THING_PROPERTIES: ReadonlySet<string> = new Set(["hasVariant", "isRelatedTo", "isSimilarTo", "isAccessoryOrSparePartFor", "makesOffer", "hasOfferCatalog", "itemOffered"]);
+
+/** The entities a page is about: the top-level view plus those reached through subject properties only. */
+export const jsonLdSubjectEntities = (jsonLd: readonly unknown[]): Entity[] => jsonLdEntitiesDeep(jsonLd, { follow: SUBJECT_PROPERTIES });
+
+/** The entities a page declares: every entity except those reached through a relation to another thing. */
+export const jsonLdDeclaredEntities = (jsonLd: readonly unknown[]): Entity[] => jsonLdEntitiesDeep(jsonLd, { skip: OTHER_THING_PROPERTIES });
 
 export const entitiesOfType = (entities: readonly Entity[], types: readonly string[]): Entity[] =>
   entities.filter((e) => typesOf(e.node).some((t) => types.includes(t)));

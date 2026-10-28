@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AuxDocument } from "../document-model.js";
-import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, jsonLdEntitiesDeep, jsonLdSubjectEntities, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
+import { PRESENCE_THRESHOLD, asArray, byCodePoint, foldForComparison, clip, entitiesOfType, escapeRegExp, flattenHeadings, isRecord, jsonLdBlocks, jsonLdEntities, jsonLdEntitiesDeep, jsonLdDeclaredEntities, jsonLdSubjectEntities, markupTypes, normaliseText, present, rawTypesOf, text, typesOf, variantOf, type Entity } from "./helpers.js";
 import { defineRule, type RuleHit } from "./types.js";
 
 // structured_data — AUX-R-008..018 (aux-and-geo-analysis.md section 2). They read `doc.structured` (the rendered copy's data when
@@ -9,9 +9,10 @@ import { defineRule, type RuleHit } from "./types.js";
 
 const strict = <T extends z.ZodRawShape>(shape: T) => z.object(shape).strict();
 const entities = (d: AuxDocument): Entity[] => jsonLdEntities(d.structured.jsonLd);
-/** Entities at any depth: for the rules that ask what the page declares or checks the thing it is about. */
 /** What the page is about (subject properties only): variants, related products and accessories are other things, not the page's claims. */
-const deepEntities = (d: AuxDocument): Entity[] => jsonLdSubjectEntities(d.structured.jsonLd);
+const subjectEntities = (d: AuxDocument): Entity[] => jsonLdSubjectEntities(d.structured.jsonLd);
+/** What the page declares, at any depth but behind a variant, related product or offer: for "does the page declare X". */
+const declaredEntities = (d: AuxDocument): Entity[] => jsonLdDeclaredEntities(d.structured.jsonLd);
 /** Every typed object wherever it sits: a malformed vocabulary term is a defect on any entity. */
 const everyEntity = (d: AuxDocument): Entity[] => jsonLdEntitiesDeep(d.structured.jsonLd);
 
@@ -65,7 +66,7 @@ export const noPrimaryEntity = defineRule({
   autoFixable: true,
   thresholds: strict({ primary_types: z.array(z.string().min(1)).min(1) }),
   evaluate(doc, t) {
-    const types = [...deepEntities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
+    const types = [...declaredEntities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
     const found = types.filter((x) => t.primary_types.includes(x)).length;
     if (found >= 1) return [];
     return [{ severity: "high", measured: found, threshold: PRESENCE_THRESHOLD, reason: "no_primary_entity", snippet: types.length === 0 ? null : types.slice(0, 5).join(", "), locator: "structured" }];
@@ -186,7 +187,7 @@ export const offerDataAbsent = defineRule({
       amountMatches(body, t.currency_symbols, t.currency_codes).some((f) => nearWord(body, f, t.price_context_words, t.context_window_chars)) ||
       unitBesideDigit(body, t.price_units);
     if (!talksPricing) return [];
-    const bad = entitiesOfType(deepEntities(doc), t.entity_types).filter((e) => {
+    const bad = entitiesOfType(subjectEntities(doc), t.entity_types).filter((e) => {
       const offers = offersOf(e.node);
       return offers.length === 0 || offers.some((o) => !hasPrice(o));
     });
@@ -223,8 +224,8 @@ export const schemaTextContradiction = defineRule({
   evaluate(doc, t) {
     const body = variantOf(doc).mainText;
     const flat = foldForComparison(`${body}\n${doc.meta.title ?? ""}`);
-    // The thing the page is about is often nested (WebPage > mainEntity > Product), so this reads the deep view, as AUX-R-012 does.
-    const all = deepEntities(doc);
+    // The thing the page is about is often nested (WebPage > mainEntity > Product), so this reads the subject view, as AUX-R-012 does.
+    const all = subjectEntities(doc);
     const hits: { reason: string; snippet: string; locator: string }[] = [];
 
     // Only an amount that sits beside a pricing word is a price the page shows ("$2B processed", "Save $500" are not).
@@ -232,6 +233,9 @@ export const schemaTextContradiction = defineRule({
       .filter((f) => nearWord(body, f, t.price_context_words, t.context_window_chars))
       .map((f) => f.readings);
     for (const e of all) {
+      // A listing's items (ItemList.itemListElement) are many things, each with its own price; the amounts the text shows near a pricing
+      // word there (a price filter, "$0 - $500") are not theirs, so the page has no price for them to disagree with.
+      if (e.locator.includes(".itemListElement")) continue;
       asArray(e.node["offers"]).forEach((o, i) => {
         if (!isRecord(o) || !present(o["price"])) return;
         const declared = toNumber(String(o["price"]));
@@ -242,6 +246,15 @@ export const schemaTextContradiction = defineRule({
         }
       });
     }
+    // A ProductGroup carries no offers of its own: its variants do. The variant set agrees with the page when any variant's price is shown;
+    // only a set of which none is shown is one disagreement (variant names are not compared).
+    for (const e of all) {
+      const variantPrices = asArray(e.node["hasVariant"]).flatMap((v) => (isRecord(v) ? asArray(v["offers"]) : [])).flatMap((o) => (isRecord(o) && present(o["price"]) ? [toNumber(String(o["price"]))] : [])).filter((n) => Number.isFinite(n));
+      if (variantPrices.length === 0 || prices.length === 0 || e.locator.includes(".itemListElement")) continue;
+      if (!variantPrices.some((v) => prices.some((rs) => rs.some((p) => Math.abs(p - v) < t.price_tolerance)))) {
+        hits.push({ reason: "price", snippet: `schema variant prices ${variantPrices.slice(0, 5).join(", ")}; page prices ${[...new Set(prices.map((rs) => rs[0]!))].slice(0, 5).join(", ")}`, locator: `${e.locator}.hasVariant` });
+      }
+    }
     for (const e of entitiesOfType(all, t.name_entity_types)) {
       const name = text(e.node["name"]);
       if (name !== undefined && !nameShown(flat, name)) hits.push({ reason: "name", snippet: `schema name ${name}`, locator: `${e.locator}.name` });
@@ -249,7 +262,8 @@ export const schemaTextContradiction = defineRule({
     for (const e of all) {
       const rating = e.node["aggregateRating"];
       if (!isRecord(rating)) continue;
-      const declaredValue = toNumber(String(rating["ratingValue"] ?? ""));
+      // A field the data leaves out has not contradicted the page: Number("") is 0, so an absent or blank one is skipped, not compared.
+      const declaredValue = present(rating["ratingValue"]) ? toNumber(String(rating["ratingValue"])) : Number.NaN;
       // "N/5" or "N out of 10", not a date ("3/5/2026": a further "/digits" follows, or a "/" precedes), and with a rating word beside it.
       const scales = t.rating_scales.map(String).join("|");
       const ratingRe = new RegExp(`(?<![\\d./])(\\d+(?:\\.\\d+)?)\\s*(?:\\/|out of)\\s*(?:${scales})\\b(?!\\s*\\/\\s*\\d)`, "giu");
@@ -259,7 +273,7 @@ export const schemaTextContradiction = defineRule({
       if (Number.isFinite(declaredValue) && shown.length > 0 && !shown.some((v) => Math.abs(v - declaredValue) < t.rating_tolerance)) {
         hits.push({ reason: "rating_value", snippet: `schema rating ${String(rating["ratingValue"])}; page ratings ${shown.slice(0, 3).join(", ")}`, locator: `${e.locator}.aggregateRating.ratingValue` });
       }
-      const declaredCount = toNumber(String(rating["reviewCount"] ?? ""));
+      const declaredCount = present(rating["reviewCount"]) ? toNumber(String(rating["reviewCount"])) : Number.NaN;
       // A count the page rounds or leaves open ("2,000+", "over 2,000", "2k", "about 2,000") is not a different count from the data's.
       const counts = [...body.matchAll(/(?<approx>\b(?:over|more than|above|under|fewer than|less than|nearly|almost|about|around|approximately|approx\.?)\s+|~\s*)?(?<n>\d(?:[\d.,]*\d)?)(?<open>\s?(?:\+|[kKmM](?![\p{L}\p{N}])))?\s+(?:reviews?|ratings?)\b/giu)]
         .filter((m) => m.groups?.["approx"] === undefined && m.groups?.["open"] === undefined)
@@ -294,7 +308,7 @@ export const featureListThin = defineRule({
       .filter((h) => t.heading_levels.includes(h.level) && !skip.has(normaliseText(h.text)))
       .map((h) => normaliseText(h.text));
     let worst: RuleHit | null = null;
-    for (const e of entitiesOfType(deepEntities(doc), t.entity_types)) {
+    for (const e of entitiesOfType(subjectEntities(doc), t.entity_types)) {
       const items = asArray(e.node["featureList"]).flatMap((v) => (typeof v === "string" ? [normaliseText(v)] : [])).filter((s) => s !== "");
       let hit: RuleHit | null = null;
       if (items.length === 0) {
@@ -322,7 +336,7 @@ export const ratingWithoutProvenance = defineRule({
   autoFixable: true,
   thresholds: strict({ provenance_keys: z.array(z.string().min(1)).min(1) }),
   evaluate(doc, t) {
-    const bad = deepEntities(doc).filter((e) => {
+    const bad = subjectEntities(doc).filter((e) => {
       const rating = e.node["aggregateRating"];
       if (!isRecord(rating)) return false;
       // A count of 0 is a count that proves nothing; a source only has to be present.
@@ -383,7 +397,7 @@ export const faqMarkupAbsent = defineRule({
   evaluate(doc, t) {
     const questions = flattenHeadings(variantOf(doc).headingTree).filter((h) => t.heading_levels.includes(h.level) && h.text.trim().endsWith("?"));
     if (questions.length < t.min_headings) return [];
-    const declared = [...deepEntities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
+    const declared = [...declaredEntities(doc).flatMap((e) => typesOf(e.node)), ...markupTypes(doc.structured.microdata), ...markupTypes(doc.structured.rdfa)];
     if (declared.some((x) => x === "FAQPage" || x === "QAPage")) return [];
     return [{ severity: "medium", measured: questions.length, threshold: t.min_headings, reason: "question_headings_without_markup", snippet: questions[0]!.text, locator: "headings" }];
   },
