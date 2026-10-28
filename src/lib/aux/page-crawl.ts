@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
+import type { CrawlPageFetch } from "../../../contracts/aux/index.js";
 import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../net/guarded-fetch.js";
 import { toRegistrableDomain } from "../net/registrable-domain.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "./politeness.js";
@@ -53,6 +54,8 @@ export interface PageRecord {
   readonly outcome: PageOutcome;
   readonly raw?: StoredCopy;
   readonly rendered?: StoredCopy;
+  /** STORY-050: what the plain fetch answered, so the document model can be rebuilt from storage. Absent when no plain copy was stored. */
+  readonly fetch?: CrawlPageFetch;
   readonly failures: PageFailure[];
   readonly skipped_reason?: SkippedPageReason;
 }
@@ -102,6 +105,25 @@ function robotsAllows(robots: ParsedRobots | "unavailable" | null, url: string):
   }
 }
 
+/** The response headers the document model reads. An allow-list: nothing else a server sends is stored. */
+const RECORDED_HEADERS = ["content-type", "x-robots-tag"] as const;
+
+function fetchRecord(response: GuardedResponse): CrawlPageFetch {
+  const headers: Record<string, string> = {};
+  for (const name of RECORDED_HEADERS) {
+    const value = response.headers[name];
+    if (value !== undefined) headers[name] = sanitiseText(Array.isArray(value) ? value.join(", ") : value, 2000);
+  }
+  return {
+    final_url: sanitiseText(response.finalUrl, MAX_URL_CHARS),
+    redirect_chain: (response.redirectChain ?? []).map((u) => sanitiseText(u, MAX_URL_CHARS)),
+    http_status: response.status,
+    headers,
+    ttfb_ms: response.ttfbMs ?? null,
+    load_ms: response.loadMs ?? null,
+  };
+}
+
 function fetchFailureReason(error: unknown): string {
   if (error instanceof GuardedFetchRefusal) return `unsafe_target:${error.reason}`;
   if (error instanceof Error && /timeout/i.test(error.message)) return "timeout";
@@ -143,6 +165,7 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
     const failures: PageFailure[] = [];
     let raw: StoredCopy | undefined;
     let rendered: StoredCopy | undefined;
+    let fetchedWith: CrawlPageFetch | undefined;
     const key = sha256(rawUrl).slice(0, 24);
 
     const keep = async (kind: "raw" | "rendered", body: Buffer, status: number | null, truncated: boolean): Promise<StoredCopy | undefined> => {
@@ -178,6 +201,7 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
       } else {
         rawOk = true;
         raw = await keep("raw", response.body, response.status, response.truncated === true);
+        if (raw !== undefined) fetchedWith = fetchRecord(response);
       }
     } catch (error) {
       if (error instanceof PolitenessDeadlineReached) {
@@ -233,6 +257,7 @@ export async function crawlPages(urls: readonly string[], deps: PageCrawlDeps): 
       outcome,
       ...(raw === undefined ? {} : { raw }),
       ...(rendered === undefined ? {} : { rendered }),
+      ...(fetchedWith === undefined ? {} : { fetch: fetchedWith }),
       failures,
     });
   }

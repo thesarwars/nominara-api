@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import type {
   ArchetypeCoverage,
   GeneratableArchetype,
   GenerationSummary,
   RejectedCandidate,
 } from "../../../contracts/prompts/index.js";
+import { incrementCounter } from "../telemetry/metrics.js";
 import type { PromptNaturaliser } from "../../modules/prompts/ports/naturaliser.js";
 import { ARCHETYPES, ARCHETYPE_BY_KEY, GRAMMAR_VERSION } from "./archetypes.js";
 import { emitCandidates, type Candidate } from "./emit.js";
@@ -13,6 +15,7 @@ import { promptRowFromCandidate, type PromptRow } from "./persist.js";
 import { prioritise, type PrioritisedCandidate } from "./prioritise.js";
 import { resolveSlots, type SlotContext } from "./slots.js";
 import { promptTextHash } from "./text-hash.js";
+import { judgeVectors, type VectorDedupePort } from "./vector-dedupe.js";
 
 // STORY-045 — §4's pipeline, steps 1 through 8, composed.
 //
@@ -73,6 +76,11 @@ export interface GeneratePassInput {
    * there is nothing worth caching when no model ran.
    */
   readonly cache?: TemplateCache;
+  /**
+   * STORY-045 AC6. Absent = exact-`text_hash` dedupe only and `novelty` unmeasured, which is what a process with no embedder bound
+   * does. Present = §4 step 5: the batch embedded in one call, compared in SQL against the whole project, rejected at >= 0.92.
+   */
+  readonly vectorDedupe?: VectorDedupePort;
 }
 
 export interface TemplateCache {
@@ -127,9 +135,12 @@ function effectiveArchetypes(input: GeneratePassInput) {
  * archetypes can emit identical text from different surfaces, and the second
  * INSERT would violate `ux_prompts_project_hash` and fail the whole pass.
  */
-function emitWithBackfill(input: GeneratePassInput): { accepted: readonly Candidate[]; rejected: RejectedCandidate[]; coverage: readonly ArchetypeCoverage[] } {
+function emitWithBackfill(
+  input: GeneratePassInput,
+  extraSkip: ReadonlySet<string> = new Set(),
+): { accepted: readonly Candidate[]; rejected: RejectedCandidate[]; coverage: readonly ArchetypeCoverage[] } {
   const archetypes = effectiveArchetypes(input);
-  const skip = new Set<string>();
+  const skip = new Set<string>(extraSkip);
   const rejected: RejectedCandidate[] = [];
   const rejectedHashes = new Set<string>();
 
@@ -202,6 +213,143 @@ function coverageFor(
 }
 
 /**
+ * A rewrite is a NEW text, so it has a new `text_hash` - and dedupe ran on the template text. Left unchecked, a rewrite equal to an
+ * existing prompt (or to another line's text) violates `ux_prompts_project_hash` and fails the whole pass at INSERT.
+ *
+ * The template text of every candidate is already known to be unique, so it is the safe fallback: a rewrite is kept only if its hash
+ * is not an existing prompt's, not another candidate's TEMPLATE hash, and not an earlier kept rewrite's. Otherwise that line (and only
+ * that line) keeps its template text and is recorded as not naturalised.
+ */
+function keepDistinct(
+  templates: readonly Candidate[],
+  rewritten: readonly Candidate[],
+  existing: ExistingHashes,
+): readonly Candidate[] {
+  const hexOf = (text: string): string => promptTextHash(text).bytes.toString("hex");
+  const templateHexes = templates.map((candidate) => hexOf(candidate.text));
+  const claimed = new Set<string>();
+  return rewritten.map((candidate, index) => {
+    if (!candidate.naturalized) return candidate;
+    const hex = hexOf(candidate.text);
+    const taken = has(existing, hex) || claimed.has(hex) || templateHexes.some((other, i) => i !== index && other === hex);
+    if (taken) return { ...templates[index]!, naturalized: false };
+    claimed.add(hex);
+    return candidate;
+  });
+}
+
+/**
+ * §4 step 5 DEDUPE by vector similarity, with FR-FAN-01a's backfill.
+ *
+ *   embed the batch in ONE call -> compare against the whole project (and within the batch) in ONE SQL round trip -> reject at
+ *   >= 0.92, keeping the earlier prompt -> backfill the archetypes that lost a variant from their next template.
+ *
+ * A backfilled variant is TEMPLATE text (the naturaliser made its one call for the pass already) and only the new texts are embedded,
+ * so a round that replaces one prompt embeds one text. Candidates are tracked by template id: a variant that survives keeps its
+ * rewritten text and its vector.
+ *
+ * FAIL OPEN on the embedding, CLOSED on the SQL. If `embed` throws (provider down, circuit open) the pass continues on exact-hash
+ * dedupe and the candidates that were never compared carry no `novelty` - suppression is an optimisation, and a model outage must not
+ * stop a customer adding prompts. If `compare` throws, the statement has aborted the request's transaction; swallowing that would
+ * write into a dead transaction, so it propagates.
+ *
+ * TERMINATES: every round that rejects anything adds at least one template id to the skip set, and there are at most four surfaces
+ * per archetype, so the loop ends in a bounded number of rounds even if every candidate is a duplicate.
+ */
+async function dedupeByVector(
+  input: GeneratePassInput,
+  port: VectorDedupePort,
+  settled: readonly Candidate[],
+  first: { readonly rejected: readonly RejectedCandidate[]; readonly coverage: readonly ArchetypeCoverage[] },
+): Promise<{ candidates: readonly Candidate[]; rejected: readonly RejectedCandidate[]; coverage: readonly ArchetypeCoverage[] }> {
+  const archetypes = effectiveArchetypes(input);
+  const vectors = new Map<string, readonly number[]>();
+  const rejected: RejectedCandidate[] = [...first.rejected];
+  const rejectedHashes = new Set(rejected.map((row) => row.text_hash));
+  const skip = new Set<string>();
+  // The first round's final texts, by template id: what a survivor keeps when the set is re-emitted.
+  const known = new Map(settled.map((candidate) => [candidate.templateId, candidate] as const));
+  let current: readonly Candidate[] = settled;
+  let coverage = first.coverage;
+
+  for (;;) {
+    const fresh = current.filter((candidate) => !vectors.has(candidate.templateId));
+    if (fresh.length > 0) {
+      try {
+        const embedded = await port.embed(fresh.map((candidate) => candidate.text));
+        if (embedded.length !== fresh.length) throw new Error("embedder returned a different number of vectors than texts");
+        fresh.forEach((candidate, index) => vectors.set(candidate.templateId, embedded[index]!));
+      } catch {
+        incrementCounter("nominara_prompts_vector_dedupe_total", { outcome: "embed_failed" });
+        return { candidates: current, rejected, coverage };
+      }
+    }
+
+    const verdicts = judgeVectors(await port.compare(current.map((candidate) => vectors.get(candidate.templateId)!)));
+    const measured = current.map((candidate, index) => ({
+      ...candidate,
+      novelty: { maxCosineToExisting: verdicts[index]!.maxCosine, nearestPromptId: verdicts[index]!.nearestPromptId },
+    }));
+
+    const losers = measured.filter((_, index) => verdicts[index]!.reject);
+    incrementCounter("nominara_prompts_vector_dedupe_total", { outcome: losers.length === 0 ? "kept_all" : "rejected_some" });
+    if (losers.length === 0) return { candidates: measured, rejected, coverage };
+
+    measured.forEach((candidate, index) => {
+      const verdict = verdicts[index]!;
+      if (!verdict.reject) {
+        known.set(candidate.templateId, candidate);
+        return;
+      }
+      skip.add(candidate.templateId);
+      const hash = promptTextHash(candidate.text);
+      if (rejectedHashes.has(hash.wire)) return;
+      rejectedHashes.add(hash.wire);
+      rejected.push({
+        text: candidate.text,
+        text_hash: hash.wire,
+        intent_archetype: candidate.archetype,
+        template_id: candidate.templateId,
+        reason: "rejected_duplicate",
+        conflicting_prompt_id: verdict.conflictingPromptId,
+      });
+    });
+
+    // Backfill: re-emit with the losers' templates skipped. Survivors come back under the same template id and keep what they had.
+    // A fresh template's text can equal a survivor's REWRITTEN text, which emit's own hash check never saw: the later one is skipped
+    // and the set re-emitted, so the archetype it belonged to is backfilled again rather than silently left a variant short.
+    let again: ReturnType<typeof emitWithBackfill>;
+    let next: Candidate[];
+    let clashed: boolean;
+    do {
+      again = emitWithBackfill(input, skip);
+      for (const row of again.rejected) {
+        if (!rejectedHashes.has(row.text_hash)) {
+          rejectedHashes.add(row.text_hash);
+          rejected.push(row);
+        }
+      }
+      const heldHashes = new Set<string>();
+      next = [];
+      clashed = false;
+      for (const candidate of again.accepted) {
+        const keep = known.get(candidate.templateId) ?? candidate;
+        const hex = promptTextHash(keep.text).bytes.toString("hex");
+        if (heldHashes.has(hex) || has(input.existingHashes, hex)) {
+          skip.add(candidate.templateId);
+          clashed = true;
+          continue;
+        }
+        heldHashes.add(hex);
+        next.push(keep);
+      }
+    } while (clashed);
+    current = next;
+    coverage = coverageFor(archetypes, current, again.coverage);
+  }
+}
+
+/**
  * One generation pass.
  *
  * Never charges anything — there is no wallet or ledger call in this file or
@@ -212,12 +360,19 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
   const topicNorm = normalizeTopic(input.topicHint ?? "");
   const requested = effectiveArchetypes(input).length * input.batchSize;
 
-  const { accepted, rejected, coverage } = emitWithBackfill(input);
+  const emittedPass = emitWithBackfill(input);
+  const accepted = emittedPass.accepted;
 
   // §4 step 4, with §8's L5 cache in front of it. The key is the NORMALISED
   // topic, so "Lead Management Platforms!" and "lead management platform"
   // share one entry — which is the whole point of step 1 feeding this.
-  const cacheKey = `${topicNorm}|${input.locale ?? ""}|${GRAMMAR_VERSION}|${String(input.batchSize)}`;
+  //
+  // The key ends in a digest of the TEMPLATE lines being rewritten. Topic, locale, grammar version and batch size do not say whose
+  // brand is in the text, and the cache is tenant-scoped, not project-scoped: keyed on those alone, a second project in the same
+  // workspace would be served the first one's rewritten lines - its brand name inside another project's prompts. The digest makes a
+  // hit mean "this exact input was rewritten before".
+  const templateDigest = createHash("sha256").update(JSON.stringify(accepted.map((candidate) => candidate.text))).digest("hex").slice(0, 16);
+  const cacheKey = `${topicNorm}|${input.locale ?? ""}|${GRAMMAR_VERSION}|${String(input.batchSize)}|${templateDigest}`;
   const cachedLines = await input.cache?.get(cacheKey);
 
   let naturalised: readonly Candidate[];
@@ -237,7 +392,17 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
     }
   }
 
-  const candidates = prioritise(naturalised, input.prioritySubsetSize);
+  const settled = keepDistinct(accepted, naturalised, input.existingHashes);
+
+  // §4 step 5. After the rewrite, because the rewrite is what the project will hold and what a near-duplicate is judged on.
+  const deduped =
+    input.vectorDedupe === undefined
+      ? { candidates: settled, rejected: emittedPass.rejected, coverage: emittedPass.coverage }
+      : await dedupeByVector(input, input.vectorDedupe, settled, emittedPass);
+  const rejected = deduped.rejected;
+  const coverage = deduped.coverage;
+
+  const candidates = prioritise(deduped.candidates, input.prioritySubsetSize);
   const rows = candidates.map((candidate) =>
     promptRowFromCandidate(candidate, {
       workspaceId: input.workspaceId,
@@ -253,8 +418,8 @@ export async function generatePass(input: GeneratePassInput): Promise<GeneratePa
     coverage,
     summary: {
       requested,
-      generated: accepted.length,
-      accepted: accepted.length,
+      generated: candidates.length,
+      accepted: candidates.length,
       rejected_duplicate: rejected.length,
       // STORY-046 owns activation. Zero here is the truth, not a placeholder —
       // and a caller who ASKS for activation is refused rather than shown it.

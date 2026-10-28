@@ -20,7 +20,7 @@ interface Harness {
 
 function harness(
   opts: {
-    pages?: Record<string, { status: number; body?: string; truncated?: boolean; finalUrl?: string } | "refuse" | "throw">;
+    pages?: Record<string, { status: number; body?: string; truncated?: boolean; finalUrl?: string; headers?: Record<string, string | string[]>; redirectChain?: string[]; ttfbMs?: number; loadMs?: number } | "refuse" | "throw">;
     renderer?: Renderer;
     hardCap?: number;
     robots?: PageCrawlDeps["robots"];
@@ -64,7 +64,16 @@ function harness(
       const hit = (opts.pages ?? {})[new URL(url).pathname] ?? { status: 200, body: `<html>raw ${url}</html>` };
       if (hit === "refuse") throw new GuardedFetchRefusal("address_not_global");
       if (hit === "throw") throw new Error("connect ECONNREFUSED 10.0.0.5:443");
-      return { status: hit.status, headers: {}, body: Buffer.from(hit.body ?? ""), finalUrl: hit.finalUrl ?? url, truncated: hit.truncated ?? false } satisfies GuardedResponse;
+      return {
+        status: hit.status,
+        headers: hit.headers ?? {},
+        body: Buffer.from(hit.body ?? ""),
+        finalUrl: hit.finalUrl ?? url,
+        truncated: hit.truncated ?? false,
+        ...(hit.redirectChain === undefined ? {} : { redirectChain: hit.redirectChain }),
+        ...(hit.ttfbMs === undefined ? {} : { ttfbMs: hit.ttfbMs }),
+        ...(hit.loadMs === undefined ? {} : { loadMs: hit.loadMs }),
+      } satisfies GuardedResponse;
     },
     store: opts.store ?? (async (relative, body) => {
       stored.set(relative, body);
@@ -320,5 +329,44 @@ describe("STORY-049 · crawlPages", () => {
     expect(h.sleeps).toEqual([]);
     expect(result.pages).toHaveLength(10);
     expect(result.pages.filter((p) => p.outcome === "skipped").every((p) => p.skipped_reason === "crawl_delay_budget")).toBe(true);
+  });
+});
+
+describe("STORY-050 AC7 / AC8 / AC10 · the page record keeps what the plain fetch answered", () => {
+  it("records the final URL, the redirect chain, the status, the model's headers and the timing beside the stored copy", async () => {
+    const h = harness({
+      pages: {
+        "/old": {
+          status: 200,
+          body: "<html>b</html>",
+          finalUrl: "https://acme.com/new",
+          redirectChain: ["https://acme.com/old"],
+          headers: { "x-robots-tag": ["nosnippet", "noarchive"], "content-type": "text/html", "set-cookie": "sid=1", server: "nginx" },
+          ttfbMs: 0,
+          loadMs: 41,
+        },
+      },
+    });
+    const { pages } = await crawlPages(["https://acme.com/old"], h.deps);
+    expect(pages[0]!.fetch).toEqual({
+      final_url: "https://acme.com/new",
+      redirect_chain: ["https://acme.com/old"],
+      http_status: 200,
+      headers: { "content-type": "text/html", "x-robots-tag": "nosnippet, noarchive" },
+      ttfb_ms: 0,
+      load_ms: 41,
+    });
+  });
+
+  it("an unmeasured timing is null, not 0, and a fetcher that reports no chain records an empty one", async () => {
+    const h = harness();
+    const { pages } = await crawlPages(["https://acme.com/a"], h.deps);
+    expect(pages[0]!.fetch).toMatchObject({ ttfb_ms: null, load_ms: null, redirect_chain: [], headers: {} });
+  });
+
+  it("a page whose plain fetch failed has no fetch record", async () => {
+    const h = harness({ pages: { "/gone": { status: 404 } } });
+    const { pages } = await crawlPages(["https://acme.com/gone"], h.deps);
+    expect(pages[0]!.fetch).toBeUndefined();
   });
 });

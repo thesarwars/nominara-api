@@ -130,6 +130,13 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
         // What the server actually received: the agent string, and the Host it was addressed by.
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ua: req.headers["user-agent"] ?? null, host: req.headers.host ?? null, accept: req.headers.accept ?? null }));
+      } else if (url === "/slow") {
+        // STORY-050 AC7: headers after 150 ms, the body 150 ms after that.
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.write("slow");
+          setTimeout(() => res.end(" body"), 150);
+        }, 150);
       } else if (url === "/never") {
         // Headers, then silence — the total-timeout case.
         res.writeHead(200, { "content-type": "text/plain" });
@@ -151,6 +158,22 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
     const response = await guardedFetch(at("/"), {}, permitTestOrigin);
     expect(response.status).toBe(200);
     expect(response.body.toString()).toBe("ok");
+  });
+
+  it("STORY-050 AC7 · measures time to first byte and total load, from the start of the call", async () => {
+    const response = await guardedFetch(at("/slow"), {}, permitTestOrigin);
+    expect(response.body.toString()).toBe("slow body");
+    expect(response.ttfbMs).toBeGreaterThanOrEqual(140);
+    expect(response.loadMs).toBeGreaterThanOrEqual(response.ttfbMs! + 140);
+    expect(response.loadMs).toBeLessThan(5000);
+  });
+
+  it("STORY-050 AC7 · a redirect hop's time counts toward the bot's wait", async () => {
+    const response = await guardedFetch(at("/relative"), {}, permitTestOrigin);
+    const direct = await guardedFetch(at("/landed"), {}, permitTestOrigin);
+    expect(response.ttfbMs).toBeGreaterThanOrEqual(0);
+    expect(response.loadMs!).toBeGreaterThanOrEqual(response.ttfbMs!);
+    expect(direct.redirectChain).toEqual([]);
   });
 
   it("follows a relative redirect and reports the final URL", async () => {
@@ -253,6 +276,19 @@ describe("STORY-131 · guardedFetch — the loop, against a real server", () => 
     const response = await guardedFetch(at("/relative"), { followRedirect: () => true }, permitTestOrigin);
     expect(response.status).toBe(200);
     expect(response.finalUrl).toBe(at("/landed"));
+  });
+
+  it("STORY-050 AC8 — the redirect chain lists every URL that redirected, in order, and is empty when nothing did", async () => {
+    const followed = await guardedFetch(at("/relative"), {}, permitTestOrigin);
+    expect(followed.redirectChain).toEqual([at("/relative")]);
+    expect(followed.finalUrl).toBe(at("/landed"));
+    expect((await guardedFetch(at("/"), {}, permitTestOrigin)).redirectChain).toEqual([]);
+  });
+
+  it("STORY-050 AC8 — a vetoed hop is not in the chain: the redirecting URL is the final URL", async () => {
+    const response = await guardedFetch(at("/relative"), { followRedirect: () => false }, permitTestOrigin);
+    expect(response.redirectChain).toEqual([]);
+    expect(response.finalUrl).toBe(at("/relative"));
   });
 
   // Scenario 15 — headers arrive, body never does.

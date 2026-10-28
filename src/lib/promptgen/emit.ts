@@ -54,6 +54,12 @@ export interface Candidate {
   readonly weight: number;
   /** How many of this surface's slots came from real context rather than a derivation. */
   readonly contextSlotCount: number;
+  /**
+   * §5's `novelty`, set ONLY when a vector comparison actually ran for this candidate (STORY-045 AC6). Absent means NOT MEASURED -
+   * exact-hash dedupe only - and is reported on the wire as null, never 0. A present `maxCosineToExisting: null` means it WAS
+   * compared and the project had nothing embedded to compare against.
+   */
+  readonly novelty?: { readonly maxCosineToExisting: number | null; readonly nearestPromptId: string | null };
 }
 
 export interface EmitInput {
