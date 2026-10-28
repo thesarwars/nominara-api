@@ -117,6 +117,91 @@ export const geoSentimentDetailSchema = z
   .strict();
 export type GeoSentimentDetail = z.infer<typeof geoSentimentDetailSchema>;
 
+// -------------------------------------------------------- A2 entity detail
+
+/** The seven scored nodes of scoring-models.md §10 (`g2` and `capterra` are one scored node). */
+export const entityScoredNodeSchema = z.enum([
+  "wikidata",
+  "wikipedia",
+  "g2_or_capterra",
+  "crunchbase",
+  "linkedin",
+  "github",
+  "category_directory",
+]);
+export type EntityScoredNode = z.infer<typeof entityScoredNodeSchema>;
+
+export const disambiguationLevelSchema = z.enum(["low", "medium", "high", "unmeasured"]);
+
+/**
+ * `GET /geo-insights/entity` -> `detail` (STORY-060, A2).
+ *
+ * Presence and completeness are separate facts: `status` is `thin` for a profile that is listed but not resolvable.
+ * `link_gap` is a profile that exists but the brand's own structured data does not link to. Disambiguation risk is
+ * reported HERE and never folded into `authority.score`; when it is `high` the score is null and `authority.suppressed`
+ * says why. `risk` is null (not 0) when fewer than the minimum name matches were seen: unmeasured is not low.
+ */
+export const geoEntityDetailSchema = z
+  .object({
+    slug: z.literal("entity"),
+    nodes: z.array(
+      z
+        .object({
+          node: entityScoredNodeSchema,
+          weight: z.number().min(0).max(1),
+          status: z.enum(["unchecked", "absent", "thin", "complete"]),
+          /** 0 absent or unchecked, 0.6 thin, 1.0 complete. */
+          presence: z.number().min(0).max(1),
+          url: z.string().nullable(),
+          missing_fields: z.array(z.string()),
+          in_brand_sameas: z.boolean(),
+          link_gap: z.boolean(),
+          /** What to do about it; null when nothing is needed. */
+          fix_path: z.string().nullable(),
+        })
+        .strict(),
+    ),
+    sameas_coverage: z.number().min(0).max(1).nullable(),
+    authority: z
+      .object({
+        score: z.number().min(0).max(100).nullable(),
+        suppressed: z.boolean(),
+        reason: z.string().nullable(),
+      })
+      .strict(),
+    disambiguation: z
+      .object({
+        risk: z.number().min(0).max(1).nullable(),
+        level: disambiguationLevelSchema,
+        name_matches: z.number().int().nonnegative(),
+        not_about_brand: z.number().int().nonnegative(),
+        minimum_matches: z.number().int().positive(),
+      })
+      .strict(),
+    cooccurrence: z
+      .object({
+        sufficient: z.boolean(),
+        reason: z.string().nullable(),
+        terms: z.array(z.string()),
+        /** Cited passages containing a category term. */
+        category_passages: z.number().int().nonnegative(),
+        /** Share of those passages that also name the entity; null when the passage minimum is not met. */
+        entities: z.array(
+          z
+            .object({
+              name: z.string().min(1),
+              is_brand: z.boolean(),
+              passages: z.number().int().nonnegative(),
+              rate: z.number().min(0).max(1).nullable(),
+            })
+            .strict(),
+        ),
+      })
+      .strict(),
+  })
+  .strict();
+export type GeoEntityDetail = z.infer<typeof geoEntityDetailSchema>;
+
 // ------------------------------------------------------- A3 structure detail
 
 export const answerFormSchema = z.enum(["ranked_list", "comparison_table", "single_recommendation", "neutral_enumeration", "narrative"]);
@@ -212,6 +297,8 @@ export const geoFindingSchema = z
     sentiment: geoSentimentDetailSchema.optional(),
     /** The A3 detail, persisted on the analysis's one finding so a read never re-aggregates (STORY-062). */
     structure: geoStructureDetailSchema.optional(),
+    /** The A2 detail, persisted on the analysis's first finding (STORY-060). */
+    entity: geoEntityDetailSchema.optional(),
   })
   .strict()
   .refine((f) => (f.task_rule_code !== undefined) !== (f.no_action === true), {
