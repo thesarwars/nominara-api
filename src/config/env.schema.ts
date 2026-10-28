@@ -425,6 +425,9 @@ export const envSchema = z
     // NEW-A-4 — optional: absent leaves Gemini honestly not capture-ready (registry.ts), it
     // does not fail boot. Never logged, never echoed in an error.
     GEMINI_API_KEY: requiredString.optional(),
+    // STORY-133 - optional: absent leaves the embedding port on the deterministic stand-in outside production (and refusing in
+    // production), it does not fail boot. Selecting the real adapter is this one variable. Never logged, never echoed in an error.
+    OPENAI_API_KEY: requiredString.optional(),
     // SCANFIX D3 - the pace the capture dispatcher holds Gemini to, in requests per minute. Default 10 =
     // the free tier of gemini-2.5-flash; raise it with the paid quota. It builds a ONE-token bucket
     // (no burst above the rate) and takes precedence over ENGINE_TOKEN_BUCKETS.gemini.

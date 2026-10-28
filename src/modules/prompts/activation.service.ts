@@ -9,6 +9,7 @@ import type {
 import { ConflictError, EntitlementExceededError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
 import { parseConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
+import { embedBatchEnqueuerFor, requestPromptEmbeddings } from "../../lib/embedding/prompt-embedding-request.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
@@ -245,6 +246,13 @@ export class PromptActivationService {
           WHERE id = $1`,
         [projectId, Math.min(cap, PROMPTS_CAP_COLUMN_MAX)],
       );
+
+      // STORY-133 DECISION 3 - the activated prompts are queued for embedding in THIS transaction (the job is enqueued after
+      // COMMIT, so a rollback leaves no orphan). Without it a prompt is permanently invisible to L2, dedupe and clustering.
+      const embedEnqueue = embedBatchEnqueuerFor(this.producer);
+      if (embedEnqueue !== undefined) {
+        await requestPromptEmbeddings(client, store.context.workspaceId, toActivate.map((prompt) => prompt.id), embedEnqueue, logger);
+      }
     }
 
     // Slots occupied after this call (`prompts_active` counts `PROMPT_OCCUPIES_SLOT`): a resumed paused row held its slot already.
