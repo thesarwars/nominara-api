@@ -217,6 +217,11 @@ const inline = (node: Node): string => textOf(node).replace(/\n/gu, " ");
 // ---------------------------------------------------------------------------------------------------------------------------
 // Main content, headings, blocks
 
+/**
+ * A SUBSTITUTE for the reference's "readability main-content extraction" (no new dependency was allowed): <main>, [role=main],
+ * <article>, else the body minus header/nav/aside/footer. Furniture in a plain <div> (a sidebar, a cookie banner) is counted as
+ * content on a div-only template, which biases AUX-R-020 toward under-firing. Pinned by a test; recorded in STORY-050.
+ */
 function mainRoot(body: Element): { root: Element; skip: (el: Element) => boolean } {
   const none = (): boolean => false;
   const main = findFirst(body, (el) => el.tagName === "main") ?? findFirst(body, (el) => attrOf(el, "role") === "main") ?? findFirst(body, (el) => el.tagName === "article");

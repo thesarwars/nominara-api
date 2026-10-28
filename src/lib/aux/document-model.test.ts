@@ -116,6 +116,17 @@ describe("STORY-050 document model", () => {
     expect(d.raw.structured.jsonLd).toEqual([]);
   });
 
+  it("STORY-050 #2b · KNOWN LIMITATION: on a <div>-only template the main text includes the sidebar and the cookie banner", () => {
+    const html = `<html><body><div class="cookie-banner">We use cookies</div><div class="sidebar"><div>Related links</div></div><div class="content"><h1>Widgets</h1><p>The real article text.</p></div></body></html>`;
+    const d = build({ rawHtml: html });
+    // Without <main>, [role=main] or <article> only header/nav/aside/footer are dropped, so furniture in a <div> is counted as content
+    // (AUX-R-020's main-to-total ratio then over-counts main text and under-fires). Recorded in STORY-050; readability is the fix.
+    expect(d.raw.mainText).toBe("We use cookies\nRelated links\nWidgets\nThe real article text.");
+    // The same furniture in semantic elements IS dropped, which is the behaviour a template that uses them gets.
+    const semantic = build({ rawHtml: `<html><body><footer>We use cookies</footer><aside>Related links</aside><div><h1>Widgets</h1><p>The real article text.</p></div></body></html>` });
+    expect(semantic.raw.mainText).toBe("Widgets\nThe real article text.");
+  });
+
   it("STORY-050 #6d · the top-level parse errors are the union of both copies, so a rule reading d.structured misses neither", () => {
     const bad = `<html><head><script type="application/ld+json">{oops</script></head><body></body></html>`;
     const good = `<html><head><script type="application/ld+json">{"@type":"A"}</script></head><body></body></html>`;
