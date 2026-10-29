@@ -278,6 +278,14 @@ describe("STORY-043 · ProjectsService.create", () => {
     }
   });
 
+  // STORY-043 round 2, finding 3 — the creation-time supplied set is RECORDED on the rows, so confirm can tell them from a prompt typed later.
+  it("STORY-043 AC12 — prompts supplied at creation are marked generator_meta.origin = 'creation'", async () => {
+    await service().create(WS, ACTOR, { root_url: "https://hubspot.com", prompts: [{ text: "best crm" }] }, 1);
+    const promptInsert = calls.find((c) => c.sql.includes("INSERT INTO tracked_prompts"))!;
+    const meta = promptInsert.params.find((p) => typeof p === "string" && p.startsWith("{") && p.includes("funnel_stage_assumed")) as string;
+    expect(JSON.parse(meta)).toMatchObject({ source: "manual", origin: "creation" });
+  });
+
   it("STORY-133 AC10 - supplied prompts (inserted active) are requested for embedding in the creation, and enqueued only after COMMIT", async () => {
     calls.length = 0;
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
@@ -1009,7 +1017,8 @@ describe("STORY-043 · confirmDiscovery tops up the free prompt allowance from t
     low_confidence_fields: [],
   };
 
-  function service(opts: { manual?: boolean; payload?: Record<string, unknown> } = {}) {
+  // `supplied`: prompts the creation request carried (marked origin 'creation'); `typedLater`: a manual prompt added after creation.
+  function service(opts: { supplied?: boolean; typedLater?: boolean; payload?: Record<string, unknown> } = {}) {
     const calls: Recorded[] = [];
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
       client: {
@@ -1019,7 +1028,11 @@ describe("STORY-043 · confirmDiscovery tops up the free prompt allowance from t
           if (sql.includes("FOR NO KEY UPDATE")) {
             return { rows: [{ name: "HubSpot", root_domain: "hubspot.com", category_slug: "crm", verticals: ["saas"], locale: null }] };
           }
-          if (sql.includes("generation_source = 'manual'")) return { rows: opts.manual === true ? [{ one: 1 }] : [] };
+          if (sql.includes("generation_source = 'manual'")) {
+            const creationOnly = sql.includes("'creation'");
+            const held = creationOnly ? opts.supplied === true : opts.supplied === true || opts.typedLater === true;
+            return { rows: held ? [{ one: 1 }] : [] };
+          }
           return { rows: [] };
         }),
       },
@@ -1051,9 +1064,17 @@ describe("STORY-043 · confirmDiscovery tops up the free prompt allowance from t
   });
 
   it("leaves a project alone whose caller supplied prompts at creation (nothing generated, manual prompts held)", async () => {
-    const { svc, calls } = service({ manual: true });
+    const { svc, calls } = service({ supplied: true });
     const result = await svc.confirmDiscovery(WS, "p1", { fields: { category: { decision: "override", value: "crm" } } }, 1);
     expect(calls.some((c) => c.sql.includes("INSERT INTO tracked_prompts"))).toBe(false);
     expect(result.prompts_free_remaining).toBe(10);
+  });
+
+  // Round 2, finding 3 — the decision rests on what the CREATION request carried, not on "no generated prompts and some manual one".
+  it("still tops up a URL-only project whose first pass generated nothing and whose user typed a manual prompt before confirming", async () => {
+    const { svc, calls } = service({ typedLater: true });
+    const result = await svc.confirmDiscovery(WS, "p1", { fields: { category: { decision: "override", value: "crm" } } }, 1);
+    expect(calls.some((c) => c.sql.includes("INSERT INTO tracked_prompts"))).toBe(true);
+    expect(result.prompts_generated).toHaveLength(10);
   });
 });
