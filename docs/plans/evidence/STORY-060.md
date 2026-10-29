@@ -52,11 +52,11 @@ Status of each story AC after this lane. "Met" means data flows end to end in pr
 | sameAs link coverage recorded (L22) | **Open, pure only** | Same as L20: needs the brand's `sameAs` source. |
 | Authority score exactly §10 (L23) | Met for the formula (hand-computed 66.3); published only once all seven nodes are checked, so **open in production** | Probe job (L20). |
 | Disambiguation risk separate (L24) | Met (computed from `mention_facts`; no profile data needed) | Judging is the v1 case heuristic, an owner-confirmable reading. |
-| High risk suppresses the score, surfaces the alias task (L25) | Met as a finding carrying `TG-ENTITY-ALIAS` and a suppressed score | A task is not generated: `TG-ENTITY-ALIAS` is not yet a `task_generation_rules` row. Needs owner approval of the code, then the rule row. |
+| High risk suppresses the score, surfaces the alias task (L25) | **Met (round 6)** | Migration 0150 seeds `TG-ENTITY-ALIAS` (owner decision 15) as a `geo_finding` rule, and `evaluateGeoFinding` (`src/lib/taskgen/evaluate.ts`) turns the persisted `entity-alias-tuning` finding into one open task stamped `source_geo_analysis = entity`; the digest lever links it. Proof: `test/integration/geo-task-rules.spec.ts` "a high-risk refresh generates exactly one open TG-ENTITY-ALIAS task, the lever links it, and a recompute adds no duplicate" (red without the migration: `s060-r6-red-0150.log`). |
 | Missing high-weight node: alert and task (L26) | **Open** | The finding carries `TG-ENTITY-NODE`, which is a disabled `pending_analysis` row; `entity_node_missing` appears only in the alert catalog and deep links and is never evaluated. Needs the rule enabled and alert-rule evaluation for `entity_node_missing`, plus the probe job. |
 | Category co-occurrence vs competitors (L27) | Met over `corpus_passages` (real once STORY-058 passages exist; stand-in passages in tests) | Real embeddings are not involved; real cited-corpus volume is. |
 | Structure: form distribution per cluster/engine (L31), position-class movement (L32) | Met (from the earlier lane) | n/a |
-| Structure-match gap with template (L33) | **Open** | `loadStructureInput` never supplies `pages`, so the gap never fires. Needs a page source from STORY-050 wired in, a cluster-to-landing-page map, a spec-list template alternative, and `TG-STRUCTURE-TEMPLATE` approved and inserted as a rule row. |
+| Structure-match gap with template (L33) | **Rule seeded; gap still dormant in production** | Migration 0150 seeds `TG-STRUCTURE-TEMPLATE`; given a `structure-gap-*` finding the task is generated (`geo-task-rules.spec.ts` "a structure-match gap with a supplied page generates one TG-STRUCTURE-TEMPLATE task per gap, once"). `loadStructureInput` still never supplies `pages`, so the gap cannot fire until a page source is wired: follow-up story (STORY-050 page source plus a cluster-to-landing-page map, a spec-list alternative). |
 | Evidence base and self-suppression (L34), free and unmetered (L35) | Met | n/a |
 
 The unit test "#6" asserts the finding and its rule code. It does not assert a generated task or an alert, and must not be read as meeting L26.
@@ -69,7 +69,7 @@ The unit test "#6" asserts the finding and its rule code. It does not assert a g
 
 ### Owner questions recorded (constants and readings not in any reference)
 1. `ENTITY_MIN_NAME_MATCHES = 30` and `ENTITY_MIN_CATEGORY_PASSAGES = 8` (reuses A1's passage minimum): confirm. Below 30 the disambiguation risk is "unmeasured" and the Entity Authority score is WITHHELD with a stated reason (round 3; previously published). Decide whether instead the score should publish when the raw ratio is <= 0.20 despite the thin count.
-2. Rule codes `TG-ENTITY-ALIAS` and `TG-STRUCTURE-TEMPLATE`: approve and add as `task_generation_rules` rows; enable `TG-ENTITY-NODE`.
+2. Rule codes `TG-ENTITY-ALIAS` and `TG-STRUCTURE-TEMPLATE`: APPROVED (owner decision 15) and seeded by migration 0150; priority, impact weight, effort, cooldown (30 days) and the `trigger_kind` members (`entity_node`, `schema_missing`, the nearest existing CHECK members) are builder readings. `TG-ENTITY-NODE` is still a disabled `pending_analysis` row.
 3. Category terms are derived from `category_slug` and `verticals`: confirm.
 4. Name-match judging is the v1 case heuristic (lowercase span of a capitalised alias, minus domains/URLs): confirm, or fund a model-assisted judge behind the same signature.
 5. Entity risk does not separate demo-seed `mention_facts` from live ones (structure does, via `data_source`): decide whether demo-derived risk must be flagged.
@@ -81,7 +81,8 @@ The unit test "#6" asserts the finding and its rule code. It does not assert a g
 - `loadEntityInput` joins `answer_captures` with LEFT JOIN: a mention whose capture is gone is still a name match. New integration test fails without it (25 of 30 counted, below the minimum).
 - `insideUrlOrDomain`: a span followed by `](` (markdown link text) is the brand; hazard case added.
 - Follow-up for L33: when the page source is wired, it must be per cluster (cluster to landing page), NOT a union; today `structure.ts` aggregates page forms across all pages, so a table on any page would suppress the gap for every cluster.
-- L25/L33 stay task-pending until `TG-ENTITY-ALIAS` / `TG-STRUCTURE-TEMPLATE` are approved; until then the high-risk alias finding ranks as a lever whose task is null. `dangerous-area-auditor` review is still owed; the STORY-060 status block is to be updated on merge.
+- L25 is task-generating (round 6). L33 is task-generating once a page source exists. `dangerous-area-auditor` review is still owed; the STORY-060 status block is to be updated on merge.
+- Reading of the reference (docs follow-up for scoring-models.md section 10): `disambiguation_risk` is estimated over the JUDGED name matches (`name_matches - unjudged`), not over all matches, because an unreadable match is unknown rather than a true positive; the 30-match minimum applies to judged matches; unreadable matches are reported as `disambiguation.unjudged`.
 
 | Gate (round 3, HEAD after this commit) | Result |
 |---|---|

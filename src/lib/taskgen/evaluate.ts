@@ -51,6 +51,8 @@ export async function evaluateRule(rule: RuleRow, condition: TaskGenerationCondi
       return evaluateSourceGap(rule, condition, ctx);
     case "prompt_stability":
       return evaluatePromptStability(rule, condition, ctx);
+    case "geo_finding":
+      return evaluateGeoFinding(rule, condition, ctx);
     case "pending_analysis":
       // The analysis this rule reads does not exist yet (D2/D4). Nothing is generated, and it is counted: a rule enabled
       // before its facts exist must be visible, not silently inert.
@@ -277,6 +279,43 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
     affectedUrl: row.url,
     // A regression is a discrete event: it counts on the open task once, even on the day the task was last refreshed.
     discrete: true,
+  }));
+}
+
+// ---- geo_finding -----------------------------------------------------------------------------------------------------
+
+/**
+ * STORY-060 / owner decision 15 — a finding the latest persisted GEO analysis carries and that names this rule (`task_rule_code`).
+ * Reads `geo_analyses` only (the rollup wrote it in the same tenant): no network call. The latest row of each window is read, and only if it is sufficient, so a finding the analysis no longer carries generates nothing; the fingerprint is the analysis plus the finding id, so the
+ * three windows carrying one finding are one task, and a recompute is a no-op for an open task. Rows computed before the rule was
+ * enabled are not read (the non-retroactive watermark every event rule uses).
+ */
+async function evaluateGeoFinding(rule: RuleRow, condition: Extract<TaskGenerationCondition, { kind: "geo_finding" }>, ctx: EvalContext): Promise<TaskDraft[]> {
+  const found = await ctx.tx.query<{ finding_id: string; headline: string; severity: string; url: string | null }>(
+    `SELECT DISTINCT ON (f ->> 'id') f ->> 'id' AS finding_id, f ->> 'headline' AS headline, f ->> 'severity' AS severity,
+            f #>> '{evidence,0,url}' AS url
+       FROM (
+         SELECT DISTINCT ON (window_days) findings, computed_at, window_start, sufficient
+           FROM geo_analyses
+          WHERE project_id = $1::uuid AND analysis = $2 AND scoring_version = $3
+          ORDER BY window_days, window_start DESC
+       ) latest
+       CROSS JOIN LATERAL jsonb_array_elements(latest.findings) AS f
+      WHERE latest.sufficient AND f ->> 'task_rule_code' = $4
+        AND left(f ->> 'id', length($5::text)) = $5::text
+        AND ($6::timestamptz IS NULL OR latest.computed_at >= $6::timestamptz)
+      ORDER BY f ->> 'id'`,
+    [ctx.projectId, condition.analysis, ctx.scoringVersion, rule.code, condition.finding_id_prefix, rule.enabled_since],
+  );
+  return found.rows.map((row) => ({
+    fingerprint: taskFingerprint(rule.code, ctx.projectId, `${condition.analysis}:${row.finding_id}`),
+    vars: { finding_headline: row.headline },
+    strength: SEVERITY_STRENGTH[row.severity] ?? 0.5,
+    baselineEngine: "all",
+    affectedEngines: [],
+    affectedPromptIds: [],
+    affectedUrl: row.url,
+    sourceGeoAnalysis: condition.analysis,
   }));
 }
 

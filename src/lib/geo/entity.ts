@@ -60,7 +60,7 @@ export const ENTITY_MIN_NAME_MATCHES = 30;
 export const ENTITY_MIN_CATEGORY_PASSAGES = 8;
 
 export const ENTITY_NODE_TASK_RULE = "TG-ENTITY-NODE";
-/** BUILDER PROPOSAL: the reference names the alias-tuning task but gives it no rule code. Not yet a `task_generation_rules` row. */
+/** The alias-tuning task rule: owner decision 15, seeded by migration 0150 (a `geo_finding` rule over this analysis's `entity-alias-tuning`). */
 export const ENTITY_ALIAS_TASK_RULE = "TG-ENTITY-ALIAS";
 
 const NODE_LABEL: Readonly<Record<EntityScoredNode, string>> = {

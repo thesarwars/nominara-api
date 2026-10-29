@@ -215,6 +215,7 @@ async function toTaskInput(
     affectedUrl: draft.affectedUrl ?? null,
     generation: {
       sourceFindingId: draft.sourceFindingId ?? null,
+      sourceGeoAnalysis: draft.sourceGeoAnalysis ?? null,
       affectedEngines: draft.affectedEngines,
       affectedPromptIds: draft.affectedPromptIds,
       playbookSlug,

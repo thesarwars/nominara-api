@@ -43,6 +43,8 @@ export interface TaskDraft {
   readonly affectedEngines: readonly string[];
   readonly affectedPromptIds: readonly string[];
   readonly sourceFindingId?: string | null;
+  /** The GEO analysis the finding came from; stamped on the task so a digest lever resolves it (`tasks.source_geo_analysis`). */
+  readonly sourceGeoAnalysis?: string | null;
   readonly sourceDomainId?: string | null;
   readonly sourceDisplacementId?: string | null;
   readonly affectedUrl?: string | null;
