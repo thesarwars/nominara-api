@@ -160,7 +160,15 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       if (!payload.success) return false;
 
       const kept: DiscoveryResponse | undefined =
-        failure.fetched === undefined ? undefined : { ...failure.fetched, discovery_status: "partial" };
+        failure.fetched === undefined
+          ? undefined
+          : {
+              ...failure.fetched,
+              // The same carry-forward `commit` does: `discover` skipped the human-decided fields, so without this a failed commit
+              // would drop them from the stored payload and the next pass would re-derive them (STORY-044 AC4).
+              fields: { ...failure.fetched.fields, ...((failure.prepared?.preserved ?? {}) as DiscoveryResponse["fields"]) },
+              discovery_status: "partial",
+            };
       await tx.query(
         `UPDATE projects SET discovery_status = 'partial', discovery = COALESCE($2::jsonb, discovery), updated_at = now()
           WHERE id = $1 AND deleted_at IS NULL AND discovery_status IN ('pending', 'running')`,

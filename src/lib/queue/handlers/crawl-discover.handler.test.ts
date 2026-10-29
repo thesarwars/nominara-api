@@ -390,6 +390,19 @@ describe("STORY-043 · crawl.discover recovers a job whose retries ran out", () 
     expect(payload.fields.brand_name).toBeDefined();
   });
 
+  it("STORY-044 AC4 — a failed COMMIT on the last attempt keeps the human-decided (user_edited) fields the prepare phase set aside", async () => {
+    const { calls, phases, job, tx } = recovering(3, 4);
+    const fetched = { discovery_status: "completed", duration_ms: 10, fields: { brand_name: { value: "Derived", confidence: 0.9, source: "x", user_edited: false } },
+      competitors_proposed: [], prompts_generated: [], prompts_free_remaining: 10, credits_charged: 0, low_confidence_fields: [] };
+    const edited = { value: "Held", confidence: 1, user_edited: true };
+    const prepared = { preserved: { description: edited }, humanDecided: ["description"] };
+    await phases.recover!(tx, job, { ...FAILED, fetched, prepared } as never);
+    const write = calls.find((c) => c.sql.includes("UPDATE projects"))!;
+    const payload = JSON.parse(write.params[1] as string) as { fields: Record<string, { value: unknown; user_edited?: boolean }> };
+    expect(payload.fields.description).toEqual(edited);
+    expect(payload.fields.brand_name?.value).toBe("Derived");
+  });
+
   it("an earlier attempt is left to the queue's retry ladder: nothing written, not settled", async () => {
     const { calls, phases, job, tx } = recovering(1, 4);
     await expect(phases.recover!(tx, job, FAILED as never)).resolves.toBe(false);
