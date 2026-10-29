@@ -9,6 +9,7 @@ import {
   ENTITY_MIN_NAME_MATCHES,
   ENTITY_NODE_TASK_RULE,
   judgeNameMatch,
+  spanOfMention,
   type EntityInput,
   type EntityNodeRecord,
 } from "../../../src/lib/geo/entity.js";
@@ -157,17 +158,48 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
   });
 
   it("#10 · below the evidence minimum the analysis suppresses itself with a stated reason", () => {
-    const none = buildEntity(input({ nodes: [] }));
+    // Nothing measurable at all: no node checked, too few name matches, no category passages.
+    const empty = { nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } };
+    const none = buildEntity(input({ nodes: [], ...empty }));
     expect(none.write.sufficient).toBe(false);
     expect(none.write.suppression_reason).toMatch(/not been checked/u);
     expect(none.write.score).toBeNull();
     expect(none.write.findings).toEqual([]);
     expect(none.detail).toBeNull();
-    const partial = buildEntity(input({ nodes: KNOWN.filter((n) => n.node !== "github" && n.node !== "linkedin") }));
+    const partial = buildEntity(input({ nodes: KNOWN.filter((n) => n.node !== "github" && n.node !== "linkedin"), ...empty }));
     expect(partial.write.sufficient).toBe(false);
     expect(partial.write.suppression_reason).toMatch(/github/u);
     expect(partial.write.suppression_reason).toMatch(/linkedin/u);
     expect(geoAnalysisWriteSchema.safeParse(partial.write).success).toBe(true);
+  });
+
+  it("#5/#6/#8 · risk and co-occurrence do not wait for the profile check: unchecked nodes withhold only the score", () => {
+    const { write, detail } = buildEntity(input({ nodes: [], nameMatches: 100, notAboutBrand: 21 }));
+    expect(write.sufficient).toBe(true);
+    expect(write.score).toBeNull();
+    expect(detail!.nodes).toHaveLength(7);
+    expect(detail!.nodes.every((n) => n.status === "unchecked" && n.presence === 0 && !n.link_gap && n.fix_path === null)).toBe(true);
+    expect(detail!.sameas_coverage).toBeNull();
+    expect(detail!.disambiguation).toMatchObject({ risk: 0.21, level: "high" });
+    expect(detail!.authority).toMatchObject({ score: null, suppressed: true });
+    expect(write.findings.some((f) => f.task_rule_code === ENTITY_ALIAS_TASK_RULE)).toBe(true);
+    // An unchecked node is not an absent one: no missing-node finding is invented.
+    expect(write.findings.some((f) => f.id.startsWith("entity-node-missing"))).toBe(false);
+    expect(detail!.cooccurrence.sufficient).toBe(true);
+    expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
+    expect(geoEntityDetailSchema.safeParse(detail).success).toBe(true);
+  });
+
+  it("partly checked nodes publish no score and no node-based finding, and name the unchecked ones", () => {
+    const { write, detail } = buildEntity(input({ nodes: KNOWN.filter((n) => n.node !== "github") }));
+    expect(write.sufficient).toBe(true);
+    expect(write.score).toBeNull();
+    expect(detail!.authority).toMatchObject({ score: null, suppressed: false });
+    expect(detail!.authority.reason).toMatch(/github/u);
+    expect(write.suppression_reason).toMatch(/github/u);
+    expect(detail!.nodes.find((n) => n.node === "github")!.status).toBe("unchecked");
+    expect(write.findings.some((f) => f.id.startsWith("entity-node-missing") || f.id === "entity-link-gap")).toBe(false);
+    expect(detail!.disambiguation.level).toBe("low");
   });
 
   it("co-occurrence: the brand's rate against each competitor's, over the passages that carry a category term", () => {
@@ -240,5 +272,22 @@ describe("STORY-060 · entity node records and name-match judging (pure)", () =>
     // an alias that is itself lowercase carries no case signal: never guessed to be a false positive
     expect(judgeNameMatch({ alias: "acme", span: "acme" })).toBe("about_brand");
     expect(judgeNameMatch({ alias: "Notion", span: "" })).toBe("about_brand");
+    // a span that is not the alias once folded is a misread offset, never a false positive
+    expect(judgeNameMatch({ alias: "Notion", span: "otion " })).toBe("about_brand");
+    expect(judgeNameMatch({ alias: "Notion", span: "ion" })).toBe("about_brand");
+    // diacritic folding is the matcher's: "Café" matched as "cafe" is still the same name
+    expect(judgeNameMatch({ alias: "Café", span: "café" })).toBe("not_about_brand");
+  });
+
+  it("spanOfMention: offsets index the NORMALISED text, so a raw CRLF, triple blank line, zero-width or astral character before the mention cannot shift the span", () => {
+    const raw = "\u{1F680} Launch\r\n\n\n\u200BWe like Notion a lot";
+    const normalised = "\u{1F680} Launch\n\nWe like Notion a lot";
+    const start = normalised.indexOf("Notion");
+    expect(spanOfMention(raw, start, start + 6)).toBe("Notion");
+    expect(judgeNameMatch({ alias: "Notion", span: spanOfMention(raw, start, start + 6)! })).toBe("about_brand");
+    // no text held, or an offset outside it, is unreadable (null), never a guess
+    expect(spanOfMention(null, 0, 3)).toBeNull();
+    expect(spanOfMention("abc", 2, 9)).toBeNull();
+    expect(spanOfMention("abc", 2, 2)).toBeNull();
   });
 });

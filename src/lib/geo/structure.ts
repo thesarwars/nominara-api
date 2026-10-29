@@ -63,7 +63,10 @@ export function structurePageFrom(doc: { url: string; blocks: readonly { tables:
   return { url: doc.url, tables, lists };
 }
 
-/** The task rule a structure-match gap generates a task through. */
+/**
+ * BUILDER PROPOSAL: the task rule a structure-match gap generates a task through. Like `TG-ENTITY-ALIAS`, it is in no reference
+ * and is not yet a `task_generation_rules` row, so `openGeoTasks` cannot resolve a task for it until the owner approves it.
+ */
 export const STRUCTURE_TASK_RULE = "TG-STRUCTURE-TEMPLATE";
 
 export interface StructureInput {

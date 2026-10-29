@@ -4,6 +4,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { geoEntityDetailSchema } from "../../contracts/analytics/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
+import { normalize } from "../../src/lib/parser/normalize.js";
 import { writeEntityNodes, type EntityCheck } from "../../src/lib/geo/entity.js";
 import { refreshProjectGeo } from "../../src/lib/rollup/refresh-project-geo.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
@@ -62,24 +63,52 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
   const read = () => withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService(new TasksService(new NoopRealtimePublisher())).analysis(projectId, "entity", { timeframe: "30d" }));
   const row = async () => (await db.query("SELECT * FROM geo_analyses WHERE project_id = $1 AND analysis = 'entity' AND window_days = 30", [projectId])).rows[0];
 
-  /** `n` brand name matches whose stored span is `span`. */
-  async function matches(n: number, span: string): Promise<void> {
+  /**
+   * `n` brand name matches. `raw` is the adapter text as stored; offsets are computed against `normalize(raw)`, as the
+   * parser does, from the first occurrence of `span` (case-sensitive) in it.
+   */
+  async function matchesIn(n: number, raw: string, span: string): Promise<void> {
+    const start = normalize(raw).indexOf(span);
     for (let i = 0; i < n; i++) {
       const id = randomUUID();
-      const text = `We looked at ${span} for teams.`;
       await db.query(
         `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,status)
          VALUES ($1,$2,$3,$4,$5,'gemini',$6,'api','v1','v1','\\x00',$7::jsonb,'parsed')`,
-        [id, workspaceId, projectId, randomUUID(), randomUUID(), IN_WINDOW, JSON.stringify({ format: "markdown", text })],
+        [id, workspaceId, projectId, randomUUID(), randomUUID(), IN_WINDOW, JSON.stringify({ format: "markdown", text: raw })],
       );
       await db.query(
         `INSERT INTO mention_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_label,matched_alias,
            occurrence_index,char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,position_class,answer_form)
-         VALUES ($1,$2,$3,$4,'gemini',$5,'brand','Notion','notion',0,13,$6,0,0.5,'neutral',0,0.5,'lexicon','recommendation','narrative')`,
-        [workspaceId, projectId, id, randomUUID(), IN_WINDOW, 13 + span.length],
+         VALUES ($1,$2,$3,$4,'gemini',$5,'brand','Notion','notion',0,$6,$7,0,0.5,'neutral',0,0.5,'lexicon','recommendation','narrative')`,
+        [workspaceId, projectId, id, randomUUID(), IN_WINDOW, start, start + span.length],
       );
     }
   }
+  const matches = (n: number, span: string) => matchesIn(n, `We looked at ${span} for teams.`, span);
+
+  it("#5/#6 · with NO profile check recorded, risk is still measured and a high one surfaces the alias task (the score waits)", async () => {
+    await matches(26, "Notion");
+    await matches(7, "notion"); // 7 of 33 = 21.2%
+    await refresh();
+    const stored = await row();
+    expect(stored).toMatchObject({ sufficient: true, score: null });
+    expect(stored.suppression_reason).toMatch(/disambiguation risk is high/iu);
+    expect(Number((await db.query("SELECT count(*) FROM entity_nodes")).rows[0].count)).toBe(0);
+    const a = await read();
+    const detail = geoEntityDetailSchema.parse(a.detail);
+    expect(detail.disambiguation).toMatchObject({ level: "high", name_matches: 33, not_about_brand: 7 });
+    expect(detail.nodes.every((n) => n.status === "unchecked")).toBe(true);
+    expect(detail.authority).toMatchObject({ score: null, suppressed: true });
+    expect(a.actions.some((x) => /aliases/iu.test(x.label))).toBe(true);
+  });
+
+  it("hazard · raw CRLF, a triple blank line, a zero-width and an astral character before a capitalised mention do not shift its span into a false positive", async () => {
+    const raw = "\u{1F680} Launch week\r\n\n\n\u200B\u{1F680}\u{1F680} We like Notion a lot.";
+    await matchesIn(30, raw, "Notion");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ level: "low", risk: 0, name_matches: 30, not_about_brand: 0 });
+  });
 
   it("no profile check recorded: persisted as insufficient with its reason, and the read has no detail", async () => {
     await refresh();
