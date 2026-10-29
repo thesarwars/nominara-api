@@ -89,7 +89,9 @@ export interface EntityInput {
   nodes: EntityNodeRecord[];
   /** Brand-name matches in the window (mention rows). */
   nameMatches: number;
-  /** Of those, the matches judged not to be about this brand. */
+  /** Of those, the matches whose answer text could not be read: reported, never judged, and outside the risk denominator. */
+  unjudged: number;
+  /** Of the judged matches (`nameMatches - unjudged`), those judged not to be about this brand. */
   notAboutBrand: number;
   cooccurrence: { terms: string[]; categoryPassages: number; entities: { name: string; isBrand: boolean; passages: number }[] };
 }
@@ -152,8 +154,9 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
   const allChecked = unchecked.length === 0;
 
   // ---- disambiguation: separate, never folded in, and independent of the node checks ----
-  const measured = input.nameMatches >= ENTITY_MIN_NAME_MATCHES;
-  const riskRaw = measured ? input.notAboutBrand / input.nameMatches : null;
+  const judged = input.nameMatches - input.unjudged;
+  const measured = judged >= ENTITY_MIN_NAME_MATCHES;
+  const riskRaw = measured ? input.notAboutBrand / judged : null;
   const level = riskRaw === null ? ("unmeasured" as const) : disambiguationLevel(riskRaw);
   const highRisk = level === "high";
 
@@ -190,9 +193,9 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
   // Unmeasured risk withholds too: a score we cannot show is free of false positives is not a score we can trust.
   const unmeasuredRisk = level === "unmeasured";
   const suppressed = highRisk || unmeasuredRisk;
-  const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(input.nameMatches)} of the ${String(ENTITY_MIN_NAME_MATCHES)} brand-name matches it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
+  const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(judged)} readable brand-name matches of the ${String(ENTITY_MIN_NAME_MATCHES)} it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
   const reason = highRisk
-    ? `Disambiguation risk is high (${pct(riskRaw!)} of ${String(input.nameMatches)} name matches are not about this brand), so the Entity Authority score would be computed over false positives and is withheld. Tune the brand's aliases first.${allChecked ? "" : ` ${notCheckedReason}`}`
+    ? `Disambiguation risk is high (${pct(riskRaw!)} of ${String(judged)} judged name matches are not about this brand), so the Entity Authority score would be computed over false positives and is withheld. Tune the brand's aliases first.${allChecked ? "" : ` ${notCheckedReason}`}`
     : unmeasuredRisk
       ? `${unmeasuredReason}${allChecked ? "" : ` ${notCheckedReason}`}`
       : allChecked
@@ -231,6 +234,7 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
       level,
       name_matches: input.nameMatches,
       not_about_brand: input.notAboutBrand,
+      unjudged: input.unjudged,
       minimum_matches: ENTITY_MIN_NAME_MATCHES,
     },
     cooccurrence: {
@@ -256,7 +260,7 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
       severity: "high",
       headline: `${pct(riskRaw!)} of the mentions matching the brand's name are not about it. Tune the brand's aliases and negative aliases before trusting any mention-based figure.`,
       detail: reason!,
-      evidence: [{ url: home, snippet: `${String(input.notAboutBrand)} of ${String(input.nameMatches)} name matches were judged not to be about this brand.` }],
+      evidence: [{ url: home, snippet: `${String(input.notAboutBrand)} of ${String(judged)} readable name matches were judged not to be about this brand.` }],
       metric: { name: "disambiguation_risk", value: round4(riskRaw!), target: DISAMBIGUATION_HIGH_ABOVE },
       task_rule_code: ENTITY_ALIAS_TASK_RULE,
     });
@@ -324,8 +328,8 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
               ? "Disambiguation risk is not yet measurable; the Entity Authority score waits for enough brand-name matches."
               : `Disambiguation risk is ${level}; the Entity Authority score waits for the authoritative profiles to be checked.`,
             detail: unmeasuredRisk ? unmeasuredReason : notCheckedReason,
-            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(input.nameMatches)} brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
-            metric: unmeasuredRisk ? { name: "name_matches", value: input.nameMatches, target: ENTITY_MIN_NAME_MATCHES } : { name: "unchecked_nodes", value: unchecked.length },
+            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(judged)} readable brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
+            metric: unmeasuredRisk ? { name: "name_matches", value: judged, target: ENTITY_MIN_NAME_MATCHES } : { name: "unchecked_nodes", value: unchecked.length },
             no_action: true,
           },
     );
@@ -447,10 +451,13 @@ export function spanOfMention(rawText: string | null, charStart: number, charEnd
 
 /** The span with a little text each side, for judging; null under the same conditions as `spanOfMention`. */
 export function mentionContext(rawText: string | null, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
-  const span = spanOfMention(rawText, charStart, charEnd);
-  if (span === null) return null;
-  const text = normalize(rawText!);
-  return { span, before: text.slice(Math.max(0, charStart - 64), charStart), after: text.slice(charEnd, charEnd + 16) };
+  return rawText === null ? null : contextOfNormalised(normalize(rawText), charStart, charEnd);
+}
+
+/** `mentionContext` over text that is already normalised. */
+function contextOfNormalised(text: string, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
+  if (charStart < 0 || charEnd <= charStart || charEnd > text.length) return null;
+  return { span: text.slice(charStart, charEnd), before: text.slice(Math.max(0, charStart - 64), charStart), after: text.slice(charEnd, charEnd + 16) };
 }
 
 // ------------------------------------------------------------------ loader
@@ -494,11 +501,14 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
 
   // One row per capture with its mentions' offsets. The span is cut in application code, from the normalised text: the
   // offsets are UTF-16 indices into the normalised string, which SQL `substr` over the raw payload cannot honour.
+  // The text is resolved as the parser resolves it (capture-parse `reusedTextOf`): an L2-reused row carries `{}` and a
+  // `source_result_id`, its mentions were matched against the SOURCE row's text, so that is where their offsets point.
   const captures = await tx.query<{ text: string | null; mentions: [string, number, number][] }>(
-    `SELECT min(ac.payload ->> 'text') AS text,
+    `SELECT min(COALESCE(NULLIF(ac.payload ->> 'text', ''), NULLIF(src.payload ->> 'text', ''))) AS text,
             json_agg(json_build_array(mf.matched_alias, mf.char_start, mf.char_end)) AS mentions
        FROM mention_facts mf
        LEFT JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at
+       LEFT JOIN answer_captures src ON src.id = ac.source_result_id AND src.workspace_id = ac.workspace_id AND src.project_id = ac.project_id
       WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $4
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)
@@ -508,13 +518,17 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
   // The parser may store the folded alias; judge against the cased spelling the project actually holds.
   const cased = new Map([p.name, ...p.brand_aliases].map((a) => [a.toLowerCase(), a]));
   let nameMatches = 0;
+  let unjudged = 0;
   let notAboutBrand = 0;
   for (const c of captures.rows) {
+    // Normalised once per capture, not once per mention.
+    const text = c.text === null ? null : normalize(c.text);
     for (const [alias, start, end] of c.mentions) {
       nameMatches += 1;
-      // A span that cannot be read (answer text no longer held) is counted as a match and never as a false positive.
-      const ctx = mentionContext(c.text, start, end);
-      if (ctx !== null && judgeNameMatch({ alias: cased.get(alias.toLowerCase()) ?? alias, ...ctx }) === "not_about_brand") notAboutBrand += 1;
+      // A span that cannot be read (answer text no longer held) is counted as a match, reported as unjudged, and never as a false positive.
+      const ctx = text === null ? null : contextOfNormalised(text, start, end);
+      if (ctx === null) unjudged += 1;
+      else if (judgeNameMatch({ alias: cased.get(alias.toLowerCase()) ?? alias, ...ctx }) === "not_about_brand") notAboutBrand += 1;
     }
   }
 
@@ -530,8 +544,10 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
   // multiplies by the competitor count. Row `-1` is the category total; an entity with no hit has no row (zero).
   const patIdx: number[] = [];
   const patText: string[] = [];
+  const patCased: boolean[] = [];
   entities.forEach((e, i) => {
-    for (const a of e.aliases) if (a.trim() !== "") { patIdx.push(i); patText.push(termPattern(a)); }
+    // A capitalised alias ("Notion") is matched case-SENSITIVELY: folding it would count the common word ("notion") as the brand and inflate the rate.
+    for (const a of e.aliases) if (a.trim() !== "") { patIdx.push(i); patText.push(termPattern(a)); patCased.push(a !== a.toLowerCase()); }
   });
   const counts = new Map<number, number>();
   if (termPatterns.length > 0) {
@@ -543,9 +559,9 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
        SELECT -1 AS idx, count(*)::int AS n FROM cat
        UNION ALL
        SELECT pats.idx, count(DISTINCT cat.rn)::int AS n
-         FROM unnest($3::int[], $4::text[]) AS pats(idx, pat) JOIN cat ON cat.text ~* pats.pat
+         FROM unnest($3::int[], $4::text[], $5::boolean[]) AS pats(idx, pat, cased) JOIN cat ON CASE WHEN pats.cased THEN cat.text ~ pats.pat ELSE cat.text ~* pats.pat END
         GROUP BY pats.idx`,
-      [projectId, termPatterns, patIdx, patText],
+      [projectId, termPatterns, patIdx, patText, patCased],
     );
     for (const r of res.rows) counts.set(r.idx, r.n);
   }
@@ -558,6 +574,7 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     rootDomain: p.root_domain,
     nodes: nodes.rows.map((r) => ({ node: r.node, present: r.present, complete: r.complete, url: r.url, missingFields: r.missing_fields, inBrandSameas: r.in_brand_sameas })),
     nameMatches,
+    unjudged,
     notAboutBrand,
     cooccurrence: {
       terms,

@@ -175,6 +175,8 @@ export const geoEntityDetailSchema = z
         level: disambiguationLevelSchema,
         name_matches: z.number().int().nonnegative(),
         not_about_brand: z.number().int().nonnegative(),
+        /** Name matches whose answer text could not be read; out of the risk denominator, never counted as false positives. */
+        unjudged: z.number().int().nonnegative(),
         minimum_matches: z.number().int().positive(),
       })
       .strict(),

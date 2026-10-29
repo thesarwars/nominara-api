@@ -49,6 +49,7 @@ const input = (over: Partial<EntityInput> = {}): EntityInput => ({
   rootDomain: "acme.com",
   nodes: KNOWN,
   nameMatches: 100,
+  unjudged: 0,
   notAboutBrand: 2,
   cooccurrence: { terms: ["crm"], categoryPassages: 40, entities: [{ name: "Acme", isBrand: true, passages: 12 }, { name: "Rival", isBrand: false, passages: 20 }] },
   ...over,
@@ -168,7 +169,7 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
 
   it("#10 · below the evidence minimum the analysis suppresses itself with a stated reason", () => {
     // Nothing measurable at all: no node checked, too few name matches, no category passages.
-    const empty = { nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } };
+    const empty = { nameMatches: 0, unjudged: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } };
     const none = buildEntity(input({ nodes: [], ...empty }));
     expect(none.write.sufficient).toBe(false);
     expect(none.write.suppression_reason).toMatch(/not been checked/u);

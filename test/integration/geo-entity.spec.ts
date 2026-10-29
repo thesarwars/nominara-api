@@ -110,12 +110,69 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
     expect(detail.disambiguation).toMatchObject({ level: "low", risk: 0, name_matches: 30, not_about_brand: 0 });
   });
 
-  it("a mention whose capture row is gone is still a name match (never a false positive), so the count is not undercounted", async () => {
-    await matches(30, "Notion");
-    await db.query("DELETE FROM answer_captures WHERE id IN (SELECT result_id FROM mention_facts WHERE project_id = $1 LIMIT 5)", [projectId]);
+  const dropCaptures = (n: number, like: string) =>
+    db.query("DELETE FROM answer_captures WHERE id IN (SELECT id FROM answer_captures WHERE project_id = $1 AND payload ->> 'text' LIKE $2 LIMIT $3)", [projectId, like, n]);
+
+  it("a mention whose capture row is gone is still a name match (never a false positive), reported as unjudged and out of the risk denominator", async () => {
+    await matches(35, "Notion");
+    await dropCaptures(5, "%Notion%");
     await refresh();
     const detail = geoEntityDetailSchema.parse((await read()).detail);
-    expect(detail.disambiguation).toMatchObject({ level: "low", name_matches: 30, not_about_brand: 0 });
+    expect(detail.disambiguation).toMatchObject({ level: "low", name_matches: 35, unjudged: 5, not_about_brand: 0 });
+  });
+
+  it("the 30-match minimum is on JUDGED matches: 30 matches of which 5 are unreadable is unmeasured, never low", async () => {
+    await inTx((tx) => writeEntityNodes(tx, projectId, ALL_PRESENT, SAMEAS));
+    await matches(30, "Notion");
+    await dropCaptures(5, "%Notion%");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ level: "unmeasured", risk: null, name_matches: 30, unjudged: 5 });
+  });
+
+  it("hazard · 20 unreadable + 30 readable mentions with 10 false positives is HIGH (10/30), not 0.20 medium over all 50", async () => {
+    await matches(10, "notion");
+    await matches(20, "Notion");
+    await matchesIn(20, "We looked at Notiom for teams.", "Notiom");
+    await dropCaptures(20, "%Notiom%");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ level: "high", name_matches: 50, unjudged: 20, not_about_brand: 10 });
+    expect(detail.disambiguation.risk).toBeCloseTo(1 / 3, 3);
+  });
+
+  /** `n` L2-reused capture rows: payload `{}` and a source_result_id, exactly as record-suppressed writes them; the text lives on the source row. */
+  async function reusedMatches(n: number, sourceRaw: string, span: string): Promise<void> {
+    const sourceId = randomUUID();
+    await db.query(
+      `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,status)
+       VALUES ($1,$2,$3,$4,$5,'gemini','2026-08-01T10:00:00Z','api','v1','v1','\\x00',$6::jsonb,'parsed')`,
+      [sourceId, workspaceId, projectId, randomUUID(), randomUUID(), JSON.stringify({ format: "markdown", text: sourceRaw })],
+    );
+    const start = normalize(sourceRaw).indexOf(span);
+    for (let i = 0; i < n; i++) {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,status,cache_layer,source_result_id)
+         VALUES ($1,$2,$3,$4,$5,'gemini',$6,'api','v1','v1','\\x00','{}'::jsonb,'parsed','l2',$7)`,
+        [id, workspaceId, projectId, randomUUID(), randomUUID(), IN_WINDOW, sourceId],
+      );
+      await db.query(
+        `INSERT INTO mention_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_label,matched_alias,
+           occurrence_index,char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,position_class,answer_form)
+         VALUES ($1,$2,$3,$4,'gemini',$5,'brand','Notion','notion',0,$6,$7,0,0.5,'neutral',0,0.5,'lexicon','recommendation','narrative')`,
+        [workspaceId, projectId, id, randomUUID(), IN_WINDOW, start, start + span.length],
+      );
+    }
+  }
+
+  it("hazard · an L2-reused row reads its text from the source row: lowercase 'notion' spans there count as not_about_brand", async () => {
+    await matches(20, "Notion");
+    await matches(5, "notion");
+    await reusedMatches(10, "We looked at notion for teams.", "notion");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ name_matches: 35, unjudged: 0, not_about_brand: 15, level: "high" });
   });
 
   it("no profile check recorded: persisted as insufficient with its reason, and the read has no detail", async () => {
@@ -179,6 +236,20 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
     expect(detail.cooccurrence).toMatchObject({ sufficient: true, category_passages: 10 });
     expect(detail.cooccurrence.entities.find((e) => e.is_brand)).toMatchObject({ passages: 2, rate: 0.2 });
     expect(detail.cooccurrence.entities.find((e) => e.name === "Rival")).toMatchObject({ passages: 6, rate: 0.6 });
+  });
+
+  it("hazard · co-occurrence matches a capitalised alias case-sensitively: the common word 'notion' in a CRM passage is not the brand", async () => {
+    for (let i = 0; i < 10; i++) {
+      await db.query(
+        `INSERT INTO corpus_passages (workspace_id,project_id,citation_url_hash,url,domain,passage_index,text,token_count,content_hash,embedding_model,expires_at)
+         VALUES ($1,$2,$3,'https://x.example/'||$4,'x.example',0,$5,10,$3,'stub',now()+interval '30 days')`,
+        [workspaceId, projectId, Buffer.from(`c${i}`), String(i), i < 2 ? "The best CRM is Notion." : i < 8 ? "A CRM built on the notion of pipelines." : "A CRM guide."],
+      );
+    }
+    await matches(30, "Notion");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.cooccurrence.entities.find((e) => e.is_brand)).toMatchObject({ passages: 2, rate: 0.2 });
   });
 
   it("#11 · free and unmetered: no credit ledger entry", async () => {
