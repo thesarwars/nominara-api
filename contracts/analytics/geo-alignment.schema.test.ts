@@ -23,13 +23,13 @@ const payload = {
 } as const;
 
 describe("STORY-059 - alignment session payload contract", () => {
-  it("scenario 10 - AC9 - the payload carries the estimate labelling and declares generation disabled", () => {
+  it("scenario 10 - AC10 - the payload carries the estimate labelling and declares generation disabled", () => {
     const parsed = alignmentSessionPayloadSchema.parse(payload);
     expect(parsed.estimate).toEqual({ method: "additive_blend_estimate", confidence: "modeled", caveat: ALIGNMENT_CAVEAT });
     expect(parsed.generation).toBe("disabled");
   });
 
-  it("scenario 10 - AC9 - a payload without the estimate label, or with another method or confidence, is not a valid payload", () => {
+  it("scenario 10 - AC10 - a payload without the estimate label, or with another method or confidence, is not a valid payload", () => {
     const { estimate: _estimate, ...without } = payload;
     expect(alignmentSessionPayloadSchema.safeParse(without).success).toBe(false);
     expect(alignmentSessionPayloadSchema.safeParse({ ...payload, estimate: { ...payload.estimate, confidence: "measured" } }).success).toBe(false);
@@ -52,6 +52,13 @@ describe("STORY-059 - alignment session payload contract", () => {
     expect(alignmentRecommendationSchema.safeParse({ ...recommendation, accuracy_warning: null }).success).toBe(false);
     expect(alignmentRecommendationSchema.safeParse({ ...recommendation, requires_human_review: false }).success).toBe(false);
     expect(alignmentRecommendationSchema.safeParse({ ...recommendation, node_type: "capability", requires_human_review: false, accuracy_warning: null }).success).toBe(true);
+  });
+
+  it("review - AC13 - a claim-bearing node cannot be declared without review, whatever its warning: the flag is not the writer's choice", () => {
+    for (const node_type of CLAIM_BEARING_NODE_TYPES) {
+      expect(alignmentRecommendationSchema.safeParse({ ...recommendation, node_type, requires_human_review: false, accuracy_warning: null }).success, node_type).toBe(false);
+      expect(alignmentRecommendationSchema.safeParse({ ...recommendation, node_type, requires_human_review: true, accuracy_warning: "Check this." }).success, node_type).toBe(true);
+    }
   });
 
   it("scenario 12 - AC13 - compliance, metric and pricing are the claim-bearing types", () => {
@@ -89,7 +96,7 @@ describe("STORY-059 - alignment session payload contract", () => {
     expect(routes.filter((r) => /(alignment|semantic|geo).*(generat|rewrite|autowrite|draft-copy)|(generat|rewrite|autowrite).*(alignment|semantic|geo)/i.test(r))).toEqual([]);
   });
 
-  it("AC9 - NFR-OPT-02 - the caveat and the contract make no ranking-guarantee claim", () => {
+  it("AC10 - NFR-OPT-02 - the caveat and the contract make no ranking-guarantee claim", () => {
     const text = readFileSync(path.join(import.meta.dirname, "geo-alignment.schema.ts"), "utf8").replace(/\/\/.*$/gm, "");
     const banned = /\b(guarantee[sd]?|will\s+rank|rank(?:s|ing)?\s+(?:higher|#?1|first)|ensures?\s+(?:citation|ranking)|boosts?\s+your\s+rank)/i;
     expect(ALIGNMENT_CAVEAT).not.toMatch(banned);

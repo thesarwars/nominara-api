@@ -68,6 +68,9 @@ export const alignmentRecommendationSchema = z
     if (r.requires_human_review !== (r.accuracy_warning !== null)) {
       ctx.addIssue({ code: "custom", message: "a node that requires review carries an accuracy warning, and only such a node does", path: ["accuracy_warning"] });
     }
+    if (CLAIM_BEARING_NODE_TYPES.includes(r.node_type) && !r.requires_human_review) {
+      ctx.addIssue({ code: "custom", message: "a compliance, metric or pricing_term node always requires human review", path: ["requires_human_review"] });
+    }
   });
 export type AlignmentRecommendation = z.infer<typeof alignmentRecommendationSchema>;
 
