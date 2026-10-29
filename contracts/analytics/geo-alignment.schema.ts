@@ -52,7 +52,7 @@ export const alignmentRecommendationSchema = z
     corpus_doc_ratio: z.number().min(0).max(1),
     /** Estimated change in the best chunk's cosine to the centroid if the phrase were added. Null when it could not be modeled. */
     projected_gain: z.number().nullable(),
-    /** 1-based; null only for a node that has no modeled gain. */
+    /** 1-based; null for a node with no modeled gain. A node modeled to move the page away from the centroid (gain <= 0) is not recommended. */
     priority_rank: z.number().int().min(1).nullable(),
     /** EVERY node is evidenced: a source URL and the sentence it came from. */
     evidence_url: z.string().min(1),
@@ -73,11 +73,14 @@ export type AlignmentRecommendation = z.infer<typeof alignmentRecommendationSche
 
 export const alignmentProjectionSchema = z
   .object({
-    /** The sum of every recommendation's gain with no diminishing returns. Shown so the difference is visible, never as a forecast. */
+    /**
+     * CHUNK-level units: every gain is the change in ONE chunk's cosine, so these sums are NOT a change in the page's alignment (the
+     * page figure is a token-weighted mean over all chunks). There is deliberately no projected page alignment: adding a chunk gain to
+     * the page mean would overstate it by roughly the number of chunks.
+     * The sum of every recommendation's gain with no diminishing returns. Shown so the difference is visible, never as a forecast. */
     naive_sum: z.number(),
     /** Gains weighted by 0.85^(i-1) for the i-th ranked node. */
     diminished_sum: z.number(),
-    projected_alignment: z.number().nullable(),
     diminishing_returns_factor: z.literal(0.85),
   })
   .strict();

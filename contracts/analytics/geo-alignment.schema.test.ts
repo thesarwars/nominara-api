@@ -18,7 +18,7 @@ const payload = {
   session_id: uuid, target_url: "https://brand.test/p", prompt_cluster_id: null, embedding_model: "m", baseline_alignment: 0.4, current_alignment: 0.4,
   target_band: { low: 0.5, high: 0.7 }, percentile_vs_corpus: 20, coverage_ratio: 0.5, centroid_source_count: 9, centroid_domains: ["a.example"],
   low_confidence: false, estimate: { method: "additive_blend_estimate", confidence: "modeled", caveat: ALIGNMENT_CAVEAT },
-  recommendations: [recommendation], projection: { naive_sum: 0.02, diminished_sum: 0.02, projected_alignment: 0.42, diminishing_returns_factor: 0.85 },
+  recommendations: [recommendation], projection: { naive_sum: 0.02, diminished_sum: 0.02, diminishing_returns_factor: 0.85 },
   generation: "disabled",
 } as const;
 
@@ -34,6 +34,11 @@ describe("STORY-059 - alignment session payload contract", () => {
     expect(alignmentSessionPayloadSchema.safeParse(without).success).toBe(false);
     expect(alignmentSessionPayloadSchema.safeParse({ ...payload, estimate: { ...payload.estimate, confidence: "measured" } }).success).toBe(false);
     expect(alignmentSessionPayloadSchema.safeParse({ ...payload, estimate: { ...payload.estimate, method: "ranking_guarantee" } }).success).toBe(false);
+  });
+
+  it("scenario 9 - review - the projection has no page-level projected_alignment (chunk gains are not page units), and one is refused", () => {
+    expect(Object.keys(alignmentSessionPayloadSchema.parse(payload).projection!).sort()).toEqual(["diminished_sum", "diminishing_returns_factor", "naive_sum"]);
+    expect(alignmentSessionPayloadSchema.safeParse({ ...payload, projection: { ...payload.projection, projected_alignment: 0.42 } }).success).toBe(false);
   });
 
   it("scenario 13 - AC12 - generation cannot be declared enabled, and an unknown key is refused", () => {
