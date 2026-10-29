@@ -2,6 +2,7 @@ import { z } from "zod";
 import { PAGINATION_LIMIT_DEFAULT, PAGINATION_LIMIT_MAX } from "../common/pagination.schema.js";
 import { auxCategorySchema } from "./aux-audit.schema.js";
 import { auxGuidanceSchema, auxPatchSchema } from "./patch.schema.js";
+import { auxRuleEvidenceSchema } from "./rule-finding.schema.js";
 import { auxFindingSeveritySchema, siteFileEvidenceSchema } from "./site-file-finding.schema.js";
 
 // NEW-C-10 (STORY-052; api-specification.md "AUX") — a finding on the wire, the
@@ -20,8 +21,8 @@ export const auxFindingStatusSchema = z.enum(AUX_FINDING_STATUSES);
 export const AUX_WONT_FIX_REASON_MAX = 1000;
 
 /**
- * `aux_findings.evidence` is jsonb and holds one of two shapes: the site-file
- * evaluators' (NEW-C-8) or the demo seed's `{selector, snippet, measured,
+ * `aux_findings.evidence` is jsonb and holds one of three shapes: the site-file
+ * evaluators' (NEW-C-8), the document-model rules' (STORY-051) or the demo seed's `{selector, snippet, measured,
  * expected}`. Both read; neither is a request.
  */
 export const auxDemoEvidenceSchema = z
@@ -32,7 +33,7 @@ export const auxDemoEvidenceSchema = z
     expected: z.unknown(),
   })
   .strict();
-export const auxFindingEvidenceSchema = z.union([siteFileEvidenceSchema, auxDemoEvidenceSchema]);
+export const auxFindingEvidenceSchema = z.union([siteFileEvidenceSchema, auxRuleEvidenceSchema, auxDemoEvidenceSchema]);
 
 export const auxFindingSchema = z
   .object({
