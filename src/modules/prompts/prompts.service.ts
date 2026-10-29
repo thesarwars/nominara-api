@@ -178,6 +178,9 @@ export class PromptsService {
     };
   }
 
+  // FOR NO KEY UPDATE is the lock crawl.discover's free-allowance writer takes on the same row (src/lib/discovery/free-prompts.ts),
+  // taken BEFORE the existing hashes are read: two writers of generated prompts cannot both see "nothing yet" and collide on the
+  // project's text-hash index. It does not block readers or the foreign-key checks a prompt insert makes against this row.
   private async loadProjectContext(
     client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> },
     projectId: string,
@@ -185,7 +188,8 @@ export class PromptsService {
     const result = await client.query<ProjectContextRow>(
       `SELECT name, root_domain, category_slug, verticals, locale, brand_aliases
          FROM projects
-        WHERE id = $1 AND deleted_at IS NULL`,
+        WHERE id = $1 AND deleted_at IS NULL
+          FOR NO KEY UPDATE`,
       [projectId],
     );
     const project = result.rows[0];

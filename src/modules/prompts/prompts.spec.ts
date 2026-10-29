@@ -1,4 +1,5 @@
 import { Test } from "@nestjs/testing";
+import type { ClientBase } from "pg";
 import { Logger } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
@@ -11,6 +12,7 @@ import { PromptListService } from "./prompt-list.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsModule } from "./prompts.module.js";
 import { PromptsService } from "./prompts.service.js";
+import { withTenantContext } from "../../tenancy/tenant-context.js";
 
 // STORY-022's compiles-test, extended by STORY-045. The module now imports
 // CacheModule, which validates the full env schema at .compile() time, so
@@ -71,5 +73,33 @@ describe("STORY-022 · PromptsModule compiles", () => {
     // PROVIDED fails only at the first request.
     expect(moduleRef.get(PromptListService)).toBeInstanceOf(PromptListService);
     await moduleRef.close();
+  });
+});
+
+// STORY-043 review (round 1), finding 3 — crawl.discover's free allowance and the onboarding step's explicit generate both write
+// generated prompts for the same project. Discovery serialises on the project row (FOR NO KEY UPDATE); this writer must take the
+// SAME lock before it reads the hashes it dedupes against, or the two read "nothing yet" and collide on ux_prompts_project_hash.
+describe("STORY-043 · PromptsService.generate serialises with discovery's free allowance", () => {
+  it("locks the project row (FOR NO KEY UPDATE) before reading the existing hashes", async () => {
+    const sqls: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        sqls.push(sql);
+        if (sql.includes("FROM projects")) {
+          return { rows: [{ name: "HubSpot", root_domain: "hubspot.com", category_slug: "crm", verticals: [], locale: null, brand_aliases: [] }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as ClientBase;
+    const service = new PromptsService({} as never);
+
+    await withTenantContext(client, { workspaceId: "11111111-1111-7111-8111-111111111111", actorId: "22222222-2222-7222-8222-222222222222" }, () =>
+      service.generate("0f9e2a7c-1b3d-4e5f-8a9b-0c1d2e3f4a5b", {} as never),
+    );
+
+    const lock = sqls.findIndex((sql) => /FROM projects[\s\S]*FOR NO KEY UPDATE/.test(sql));
+    const hashes = sqls.findIndex((sql) => sql.includes("SELECT id, text_hash FROM tracked_prompts"));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(hashes).toBeGreaterThan(lock);
   });
 });
