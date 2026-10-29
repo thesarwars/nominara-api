@@ -8,7 +8,7 @@ const find = (candidates: ReturnType<typeof extractNodeCandidates>, normalized: 
 describe("STORY-059 - normalisePhrase", () => {
   it("lowercases, folds punctuation and whitespace, keeps digits and %", () => {
     expect(normalisePhrase("  SOC 2,  Type-II  ")).toBe("soc 2 type ii");
-    expect(normalisePhrase("99.9% Uptime")).toBe("99.9% uptime");
+    expect(normalisePhrase("98.7% Uptime")).toBe("98.7% uptime");
   });
   it("is stable under its own output", () => {
     const once = normalisePhrase("Single   Sign-On (SSO)");
@@ -89,7 +89,7 @@ describe("STORY-059 AC5 - typing by a deterministic keyword map", () => {
     ["soc 2 type ii report", "compliance"],
     ["hipaa compliance", "compliance"],
     ["gdpr", "compliance"],
-    ["99.9% uptime", "metric"],
+    ["98.7% uptime", "metric"],
     ["50% faster reports", "metric"],
     ["per seat pricing", "pricing_term"],
     ["free trial", "pricing_term"],

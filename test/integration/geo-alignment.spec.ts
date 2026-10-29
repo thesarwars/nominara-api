@@ -387,12 +387,12 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
   }, 60_000);
 
   it("AC6 - nodes are typed by the deterministic map; compliance, metric and pricing set the review flag", async () => {
-    await seedTexts(corpusTexts(10, () => "We hold a SOC 2 report. We guarantee 99.9% uptime. Pricing is per seat. We support audit logging."));
+    await seedTexts(corpusTexts(10, () => "We hold a SOC 2 report. We guarantee 98.7% uptime. Pricing is per seat. We support audit logging."));
     const session = await addSession();
     await extractSemanticNodes(deps(), session);
     const types = new Map((await nodeRows()).map((n) => [n.phrase_normalized as string, { type: n.node_type as string, review: n.requires_human_review as boolean }]));
     expect(types.get("soc 2 report")).toEqual({ type: "compliance", review: true });
-    expect(types.get("99.9% uptime")).toEqual({ type: "metric", review: true });
+    expect(types.get("98.7% uptime")).toEqual({ type: "metric", review: true });
     expect(types.get("audit logging")).toEqual({ type: "capability", review: false });
     expect([...types.values()].filter((t) => ["compliance", "metric", "pricing_term"].includes(t.type)).every((t) => t.review)).toBe(true);
     expect([...types.values()].filter((t) => !["compliance", "metric", "pricing_term"].includes(t.type)).every((t) => !t.review)).toBe(true);
