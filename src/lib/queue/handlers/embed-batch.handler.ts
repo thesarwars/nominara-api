@@ -181,8 +181,9 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
             RETURNING t.id`,
   },
   corpus_passages: {
-    // The row carries its model from insert (NOT NULL) and ux_corpus_passages (workspace, hash, model) allows ONE row per
-    // content, so L7 is the unique key itself; a passage stored under another model is not this job's to embed.
+    // The row carries its model from insert (NOT NULL) and ux_corpus_passages_cluster (workspace, project, cluster, hash, model)
+    // allows ONE row per (cluster, content), so each cluster's copy of a shared text is embedded once for that cluster (owner
+    // decision 11); a passage stored under another model is not this job's to embed.
     pending: `SELECT id, text, encode(content_hash, 'hex') AS hash, false AS is_draft
                 FROM corpus_passages
                WHERE embedding IS NULL AND embedding_model = $2 AND id = ANY($1::uuid[]) AND workspace_id = app.current_workspace()

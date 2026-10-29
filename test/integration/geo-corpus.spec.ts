@@ -362,7 +362,7 @@ describe("STORY-058 - corpus passages and centroid", () => {
     const first = await build();
     expect(first.status).toBe("complete");
     const again = await build();
-    expect(again.passagesConflictSkipped).toBe(0);
+    expect(again).not.toHaveProperty("passagesConflictSkipped");
     expect(again.status).toBe("complete");
     expect(again.passagesDeduplicated).toBe(1);
     expect(await passageRows()).toHaveLength(1);
@@ -603,13 +603,13 @@ describe("STORY-058 - corpus passages and centroid", () => {
     pages.set("https://second.example/p", { kind: "html", html: articleHtml("shared words") });
     const again = await build();
     expect((await passageRows()).map((r) => r.url)).toEqual(["https://second.example/p"]);
-    expect(again.passagesConflictSkipped).toBe(0);
+    expect(again).not.toHaveProperty("passagesConflictSkipped");
     expect(again.status).toBe("complete");
   }, 60_000);
 
   // ---- a passage held by another cluster / project (the schema key has neither) -----------------------------------------
 
-  it("review - one page cited for two clusters of one project: the second cluster is fetched too and keeps every passage the first did not store", async () => {
+  it("review - AC1/AC4 - one page cited for two clusters of one project: the second cluster is fetched too and holds EVERY passage it selected, including text the first also holds", async () => {
     const clusterB = randomUUID();
     const promptA = await addPrompt(PROMPT_TEXTS[0]!);
     const promptB = await addPrompt("pricing plans for agencies", clusterB);
@@ -625,18 +625,20 @@ describe("STORY-058 - corpus passages and centroid", () => {
 
     const second = await buildCorpus(deps(), { projectId, clusterId: clusterB });
     expect(fetchCalls).toHaveLength(2); // not skipped because another cluster holds the page
-    expect(second.passagesWritten).toBe(2); // B1 and B2; the text both clusters selected ("Both") is held by the first
-    expect(second.passagesConflictSkipped).toBe(1);
-    expect(second.status).toBe("partial");
+    expect(second.passagesWritten).toBe(3); // B1, B2 AND the text both clusters selected ("Both"): each cluster holds its own copy
+    expect(second.status).toBe("complete");
+    expect(second).not.toHaveProperty("passagesConflictSkipped");
     const stored = await passageRows(`prompt_cluster_id = '${clusterB}'`);
-    expect(stored).toHaveLength(2);
-    expect(stored.every((r) => /\bB[12]\b/.test(r.text))).toBe(true);
+    expect(stored).toHaveLength(3);
+    expect(stored.some((r) => /\bBoth\b/.test(r.text))).toBe(true);
+    // the first cluster still holds its own copy of the shared text
+    expect((await passageRows(`prompt_cluster_id = '${clusterId}'`)).some((r) => /\bBoth\b/.test(r.text))).toBe(true);
     // B now has live rows for the page: it is cached for the next build
     await buildCorpus(deps(), { projectId, clusterId: clusterB });
     expect(fetchCalls).toHaveLength(2);
   }, 60_000);
 
-  it("review - a text held only by an EXPIRED row of another cluster is adopted, not blocked forever", async () => {
+  it("review - AC1 - an EXPIRED row of another cluster is that cluster's own: left alone, never adopted, and it does not block this cluster's copy", async () => {
     const clusterB = randomUUID();
     const promptA = await addPrompt(PROMPT_TEXTS[0]!);
     const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
@@ -647,12 +649,12 @@ describe("STORY-058 - corpus passages and centroid", () => {
     await cite(promptA, "https://new.example/p");
     pages.set("https://new.example/p", { kind: "html", html: articleHtml("shared") });
     const result = await build();
-    expect(result.passagesConflictSkipped).toBe(0);
+    expect(result.passagesWritten).toBe(1);
     expect(result.status).toBe("complete");
-    const rows = await passageRows();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.url).toBe("https://new.example/p");
     expect(await passageRows(`prompt_cluster_id = '${clusterId}'`)).toHaveLength(1);
+    const theirs = await passageRows(`prompt_cluster_id = '${clusterB}'`);
+    expect(theirs).toHaveLength(1);
+    expect(theirs[0]!.url).toBe("https://old.example/p");
   }, 60_000);
 
   it("review - a URL's cached rows that cross expiry during the fetch phase are not deleted by the superseded-row cleanup", async () => {
@@ -685,7 +687,7 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(again.status).toBe("complete");
   }, 60_000);
 
-  it("review - identical text under two URLs of two clusters: the passage the second cluster could not store is counted, and the build is partial", async () => {
+  it("review - AC1/AC4 - identical text cited by two clusters: each cluster holds it and gets its own embedding, and neither build is partial", async () => {
     const clusterB = randomUUID();
     const promptA = await addPrompt(PROMPT_TEXTS[0]!);
     const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB);
@@ -696,9 +698,40 @@ describe("STORY-058 - corpus passages and centroid", () => {
     pages.set("https://y.example/p", same);
     expect((await build()).status).toBe("complete");
     const second = await buildCorpus(deps(), { projectId, clusterId: clusterB });
-    expect(second.passagesWritten).toBe(0);
-    expect(second.passagesConflictSkipped).toBe(1);
-    expect(second.status).toBe("partial");
+    expect(second.passagesWritten).toBe(1);
+    expect(second.status).toBe("complete");
+    expect(second).not.toHaveProperty("passagesConflictSkipped");
+    const provider = new CountingProvider(STAND_IN_EMBEDDING_MODEL);
+    await drainEmbedQueue(provider);
+    const rows = await db.query("SELECT prompt_cluster_id, embedding IS NOT NULL AS has_vector FROM corpus_passages ORDER BY prompt_cluster_id");
+    expect(rows.rows).toHaveLength(2);
+    expect(rows.rows.every((r: { has_vector: boolean }) => r.has_vector)).toBe(true);
+    // each cluster's centroid is made of its own copy
+    for (const [cluster, url] of [[clusterId, "https://x.example/p"], [clusterB, "https://y.example/p"]] as const) {
+      const session = randomUUID();
+      await db.query(`INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model) VALUES ($1,$2,$3,'https://brand.test/p',$4,'{chatgpt}',$5)`, [session, workspaceId, projectId, cluster, STAND_IN_EMBEDDING_MODEL]);
+      const centroid = await centroidOf(session);
+      expect(centroid.sourceCount).toBe(1);
+      expect((await passageRows(`prompt_cluster_id = '${cluster}'`))[0]!.url).toBe(url);
+    }
+  }, 60_000);
+
+  it("review - AC1 - identical text cited by two PROJECTS of one workspace: each project holds it, neither build is partial", async () => {
+    const projectB = randomUUID();
+    const clusterB = randomUUID();
+    await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1, $2, 'P2', $3, 'https://brand2.test', 'brand2.test')`, [projectB, workspaceId, `p-${randomUUID().slice(0, 8)}`]);
+    await db.query("INSERT INTO project_engines (workspace_id, project_id, engine_key, weight) VALUES ($1,$2,'perplexity',1.0)", [workspaceId, projectB]);
+    const promptA = await addPrompt(PROMPT_TEXTS[0]!);
+    const promptB = await addPrompt(PROMPT_TEXTS[1]!, clusterB, workspaceId, projectB);
+    await cite(promptA, "https://x.example/p");
+    await cite(promptB, "https://x.example/p", { project: projectB });
+    pages.set("https://x.example/p", { kind: "html", html: articleHtml("identical") });
+    expect((await build()).status).toBe("complete");
+    const second = await buildCorpus(deps(), { projectId: projectB, clusterId: clusterB });
+    expect(second.passagesWritten).toBe(1);
+    expect(second.status).toBe("complete");
+    expect(await passageRows(`project_id = '${projectId}'`)).toHaveLength(1);
+    expect(await passageRows(`project_id = '${projectB}'`)).toHaveLength(1);
   }, 60_000);
 
   it("review - AC9/AC10 - a session's centroid reads only its own cluster's passages, not a sibling cluster of the same project", async () => {

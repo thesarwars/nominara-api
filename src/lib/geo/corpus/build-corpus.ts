@@ -23,9 +23,11 @@ import { centroidWeight, expiresAtFrom } from "./weights.js";
 //   3. write  (one short tenant transaction)  every passage of the build is upserted, weights of cached URLs refreshed, superseded
 //             stale rows removed. The embed jobs are enqueued AFTER that commit.
 //
-// DEDUPE (AC13). content_hash = sha256 of the whitespace-normalised text, and ux_corpus_passages is (workspace, content_hash, model),
-// so identical text is one row however many URLs carry it, and a rebuild of unchanged content only moves its expiry. Embedding is
-// requested only for rows still at `embedding IS NULL`, so an unchanged passage is never re-embedded.
+// DEDUPE (AC13). content_hash = sha256 of the whitespace-normalised text, and the key (migration 0151, owner decision 11) is
+// (workspace, project, cluster, content_hash, model), so identical text is one row PER CLUSTER however many URLs carry it, and a
+// rebuild of unchanged content only moves its expiry. Two clusters or projects citing the same text each hold their own copy, at
+// one embedding per (cluster, text): nothing a sibling holds can block or be adopted by this build. Embedding is requested only for
+// rows still at `embedding IS NULL`, so an unchanged passage is never re-embedded.
 //
 // CACHE AND EXPIRY (AC4/AC12). A URL with an unexpired passage under the pinned model is NOT fetched again (the 30-day cache is the
 // table itself); an expired one is re-fetched and, once its fresh passages are written, its superseded expired rows are deleted.
@@ -65,12 +67,6 @@ export interface CorpusBuildResult {
   readonly failed: number;
   /** Fetched fine but no chunk shared a term with the cluster's prompts. */
   readonly empty: number;
-  /**
-   * Passages fetched fine but not stored because IDENTICAL text is held, live, by ANOTHER cluster or project (ux_corpus_passages is
-   * (workspace, content_hash, model): neither is in the key - open owner question, plans-7day/questions-058-corpus-key.md). Only
-   * identical text is lost; the URL's other passages are stored. Never silent: the build is partial.
-   */
-  readonly passagesConflictSkipped: number;
   /** Passages whose text this corpus already holds under another of its own URLs (syndicated copies). Dedupe working; NOT partial. */
   readonly passagesDeduplicated: number;
   readonly passagesWritten: number;
@@ -184,7 +180,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   const written = await deps.runInTx(async (tx) => {
     let inserted = 0;
     let refreshed = 0;
-    let conflictSkipped = 0;
     let deduplicated = 0;
 
     // The corpus is THIS build's selection (reference section 6: top K, owned excluded). A URL that fell out of the top set, or
@@ -206,23 +201,18 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
                 v.tc, decode(v.ch, 'hex'), $3, v.freq, v.aw, v.cw, $4, $5
            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::int[], $11::text[], $12::boolean[], $13::int[], $14::text[], $15::int[], $16::real[], $17::real[])
                 AS v(uh, url, domain, ek, idx, text, ff, tc, ch, freq, aw, cw)
-         ON CONFLICT (workspace_id, content_hash, embedding_model) DO UPDATE
-            SET project_id = EXCLUDED.project_id, prompt_cluster_id = EXCLUDED.prompt_cluster_id, citation_url_hash = EXCLUDED.citation_url_hash, url = EXCLUDED.url, domain = EXCLUDED.domain,
+         ON CONFLICT (workspace_id, project_id, prompt_cluster_id, content_hash, embedding_model) DO UPDATE
+            SET citation_url_hash = EXCLUDED.citation_url_hash, url = EXCLUDED.url, domain = EXCLUDED.domain,
                 passage_index = EXCLUDED.passage_index, from_text_fragment = EXCLUDED.from_text_fragment, token_count = EXCLUDED.token_count,
                 fetched_at = EXCLUDED.fetched_at, expires_at = EXCLUDED.expires_at, engine_keys = EXCLUDED.engine_keys,
                 citation_frequency = EXCLUDED.citation_frequency, avg_position_weight = EXCLUDED.avg_position_weight,
                 centroid_weight = EXCLUDED.centroid_weight
-          -- An EXPIRED row is adopted whoever holds it: it no longer contributes to any centroid, and its owner cluster may never
-          -- rebuild, so it must not block the text forever (the row moves to this project and cluster). A LIVE row is adopted only
-          -- when it is this corpus's row for the same URL. A live row of another URL of THIS corpus is the same text under a second
-          -- URL: left alone and counted as deduplicated below. A live row of another project or cluster is theirs: left alone and the
-          -- draft is COUNTED as conflict-skipped (never silent; the build is partial). Only identical TEXT collides - the key is
-          -- (workspace, content_hash, model) - so the URL's other passages are stored. Whether the key should carry the project and
-          -- cluster is an open owner question: plans-7day/questions-058-corpus-key.md.
+          -- The key is this corpus's own (project, cluster), so the only row that can conflict is this corpus's. An EXPIRED row is
+          -- refreshed by the URL that now carries the text (it no longer contributes to the centroid). A LIVE row is refreshed only
+          -- when it is this corpus's row for the same URL; a live row of another URL of THIS corpus is the same text under a second
+          -- URL: left alone and counted as deduplicated below. A sibling cluster's or project's row is never a conflict at all.
           WHERE corpus_passages.expires_at <= now()
-             OR (corpus_passages.project_id = EXCLUDED.project_id
-                 AND corpus_passages.prompt_cluster_id IS NOT DISTINCT FROM EXCLUDED.prompt_cluster_id
-                 AND corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash)
+             OR corpus_passages.citation_url_hash = EXCLUDED.citation_url_hash
          RETURNING (xmax = 0) AS inserted, encode(corpus_passages.content_hash, 'hex') AS ch`,
         [
           projectId, clusterId, deps.embeddingModel, fetchedAt.toISOString(), expiresAt.toISOString(),
@@ -237,21 +227,9 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
         if (row.inserted) inserted += 1;
         else refreshed += 1;
       }
-      // A rejected draft is either a copy of text this corpus already holds (deduplicated) or text another cluster/project holds.
+      // A rejected draft is a copy of text this corpus already holds under another of its URLs: deduplicated, not an error.
       const stored = new Set(upsert.rows.map((row) => row.ch));
-      const rejected = unique.filter((draft) => !stored.has(draft.contentHashHex));
-      if (rejected.length > 0) {
-        const own = await tx.query<{ ch: string }>(
-          `SELECT DISTINCT encode(content_hash, 'hex') AS ch
-             FROM corpus_passages
-            WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
-              AND embedding_model = $3 AND encode(content_hash, 'hex') = ANY($4::text[])`,
-          [projectId, clusterId, deps.embeddingModel, rejected.map((draft) => draft.contentHashHex)],
-        );
-        const heldHere = new Set(own.rows.map((row) => row.ch));
-        deduplicated = rejected.filter((draft) => heldHere.has(draft.contentHashHex)).length;
-        conflictSkipped = rejected.length - deduplicated;
-      }
+      deduplicated = unique.filter((draft) => !stored.has(draft.contentHashHex)).length;
     }
 
     // A cached URL keeps its text but its citations moved on: refresh the weights the centroid reads.
@@ -293,7 +271,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
         ORDER BY id`,
       [projectId, clusterId, deps.embeddingModel],
     );
-    return { inserted, refreshed, conflictSkipped, deduplicated, pendingIds: pending.rows.map((row) => row.id) };
+    return { inserted, refreshed, deduplicated, pendingIds: pending.rows.map((row) => row.id) };
   });
 
   // ---- after commit: ask for the vectors -------------------------------------------------------------------------------
@@ -313,13 +291,12 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     }
   }
 
-  const status = counts.refused + counts.failed + written.conflictSkipped > 0 ? "partial" : "complete";
+  const status = counts.refused + counts.failed > 0 ? "partial" : "complete";
   const result: CorpusBuildResult = {
     status,
     candidates: read.candidates.length,
     ...counts,
     passagesWritten: written.inserted,
-    passagesConflictSkipped: written.conflictSkipped,
     passagesDeduplicated: written.deduplicated,
     passagesRefreshed: written.refreshed,
     embedJobs,
@@ -330,7 +307,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   for (const [outcome, count] of Object.entries(counts)) {
     for (let i = 0; i < count; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome });
   }
-  for (let i = 0; i < written.conflictSkipped; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome: "passage_conflict_skipped" });
   observeValue("nominara_geo_corpus_passages_written", written.inserted, { status });
   // Workspace ID only; no URL, no passage text, no domain (competitor content is not ours to log).
   logger.log({
@@ -345,7 +321,6 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     refused: counts.refused,
     failed: counts.failed,
     empty: counts.empty,
-    passages_conflict_skipped: written.conflictSkipped,
     passages_deduplicated: written.deduplicated,
     passages_written: written.inserted,
     embed_jobs: embedJobs,
