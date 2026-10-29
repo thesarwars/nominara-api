@@ -132,6 +132,8 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   );
   const pendingNodes = waiting.rows[0]?.n ?? 0;
   if (pendingNodes > 0) {
+    // A snapshot of a half-built corpus must not outlive the scope that changed: clear what the previous analysis left on the session.
+    await tx.query("UPDATE geo_alignments SET coverage_ratio = NULL, recommendations = '[]'::jsonb, updated_at = now() WHERE id = $1 AND workspace_id = app.current_workspace()", [sessionId]);
     incrementCounter("nominara_geo_alignment_analysis_pending_total");
     logger.log({ event: "geo.alignment.nodes_pending", workspace_id: s.workspace_id, pending_nodes: pendingNodes });
     return { found: true, collapsed: 0, pending: true, pendingNodes, nodes: 0, present: 0, missing: 0, ranked: 0, coverageRatio: null, recommendations: 0, lowConfidence: isLowConfidence(s.centroid_source_count) };

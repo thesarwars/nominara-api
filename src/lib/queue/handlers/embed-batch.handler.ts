@@ -314,12 +314,14 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
     const writeIds = prepared.writes.map((write) => write.id);
     // STORY-059: `analyseNodes` bulk-UPDATEs a scope's semantic_nodes while holding that scope's advisory lock. This UPDATE touches rows
     // of the same scope, so without the lock the two take row locks in different orders and can deadlock. Take it first, scope by scope in
-    // a fixed order (project, then cluster), so two jobs spanning several scopes cannot lock against each other either.
+    // a fixed order (the lock key's own hash, the order the locks are taken in), so two jobs spanning several scopes cannot lock against each other either.
     if (payload.table === "semantic_nodes") {
       const scopes = await tx.query<{ project_id: string; prompt_cluster_id: string | null }>(
-        `SELECT DISTINCT project_id, prompt_cluster_id FROM semantic_nodes
-          WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[])
-          ORDER BY project_id, prompt_cluster_id NULLS LAST`,
+        `SELECT project_id, prompt_cluster_id FROM (
+           SELECT DISTINCT project_id, prompt_cluster_id FROM semantic_nodes
+            WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[])
+         ) s
+          ORDER BY hashtextextended(project_id::text || ':' || COALESCE(prompt_cluster_id::text, ''), 0), project_id, prompt_cluster_id NULLS LAST`,
         [writeIds],
       );
       for (const scope of scopes.rows) await lockNodeScope(tx, scope.project_id, scope.prompt_cluster_id);

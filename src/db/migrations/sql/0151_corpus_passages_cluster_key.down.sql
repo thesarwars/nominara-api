@@ -15,5 +15,8 @@ DELETE FROM corpus_passages cp
 CREATE UNIQUE INDEX IF NOT EXISTS ux_corpus_passages ON corpus_passages (workspace_id, content_hash, embedding_model);
 DROP INDEX IF EXISTS ux_corpus_passages_cluster;
 
+DROP INDEX IF EXISTS ix_semantic_nodes_collapsed_into;
+ALTER TABLE semantic_nodes DROP CONSTRAINT IF EXISTS fk_semantic_nodes_collapsed_into;
 ALTER TABLE semantic_nodes DROP COLUMN collapsed_into_id;
+DROP INDEX IF EXISTS ux_semantic_nodes_scope_id;
 ALTER TABLE semantic_nodes DROP COLUMN embedding_model;

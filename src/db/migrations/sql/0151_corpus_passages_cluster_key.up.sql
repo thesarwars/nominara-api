@@ -37,7 +37,18 @@ COMMENT ON COLUMN semantic_nodes.embedding_model IS
 -- where it is set. ON DELETE SET NULL: a keeper that later goes away (its concept fell below the prevalence threshold) does not orphan or
 -- hide its collapsed rows - they become live again, vector intact, and the next analysis judges them afresh. Expand only: one nullable
 -- column, NULL on every existing row (nothing has ever inserted a node), so there is nothing to backfill.
-ALTER TABLE semantic_nodes ADD COLUMN collapsed_into_id uuid REFERENCES semantic_nodes (id) ON DELETE SET NULL;
+--
+-- The keeper must be in the SAME tenant and project (round 4): the foreign key is composite, (workspace_id, project_id, collapsed_into_id) ->
+-- (workspace_id, project_id, id), backed by a unique index on that triple, so the database refuses a keeper of another project or workspace
+-- (MATCH SIMPLE: a NULL collapsed_into_id is not checked). ON DELETE SET NULL (collapsed_into_id) - the column list needs Postgres 15+ and
+-- keeps workspace_id and project_id, which are NOT NULL and are the row's tenant, from being nulled. The partial index serves the referential
+-- action: without it every DELETE on semantic_nodes (a project cascade included) scans the table for rows pointing at the deleted keeper.
+CREATE UNIQUE INDEX ux_semantic_nodes_scope_id ON semantic_nodes (workspace_id, project_id, id);
+ALTER TABLE semantic_nodes ADD COLUMN collapsed_into_id uuid;
+ALTER TABLE semantic_nodes ADD CONSTRAINT fk_semantic_nodes_collapsed_into
+  FOREIGN KEY (workspace_id, project_id, collapsed_into_id) REFERENCES semantic_nodes (workspace_id, project_id, id)
+  ON DELETE SET NULL (collapsed_into_id);
+CREATE INDEX ix_semantic_nodes_collapsed_into ON semantic_nodes (collapsed_into_id) WHERE collapsed_into_id IS NOT NULL;
 
 COMMENT ON COLUMN semantic_nodes.collapsed_into_id IS
   'STORY-059 AC6 - the surviving node this near-duplicate (cosine >= 0.93) was collapsed into; NULL for a live node. Readers exclude non-NULL.';

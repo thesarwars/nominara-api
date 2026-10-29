@@ -487,7 +487,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await liveNodeRows()).map((n) => n.phrase_normalized)).toEqual(["access control"]);
   }, 60_000);
 
-  it("scenario 5 - nodes of different clusters never collapse into each other, and an unembedded node is never collapsed", async () => {
+  it("scenario 5 - nodes of different clusters never collapse into each other", async () => {
     const sibling = randomUUID();
     await addNode("same concept", { ratio: 0.9, embedding: angle(0) });
     await addNode("same concept sibling", { ratio: 0.9, embedding: angle(1), cluster: sibling });
@@ -495,7 +495,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     await inTx((tx) => analyseNodes(tx, session, words));
     expect(await nodeRows()).toHaveLength(3);
-    expect(await liveNodeRows(), "none collapsed: the sibling is another scope, and an unembedded node is never a candidate").toHaveLength(3);
+    expect(await liveNodeRows(), "none collapsed: the sibling is another scope").toHaveLength(3);
   }, 60_000);
 
   // ---- scenario 6: presence ----------------------------------------------------------------------------------------------
@@ -1140,6 +1140,54 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(done).toMatchObject({ pending: false, pendingNodes: 0, collapsed: 1, nodes: 2 });
     expect(await collapsedRows()).toHaveLength(1);
   }, 60_000);
+
+  it("review round 4 - pending after a completed analysis: the session no longer serves the old recommendations or coverage", async () => {
+    await addNode("audit logging", { ratio: 0.8, embedding: angle(0) });
+    await addNode("single sign on", { ratio: 0.6, embedding: vec({ 5: 1 }) });
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
+    const first = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(first.recommendations, "the first analysis recommended something").toBeGreaterThan(0);
+    expect((await inTx((tx) => readSessionPayload(tx, session))).recommendations.length).toBeGreaterThan(0);
+    expect((await sessionRow(session)).coverage_ratio).not.toBeNull();
+
+    await addNode("freshly extracted", { embedding: null });
+    expect(await inTx((tx) => analyseNodes(tx, session, words))).toMatchObject({ pending: true });
+    const payload = await inTx((tx) => readSessionPayload(tx, session));
+    expect(payload.recommendations, "the old snapshot is not served while the scope is pending").toEqual([]);
+    expect(payload.coverage_ratio).toBeNull();
+  }, 60_000);
+
+  it("review round 4 - the database refuses a keeper of another project, or of another tenant", async () => {
+    const keeper = await addNode("audit logging", { embedding: angle(0) });
+    const dup = await addNode("audit trail", { embedding: angle(10) });
+    const otherProject = randomUUID();
+    await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1, $2, 'PX', $3, 'https://x.test', 'x.test')`, [otherProject, workspaceId, `p-${randomUUID().slice(0, 8)}`]);
+    const foreign = randomUUID();
+    await db.query(
+      `INSERT INTO semantic_nodes (id, workspace_id, project_id, phrase, phrase_normalized, node_type, evidence_url, evidence_snippet) VALUES ($1,$2,$3,'x','x','capability','https://x.test','x')`,
+      [foreign, workspaceId, otherProject],
+    );
+    await expect(db.query("UPDATE semantic_nodes SET collapsed_into_id = $2 WHERE id = $1", [dup, foreign]), "another project of the same workspace").rejects.toMatchObject({ code: "23503" });
+    const tenantForeign = randomUUID();
+    const otherProj = randomUUID();
+    await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1, $2, 'PB', $3, 'https://b.test', 'b.test')`, [otherProj, otherWorkspaceId, `p-${randomUUID().slice(0, 8)}`]);
+    await db.query(
+      `INSERT INTO semantic_nodes (id, workspace_id, project_id, phrase, phrase_normalized, node_type, evidence_url, evidence_snippet) VALUES ($1,$2,$3,'y','y','capability','https://b.test','y')`,
+      [tenantForeign, otherWorkspaceId, otherProj],
+    );
+    await expect(db.query("UPDATE semantic_nodes SET collapsed_into_id = $2 WHERE id = $1", [dup, tenantForeign]), "another workspace").rejects.toMatchObject({ code: "23503" });
+    await db.query("UPDATE semantic_nodes SET collapsed_into_id = $2 WHERE id = $1", [dup, keeper]);
+    // the keeper's deletion frees the row WITHOUT touching its tenant or project columns (column-list SET NULL)
+    await db.query("DELETE FROM semantic_nodes WHERE id = $1", [keeper]);
+    const row = (await db.query("SELECT workspace_id, project_id, collapsed_into_id FROM semantic_nodes WHERE id = $1", [dup])).rows[0]!;
+    expect(row).toMatchObject({ workspace_id: workspaceId, project_id: projectId, collapsed_into_id: null });
+  }, 60_000);
+
+  it("review round 4 - collapsed_into_id is indexed, so a delete does not scan the table", async () => {
+    const found = await db.query("SELECT indexdef FROM pg_indexes WHERE tablename = 'semantic_nodes' AND indexname = 'ix_semantic_nodes_collapsed_into'");
+    expect(found.rows).toHaveLength(1);
+    expect(String(found.rows[0]!.indexdef)).toContain("(collapsed_into_id)");
+  });
 
   it("RLS - workspace B's passages never become workspace A's nodes, and A cannot read B's session or nodes", async () => {
     await addPassage(0, { text: "We provide hidden telemetry. We provide hidden telemetry.", ws: otherWorkspaceId, embedding: null });

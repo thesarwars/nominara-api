@@ -420,7 +420,13 @@ describe("STORY-133 · embed.batch", () => {
       await lockNodeScope(holder, projectId, cluster); // an analysis of this scope is mid-flight
       let settled = false;
       const running = runAsWorker(handler(provider), job(ids, "semantic_nodes")).then(() => { settled = true; });
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Bounded poll: wait until the worker is queued on the scope's advisory lock (not granted), then assert it has not settled.
+      let queued = 0;
+      for (let i = 0; i < 200 && queued === 0; i += 1) {
+        queued = Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).rows[0]!.n);
+        if (queued === 0) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(queued, "the worker is waiting on the scope's advisory lock").toBeGreaterThan(0);
       expect(settled, "the write waits for the scope's lock").toBe(false);
       expect((await db.query("SELECT count(*) AS n FROM semantic_nodes WHERE embedding IS NOT NULL")).rows[0]!.n).toBe("0");
       await holder.query("COMMIT");
