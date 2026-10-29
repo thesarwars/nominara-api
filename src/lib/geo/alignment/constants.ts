@@ -20,6 +20,8 @@ export const ALIGNMENT = {
   /** Candidates: "noun phrases (2-5 tokens)". */
   minPhraseTokens: 2,
   maxPhraseTokens: 5,
+  /** At most this many candidate phrases per extraction. A BUILDER CHOICE (the reference sets no cap); it bounds the nodes embedded and deduped per scope. */
+  maxCandidates: 100,
   /** The embedding columns are halfvec(1536) (STORY-133). */
   dimensions: 1536,
 } as const;

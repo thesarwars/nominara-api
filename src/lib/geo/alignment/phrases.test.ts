@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { classifyNodeType, accuracyWarningFor, requiresHumanReview } from "./node-types.js";
+import { ALIGNMENT } from "./constants.js";
 import { extractNodeCandidates, normalisePhrase } from "./phrases.js";
 
 const docs = (texts: readonly string[]) => texts.map((text, i) => ({ url: `https://d${String(i)}.example/p`, text }));
@@ -116,5 +117,14 @@ describe("STORY-059 scenario 12 / AC13 - compliance, metric and pricing set the 
   it.each(["capability", "integration", "persona", "industry", "entity", "differentiator"] as const)("%s does not, and has no warning", (type) => {
     expect(requiresHumanReview(type)).toBe(false);
     expect(accuracyWarningFor(type)).toBeNull();
+  });
+});
+
+describe("STORY-059 - the candidate cap", () => {
+  it("review - the cap is a named constant in ALIGNMENT (a builder choice, not in the reference) and the extraction honours it", () => {
+    expect(ALIGNMENT.maxCandidates).toBe(100);
+    const words = Array.from({ length: 400 }, (_, i) => `term${String(i).padStart(3, "a")}x`);
+    const text = Array.from({ length: 80 }, (_, i) => `${words[i * 5]!} ${words[i * 5 + 1]!} ${words[i * 5 + 2]!}.`).join(" ");
+    expect(extractNodeCandidates(docs([text, text, text])).length).toBeLessThanOrEqual(ALIGNMENT.maxCandidates);
   });
 });

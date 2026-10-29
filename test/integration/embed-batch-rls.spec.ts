@@ -64,7 +64,7 @@ describe("STORY-133 · embed.batch under the runtime role (RLS in force)", () =>
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE usage_ledger, usage_counters, content_chunks, tracked_prompts, projects, workspaces CASCADE");
+    await db.query("TRUNCATE usage_ledger, usage_counters, semantic_nodes, content_chunks, tracked_prompts, projects, workspaces CASCADE");
     [wsA, wsB, projA, projB] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
     for (const [ws, project] of [[wsA, projA], [wsB, projB]] as const) {
       await db.query("INSERT INTO workspaces (id, name, slug, plan_key) VALUES ($1, 'W', $2, 'growth')", [ws, `w-${randomUUID().slice(0, 8)}`]);
@@ -95,6 +95,16 @@ describe("STORY-133 · embed.batch under the runtime role (RLS in force)", () =>
         embedded ? STAND_IN_EMBEDDING_MODEL : null,
         embedded ? `[${["1", ...new Array<string>(1535).fill("0")].join(",")}]` : null,
       ],
+    );
+    return id;
+  }
+
+  async function addNode(ws: string, project: string, phrase: string): Promise<string> {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO semantic_nodes (id, workspace_id, project_id, phrase, phrase_normalized, node_type, corpus_doc_ratio, evidence_url, evidence_snippet)
+       VALUES ($1, $2, $3, $4, lower($4), 'capability', 0.5, 'https://example.test/e', 'evidence')`,
+      [id, ws, project, phrase],
     );
     return id;
   }
@@ -142,6 +152,15 @@ describe("STORY-133 · embed.batch under the runtime role (RLS in force)", () =>
 
     expect(provider.sent, "no cross-tenant reuse: A's own text was embedded").toEqual(["shared boilerplate chunk text"]);
     expect(await state("content_chunks", aChunk)).toEqual({ has_vector: true, embedding_model: STAND_IN_EMBEDDING_MODEL });
+  }, 60_000);
+
+  it("tenancy - STORY-059 - a job signed for A naming ONLY B's semantic node does nothing: no provider call, no vector, no model, no metering", async () => {
+    const bNode = await addNode(wsB, projB, "workspace b secret concept");
+    const provider = new RecordingProvider();
+    await runAs(wsA, provider, "semantic_nodes", [bNode]);
+    expect(provider.sent).toEqual([]);
+    expect(await state("semantic_nodes", bNode)).toEqual({ has_vector: false, embedding_model: null });
+    expect((await db.query("SELECT 1 FROM usage_ledger")).rowCount).toBe(0);
   }, 60_000);
 
   it("metering - under the runtime role the usage_ledger row is written and usage_counters is incremented (not swallowed by the savepoint)", async () => {

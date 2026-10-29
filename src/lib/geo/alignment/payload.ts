@@ -18,8 +18,10 @@ import { diminishedSum } from "./gain.js";
 // for a thin corpus), so the payload and the stored session cannot disagree.
 //
 // THE PROJECTION is scalar arithmetic over the SHOWN recommendations' gains: the naive sum beside the sum with 0.85^(i-1)
-// applied in rank order. `projected_alignment` is the page's current alignment plus the DIMINISHED sum, capped at 1, and is null
-// when the page has no alignment. It is null altogether when no shown recommendation has a modeled gain (nothing to project).
+// applied in rank order. Both are in CHUNK units (each gain is the change in the best chunk's cosine), so there is deliberately NO
+// projected page alignment: the page figure is a token-weighted mean over all chunks, and adding a chunk gain to it would overstate it
+// by roughly the number of chunks (the over-projection the story calls trust-destroying). The projection is null altogether when no
+// shown recommendation has a modeled gain (nothing to project).
 
 export async function readSessionPayload(tx: ClientBase, sessionId: string): Promise<AlignmentSessionPayload> {
   const result = await tx.query<{
@@ -48,7 +50,6 @@ export async function readSessionPayload(tx: ClientBase, sessionId: string): Pro
       : {
           naive_sum: modeled.reduce((sum, gain) => sum + gain, 0),
           diminished_sum: diminished,
-          projected_alignment: row.current_alignment === null ? null : Math.min(1, row.current_alignment + diminished),
           diminishing_returns_factor: ALIGNMENT.diminishing,
         };
 

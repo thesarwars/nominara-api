@@ -8,6 +8,7 @@ import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import { ALIGNMENT } from "./constants.js";
 import { accuracyWarningFor } from "./node-types.js";
 import { normalisePhrase } from "./phrases.js";
+import { lockNodeScope } from "./scope-lock.js";
 
 // STORY-059 AC5-AC9, AC13 - everything that happens to the nodes once they hold vectors, in ONE transaction with no network:
 //
@@ -25,9 +26,17 @@ import { normalisePhrase } from "./phrases.js";
 // collapses into A and C SURVIVES: B was removed, and a removed node removes nothing. A transitive rule would delete C for being near
 // a node that is itself gone. The loop is bounded by the node count (at most 100 per extraction) and each pass is one statement.
 //
+// SESSION STATE LIVES ON SHARED ROWS. present_in_content, projected_gain and priority_rank are written onto semantic_nodes rows that
+// every session of the same (project, cluster) shares, and an extraction replaces the scope's rows (new ids). Only the per-session
+// `recommendations` snapshot on geo_alignments is session state: analysing session B overwrites what session A was computed from,
+// and a node_id in A's snapshot (or later in patches.applied_node_ids) can point at a row a re-extraction deleted. No consumer may read
+// the node columns as session state. Writers of one scope are serialised by a transaction-scoped advisory lock (scope-lock.ts).
+//
 // PRESENCE has two branches in the reference: the normalised phrase, OR a phrase of the content at cosine >= 0.90 to it. Only the
 // first is built. The second needs a vector for every phrase of the CONTENT, and no table stores one (a content chunk is 512 tokens
-// and is never within 0.90 of a four-word phrase); storing them is a schema change this story did not name. Until then a close
+// and is never within 0.90 of a four-word phrase); storing them is a schema change this story did not name. It is a DESIGN decision
+// (for example, content-phrase rows embedded through embed.batch), not something real embeddings alone would flip: AC7 stays open
+// until the owner chooses where those vectors are stored. Until then a close
 // paraphrase reads as ABSENT, which errs toward recommending a concept the page may already express - never toward hiding a gap.
 //
 // THE GAIN is the best chunk's. The reference defines the gain of "this chunk"; a node is reported at the chunk it helps most, which is
@@ -92,6 +101,8 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   const s = found.rows[0];
   if (s === undefined) return { found: false, collapsed: 0, nodes: 0, present: 0, missing: 0, ranked: 0, coverageRatio: null, recommendations: 0, lowConfidence: true };
   const scope = [s.project_id, s.prompt_cluster_id] as const;
+  // Held to commit: another analysis or extraction of this scope waits instead of interleaving its DELETEs and UPDATEs with ours.
+  await lockNodeScope(tx, s.project_id, s.prompt_cluster_id);
 
   // ---- 1. dedupe ----------------------------------------------------------------------------------------------------
   let collapsed = 0;
@@ -125,7 +136,8 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
       WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 ORDER BY id`,
     [...scope],
   );
-  const content = ` ${normalisePhrase(s.draft_content_md ?? s.live_content_md ?? "")} `;
+  // The same flag selects the content and the chunks: a live analysis reports the live page, a draft analysis the draft (else the live page).
+  const content = ` ${normalisePhrase((draft ? (s.draft_content_md ?? s.live_content_md) : s.live_content_md) ?? "")} `;
   const presentIds = new Set(nodes.rows.filter((n) => content.includes(` ${normalisePhrase(n.phrase_normalized)} `)).map((n) => n.id));
   await tx.query(
     `UPDATE semantic_nodes n SET present_in_content = (n.id = ANY($3::uuid[]))
@@ -166,15 +178,20 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
        SELECT * FROM unnest($4::uuid[], $5::int[]) AS t(id, te)
      ), pairs AS (
        SELECT n.id AS node_id,
-              (c.embedding::vector(1536) <=> s.centroid::vector(1536))
-              - (l2_normalize(c.embedding::vector(1536) * array_fill((1 - a.alpha)::real, ARRAY[1536])::vector(1536)
+              (e.embedding::vector(1536) <=> s.centroid::vector(1536))
+              - (l2_normalize(e.embedding::vector(1536) * array_fill((1 - a.alpha)::real, ARRAY[1536])::vector(1536)
                               + n.embedding::vector(1536) * array_fill(a.alpha::real, ARRAY[1536])::vector(1536))
                  <=> s.centroid::vector(1536)) AS gain
          FROM s
          JOIN semantic_nodes n ON n.workspace_id = app.current_workspace() AND n.project_id = $2 AND n.prompt_cluster_id IS NOT DISTINCT FROM $3
          JOIN t ON t.id = n.id
          JOIN content_chunks c ON c.session_id = s.id AND c.workspace_id = app.current_workspace() AND c.is_draft = $8
-                              AND c.embedding IS NOT NULL AND c.embedding_model = s.embedding_model
+        CROSS JOIN LATERAL (
+          SELECT x.embedding FROM content_chunks x
+           WHERE x.workspace_id = app.current_workspace() AND x.content_hash = c.content_hash AND x.is_draft = c.is_draft
+             AND x.embedding_model = s.embedding_model AND x.embedding IS NOT NULL
+           LIMIT 1
+        ) e
         CROSS JOIN LATERAL (SELECT LEAST($6::double precision, t.te::double precision / NULLIF(c.token_count + t.te, 0) * $7::double precision) AS alpha) a
         WHERE n.embedding IS NOT NULL AND n.embedding_model = s.embedding_model AND NOT n.present_in_content AND t.te > 0
      ), best AS (
@@ -212,7 +229,9 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
       ORDER BY priority_rank NULLS LAST, corpus_doc_ratio DESC, phrase_normalized, id`,
     [...scope],
   );
-  const recommendations: AlignmentRecommendation[] = missing.rows.map((n) => {
+  // A node modeled to move the page AWAY from the centroid (gain <= 0) is not a recommendation: it has no rank and would be shown to a
+  // customer as a concept to add. A node with NO modeled gain (null) is kept, labelled as such, and is dropped under low confidence.
+  const recommendations: AlignmentRecommendation[] = missing.rows.filter((n) => n.projected_gain === null || n.projected_gain > 0).map((n) => {
     const type = semanticNodeTypeSchema.parse(n.node_type);
     return alignmentRecommendationSchema.parse({
       node_id: n.id,

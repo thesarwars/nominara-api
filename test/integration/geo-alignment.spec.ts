@@ -175,9 +175,9 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     );
   }
 
-  async function addChunk(session: string, index: number, embedding: number[] | null, tokens: number, isDraft = false): Promise<string> {
+  async function addChunk(session: string, index: number, embedding: number[] | null, tokens: number, isDraft = false, sharedText?: string): Promise<string> {
     const id = randomUUID();
-    const text = `chunk ${String(index)} ${randomUUID()}`;
+    const text = sharedText ?? `chunk ${String(index)} ${randomUUID()}`;
     await db.query(
       `INSERT INTO content_chunks (id, workspace_id, project_id, session_id, url, chunk_index, text, token_count, content_hash, embedding, embedding_model, is_draft)
        VALUES ($1,$2,$3,$4,'https://brand.test/p',$5,$6,$7,$8,$9::halfvec,$10,$11)`,
@@ -470,7 +470,8 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await addNode("chain b", { ratio: 0.8, embedding: angle(ACOS_95) });
     await addNode("chain c", { ratio: 0.7, embedding: angle(2 * ACOS_95) });
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
-    await inTx((tx) => analyseNodes(tx, session, words));
+    const summary = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(summary.collapsed).toBe(1);
     expect((await nodeRows()).map((n) => n.phrase_normalized)).toEqual(["chain a", "chain c"]);
   }, 60_000);
 
@@ -506,11 +507,20 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(present["data residency"]).toBe(false);
   }, 60_000);
 
-  it("scenario 6 - presence is judged on the DRAFT when there is one, else on the live page", async () => {
+  it("scenario 6 - presence is judged on the DRAFT in a draft analysis, and on the LIVE page in a live one", async () => {
     await addNode("audit logging", { embedding: vec({ 0: 1 }) });
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "We offer audit logging.", draft: "We offer nothing." });
-    await inTx((tx) => analyseNodes(tx, session, words));
+    await inTx((tx) => analyseNodes(tx, session, words, { draft: true }));
     expect((await nodeByPhrase("audit logging")).present_in_content).toBe(false);
+    await inTx((tx) => analyseNodes(tx, session, words));
+    expect((await nodeByPhrase("audit logging")).present_in_content, "a live analysis reports the LIVE page's coverage, whatever draft exists").toBe(true);
+  }, 60_000);
+
+  it("scenario 6 - a draft analysis of a session with no draft falls back to the live page", async () => {
+    await addNode("audit logging", { embedding: vec({ 0: 1 }) });
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "We offer audit logging." });
+    await inTx((tx) => analyseNodes(tx, session, words, { draft: true }));
+    expect((await nodeByPhrase("audit logging")).present_in_content).toBe(true);
   }, 60_000);
 
   it("scenario 6 - presence is on word boundaries: 'audit logging' is not present in 'unaudit logging tools'", async () => {
@@ -653,17 +663,14 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(payload.projection!.diminished_sum).toBeCloseTo(gains[0]! + 0.85 * gains[1]! + 0.85 ** 2 * gains[2]!, 6);
     expect(payload.projection!.diminished_sum).toBeLessThan(naive);
     expect(payload.projection!.diminishing_returns_factor).toBe(0.85);
-    const current = payload.current_alignment!;
-    expect(payload.projection!.projected_alignment).toBeCloseTo(Math.min(1, current + payload.projection!.diminished_sum), 6);
-    expect(payload.projection!.projected_alignment!).toBeLessThanOrEqual(1);
+    expect(Object.keys(payload.projection!).sort(), "chunk gains are not page units: no projected page alignment").toEqual(["diminished_sum", "diminishing_returns_factor", "naive_sum"]);
   }, 60_000);
 
-  it("scenario 9 - the projected alignment never exceeds 1, and is NULL when the page has no alignment", async () => {
+  it("scenario 9 - a session with no modeled gain has no projection at all (null, not zeros)", async () => {
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
-    await addNode("alpha beta gamma delta", { embedding: vec({ 1: 1 }) });
+    await addNode("alpha beta gamma delta", { embedding: null });
     await inTx((tx) => analyseNodes(tx, session, words));
-    const payload = await inTx((tx) => readSessionPayload(tx, session));
-    expect(payload.projection === null || payload.projection.projected_alignment === null).toBe(true);
+    expect((await inTx((tx) => readSessionPayload(tx, session))).projection).toBeNull();
   }, 60_000);
 
   // ---- scenario 10, 12: the payload ---------------------------------------------------------------------------------------
@@ -693,7 +700,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await addChunk(session, 0, vec({ 0: 1 }), 100);
     const id = await addNode("soc 2 report", { type: "compliance", embedding: vec({ 1: 1 }) });
     await db.query("UPDATE semantic_nodes SET requires_human_review = true WHERE id = $1", [id]);
-    await addNode("audit logging tools", { type: "capability", embedding: vec({ 2: 1 }) });
+    await addNode("audit logging tools", { type: "capability", embedding: vec({ 1: 1, 3: 0.6 }) }); // a positive gain (a node modeled to move the page away from the centroid is not recommended) and not a near-duplicate of the compliance node
     await inTx((tx) => analyseNodes(tx, session, words));
     const payload = await inTx((tx) => readSessionPayload(tx, session));
     const compliance = payload.recommendations.find((r) => r.phrase === "soc 2 report")!;
@@ -744,6 +751,154 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
   }, 60_000);
 
   // ---- tenancy and observability ------------------------------------------------------------------------------------------
+
+  // ---- review round 1 -----------------------------------------------------------------------------------------------------
+
+  const PAGE = sentencePage([["Reporting", "Teams compare reporting tools by export formats."], ["Pricing", "Plans start free for small teams."]]);
+
+  it("review - AC2/AC3 - a SECOND session over the same URL is embedded for alignment too: ux_content_chunks has no session, so L7 reuse is by reading", async () => {
+    await seedCorpus();
+    pages.set("https://brand.test/p", { kind: "html", html: PAGE });
+    const first = await openAlignmentSession(deps(), { projectId, clusterId, targetUrl: "https://brand.test/p", engineKeys: ["chatgpt"], createdBy: null });
+    await drainEmbedQueue();
+    const second = await openAlignmentSession(deps(), { projectId, clusterId, targetUrl: "https://brand.test/p", engineKeys: ["chatgpt"], createdBy: null });
+    await drainEmbedQueue();
+    const figures = [];
+    for (const session of [first.sessionId, second.sessionId]) {
+      await inTx((tx) => computeCentroid(tx, session));
+      figures.push(await inTx((tx) => computeAlignment(tx, session)));
+    }
+    expect(figures[0]!.currentAlignment).not.toBeNull();
+    expect(figures[1]!.currentAlignment, "the second session is measured, not silently NULL").not.toBeNull();
+    expect(figures[1]!.chunks).toBe(second.chunks);
+    expect(figures[1]!.currentAlignment!).toBeCloseTo(figures[0]!.currentAlignment!, 6);
+  }, 90_000);
+
+  it("review - AC3 - a session whose chunks are only PARTLY shared is measured over ALL of them, and a chunk repeated inside the page counts each time", async () => {
+    await seedCorpus();
+    const x = unit(vec({ 0: 1, 1: 0.2 }));
+    const y = unit(vec({ 3: 1, 0: 0.5 }));
+    const s1 = await addSession();
+    await addChunk(s1, 0, x, 100, false, "shared boilerplate paragraph");
+    const s2 = await addSession();
+    await addChunk(s2, 0, null, 100, false, "shared boilerplate paragraph"); // sibling embedded in s1; its own key is held elsewhere
+    await addChunk(s2, 1, null, 100, false, "shared boilerplate paragraph"); // repeated in the same page
+    await addChunk(s2, 2, y, 100);
+    await inTx((tx) => computeCentroid(tx, s2));
+    const figures = await inTx((tx) => computeAlignment(tx, s2));
+    const centroid = expectedCentroid();
+    expect(figures.chunks).toBe(3);
+    expect(figures.currentAlignment!).toBeCloseTo((2 * cos(x, centroid) + cos(y, centroid)) / 3, 2);
+  }, 60_000);
+
+  it("review - AC9 - the projected gain of a session whose chunk shares its vector with another session's is modeled, not NULL", async () => {
+    const c = unit(vec({ 0: 1, 1: 1 }));
+    const chunk = vec({ 0: 1 });
+    const s1 = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
+    await addChunk(s1, 0, chunk, 100, false, "shared boilerplate paragraph");
+    const s2 = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
+    await addChunk(s2, 0, null, 100, false, "shared boilerplate paragraph");
+    await addNode("alpha beta gamma delta", { embedding: vec({ 1: 1 }) });
+    await inTx((tx) => analyseNodes(tx, s2, words));
+    expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain as number).toBeCloseTo(expectedGain(chunk, c, vec({ 1: 1 }), 4, 100), 2);
+  }, 60_000);
+
+  it("review - AC4 - the live baseline is set ONCE: a later live recompute moves current_alignment, not the baseline", async () => {
+    await seedCorpus();
+    const session = await addSession();
+    const chunk = await addChunk(session, 0, unit(vec({ 0: 1, 1: 0.2 })), 100);
+    await inTx(async (tx) => { await computeCentroid(tx, session); await computeAlignment(tx, session); });
+    const first = await sessionRow(session);
+    await db.query("UPDATE content_chunks SET embedding = $2::halfvec WHERE id = $1", [chunk, lit(vec({ 3: 1 }))]);
+    await inTx((tx) => computeAlignment(tx, session));
+    const second = await sessionRow(session);
+    expect(second.current_alignment).not.toBeCloseTo(first.current_alignment as number, 2);
+    expect(second.baseline_alignment).toBe(first.baseline_alignment);
+  }, 60_000);
+
+  it("review - AC11 - a draft recompute with no embedded draft chunk reports NO current alignment (NULL), never the live page's stale figure; the baseline is untouched", async () => {
+    await seedCorpus();
+    const session = await addSession();
+    await addChunk(session, 0, unit(vec({ 0: 1, 1: 0.2 })), 100);
+    await inTx(async (tx) => { await computeCentroid(tx, session); await computeAlignment(tx, session); });
+    const live = await sessionRow(session);
+    expect(live.current_alignment).not.toBeNull();
+    await inTx((tx) => computeAlignment(tx, session, { draft: true }));
+    const draft = await sessionRow(session);
+    expect(draft.current_alignment).toBeNull();
+    expect(draft.baseline_alignment).toBe(live.baseline_alignment);
+  }, 60_000);
+
+  it("review - AC13 - a missing node modeled to move the page AWAY from the centroid (gain <= 0) is not recommended, and has no rank", async () => {
+    const c = unit(vec({ 0: 1, 1: 1 }));
+    const session = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
+    await addChunk(session, 0, unit(vec({ 0: 1, 1: 1 })), 100);
+    await addNode("helpful concept here", { embedding: unit(vec({ 0: 1, 1: 1 })), ratio: 0.9 });
+    await addNode("harmful concept here", { embedding: unit(vec({ 0: -1, 1: -1 })), ratio: 0.9 });
+    await inTx((tx) => analyseNodes(tx, session, words));
+    const harmful = await nodeByPhrase("harmful concept here");
+    expect(harmful.projected_gain as number).toBeLessThanOrEqual(0);
+    expect(harmful.priority_rank).toBeNull();
+    const payload = await inTx((tx) => readSessionPayload(tx, session));
+    expect(payload.recommendations.map((r) => r.phrase)).not.toContain("harmful concept here");
+    expect(payload.recommendations.every((r) => r.projected_gain === null || r.projected_gain > 0)).toBe(true);
+  }, 60_000);
+
+  it("review - tenancy - the session INSERT carries its own workspace predicate: a project of another workspace opens no session even on a connection that bypasses RLS", async () => {
+    pages.set("https://brand.test/p", { kind: "html", html: PAGE });
+    const bypass = deps({ runInTx: (fn) => withTenantContext(db, { workspaceId: otherWorkspaceId, actorId: SYSTEM_ACTOR_ID }, fn), workspaceId: otherWorkspaceId });
+    await expect(openAlignmentSession(bypass, { projectId, clusterId, targetUrl: "https://brand.test/p", engineKeys: ["chatgpt"], createdBy: null })).rejects.toMatchObject({ code: "validation_failed" });
+    expect((await db.query("SELECT count(*)::int AS n FROM geo_alignments")).rows[0]).toEqual({ n: 0 });
+  }, 60_000);
+
+  it("review - concurrency - two extractions of one scope are serialised: the second waits for the first and replaces it, instead of failing on the unique key", async () => {
+    await seedTexts(corpusTexts(10, () => "We provide audit logging."));
+    const session = await addSession();
+    const password = resolvePassword("nominara_app", {});
+    const second = new Client({ host: container.getHost(), port: container.getMappedPort(5432), database: container.getDatabase(), user: "nominara_app", password });
+    await second.connect();
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let wrote!: () => void;
+      const written = new Promise<void>((resolve) => { wrote = resolve; });
+      let steps = 0;
+      const holding = deps({
+        runInTx: async (fn) => {
+          steps += 1;
+          const isWrite = steps === 2;
+          return withTenantContext(appDb, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+            const out = await fn(tx);
+            if (isWrite) { wrote(); await gate; }
+            return out;
+          });
+        },
+      });
+      const firstRun = extractSemanticNodes(holding, session);
+      await written;
+      const other = extractSemanticNodes(deps({ runInTx: (fn) => withTenantContext(second, { workspaceId, actorId: SYSTEM_ACTOR_ID }, fn) }), session);
+      const raced = Promise.allSettled([other]);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      release();
+      await firstRun;
+      expect((await raced)[0]).toMatchObject({ status: "fulfilled" });
+      expect((await nodeRows()).filter((n) => n.phrase_normalized === "audit logging")).toHaveLength(1);
+    } finally {
+      await second.end();
+    }
+  }, 90_000);
+
+  it("review - concurrency - an analysis holds the scope's advisory lock until it commits (so two analyses of one scope cannot interleave)", async () => {
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
+    await addNode("alpha beta gamma delta", { embedding: vec({ 1: 1 }) });
+    const before = Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0]!.n);
+    let during = -1;
+    await inTx(async (tx) => {
+      await analyseNodes(tx, session, words);
+      during = Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND granted")).rows[0]!.n);
+    });
+    expect(during).toBeGreaterThan(before);
+  }, 60_000);
 
   it("RLS - workspace B's passages never become workspace A's nodes, and A cannot read B's session or nodes", async () => {
     await addPassage(0, { text: "We provide hidden telemetry. We provide hidden telemetry.", ws: otherWorkspaceId, embedding: null });

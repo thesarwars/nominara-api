@@ -90,7 +90,7 @@ async function run(deps: AlignmentDeps, input: OpenSessionInput): Promise<OpenSe
     const session = await tx.query<{ id: string }>(
       `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, live_content_md, created_by)
        SELECT p.workspace_id, p.id, $2, $3, $4::text[], $5, $6, $7
-         FROM projects p WHERE p.id = $1 AND p.deleted_at IS NULL
+         FROM projects p WHERE p.id = $1 AND p.workspace_id = app.current_workspace() AND p.deleted_at IS NULL
        RETURNING id`,
       [input.projectId, input.targetUrl, input.clusterId, [...input.engineKeys], deps.embeddingModel, markdown, input.createdBy],
     );

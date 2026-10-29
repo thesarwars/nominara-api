@@ -50,7 +50,6 @@ export interface NodeCandidate {
   readonly evidenceSnippet: string;
 }
 
-const MAX_CANDIDATES = 100;
 const SNIPPET_MAX = 300;
 
 interface Tally {
@@ -128,5 +127,5 @@ export function extractNodeCandidates(documents: readonly CorpusDocument[]): Nod
       evidenceSnippet: snippetAround(tally.evidenceSentence, tally.phrase),
     }))
     .sort((a, b) => b.docRatio - a.docRatio || b.frequency - a.frequency || (a.normalized < b.normalized ? -1 : a.normalized > b.normalized ? 1 : 0))
-    .slice(0, MAX_CANDIDATES);
+    .slice(0, ALIGNMENT.maxCandidates);
 }

@@ -6,6 +6,7 @@ import type { EnqueueEmbedBatch } from "../../embedding/prompt-embedding-request
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { classifyNodeType, requiresHumanReview } from "./node-types.js";
 import { extractNodeCandidates, type CorpusDocument } from "./phrases.js";
+import { lockNodeScope } from "./scope-lock.js";
 
 // STORY-059 AC5 / AC6 / AC7 - semantic node extraction: the cited documents' phrases, kept at or above the corpus-prevalence
 // threshold, typed by the deterministic map, EVIDENCED, and queued for their vectors.
@@ -83,6 +84,7 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
   const candidates = extractNodeCandidates(documents);
 
   const written = await deps.runInTx(async (tx) => {
+    await lockNodeScope(tx, read.projectId, read.clusterId);
     await tx.query(
       `DELETE FROM semantic_nodes WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2`,
       [read.projectId, read.clusterId],

@@ -27,8 +27,17 @@ import { ALIGNMENT } from "./constants.js";
 // NULL IS NOT 0. No centroid: nothing is measured and nothing is written. No embedded chunk: the page has no alignment and no
 // percentile, and the band (a fact about the corpus) still stands. No cited document: no band and no percentile.
 //
-// `draft` selects which chunks are measured: the live page (`is_draft = false`, which also sets the baseline once) or the customer's
-// draft (`is_draft = true`, which moves only `current_alignment`).
+// `draft` selects which chunks are measured: the live page (`is_draft = false`, which also sets the baseline - ONCE: a later live
+// recompute moves `current_alignment` and leaves the baseline) or the customer's draft (`is_draft = true`, which moves only
+// `current_alignment`). A draft with no embedded chunk has NO current alignment (NULL): the live figure is never carried over as if it
+// described the draft.
+//
+// A CHUNK'S VECTOR IS READ BY ITS HASH. `ux_content_chunks` is (workspace_id, content_hash, embedding_model, is_draft) and has no
+// session, so when a second session (the same URL again, another cluster, a shared boilerplate chunk, or a block repeated inside one
+// page) holds a hash an embedded row already holds, embed.batch embeds ONE row and leaves the others at NULL (L7 reuse). The vector is
+// therefore taken from the embedded row of the same workspace, hash, model and kind, by a lateral lookup on that index, so every
+// chunk of the session is measured and counts toward the token weighting. A chunk whose hash has no embedded row is still pending
+// and is neither averaged nor counted.
 
 const tracer = trace.getTracer("nominara.geo-alignment");
 const logger = new Logger("geo.alignment");
@@ -65,13 +74,23 @@ export async function computeAlignment(tx: ClientBase, sessionId: string, option
 async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<AlignmentFigures> {
   // 1. per chunk. Only chunks that are embedded, of THIS session, of the measured kind.
   const chunked = await tx.query<{ n: number }>(
-    `WITH done AS (
+    `WITH g AS (
+       SELECT id, centroid, embedding_model FROM geo_alignments WHERE id = $1 AND workspace_id = app.current_workspace() AND centroid IS NOT NULL
+     ), src AS (
+       SELECT c.id, v.embedding, g.centroid
+         FROM g
+         JOIN content_chunks c ON c.session_id = g.id AND c.workspace_id = app.current_workspace() AND c.is_draft = $2
+        CROSS JOIN LATERAL (
+          SELECT x.embedding FROM content_chunks x
+           WHERE x.workspace_id = app.current_workspace() AND x.content_hash = c.content_hash AND x.is_draft = c.is_draft
+             AND x.embedding_model = g.embedding_model AND x.embedding IS NOT NULL
+           LIMIT 1
+        ) v
+     ), done AS (
        UPDATE content_chunks c
-          SET alignment = (1 - (c.embedding <=> g.centroid))::real
-         FROM geo_alignments g
-        WHERE g.id = $1 AND g.workspace_id = app.current_workspace() AND g.centroid IS NOT NULL
-          AND c.session_id = g.id AND c.workspace_id = app.current_workspace() AND c.is_draft = $2
-          AND c.embedding IS NOT NULL AND c.embedding_model = g.embedding_model
+          SET alignment = (1 - (src.embedding <=> src.centroid))::real
+         FROM src
+        WHERE c.id = src.id AND c.workspace_id = app.current_workspace()
        RETURNING c.id
      ) SELECT count(*)::int AS n FROM done`,
     [sessionId, draft],
@@ -110,8 +129,8 @@ async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<A
          FROM docs CROSS JOIN page WHERE docs.a IS NOT NULL AND page.a IS NOT NULL
      )
      UPDATE geo_alignments g
-        SET baseline_alignment = CASE WHEN $2 THEN g.baseline_alignment ELSE page.a END,
-            current_alignment = CASE WHEN $2 THEN COALESCE(page.a, g.current_alignment) ELSE page.a END,
+        SET baseline_alignment = CASE WHEN $2 THEN g.baseline_alignment ELSE COALESCE(g.baseline_alignment, page.a) END,
+            current_alignment = page.a,
             target_band_low = band.lo, target_band_high = band.hi,
             percentile_vs_corpus = pct.p,
             updated_at = now()
