@@ -16,7 +16,10 @@ import { lockNodeScope } from "./scope-lock.js";
 // `embedding IS NULL` (no vector, no model), and the next extraction re-requests them.
 //
 // RECONCILIATION. A node set is one project-and-cluster's: a concept that fell below the threshold since the last run is deleted, a
-// concept that is still there keeps its row and its vector, a new one is inserted. Sibling clusters' nodes are untouched. (`ux_semantic_nodes`
+// concept that is still there keeps its row and its vector, a new one is inserted. A row the analysis COLLAPSED into a near-duplicate
+// (`collapsed_into_id`) is still a row: it is updated, never re-inserted, and never re-requested, so the collapse survives the next
+// extraction (review round 3). Its marker is cleared only when its vector is from another model than the session's - the collapse was
+// judged in a different vector space, so it is re-embedded and re-judged. A deleted keeper clears the markers of its rows (ON DELETE SET NULL). Sibling clusters' nodes are untouched. (`ux_semantic_nodes`
 // treats a NULL cluster as distinct, so an ON CONFLICT upsert would stack duplicates for a cluster-less session; update-then-insert
 // under the scope lock has no such hole.) Only nodes still at `embedding IS NULL` are requested from embed.batch.
 //
@@ -109,7 +112,8 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
               evidence_snippet = v.snippet, requires_human_review = v.review, present_in_content = false, projected_gain = NULL,
               priority_rank = NULL, computed_at = now(),
               embedding = CASE WHEN n.embedding_model = $11 THEN n.embedding END,
-              embedding_model = CASE WHEN n.embedding_model = $11 THEN n.embedding_model END
+              embedding_model = CASE WHEN n.embedding_model = $11 THEN n.embedding_model END,
+              collapsed_into_id = CASE WHEN n.embedding_model = $11 THEN n.collapsed_into_id END
          FROM ${rows}
         WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2 AND n.phrase_normalized = v.norm`,
       [read.projectId, read.clusterId, ...values, read.model],
@@ -128,7 +132,7 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
     );
     const waiting = await tx.query<{ id: string }>(
       `SELECT id FROM semantic_nodes
-        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND embedding IS NULL`,
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND collapsed_into_id IS NULL AND embedding IS NULL`,
       [read.projectId, read.clusterId],
     );
     return waiting.rows.map((row) => row.id).sort();

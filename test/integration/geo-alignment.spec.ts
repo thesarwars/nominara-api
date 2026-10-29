@@ -198,6 +198,8 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
 
   const sessionRow = async (id: string) => (await db.query("SELECT * FROM geo_alignments WHERE id = $1", [id])).rows[0] as Record<string, unknown>;
   const nodeRows = async () => (await db.query("SELECT * FROM semantic_nodes WHERE project_id = $1 ORDER BY phrase_normalized", [projectId])).rows as Record<string, unknown>[];
+  /** What every reader sees: the nodes that were not collapsed into a near-duplicate. */
+  const liveNodeRows = async () => (await nodeRows()).filter((n) => n.collapsed_into_id === null);
   const nodeByPhrase = async (phrase: string) => (await nodeRows()).find((n) => n.phrase_normalized === phrase.toLowerCase())!;
 
   // The corpus: five cited documents, each one passage, at increasing angles from e0. The centroid is computed by the REAL statement.
@@ -448,7 +450,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     const summary = await inTx((tx) => analyseNodes(tx, session, words));
     expect(summary.collapsed).toBe(1);
-    expect((await nodeRows()).map((n) => n.phrase_normalized)).toEqual(["audit logging", "single sign on"]);
+    expect((await liveNodeRows()).map((n) => n.phrase_normalized)).toEqual(["audit logging", "single sign on"]);
   }, 60_000);
 
   it("scenario 5 - boundary - cosine 0.93 collapses, just under does not", async () => {
@@ -458,13 +460,13 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await addNode("alpha three", { ratio: 0.4, embedding: angle(at + 0.5 + 40) }); // far
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     await inTx((tx) => analyseNodes(tx, session, words));
-    expect((await nodeRows()).map((n) => n.phrase_normalized)).toEqual(["alpha one", "alpha three"]);
+    expect((await liveNodeRows()).map((n) => n.phrase_normalized)).toEqual(["alpha one", "alpha three"]);
     await db.query("TRUNCATE semantic_nodes");
     await addNode("beta one", { ratio: 0.8, embedding: angle(0) });
     await addNode("beta two", { ratio: 0.5, embedding: angle(at + 0.5) }); // cos < 0.93
     const second = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     await inTx((tx) => analyseNodes(tx, second, words));
-    expect(await nodeRows()).toHaveLength(2);
+    expect(await liveNodeRows()).toHaveLength(2);
   }, 60_000);
 
   it("scenario 5 - a chain A~B~C where A and C are NOT near: B collapses into A, and C survives (B was removed, so it removes nothing)", async () => {
@@ -474,7 +476,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     const summary = await inTx((tx) => analyseNodes(tx, session, words));
     expect(summary.collapsed).toBe(1);
-    expect((await nodeRows()).map((n) => n.phrase_normalized)).toEqual(["chain a", "chain c"]);
+    expect((await liveNodeRows()).map((n) => n.phrase_normalized)).toEqual(["chain a", "chain c"]);
   }, 60_000);
 
   it("scenario 5 - equal prevalence is a tie: the shorter phrase is kept, and the result does not depend on row order", async () => {
@@ -482,17 +484,18 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await addNode("access control", { ratio: 0.5, embedding: angle(5) });
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     await inTx((tx) => analyseNodes(tx, session, words));
-    expect((await nodeRows()).map((n) => n.phrase_normalized)).toEqual(["access control"]);
+    expect((await liveNodeRows()).map((n) => n.phrase_normalized)).toEqual(["access control"]);
   }, 60_000);
 
   it("scenario 5 - nodes of different clusters never collapse into each other, and an unembedded node is never collapsed", async () => {
     const sibling = randomUUID();
     await addNode("same concept", { ratio: 0.9, embedding: angle(0) });
     await addNode("same concept sibling", { ratio: 0.9, embedding: angle(1), cluster: sibling });
-    await addNode("waiting for vector", { ratio: 0.1, embedding: null });
+    await addNode("waiting for vector", { ratio: 0.1, embedding: null, cluster: sibling });
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9 });
     await inTx((tx) => analyseNodes(tx, session, words));
     expect(await nodeRows()).toHaveLength(3);
+    expect(await liveNodeRows(), "none collapsed: the sibling is another scope, and an unembedded node is never a candidate").toHaveLength(3);
   }, 60_000);
 
   // ---- scenario 6: presence ----------------------------------------------------------------------------------------------
@@ -607,25 +610,29 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain as number).toBeCloseTo(best, 2);
   }, 60_000);
 
-  it("scenario 8 - a node with no vector, a present node, or a session with no embedded chunk has gain NULL, not 0", async () => {
+  it("scenario 8 - a present node, or a session with no embedded chunk, has gain NULL, not 0", async () => {
     const c = unit(vec({ 0: 1, 1: 1 }));
     const session = await addSession({ centroid: c, sourceCount: 9, live: "we have audit logging" });
     await addChunk(session, 0, vec({ 0: 1 }), 100);
     await addNode("audit logging", { embedding: vec({ 1: 1 }) }); // present
-    await addNode("waiting for vector", { embedding: null });
+    await addNode("other concept", { embedding: vec({ 2: 1 }) }); // absent, and modeled only against a session that has an embedded chunk
     await inTx((tx) => analyseNodes(tx, session, words));
     expect((await nodeByPhrase("audit logging")).projected_gain).toBeNull();
-    expect((await nodeByPhrase("waiting for vector")).projected_gain).toBeNull();
-    expect((await nodeByPhrase("waiting for vector")).priority_rank).toBeNull();
+    expect((await nodeByPhrase("other concept")).projected_gain).not.toBeNull();
+    const bare = await addSession({ centroid: c, sourceCount: 9, live: "we have audit logging" }); // no chunk at all
+    await inTx((tx) => analyseNodes(tx, bare, words));
+    expect((await nodeByPhrase("other concept")).projected_gain).toBeNull();
+    expect((await nodeByPhrase("other concept")).priority_rank).toBeNull();
   }, 60_000);
 
-  it("scenario 8 - a node embedded under ANOTHER model is not modeled against this session's vectors (EC-23)", async () => {
+  it("scenario 8 - a node embedded under ANOTHER model is not modeled against this session's vectors (EC-23): the scope is held as pending", async () => {
     const c = unit(vec({ 0: 1, 1: 1 }));
     const session = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
     await addChunk(session, 0, vec({ 0: 1 }), 100);
     const id = await addNode("alpha beta gamma delta", { embedding: vec({ 1: 1 }) });
     await db.query("UPDATE semantic_nodes SET embedding_model = 'another-model' WHERE id = $1", [id]);
-    await inTx((tx) => analyseNodes(tx, session, words));
+    const summary = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(summary).toMatchObject({ pending: true, pendingNodes: 1 });
     expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain).toBeNull();
   }, 60_000);
 
@@ -742,7 +749,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
 
   it("AC14 - fail closed: under low confidence a missing node with no modeled gain (no rank) is dropped, not shown", async () => {
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 3, live: "unrelated" });
-    await addNode("waiting for vector", { embedding: null });
+    await addNode("no chunk to model against", { embedding: vec({ 3: 1 }) }); // embedded, but the session has no chunk: gain NULL, no rank
     await inTx((tx) => analyseNodes(tx, session, words));
     expect((await inTx((tx) => readSessionPayload(tx, session))).recommendations).toEqual([]);
     const enough = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
@@ -1024,6 +1031,115 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(after.embedding_model).toBe(MODEL);
     expect(again.nodes).toBe((await nodeRows()).length);
   }, 90_000);
+
+  // ---- review round 3: the collapse is PERSISTED ---------------------------------------------------------------------------
+
+  const collapsedRows = async () => (await db.query("SELECT * FROM semantic_nodes WHERE project_id = $1 AND collapsed_into_id IS NOT NULL ORDER BY phrase_normalized", [projectId])).rows as Record<string, unknown>[];
+  const recommendedPhrases = async (session: string): Promise<string[]> => (await inTx((tx) => readSessionPayload(tx, session))).recommendations.map((r) => r.phrase).sort();
+
+  it("review round 3 - AC6 - HAZARD: extract, drain embed.batch, analyse, extract again - no collapsed duplicate reappears, a collapsed phrase is not embedded again, and the recommendations are the same", async () => {
+    await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
+    await extractSemanticNodes(deps(), session);
+    await drainEmbedQueue();
+    // Real geometry: every node orthogonal to the others except the first two, which are near-duplicates (cosine 0.985).
+    const nodes = await nodeRows();
+    expect(nodes.length).toBeGreaterThan(2);
+    for (const [i, n] of nodes.entries()) await db.query("UPDATE semantic_nodes SET embedding = $2::halfvec WHERE id = $1", [n.id, lit(i === 0 ? angle(0) : i === 1 ? angle(10) : vec({ [i + 2]: 1 }))]);
+
+    const first = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(first.collapsed).toBe(1);
+    const afterAnalyse = await nodeRows();
+    const recommendations = await recommendedPhrases(session);
+    expect(recommendations).toHaveLength(nodes.length - 1);
+
+    const again = await extractSemanticNodes(deps(), session);
+    expect(again.embedJobs, "no embed request for a collapsed phrase").toBe(0);
+    expect(enqueued, "nothing is enqueued at all: every row already holds its vector").toHaveLength(0);
+    expect((await nodeRows()).map((n) => n.id), "the same rows: the collapsed duplicate is not re-inserted").toEqual(afterAnalyse.map((n) => n.id));
+    expect((await nodeRows()).every((n) => n.embedding !== null)).toBe(true);
+
+    const second = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(second.pending).toBe(false);
+    expect(second.collapsed).toBe(1);
+    expect(await recommendedPhrases(session)).toEqual(recommendations);
+    const collapsed = await collapsedRows();
+    expect(collapsed).toHaveLength(1);
+    expect(recommendations).not.toContain(collapsed[0]!.phrase_normalized);
+  }, 120_000);
+
+  it("review round 3 - AC6 - a collapsed node is KEPT and marked with its keeper, not deleted; every reader leaves it out (nodes, coverage, recommendations)", async () => {
+    const keeper = await addNode("audit logging", { ratio: 0.8, embedding: angle(0) });
+    await addNode("audit trail", { ratio: 0.5, embedding: angle(10) });
+    await addNode("single sign on", { ratio: 0.6, embedding: vec({ 5: 1 }) });
+    // The COLLAPSED phrase is on the page, and so is one live phrase: the collapsed one must not count as required, nor as present.
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "we keep an audit trail and single sign on" });
+    const summary = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(summary).toMatchObject({ collapsed: 1, nodes: 2, present: 1, missing: 1, pending: false });
+    expect(await nodeRows()).toHaveLength(3);
+    expect((await collapsedRows()).map((n) => [n.phrase_normalized, n.collapsed_into_id])).toEqual([["audit trail", keeper]]);
+    expect((await sessionRow(session)).coverage_ratio, "1 of the 2 live nodes, not 2 of 3 and not 1 of 3").toBe(0.5);
+    expect(await recommendedPhrases(session)).toEqual(["audit logging"]);
+  }, 60_000);
+
+  it("review round 3 - AC6 - a node that was collapsed into a keeper that LATER disappears is neither orphaned nor hidden: it is live again, with its vector", async () => {
+    const stale = await addNode("stale concept", { ratio: 0.9, embedding: angle(0) });
+    const survivor = await addNode("audit logging", { ratio: 0.5, embedding: angle(10) });
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
+    await inTx((tx) => analyseNodes(tx, session, words));
+    expect((await nodeByPhrase("audit logging")).collapsed_into_id).toBe(stale);
+
+    // The corpus no longer yields "stale concept" (it is not a candidate), so the extraction deletes it. "audit logging" still is one.
+    await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
+    await extractSemanticNodes(deps(), session);
+    const after = await nodeByPhrase("audit logging");
+    expect(after.id, "the row survives the keeper's deletion").toBe(survivor);
+    expect(after.collapsed_into_id, "and is no longer marked").toBeNull();
+    expect(after.embedding, "its vector is kept").not.toBeNull();
+    expect((await nodeRows()).find((n) => n.id === stale)).toBeUndefined();
+    expect(enqueued.flatMap((e) => e.payload.ids as string[]), "and it is not embedded again").not.toContain(survivor);
+    await drainEmbedQueue();
+    await inTx((tx) => analyseNodes(tx, session, words));
+    expect(await recommendedPhrases(session)).toContain("audit logging");
+  }, 90_000);
+
+  it("review round 3 - AC6 - a collapsed node whose vector is from ANOTHER model is un-collapsed and queued again (the collapse was judged in a different vector space)", async () => {
+    await addNode("provide audit logging", { ratio: 0.9, embedding: angle(0) }); // the keeper is still a candidate, so only the model can un-collapse
+    const collapsedId = await addNode("audit logging", { ratio: 0.5, embedding: angle(10) });
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
+    await inTx((tx) => analyseNodes(tx, session, words));
+    expect(await collapsedRows()).toHaveLength(1);
+    await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
+    await db.query("UPDATE corpus_passages SET embedding_model = 'next-model'");
+    await db.query("UPDATE geo_alignments SET embedding_model = 'next-model' WHERE id = $1", [session]);
+    await extractSemanticNodes(deps({ embeddingModel: "next-model" }), session);
+    const row = await nodeByPhrase("audit logging");
+    expect(row.id).toBe(collapsedId);
+    expect(row.collapsed_into_id).toBeNull();
+    expect(row.embedding).toBeNull();
+    expect(enqueued.flatMap((e) => e.payload.ids as string[])).toContain(collapsedId);
+  }, 90_000);
+
+  it("review round 3 - AC6 - PENDING guard: while a node of the scope has no vector (or one from another model) nothing is deduped or analysed, and it says so; a sibling cluster's pending node does not block", async () => {
+    await addNode("audit logging", { ratio: 0.8, embedding: angle(0) });
+    await addNode("audit trail", { ratio: 0.5, embedding: angle(10) });
+    const waiting = await addNode("waiting for vector", { embedding: null });
+    await addNode("sibling waiting", { embedding: null, cluster: randomUUID() });
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
+    const held = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(held).toMatchObject({ found: true, pending: true, pendingNodes: 1, collapsed: 0, recommendations: 0 });
+    expect(await collapsedRows(), "nothing deduped").toHaveLength(0);
+    expect((await sessionRow(session)).coverage_ratio, "no coverage computed").toBeNull();
+    expect((await sessionRow(session)).recommendations).toEqual([]);
+
+    await db.query("UPDATE semantic_nodes SET embedding = $2::halfvec, embedding_model = 'another-model' WHERE id = $1", [waiting, lit(vec({ 7: 1 }))]);
+    expect(await inTx((tx) => analyseNodes(tx, session, words))).toMatchObject({ pending: true, pendingNodes: 1 });
+
+    await db.query("UPDATE semantic_nodes SET embedding_model = $2 WHERE id = $1", [waiting, MODEL]);
+    const done = await inTx((tx) => analyseNodes(tx, session, words));
+    expect(done).toMatchObject({ pending: false, pendingNodes: 0, collapsed: 1, nodes: 2 });
+    expect(await collapsedRows()).toHaveLength(1);
+  }, 60_000);
 
   it("RLS - workspace B's passages never become workspace A's nodes, and A cannot read B's session or nodes", async () => {
     await addPassage(0, { text: "We provide hidden telemetry. We provide hidden telemetry.", ws: otherWorkspaceId, embedding: null });

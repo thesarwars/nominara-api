@@ -12,12 +12,24 @@ import { lockNodeScope } from "./scope-lock.js";
 
 // STORY-059 AC5-AC9, AC13 - everything that happens to the nodes once they hold vectors, in ONE transaction with no network:
 //
+//   0. PENDING   a scope with a node that has no vector (or one from another model) is not analysed at all: it reports `pending`
 //   1. DEDUPE    collapse nodes at pairwise cosine >= 0.93, keeping the higher corpus_doc_ratio (SQL, `<=>`)
 //   2. PRESENCE  the normalised phrase appears in the draft (else the live page) on word boundaries
 //   3. COVERAGE  |present| / |required|; NULL when nothing is required (no node is not "fully covered", and not "uncovered")
 //   4. GAIN      the additive-blend estimate per (node, chunk), the node keeping its BEST chunk's (SQL)
 //   5. RANK      projected_gain x corpus_doc_ratio x type multiplier, over the nodes still missing
 //   6. RECOMMEND the missing nodes, labelled and flagged, suppressed under low confidence (EC-24), written onto the session
+//
+// THE COLLAPSE IS PERSISTED. A collapsed node is not deleted: its `collapsed_into_id` names the keeper, and every reader (presence,
+// coverage, gain, rank, recommendations, the counts) excludes it. Deleting it was undone by the next extraction, which still yields the
+// phrase: it came back with no vector and was embedded again on every cycle (review round 3). Extraction now keeps the row and its
+// vector. Each analysis recomputes the collapse from scratch (clears the markers, then runs the greedy pass), so a keeper that was
+// itself collapsed into a newcomer cannot leave rows pointing at a hidden node. A keeper that is DELETED sets its rows' marker back to NULL
+// (ON DELETE SET NULL): they are live again with their vectors, never orphaned and never hidden.
+//
+// THE PENDING GUARD. Dedupe over a partly-embedded scope would collapse against an incomplete set, and the recommendations written onto
+// the session would be a snapshot of a half-built corpus. While any node of the scope lacks a vector for the session's model nothing is
+// touched: the summary says `pending` and the caller re-analyses once embed.batch has drained. Fail closed.
 //
 // All vector arithmetic is SQL. The application passes scalars in (token counts, constants) and reads scalars out.
 //
@@ -53,8 +65,12 @@ const GENERIC_REVIEW_WARNING = "This concept needs a human check. Only add it if
 
 export interface AnalyseNodesSummary {
   readonly found: boolean;
-  /** Nodes removed as near-duplicates of a higher-prevalence node. */
+  /** Nodes collapsed into a near-duplicate keeper of higher prevalence (kept, marked, and excluded from every reader). */
   readonly collapsed: number;
+  /** True when the scope still has nodes without a vector for this session's model: nothing was deduped, analysed or written. */
+  readonly pending: boolean;
+  /** How many nodes of the scope are waiting for a vector. */
+  readonly pendingNodes: number;
   readonly nodes: number;
   readonly present: number;
   readonly missing: number;
@@ -102,41 +118,62 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
     [sessionId],
   );
   const s = found.rows[0];
-  if (s === undefined) return { found: false, collapsed: 0, nodes: 0, present: 0, missing: 0, ranked: 0, coverageRatio: null, recommendations: 0, lowConfidence: true };
+  if (s === undefined) return { found: false, collapsed: 0, pending: false, pendingNodes: 0, nodes: 0, present: 0, missing: 0, ranked: 0, coverageRatio: null, recommendations: 0, lowConfidence: true };
   const scope = [s.project_id, s.prompt_cluster_id] as const;
   // Held to commit: another analysis or extraction of this scope waits instead of interleaving its DELETEs and UPDATEs with ours.
   await lockNodeScope(tx, s.project_id, s.prompt_cluster_id);
 
+  // ---- 0. pending guard ---------------------------------------------------------------------------------------------
+  const waiting = await tx.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM semantic_nodes
+      WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
+        AND (embedding IS NULL OR embedding_model IS DISTINCT FROM $3)`,
+    [...scope, s.embedding_model],
+  );
+  const pendingNodes = waiting.rows[0]?.n ?? 0;
+  if (pendingNodes > 0) {
+    incrementCounter("nominara_geo_alignment_analysis_pending_total");
+    logger.log({ event: "geo.alignment.nodes_pending", workspace_id: s.workspace_id, pending_nodes: pendingNodes });
+    return { found: true, collapsed: 0, pending: true, pendingNodes, nodes: 0, present: 0, missing: 0, ranked: 0, coverageRatio: null, recommendations: 0, lowConfidence: isLowConfidence(s.centroid_source_count) };
+  }
+
   // ---- 1. dedupe ----------------------------------------------------------------------------------------------------
+  // Recomputed from scratch: the previous collapse is cleared, then the greedy pass marks it again. Same inputs, same result.
+  await tx.query(
+    `UPDATE semantic_nodes SET collapsed_into_id = NULL
+      WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND collapsed_into_id IS NOT NULL`,
+    [...scope],
+  );
   let collapsed = 0;
   const kept: string[] = [];
   for (;;) {
     const next = await tx.query<{ id: string }>(
       `SELECT id FROM semantic_nodes
         WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
-          AND embedding IS NOT NULL AND embedding_model = $3 AND NOT (id = ANY($4::uuid[]))
+          AND collapsed_into_id IS NULL AND embedding IS NOT NULL AND embedding_model = $3 AND NOT (id = ANY($4::uuid[]))
         ORDER BY corpus_doc_ratio DESC, cardinality(string_to_array(phrase_normalized, ' ')), phrase_normalized, id
         LIMIT 1`,
       [...scope, s.embedding_model, kept],
     );
     const keeper = next.rows[0]?.id;
     if (keeper === undefined) break;
-    const removed = await tx.query(
-      `DELETE FROM semantic_nodes d USING semantic_nodes k
+    const marked = await tx.query(
+      `UPDATE semantic_nodes d SET collapsed_into_id = k.id, present_in_content = false, projected_gain = NULL, priority_rank = NULL
+         FROM semantic_nodes k
         WHERE k.id = $5 AND k.workspace_id = app.current_workspace()
           AND d.workspace_id = app.current_workspace() AND d.project_id = $1 AND d.prompt_cluster_id IS NOT DISTINCT FROM $2
-          AND d.id <> k.id AND d.embedding IS NOT NULL AND d.embedding_model = $3 AND NOT (d.id = ANY($4::uuid[]))
+          AND d.id <> k.id AND d.collapsed_into_id IS NULL AND d.embedding IS NOT NULL AND d.embedding_model = $3 AND NOT (d.id = ANY($4::uuid[]))
           AND (1 - (d.embedding <=> k.embedding)) >= $6`,
       [...scope, s.embedding_model, kept, keeper, ALIGNMENT.dedupeCosine],
     );
-    collapsed += removed.rowCount ?? 0;
+    collapsed += marked.rowCount ?? 0;
     kept.push(keeper);
   }
 
   // ---- 2. presence --------------------------------------------------------------------------------------------------
   const nodes = await tx.query<{ id: string; phrase_normalized: string }>(
     `SELECT id, phrase_normalized FROM semantic_nodes
-      WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 ORDER BY id`,
+      WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND collapsed_into_id IS NULL ORDER BY id`,
     [...scope],
   );
   // The same flag selects the content and the chunks: a live analysis reports the live page, a draft analysis the draft (else the live page).
@@ -144,7 +181,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   const presentIds = new Set(nodes.rows.filter((n) => content.includes(` ${normalisePhrase(n.phrase_normalized)} `)).map((n) => n.id));
   await tx.query(
     `UPDATE semantic_nodes n SET present_in_content = (n.id = ANY($3::uuid[]))
-      WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2`,
+      WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2 AND n.collapsed_into_id IS NULL`,
     [...scope, [...presentIds]],
   );
 
@@ -152,7 +189,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   await tx.query(
     `UPDATE semantic_nodes SET requires_human_review = true
       WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
-        AND node_type = ANY($3::text[]) AND NOT requires_human_review`,
+        AND collapsed_into_id IS NULL AND node_type = ANY($3::text[]) AND NOT requires_human_review`,
     [...scope, [...CLAIM_BEARING_NODE_TYPES]],
   );
 
@@ -161,7 +198,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
     `UPDATE geo_alignments g
         SET coverage_ratio = c.ratio, updated_at = now()
        FROM (SELECT (count(*) FILTER (WHERE present_in_content))::real / NULLIF(count(*), 0) AS ratio
-               FROM semantic_nodes WHERE workspace_id = app.current_workspace() AND project_id = $2 AND prompt_cluster_id IS NOT DISTINCT FROM $3) c
+               FROM semantic_nodes WHERE workspace_id = app.current_workspace() AND project_id = $2 AND prompt_cluster_id IS NOT DISTINCT FROM $3 AND collapsed_into_id IS NULL) c
       WHERE g.id = $1 AND g.workspace_id = app.current_workspace()
       RETURNING g.coverage_ratio AS coverage`,
     [sessionId, ...scope],
@@ -171,7 +208,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   const modelable = await tx.query<{ id: string; phrase: string }>(
     `SELECT id, phrase FROM semantic_nodes
       WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
-        AND NOT present_in_content AND embedding IS NOT NULL AND embedding_model = $3 ORDER BY id`,
+        AND collapsed_into_id IS NULL AND NOT present_in_content AND embedding IS NOT NULL AND embedding_model = $3 ORDER BY id`,
     [...scope, s.embedding_model],
   );
   await tx.query(
@@ -202,7 +239,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
      )
      UPDATE semantic_nodes n
         SET projected_gain = (SELECT best.gain FROM best WHERE best.node_id = n.id), computed_at = now()
-      WHERE n.workspace_id = app.current_workspace() AND n.project_id = $2 AND n.prompt_cluster_id IS NOT DISTINCT FROM $3`,
+      WHERE n.workspace_id = app.current_workspace() AND n.project_id = $2 AND n.prompt_cluster_id IS NOT DISTINCT FROM $3 AND n.collapsed_into_id IS NULL`,
     [sessionId, ...scope, modelable.rows.map((n) => n.id), modelable.rows.map((n) => tokenizer.count(n.phrase)), ALIGNMENT.alphaCap, ALIGNMENT.kappa, draft],
   );
 
@@ -214,10 +251,10 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
                          corpus_doc_ratio DESC, phrase_normalized, id) AS rk
          FROM semantic_nodes
         WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
-          AND NOT present_in_content AND projected_gain IS NOT NULL AND projected_gain > 0
+          AND collapsed_into_id IS NULL AND NOT present_in_content AND projected_gain IS NOT NULL AND projected_gain > 0
      )
      UPDATE semantic_nodes n SET priority_rank = (SELECT r.rk FROM r WHERE r.id = n.id)::smallint
-      WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2`,
+      WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2 AND n.collapsed_into_id IS NULL`,
     [...scope, ALIGNMENT.claimMultiplier],
   );
 
@@ -228,7 +265,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   }>(
     `SELECT id, phrase, node_type, corpus_doc_ratio, projected_gain, priority_rank, evidence_url, evidence_snippet, requires_human_review
        FROM semantic_nodes
-      WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND NOT present_in_content
+      WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND collapsed_into_id IS NULL AND NOT present_in_content
       ORDER BY priority_rank NULLS LAST, corpus_doc_ratio DESC, phrase_normalized, id`,
     [...scope],
   );
@@ -257,6 +294,8 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   const summary: AnalyseNodesSummary = {
     found: true,
     collapsed,
+    pending: false,
+    pendingNodes: 0,
     nodes: nodes.rows.length,
     present: presentIds.size,
     missing: missing.rows.length,

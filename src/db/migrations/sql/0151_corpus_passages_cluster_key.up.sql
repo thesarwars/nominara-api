@@ -28,3 +28,16 @@ ALTER TABLE semantic_nodes ADD COLUMN embedding_model text;
 
 COMMENT ON COLUMN semantic_nodes.embedding_model IS
   'STORY-059 - the model that produced semantic_nodes.embedding (EC-23). NULL while embedding is NULL.';
+
+-- STORY-059 AC6 (review round 3) - a near-duplicate semantic node is COLLAPSED, not deleted.
+--
+-- The analysis used to DELETE the lower-prevalence node of a near-duplicate pair, but the next extraction still yields that phrase, so it
+-- was inserted again with no vector and embedded again on every cycle. The collapse is now a fact stored on the row: `collapsed_into_id`
+-- names the keeper. Extraction keeps the row (and its vector) and never re-inserts or re-embeds the phrase; every reader excludes rows
+-- where it is set. ON DELETE SET NULL: a keeper that later goes away (its concept fell below the prevalence threshold) does not orphan or
+-- hide its collapsed rows - they become live again, vector intact, and the next analysis judges them afresh. Expand only: one nullable
+-- column, NULL on every existing row (nothing has ever inserted a node), so there is nothing to backfill.
+ALTER TABLE semantic_nodes ADD COLUMN collapsed_into_id uuid REFERENCES semantic_nodes (id) ON DELETE SET NULL;
+
+COMMENT ON COLUMN semantic_nodes.collapsed_into_id IS
+  'STORY-059 AC6 - the surviving node this near-duplicate (cosine >= 0.93) was collapsed into; NULL for a live node. Readers exclude non-NULL.';

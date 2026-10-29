@@ -4,6 +4,7 @@ import { UnrecoverableError, type Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { EmbeddingProviderError, type EmbeddingProvider } from "../../../modules/prompts/ports/embedding-provider.js";
 import { selectEmbeddingProvider } from "../../../modules/prompts/embedding-provider.selector.js";
+import { lockNodeScope } from "../../geo/alignment/scope-lock.js";
 import { CircuitBreaker, CircuitOpenError } from "../../resilience/circuit-breaker.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../usage/billing-period.js";
@@ -310,8 +311,21 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
 
   const commit = async (tx: ClientBase, prepared: EmbedPrepared, fetched: EmbedFetched): Promise<void> => {
     const { payload } = prepared;
+    const writeIds = prepared.writes.map((write) => write.id);
+    // STORY-059: `analyseNodes` bulk-UPDATEs a scope's semantic_nodes while holding that scope's advisory lock. This UPDATE touches rows
+    // of the same scope, so without the lock the two take row locks in different orders and can deadlock. Take it first, scope by scope in
+    // a fixed order (project, then cluster), so two jobs spanning several scopes cannot lock against each other either.
+    if (payload.table === "semantic_nodes") {
+      const scopes = await tx.query<{ project_id: string; prompt_cluster_id: string | null }>(
+        `SELECT DISTINCT project_id, prompt_cluster_id FROM semantic_nodes
+          WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[])
+          ORDER BY project_id, prompt_cluster_id NULLS LAST`,
+        [writeIds],
+      );
+      for (const scope of scopes.rows) await lockNodeScope(tx, scope.project_id, scope.prompt_cluster_id);
+    }
     const written = await tx.query(TABLE_SQL[payload.table].write, [
-      prepared.writes.map((write) => write.id),
+      writeIds,
       prepared.writes.map((write) => fetched.vectors[write.textIndex]!),
       prepared.model,
     ]);
