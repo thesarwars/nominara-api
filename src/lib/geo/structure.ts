@@ -16,11 +16,12 @@ import { SCORING_VERSION } from "../scoring/index.js";
 // (`mention_facts.answer_form`, `.position_class`). Free and unmetered; no
 // engine, embedding provider or crawl is touched.
 //
-// WHAT IS DELIBERATELY NOT HERE: the structure-match gap (a table-dominant
-// cluster against a brand page with neither table nor spec list). It needs the
-// brand's page, and no page crawl exists. The verdict is therefore always
-// `no_action`, with that reason stated, and `page_forms`/`template` are empty.
-// A gap asserted without the page would be a fabricated finding.
+// The structure-match gap (a table-dominant cluster against a brand page with
+// neither table nor spec list) needs the brand's page. `StructureInput.pages`
+// carries what the document model (STORY-050) found on it; while the loader
+// has no page source it is null, and then the verdict is `no_action` with that
+// reason stated and `page_forms`/`template` empty. A gap asserted without the
+// page would be a fabricated finding, so "no pages" never fires one.
 
 /** product-spec §A3 / geo-insights catalogue: "30 parsed answers in the window." */
 export const STRUCTURE_MIN_ANSWERS = 30;
@@ -42,6 +43,29 @@ export const DEMO_NORMALIZER_VERSION = "demo-seed";
 export const NO_PAGE_CRAWL_REASON =
   "No page crawl exists for this project, so the structure-match gap cannot be assessed against the brand's page. No gap is asserted.";
 
+/** What the AUX document model found on one of the brand's own pages (`ContentBlock.tables` / `.lists`, summed over the page). */
+export interface StructurePage {
+  url: string;
+  tables: number;
+  lists: { ordered: number; unordered: number; definition: number };
+}
+
+/** One page's forms from its document model (STORY-050): the blocks' tables and lists, summed over the page. Pure. */
+export function structurePageFrom(doc: { url: string; blocks: readonly { tables: number; lists: StructurePage["lists"] }[] }): StructurePage {
+  const lists = { ordered: 0, unordered: 0, definition: 0 };
+  let tables = 0;
+  for (const b of doc.blocks) {
+    tables += b.tables;
+    lists.ordered += b.lists.ordered;
+    lists.unordered += b.lists.unordered;
+    lists.definition += b.lists.definition;
+  }
+  return { url: doc.url, tables, lists };
+}
+
+/** The task rule a structure-match gap generates a task through. */
+export const STRUCTURE_TASK_RULE = "TG-STRUCTURE-TEMPLATE";
+
 export interface StructureInput {
   windowStart: string;
   windowDays: 7 | 30 | 90;
@@ -59,6 +83,11 @@ export interface StructureInput {
   position: { cls: PositionClassValue; answers: number }[];
   /** The same, for the window of equal length immediately before. */
   priorPosition: { cls: PositionClassValue; answers: number }[];
+  /**
+   * The brand's own assessed pages. `null`/absent/empty means NOT ASSESSED (no page source, or a crawl that fetched
+   * nothing) and never means "a page with no table": a gap is only asserted against a page that was actually read.
+   */
+  pages?: readonly StructurePage[] | null;
 }
 
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
@@ -100,6 +129,33 @@ function clusterDistributions(rows: StructureInput["forms"]): GeoStructureCluste
       };
     })
     .sort((a, b) => b.total - a.total || (a.cluster_id === null ? 1 : b.cluster_id === null ? -1 : a.cluster_id.localeCompare(b.cluster_id)));
+}
+
+const PAGE_FORM_ORDER = ["table", "definition_list", "ordered_list", "unordered_list"] as const;
+
+/** The forms the assessed pages provide, in a fixed order. */
+function pageFormsOf(pages: readonly StructurePage[]): string[] {
+  const has: Record<(typeof PAGE_FORM_ORDER)[number], boolean> = {
+    table: pages.some((p) => p.tables > 0),
+    definition_list: pages.some((p) => p.lists.definition > 0),
+    ordered_list: pages.some((p) => p.lists.ordered > 0),
+    unordered_list: pages.some((p) => p.lists.unordered > 0),
+  };
+  return PAGE_FORM_ORDER.filter((f) => has[f]);
+}
+
+/** The structural task's template: the shape engines already answer this cluster in, for the brand's page to mirror. */
+export function structureTemplate(clusterLabel: string): string {
+  return [
+    `Add a comparison table to the page that answers "${clusterLabel}". Engines answer this topic as a table, so give them rows to lift.`,
+    "",
+    "| Option | Best for | Key capability | Pricing |",
+    "|---|---|---|---|",
+    "| <Your product> | <audience> | <capability stated as a fact> | <price and currency> |",
+    "| <Alternative> | <audience> | <capability> | <price and currency> |",
+    "",
+    "Keep every cell a plain statement, include the brand's own row, and mark the table up as an HTML table (not an image).",
+  ].join("\n");
 }
 
 /** Pure: the persisted row and the read detail from one aggregate, so they cannot disagree. */
@@ -163,33 +219,64 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
         ? ` The brand sits in the recommendation clause in ${pct(rec.share)} of its answers (no prior window to compare).`
         : ` The brand's recommendation-clause share moved from ${pct(rec.prior)} to ${pct(rec.share)}.`;
 
+  const pages = input.pages ?? [];
+  const assessed = pages.length > 0;
+  const pageForms = pageFormsOf(pages);
+  const providesStructure = pageForms.includes("table") || pageForms.includes("definition_list");
+  const clusters = clusterDistributions(input.forms);
+  const gaps = assessed && !providesStructure ? clusters.filter((c) => c.sufficient && c.dominant_form === "comparison_table") : [];
+  const firstGap = gaps[0];
+  const rationale = !assessed
+    ? NO_PAGE_CRAWL_REASON
+    : firstGap !== undefined
+      ? `The dominant answer form for ${gaps.map((g) => g.label ?? "unclustered prompts").join(", ")} is a comparison table, and the brand's assessed pages provide neither a table nor a spec list.`
+      : `The brand's assessed pages provide ${pageForms.length === 0 ? "no tables or lists" : pageForms.join(", ")}; no structure-match gap applies.`;
+
   const detail: GeoStructureDetail = {
     slug: "structure",
     forms,
     total,
     dominant_form: dominant.form,
     engines,
-    page_forms: [],
-    clusters: clusterDistributions(input.forms),
+    page_forms: pageForms,
+    clusters,
     brand_answers: brandAnswers,
     prior_brand_answers: priorAnswers,
     position,
-    template: null,
-    rationale: NO_PAGE_CRAWL_REASON,
+    template: firstGap === undefined ? null : structureTemplate(firstGap.label ?? "this topic"),
+    rationale,
   };
 
   const finding: GeoFinding = {
     id: "structure-dominant-form",
     severity: "info",
     headline: `${FORM_LABEL[dominant.form]} is the dominant answer form (${pct(dominant.count / total)} of ${String(total)} answers).${movement}`,
-    detail: NO_PAGE_CRAWL_REASON,
-    // The only page this analysis can point at is the one it could not assess.
-    evidence: [{ url: `https://${input.rootDomain}/`, snippet: "No page crawl: the page's answer forms could not be assessed." }],
+    detail: rationale,
+    // Without an assessed page, the only page this analysis can point at is the one it could not assess.
+    evidence: [
+      assessed
+        ? { url: pages[0]!.url, snippet: `Provides: ${pageForms.length === 0 ? "no tables or lists" : pageForms.join(", ")}.` }
+        : { url: `https://${input.rootDomain}/`, snippet: "No page crawl: the page's answer forms could not be assessed." },
+    ],
     metric: { name: "dominant_form_share", value: round4(dominant.count / total) },
     no_action: true,
     // The detail rides on the finding so a read returns the stored row's own aggregate.
     structure: detail,
   };
+
+  const gapFindings: GeoFinding[] = gaps.map((g) => {
+    const tables = g.forms.find((x) => x.form === "comparison_table")?.count ?? 0;
+    const label = g.label ?? "unclustered prompts";
+    return {
+      id: `structure-gap-${g.cluster_id ?? "unclustered"}`,
+      severity: "medium" as const,
+      headline: `Answers for ${label} are mostly comparison tables (${pct(tables / g.total)} of ${String(g.total)}), and the brand's page provides neither a table nor a spec list.`,
+      detail: structureTemplate(label),
+      evidence: [{ url: pages[0]!.url, snippet: `Provides: ${pageForms.length === 0 ? "no tables or lists" : pageForms.join(", ")}.` }],
+      metric: { name: "cluster_table_share", value: round4(tables / g.total) },
+      task_rule_code: STRUCTURE_TASK_RULE,
+    };
+  });
 
   return {
     write: {
@@ -198,7 +285,7 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
       evidence_passages: 0,
       sufficient: true,
       suppression_reason: null,
-      findings: [finding],
+      findings: [finding, ...gapFindings],
       lever_rank: null,
     },
     detail,

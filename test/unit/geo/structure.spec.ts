@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { geoAnalysisWriteSchema, geoStructureDetailSchema } from "../../../contracts/analytics/index.js";
-import { buildStructure, STRUCTURE_MIN_ANSWERS, type StructureInput } from "../../../src/lib/geo/structure.js";
+import { buildStructure, STRUCTURE_MIN_ANSWERS, structurePageFrom, type StructureInput } from "../../../src/lib/geo/structure.js";
 
 // STORY-060 — A3 answer structure. Scenario numbers refer to the story's
 // table; #8 is deliberately NOT the story's "gap fires": the plan overrides it
@@ -241,5 +241,72 @@ describe("STORY-060 · A3 answer structure (pure)", () => {
       const { clusters: _omitted, ...legacy } = detail!;
       expect(geoStructureDetailSchema.safeParse(legacy).success).toBe(true);
     });
+  });
+});
+
+describe("STORY-060 · A3 structure-match gap (pure)", () => {
+  const tableDominant = (): StructureInput["forms"] => [f("gemini", "comparison_table", 24, "live", { id: "11111111-1111-4111-8111-111111111111", label: "CRM pricing" }), f("gemini", "narrative", 6, "live", { id: "11111111-1111-4111-8111-111111111111", label: "CRM pricing" })];
+  const prose = { url: "https://acme.com/pricing", tables: 0, lists: { ordered: 0, unordered: 2, definition: 0 } };
+
+  it("#8 · prose-only brand page against a table-dominant cluster: the gap fires with a template and a task rule", () => {
+    const { write, detail } = buildStructure(input({ forms: tableDominant(), pages: [prose] }));
+    const gap = write.findings.find((x) => x.id.startsWith("structure-gap-"))!;
+    expect(gap.task_rule_code).toBe("TG-STRUCTURE-TEMPLATE");
+    expect(gap.no_action).toBeUndefined();
+    expect(gap.evidence[0]!.url).toBe("https://acme.com/pricing");
+    expect(gap.headline).toMatch(/CRM pricing/u);
+    expect(detail!.template).toMatch(/\| .* \|/u);
+    expect(detail!.template).toMatch(/CRM pricing/u);
+    expect(detail!.page_forms).toEqual(["unordered_list"]);
+    expect(detail!.rationale).toMatch(/neither a table nor a spec list/u);
+    expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
+    expect(geoStructureDetailSchema.safeParse(detail).success).toBe(true);
+  });
+
+  it("no gap when any assessed page provides a table, or a definition (spec) list", () => {
+    for (const page of [{ ...prose, tables: 1 }, { ...prose, lists: { ordered: 0, unordered: 0, definition: 1 } }]) {
+      const { write } = buildStructure(input({ forms: tableDominant(), pages: [prose, page] }));
+      expect(write.findings.some((x) => x.id.startsWith("structure-gap-"))).toBe(false);
+    }
+  });
+
+  it("no gap when the dominant form is not a table, or the cluster is below the evidence minimum", () => {
+    const narrative = buildStructure(input({ forms: [f("gemini", "narrative", 30)], pages: [prose] }));
+    expect(narrative.write.findings.some((x) => x.id.startsWith("structure-gap-"))).toBe(false);
+    const thin = buildStructure(input({ forms: [f("gemini", "comparison_table", 29, "live", { id: "11111111-1111-4111-8111-111111111111", label: "Thin" }), f("gemini", "narrative", 1)], pages: [prose] }));
+    expect(thin.write.findings.some((x) => x.id.startsWith("structure-gap-"))).toBe(false);
+  });
+
+  it("one gap per table-dominant cluster, each with its own template", () => {
+    const other = { id: "22222222-2222-4222-8222-222222222222", label: "CRM integrations" };
+    const { write } = buildStructure(input({ forms: [...tableDominant(), f("gemini", "comparison_table", 30, "live", other)], pages: [prose] }));
+    expect(write.findings.filter((x) => x.id.startsWith("structure-gap-")).map((x) => x.id).sort()).toEqual([
+      "structure-gap-11111111-1111-4111-8111-111111111111",
+      "structure-gap-22222222-2222-4222-8222-222222222222",
+    ]);
+  });
+
+  it("pages not assessed (undefined, null or an empty list) never fabricate a gap", () => {
+    for (const pages of [undefined, null, []] as const) {
+      const { write, detail } = buildStructure(input({ forms: tableDominant(), ...(pages === undefined ? {} : { pages }) }));
+      expect(write.findings.some((x) => x.id.startsWith("structure-gap-"))).toBe(false);
+      expect(detail!.template).toBeNull();
+      expect(detail!.rationale).toMatch(/No page crawl/u);
+    }
+  });
+});
+
+describe("STORY-060 · a document model becomes an assessed page", () => {
+  it("sums tables and each list kind over every block, and keeps the URL", () => {
+    const block = (tables: number, ordered: number, unordered: number, definition: number) => ({ tables, lists: { ordered, unordered, definition } });
+    expect(structurePageFrom({ url: "https://acme.com/p", blocks: [block(1, 0, 2, 0), block(0, 3, 0, 1), block(2, 0, 0, 0)] })).toEqual({
+      url: "https://acme.com/p",
+      tables: 3,
+      lists: { ordered: 3, unordered: 2, definition: 1 },
+    });
+  });
+
+  it("a page with no blocks is an assessed page with nothing on it (zeros, not null)", () => {
+    expect(structurePageFrom({ url: "https://acme.com/", blocks: [] })).toEqual({ url: "https://acme.com/", tables: 0, lists: { ordered: 0, unordered: 0, definition: 0 } });
   });
 });
