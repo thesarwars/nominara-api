@@ -224,9 +224,10 @@ describe("STORY-043 · discover", () => {
     expect(result.duration_ms).toBeGreaterThan(0);
   });
 
-  // Not built, and empty rather than faked — an invented competitor list with
-  // no basis is exactly what §4.5 forbids.
-  it("proposes no competitors or prompts — both are downstream stories", async () => {
+  // A page with no comparison link yields no competitor rather than an invented one — an unexplained list is exactly what
+  // §4.5 forbids. (Competitors from a page that HAS such links: discover-signals.test.ts.) `discover` itself persists no prompts;
+  // the handler's commit phase generates the allowance (free-prompts.ts).
+  it("proposes no competitors when the page names none, and generates no prompts itself", async () => {
     const result = await discover(BASE, depsServing(PAGE));
     expect(result.competitors_proposed).toEqual([]);
     expect(result.prompts_generated).toEqual([]);

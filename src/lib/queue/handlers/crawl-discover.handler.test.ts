@@ -1,9 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { Logger } from "@nestjs/common";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { createCrawlDiscoverHandler } from "./crawl-discover.handler.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { DiscoverDeps } from "../../discovery/discover.js";
+import { phasesOf } from "../worker-factory.js";
+import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
+
+vi.mock("../../telemetry/metrics.js", () => ({ observeValue: vi.fn(), incrementCounter: vi.fn() }));
 
 // STORY-043 scenario 2 — "read the project before discovery finishes:
 // usable, initialising, discovery running."
@@ -207,5 +212,151 @@ describe("STORY-043 · crawl.discover handler", () => {
     const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
     const payload = JSON.parse(write.params[1] as string) as { fields: Record<string, { value: unknown }> };
     expect(payload.fields.brand_name?.value).toBe("HubSpot");
+  });
+});
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// ADR-0003 / NFR-ARCH-04 — no transaction across the fetch. AC8, AC11, AC12 (first half), AC15.
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+const COMPARISON_PAGE = `<html><head><title>HubSpot | CRM</title></head><body>
+  <a href="/compare/hubspot-vs-salesforce">HubSpot vs Salesforce</a></body></html>`;
+
+/** A transaction stub rich enough for the commit phase's prompt generation: a real project row, no prior prompts. */
+function richTx(calls: { sql: string; params: unknown[] }[], opts: { existingDiscoveryPrompts?: unknown[] } = {}) {
+  return {
+    query: vi.fn(async (sql: string, params: unknown[] = []) => {
+      calls.push({ sql, params });
+      if (sql.includes("SELECT root_domain")) return { rows: [{ root_domain: "hubspot.com", discovery: {} }] };
+      if (sql.includes("FROM projects") && sql.includes("FOR NO KEY UPDATE")) {
+        return { rows: [{ name: "HubSpot", category_slug: "crm", verticals: ["saas"], locale: null }] };
+      }
+      if (sql.includes("generator_meta->>'origin'")) return { rows: opts.existingDiscoveryPrompts ?? [] };
+      return { rows: [] };
+    }),
+  } as unknown as ClientBase;
+}
+
+describe("STORY-043 · crawl.discover is a phased job (ADR-0003)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("is registered as a PHASED processor, so the production worker splits the transaction", () => {
+    expect(phasesOf(createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE)))).toBeDefined();
+  });
+
+  it("AC8 / KAD-06 — the fetch happens with NO transaction: prepare's client is untouched from the moment the fetch begins", async () => {
+    const prepareCalls: { sql: string; params: unknown[] }[] = [];
+    const commitCalls: { sql: string; params: unknown[] }[] = [];
+    const events: string[] = [];
+    const prepareTx = richTx(prepareCalls);
+    const inner = prepareTx.query as unknown as (sql: string, params?: unknown[]) => Promise<unknown>;
+    (prepareTx as unknown as { query: unknown }).query = async (sql: string, params?: unknown[]) => {
+      events.push("tx1");
+      return inner(sql, params);
+    };
+    const deps: DiscoverDeps = {
+      fetch: vi.fn(async () => {
+        events.push("fetch");
+        return { status: 200, headers: {}, body: Buffer.from(PAGE), finalUrl: "https://hubspot.com/" };
+      }),
+      now: () => Date.now(),
+    };
+    const phases = phasesOf(createCrawlDiscoverHandler(CONTEXT, deps))!;
+    const job = jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] });
+
+    const prepared = await phases.prepare(prepareTx, job);
+    const fetched = await phases.run(prepared as never, job);
+    await phases.commit(richTx(commitCalls), prepared as never, fetched, job);
+
+    expect(events.indexOf("fetch")).toBeGreaterThan(events.lastIndexOf("tx1"));
+    expect(prepareCalls.some((c) => c.sql.includes("discovery_status = 'running'"))).toBe(true);
+    expect(commitCalls.some((c) => c.sql.includes("SET discovery = $2"))).toBe(true);
+    // Nothing written by the commit phase marks the project running a second time, and the fetch phase wrote nothing.
+    expect(commitCalls.some((c) => c.sql.includes("discovery_status = 'running'"))).toBe(false);
+  });
+});
+
+describe("STORY-043 · crawl.discover writes competitors and the free allowance into the review payload", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("AC11 — competitors_proposed from the site's own comparison link reach the payload with a basis", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(COMPARISON_PAGE));
+    await handler(richTx(calls), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as { competitors_proposed: { name: string; basis: string }[] };
+    expect(payload.competitors_proposed).toEqual([expect.objectContaining({ name: "Salesforce", basis: "own comparison page" })]);
+  });
+
+  it("AC12 — the free allowance is generated (10 inserts, archived) and reported; the payload says 0 credits and 0 remaining", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+    await handler(richTx(calls), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    expect(calls.filter((c) => c.sql.includes("INSERT INTO tracked_prompts"))).toHaveLength(10);
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as {
+      prompts_generated: { generation_source: string }[];
+      prompts_free_remaining: number;
+      credits_charged: number;
+    };
+    expect(payload.prompts_generated).toHaveLength(10);
+    expect(payload.prompts_generated.every((p) => p.generation_source === "discovery")).toBe(true);
+    expect(payload.prompts_free_remaining).toBe(0);
+    expect(payload.credits_charged).toBe(0);
+    // Nothing in this job touches the wallet.
+    expect(calls.some((c) => /credit|wallet|ledger/i.test(c.sql))).toBe(false);
+  });
+
+  it("AC12 — prompts the caller supplied at creation: supplied wins, so none are generated and the allowance is untouched", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+    await handler(richTx(calls), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: ["prompts"] }));
+
+    expect(calls.some((c) => c.sql.includes("INSERT INTO tracked_prompts"))).toBe(false);
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as { prompts_generated: unknown[]; prompts_free_remaining: number };
+    expect(payload.prompts_generated).toEqual([]);
+    expect(payload.prompts_free_remaining).toBe(10);
+  });
+
+  it("scenario 13 — an unreachable site still gets its allowance and a partial payload (the project stays usable)", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const deps: DiscoverDeps = { fetch: vi.fn(async () => { throw new Error("down"); }), now: () => Date.now() };
+    await createCrawlDiscoverHandler(CONTEXT, deps)(richTx(calls), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    expect(write.params[2]).toBe("partial");
+  });
+});
+
+describe("STORY-043 · crawl.discover observability", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("AC15 — records the duration as nominara_discovery_duration_ms, labelled by status, and counts the outcome", async () => {
+    const observe = vi.mocked(observeValue);
+    const count = vi.mocked(incrementCounter);
+    observe.mockClear();
+    count.mockClear();
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+
+    await handler(richTx([]), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    expect(observe).toHaveBeenCalledWith("nominara_discovery_duration_ms", expect.any(Number), { status: "completed" });
+    expect(count).toHaveBeenCalledWith("nominara_discovery_completed_total", { status: "completed" });
+  });
+
+  it("logs the workspace ID and never the brand name, a competitor or prompt text", async () => {
+    const lines: string[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(String(m)));
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(COMPARISON_PAGE));
+
+    await handler(richTx([]), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    const summary = lines.find((l) => l.includes(PROJECT))!;
+    expect(summary).toContain(WORKSPACE);
+    for (const leak of ["HubSpot", "Salesforce"]) expect(summary).not.toContain(leak);
   });
 });

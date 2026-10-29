@@ -1,7 +1,14 @@
-import { LOW_CONFIDENCE_THRESHOLD, type DiscoveredField, type DiscoveryResponse } from "../../../contracts/projects/index.js";
+import {
+  LOW_CONFIDENCE_THRESHOLD,
+  type DiscoveredField,
+  type DiscoveryResponse,
+  type ProposedCompetitor,
+} from "../../../contracts/projects/index.js";
 import { guardedFetch } from "../net/guarded-fetch.js";
 import { CONFIDENCE, extractFromHtml } from "./extract.js";
 import { proposeNegativeAliases } from "./common-words.js";
+import { proposeCompetitors } from "./competitors.js";
+import { extractHtmlSignals } from "./html-signals.js";
 
 // STORY-043 — the discovery pass. api-specification.md §4.5.
 //
@@ -36,11 +43,53 @@ export interface DiscoverInput {
   readonly rootDomain: string;
   /** Optional keys the caller supplied at creation — these are skipped entirely. */
   readonly fieldsSupplied: readonly string[];
+  /** Names the project already goes by (its stored name and aliases), so "Acme vs X" is read correctly when the caller supplied the name. */
+  readonly knownBrandNames?: readonly string[];
 }
 
 export interface DiscoverDeps {
   readonly fetch: typeof guardedFetch;
   readonly now: () => number;
+}
+
+/** product-spec.md FR-ONB-02a / edge-cases-and-slos.md row 33 — "p50 <= 20 s, p95 <= 45 s". */
+export const DISCOVERY_LATENCY_OBJECTIVE = { p50Ms: 20_000, p95Ms: 45_000 } as const;
+
+/** A pass that outlives the upper-percentile objective is cut off and finishes as a partial project. */
+export const DISCOVERY_BUDGET_MS = DISCOVERY_LATENCY_OBJECTIVE.p95Ms;
+
+/**
+ * The value at zero-based index ceil(p * n), clamped: deliberately the CONSERVATIVE percentile, so one slow pass in twenty is the p95
+ * rather than being averaged away (nearest-rank would call 1-in-20 "the 19th value" and hide it).
+ */
+function conservativePercentile(sorted: readonly number[], p: number): number {
+  return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length))]!;
+}
+
+/**
+ * Whether measured durations meet the objective at the median AND the upper percentile, each judged on its own (<=).
+ * `null` when nothing was measured: no data is not "met", and it is not "missed" either.
+ */
+export function meetsLatencyObjective(durationsMs: readonly number[]): boolean | null {
+  if (durationsMs.length === 0) return null;
+  const sorted = [...durationsMs].sort((a, b) => a - b);
+  return (
+    conservativePercentile(sorted, 0.5) <= DISCOVERY_LATENCY_OBJECTIVE.p50Ms &&
+    conservativePercentile(sorted, 0.95) <= DISCOVERY_LATENCY_OBJECTIVE.p95Ms
+  );
+}
+
+/** Rejects after `ms`, clearing its timer when the race is settled either way. */
+async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("discovery: budget exceeded")), ms);
+  });
+  try {
+    return await Promise.race([work, budget]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export const DEFAULT_DISCOVER_DEPS: DiscoverDeps = { fetch: guardedFetch, now: () => Date.now() };
@@ -60,10 +109,11 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
   const skip = new Set(input.fieldsSupplied.map((key) => FIELD_FOR_SUPPLIED[key] ?? key));
 
   const fields: Record<string, DiscoveredField> = {};
+  let competitors: ProposedCompetitor[] = [];
   let reachedSite = true;
 
   try {
-    const response = await deps.fetch(input.rootUrl);
+    const response = await withinBudget(deps.fetch(input.rootUrl), DISCOVERY_BUDGET_MS);
     if (response.status >= 400) {
       // Reached, and refused us. Whatever we can derive without the document
       // still stands, so this is not a clean completion.
@@ -71,11 +121,50 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
     } else {
       const html = response.body.toString("utf8");
       const extracted = extractFromHtml(html);
+      const signals = extractHtmlSignals(html);
 
-      if (!skip.has("brand_name") && extracted.brandName) put(fields, "brand_name", extracted.brandName);
-      if (!skip.has("description") && extracted.description) put(fields, "description", extracted.description);
-      if (!skip.has("products") && extracted.products) put(fields, "products", extracted.products);
+      // The name, with the logo's alt text as a second reading: agreement lifts a title-derived name over the line, disagreement
+      // changes nothing (the stronger source stands), and a logo alone is a low-confidence guess.
+      let brandName = extracted.brandName;
+      if (signals.logoAlt !== undefined) {
+        if (brandName === undefined) {
+          brandName = { value: signals.logoAlt, confidence: CONFIDENCE.logoAlt, source: "logo alt text" };
+        } else if (sameName(brandName.value, signals.logoAlt) && brandName.confidence < CONFIDENCE.corroborated) {
+          brandName = { value: brandName.value, confidence: CONFIDENCE.corroborated, source: `${brandName.source} + logo alt text` };
+        }
+      }
+      if (!skip.has("brand_name") && brandName) put(fields, "brand_name", brandName);
+
+      // Hero copy only stands in where the page declared no description.
+      let description = extracted.description;
+      if (description === undefined && signals.heroCopy !== undefined) {
+        const { headline, lede } = signals.heroCopy;
+        const lead = /[.!?]$/.test(headline) ? headline : `${headline}.`;
+        description = { value: lede === undefined ? headline : `${lead} ${lede}`, confidence: CONFIDENCE.heroCopy, source: "hero copy" };
+      }
+      if (!skip.has("description") && description) put(fields, "description", description);
+
+      // Nav labels only where there is no Product schema.
+      const products =
+        extracted.products ??
+        (signals.navProducts === undefined
+          ? undefined
+          : { value: signals.navProducts, confidence: CONFIDENCE.navStructure, source: "nav structure" });
+      if (!skip.has("products") && products) put(fields, "products", products);
       if (!skip.has("locale") && extracted.locale) put(fields, "locale", extracted.locale);
+
+      // AC11 — read against every name the brand is known by, supplied or discovered, so a supplied name does not blind it.
+      if (!skip.has("competitors")) {
+        competitors = proposeCompetitors({
+          brandNames: [
+            ...(input.knownBrandNames ?? []),
+            ...(extracted.brandName ? [extracted.brandName.value] : []),
+            ...(signals.logoAlt ? [signals.logoAlt] : []),
+            ...(domainStem(input.rootDomain) ? [domainStem(input.rootDomain)!] : []),
+          ],
+          links: signals.comparisonLinks,
+        });
+      }
     }
   } catch {
     // Timeout, size cap, connection failure, or a guard refusal — the URL
@@ -125,15 +214,9 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
     discovery_status: status,
     duration_ms: deps.now() - startedAt,
     fields,
-    // NOT built, and deliberately empty rather than faked:
-    //   competitors — needs the site's own comparison pages, i.e. multi-page
-    //     selection, which is STORY-049.
-    //   prompts — the free allowance comes from the archetype grammar, which
-    //     is STORY-045 and is explicitly downstream of this story.
-    // An invented competitor list is worse than none: §4.5 requires a BASIS
-    // per competitor precisely because an unexplained list is not something a
-    // customer can judge.
-    competitors_proposed: [],
+    // Only as far as the root document shows (competitors.ts says why). Empty, never invented, when the page names none.
+    competitors_proposed: competitors,
+    // Generated and persisted by the handler's commit phase (free-prompts.ts) — this pass is pure and writes nothing.
     prompts_generated: [],
     prompts_free_remaining: FREE_PROMPT_ALLOWANCE,
     // AC12 — discovery charges nothing. A literal, so a future edit that
@@ -150,6 +233,11 @@ export const FREE_PROMPT_ALLOWANCE = 10;
 
 function put(fields: Record<string, DiscoveredField>, name: string, field: { value: unknown; confidence: number; source: string }): void {
   fields[name] = { value: field.value, confidence: field.confidence, source: field.source, user_edited: false };
+}
+
+function sameName(a: string, b: string): boolean {
+  const n = (x: string): string => x.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  return n(a) !== "" && n(a) === n(b);
 }
 
 /** `hubspot.com` -> `HubSpot`-ish. The registrable domain's first label, capitalised. */
