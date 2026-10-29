@@ -195,6 +195,23 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
              WHERE t.id = v.id AND t.embedding IS NULL AND t.embedding_model = $3 AND t.workspace_id = app.current_workspace()
             RETURNING t.id`,
   },
+  semantic_nodes: {
+    // STORY-059 (owner decision 2026-10-28 #4): a node's phrase is embedded here, and the model is written WITH the vector, so a
+    // node is never half-stamped. A node with a vector under another model is re-embedded (EC-23: one model per comparison), and
+    // the table has no content hash, so there is no L7 copy: a phrase is a handful of tokens.
+    pending: `SELECT id, phrase AS text, NULL::text AS hash, false AS is_draft
+                FROM semantic_nodes
+               WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND $2::text IS NOT NULL
+                 AND (embedding IS NULL OR embedding_model IS DISTINCT FROM $2)
+               ORDER BY id`,
+    reuse: undefined,
+    write: `UPDATE semantic_nodes t
+               SET embedding = v.vec::halfvec(1536), embedding_model = $3
+              FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
+             WHERE t.id = v.id AND t.workspace_id = app.current_workspace()
+               AND (t.embedding IS NULL OR t.embedding_model IS DISTINCT FROM $3)
+            RETURNING t.id`,
+  },
 };
 
 export function createEmbedBatchHandler(context: QueueHandlerContext, deps: EmbedBatchDeps = {}): JobProcessor {

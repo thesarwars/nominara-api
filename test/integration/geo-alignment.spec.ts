@@ -38,7 +38,6 @@ const KEYS = { current: { kid: "k1", key: Buffer.from("embed-batch-test-signing-
 const EMBED_ENTRY = QUEUE_TOPOLOGY.find((entry) => entry.name === "embed.batch")!;
 const MODEL = STAND_IN_EMBEDDING_MODEL;
 const words = { count: (text: string): number => (text.trim() === "" ? 0 : text.trim().split(/\s+/).length) };
-const TOL = 3e-3;
 
 // ---- independent vector arithmetic (test side only) ----------------------------------------------------------------------
 const DIM = 1536;
@@ -288,6 +287,21 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((row.target_band_low as number) <= (row.target_band_high as number)).toBe(true);
   }, 60_000);
 
+  it("scenario 2 - AC4 - a page identical to a cited document TIES with it: the percentile counts documents at or below the page", async () => {
+    await seedCorpus();
+    const session = await addSession();
+    const twin = DOC_VECTORS[2]!;
+    await addChunk(session, 0, twin, 200);
+    await inTx(async (tx) => {
+      await computeCentroid(tx, session);
+      await computeAlignment(tx, session);
+    });
+    const c = expectedCentroid();
+    const page = cos(twin, c);
+    const atOrBelow = DOC_VECTORS.map((v) => cos(v, c)).filter((d) => d <= page + 1e-6).length;
+    expect((await sessionRow(session)).percentile_vs_corpus).toBe(Math.round((100 * atOrBelow) / DOC_VECTORS.length));
+  }, 60_000);
+
   it("scenario 2 - AC4 - a document's alignment is its passages' token-weighted mean, not one vote per passage", async () => {
     // one document with a long on-centroid passage and a short far one, against one plain document: weighting decides the band.
     await addPassage(0, { embedding: vec({ 0: 1 }), tokens: 900, url: "https://same.example/p", text: "long passage" });
@@ -345,7 +359,8 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
   // ---- scenarios 3, 4: semantic node extraction --------------------------------------------------------------------------
 
   async function seedTexts(texts: readonly string[]): Promise<void> {
-    for (const [i, text] of texts.entries()) await addPassage(i, { text, embedding: null });
+    // each text gets its own marker: the key is (cluster, text), so two documents with identical text are ONE passage
+    for (const [i, text] of texts.entries()) await addPassage(i, { text: `${text} Marker${String(i)}x.`, embedding: null });
   }
   const corpusTexts = (n: number, base: (i: number) => string): string[] => Array.from({ length: n }, (_, i) => base(i));
 
@@ -559,7 +574,8 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await addNode("one two three four five", { embedding: phrase });
     await inTx((tx) => analyseNodes(tx, session, words));
     const capped = expectedGain(chunk, c, phrase, 5, 10);
-    const uncapped = cos(unit(add(chunk, phrase, 1 - (5 / 15) * 3.5 < 0 ? 0 : 1 - (5 / 15) * 3.5, (5 / 15) * 3.5)), c) - cos(chunk, c);
+    const uncappedAlpha = (5 / 15) * 3.5; // 1.17: past 1, which is exactly why the cap exists
+    const uncapped = cos(unit(add(chunk, phrase, Math.max(0, 1 - uncappedAlpha), uncappedAlpha)), c) - cos(chunk, c);
     const got = (await nodeByPhrase("one two three four five")).projected_gain as number;
     expect(got).toBeCloseTo(capped, 2);
     expect(Math.abs(got - uncapped)).toBeGreaterThan(0.01);
@@ -604,13 +620,14 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
   // ---- priority and the projection ---------------------------------------------------------------------------------------
 
   it("AC13 - priority_rank orders by projected_gain x corpus_doc_ratio x multiplier, and compliance/metric carry 1.15", async () => {
-    const c = unit(vec({ 0: 1, 1: 1 }));
+    // e1, e2, e3 are each at the same angle to the chunk (e0) and the centroid, so the gain is identical for all three and ONLY the
+    // ratio and the multiplier decide. They are mutually orthogonal, so none collapses into another.
+    const c = unit(vec({ 0: 1, 1: 1, 2: 1, 3: 1 }));
     const session = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
     await addChunk(session, 0, vec({ 0: 1 }), 100);
-    // identical vectors and token counts, so the gain is identical and ONLY ratio and multiplier decide.
     await addNode("plain concept one", { type: "capability", ratio: 0.52, embedding: vec({ 1: 1 }) });
-    await addNode("soc 2 report", { type: "compliance", ratio: 0.47, embedding: vec({ 1: 1 }) }); // 0.47 x 1.15 = 0.5405 > 0.52
-    await addNode("plain concept two", { type: "capability", ratio: 0.3, embedding: vec({ 1: 1 }) });
+    await addNode("soc 2 report", { type: "compliance", ratio: 0.47, embedding: vec({ 2: 1 }) }); // 0.47 x 1.15 = 0.5405 > 0.52
+    await addNode("plain concept two", { type: "capability", ratio: 0.3, embedding: vec({ 3: 1 }) });
     await inTx((tx) => analyseNodes(tx, session, words));
     const ranks = Object.fromEntries((await nodeRows()).map((n) => [n.phrase_normalized as string, n.priority_rank]));
     expect(ranks).toEqual({ "soc 2 report": 1, "plain concept one": 2, "plain concept two": 3 });
@@ -623,7 +640,10 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await addNode("first concept here", { ratio: 0.9, embedding: vec({ 1: 1 }) });
     await addNode("second concept here", { ratio: 0.8, embedding: vec({ 2: 1 }) });
     await addNode("third concept here", { ratio: 0.7, embedding: vec({ 1: 1, 2: 1 }) });
-    await inTx((tx) => analyseNodes(tx, session, words));
+    await inTx(async (tx) => {
+      await computeAlignment(tx, session);
+      await analyseNodes(tx, session, words);
+    });
     const payload = await inTx((tx) => readSessionPayload(tx, session));
     const recs = payload.recommendations.filter((r) => r.projected_gain !== null).sort((a, b) => a.priority_rank! - b.priority_rank!);
     expect(recs).toHaveLength(3);
@@ -633,7 +653,9 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(payload.projection!.diminished_sum).toBeCloseTo(gains[0]! + 0.85 * gains[1]! + 0.85 ** 2 * gains[2]!, 6);
     expect(payload.projection!.diminished_sum).toBeLessThan(naive);
     expect(payload.projection!.diminishing_returns_factor).toBe(0.85);
-    expect(payload.projection!.projected_alignment).toBeLessThanOrEqual(1);
+    const current = payload.current_alignment!;
+    expect(payload.projection!.projected_alignment).toBeCloseTo(Math.min(1, current + payload.projection!.diminished_sum), 6);
+    expect(payload.projection!.projected_alignment!).toBeLessThanOrEqual(1);
   }, 60_000);
 
   it("scenario 9 - the projected alignment never exceeds 1, and is NULL when the page has no alignment", async () => {

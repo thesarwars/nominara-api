@@ -13,7 +13,7 @@ export const EMBED_PROVIDER_BATCH_SIZE = 96;
 export const EMBED_JOB_MAX_IDS = EMBED_PROVIDER_BATCH_SIZE * 10;
 
 /** The tables `embed.batch` writes a vector to. Anything else is refused at the payload. */
-export const EMBED_TABLES = ["tracked_prompts", "content_chunks", "corpus_passages"] as const;
+export const EMBED_TABLES = ["tracked_prompts", "content_chunks", "corpus_passages", "semantic_nodes"] as const;
 export type EmbedTable = (typeof EMBED_TABLES)[number];
 
 export const embedBatchPayloadSchema = z

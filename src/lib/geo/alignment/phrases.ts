@@ -27,9 +27,9 @@ export function normalisePhrase(text: string): string {
   return text
     .normalize("NFKC")
     .toLowerCase()
-    .replace(/(?<=\d)\.(?=\d)/g, "\u0001")
-    .replace(/[^\p{L}\p{N}%\u0001]+/gu, " ")
-    .replace(/\u0001/g, ".")
+    .replace(/(?<=\d)\.(?=\d)/g, "\uE000")
+    .replace(/[^\p{L}\p{N}%\uE000]+/gu, " ")
+    .replace(/\uE000/g, ".")
     .trim();
 }
 
