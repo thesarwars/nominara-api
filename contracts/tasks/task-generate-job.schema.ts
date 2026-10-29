@@ -17,6 +17,7 @@ export const TASK_TRIGGER_KINDS = [
   "source_gap",
   "prompt_stability",
   "pending_analysis",
+  "geo_finding",
 ] as const;
 
 export const taskGenerateJobPayloadSchema = z

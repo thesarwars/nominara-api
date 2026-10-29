@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { geoSlugSchema } from "../analytics/geo-insights.schema.js";
 
 // STORY-063 — the shapes behind the three jsonb columns the task generation engine owns.
 //
@@ -114,6 +115,19 @@ export const pendingAnalysisConditionSchema = z
   })
   .strict();
 
+/**
+ * A finding the latest persisted GEO analysis (`geo_analyses`) carries: `analysis`, a finding whose id starts with
+ * `finding_id_prefix` and whose `task_rule_code` is the rule's own code. The evaluator reads the latest SUFFICIENT row per window
+ * and generates one task per finding id, stamped with `tasks.source_geo_analysis` so the digest's lever resolves it.
+ */
+export const geoFindingConditionSchema = z
+  .object({
+    kind: z.literal("geo_finding"),
+    analysis: geoSlugSchema,
+    finding_id_prefix: z.string().min(1),
+  })
+  .strict();
+
 export const taskGenerationConditionSchema = z.discriminatedUnion("kind", [
   metricWindowConditionSchema,
   competitorOvertakeConditionSchema,
@@ -122,6 +136,7 @@ export const taskGenerationConditionSchema = z.discriminatedUnion("kind", [
   sourceGapConditionSchema,
   promptStabilityConditionSchema,
   pendingAnalysisConditionSchema,
+  geoFindingConditionSchema,
 ]);
 export type TaskGenerationCondition = z.infer<typeof taskGenerationConditionSchema>;
 export type MetricWindowCondition = z.infer<typeof metricWindowConditionSchema>;

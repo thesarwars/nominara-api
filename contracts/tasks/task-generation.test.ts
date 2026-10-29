@@ -37,6 +37,14 @@ describe("STORY-063 · task generation condition grammar", () => {
     expect(taskGenerationConditionSchema.safeParse({ kind: "pending_analysis", analysis: "negative_cell_rate" }).success).toBe(true);
   });
 
+  it("[STORY-060 AC6/S3] geo_finding names an analysis and a finding-id prefix, and nothing else", () => {
+    const ok = { kind: "geo_finding", analysis: "entity", finding_id_prefix: "entity-alias-tuning" };
+    expect(taskGenerationConditionSchema.safeParse(ok).success).toBe(true);
+    expect(taskGenerationConditionSchema.safeParse({ ...ok, analysis: "nope" }).success).toBe(false);
+    expect(taskGenerationConditionSchema.safeParse({ ...ok, finding_id_prefix: "" }).success).toBe(false);
+    expect(taskGenerationConditionSchema.safeParse({ ...ok, sql: "select 1" }).success).toBe(false);
+  });
+
   it("baseline metrics keep null distinct from 0", () => {
     const base = { captured_at: "2026-10-19T00:00:00.000Z", metric_date: "2026-10-19", window_days: 7, engine_key: "all", cells_total: 0, sov: null, presence_rate: null, visibility_score: null, owned_citation_count: null };
     expect(taskBaselineMetricsSchema.parse(base).sov).toBeNull();
