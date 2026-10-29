@@ -43,6 +43,7 @@ export const topicClusters = pgTable("topic_clusters", {
   computedAt: timestamp("computed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  embeddingModel: text("embedding_model"),
 });
 
 export const trackedPrompts = pgTable("tracked_prompts", {
