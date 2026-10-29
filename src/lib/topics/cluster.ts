@@ -28,7 +28,7 @@ export const CLUSTERABLE_BASE_SQL = clusterableBaseSql("p");
  * commercial_intent) changes the hash and the commit-phase stale check sees it.
  */
 export function promptSetMemberSql(alias: string): string {
-  return `${alias}.id::text || ':' || coalesce(${alias}.funnel_stage, '')`;
+  return `concat_ws(':', ${alias}.id::text, coalesce(${alias}.funnel_stage, ''))`;
 }
 
 /** sha256 over the model and the sorted members (id + funnel stage) of the clusterable set. `$model` and the id list are SQL fragments the caller supplies. */
