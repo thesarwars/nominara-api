@@ -52,11 +52,11 @@ export const ENTITY_THIN_PRESENCE = 0.6;
 export const DISAMBIGUATION_MEDIUM_FROM = 0.05;
 export const DISAMBIGUATION_HIGH_ABOVE = 0.2;
 /**
- * BUILDER READING, not in the reference: the fewest brand-name matches a risk ratio is computed over (the same 30 the
+ * Owner decision 16 (2026-10-29): the fewest brand-name matches a risk ratio is computed over (the same 30 the
  * other analyses and the §15 alert floor use). Below it the risk is "unmeasured", never low.
  */
 export const ENTITY_MIN_NAME_MATCHES = 30;
-/** BUILDER READING: A1's "8 cited passages" is the only passage minimum the reference states; co-occurrence reuses it. */
+/** Owner decision 16 (2026-10-29): A1's "8 cited passages" is the only passage minimum the reference states; co-occurrence reuses it. */
 export const ENTITY_MIN_CATEGORY_PASSAGES = 8;
 
 export const ENTITY_NODE_TASK_RULE = "TG-ENTITY-NODE";
@@ -89,7 +89,7 @@ export interface EntityInput {
   nodes: EntityNodeRecord[];
   /** Brand-name matches in the window (mention rows). */
   nameMatches: number;
-  /** Of those, the matches whose answer text could not be read: reported, never judged, and outside the risk denominator. */
+  /** Of those, the matches that could not be judged (answer text unreadable, or no case signal for the brand): reported, never judged, and outside the risk denominator. */
   unjudged: number;
   /** Of the judged matches (`nameMatches - unjudged`), those judged not to be about this brand. */
   notAboutBrand: number;
@@ -193,7 +193,7 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
   // Unmeasured risk withholds too: a score we cannot show is free of false positives is not a score we can trust.
   const unmeasuredRisk = level === "unmeasured";
   const suppressed = highRisk || unmeasuredRisk;
-  const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(judged)} readable brand-name matches of the ${String(ENTITY_MIN_NAME_MATCHES)} it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
+  const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(judged)} judged brand-name matches of the ${String(ENTITY_MIN_NAME_MATCHES)} it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
   const reason = highRisk
     ? `Disambiguation risk is high (${pct(riskRaw!)} of ${String(judged)} judged name matches are not about this brand), so the Entity Authority score would be computed over false positives and is withheld. Tune the brand's aliases first.${allChecked ? "" : ` ${notCheckedReason}`}`
     : unmeasuredRisk
@@ -328,7 +328,7 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
               ? "Disambiguation risk is not yet measurable; the Entity Authority score waits for enough brand-name matches."
               : `Disambiguation risk is ${level}; the Entity Authority score waits for the authoritative profiles to be checked.`,
             detail: unmeasuredRisk ? unmeasuredReason : notCheckedReason,
-            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(judged)} readable brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
+            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(judged)} judged brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
             metric: unmeasuredRisk ? { name: "name_matches", value: judged, target: ENTITY_MIN_NAME_MATCHES } : { name: "unchecked_nodes", value: unchecked.length },
             no_action: true,
           },
@@ -412,20 +412,25 @@ export async function writeEntityNodes(tx: ClientBase, projectId: string, checks
 // ------------------------------------------------------ name-match judging
 
 /**
- * BUILDER READING (v1): the reference defines the risk as the share of name matches "NOT about this brand" without
- * saying how a match is judged. The only signal the stored facts carry for free is case: the parser folds case when it
- * matches, so a lowercase span of a capitalised name ("notion" for "Notion") is the common word, not the brand. An
- * alias with no uppercase letter carries no such signal and is never guessed to be a false positive. A model-assisted
- * judge would sit behind this same signature, run outside the transaction, and is not built.
+ * v1 case heuristic, kept by owner decision 17 (2026-10-29). The reference defines the risk as the share of name matches
+ * "NOT about this brand" without saying how a match is judged. The only signal the stored facts carry for free is case: the
+ * parser folds case when it matches, so a lowercase span of a capitalised name ("notion" for "Notion") is the common word,
+ * not the brand. A brand whose cased spelling has no uppercase letter carries no such signal, so its matches are
+ * "unjudged" (counted as matches, outside the risk denominator), never guessed to be about the brand; so is a span that is
+ * not the alias once folded (a misread offset). The heuristic undercounts false positives (sentence-initial and
+ * markup-wrapped capitalised uses pass), so risk is biased low.
+ * FOLLOW-UP, not started: a model-assisted judge behind this same signature, run outside the transaction. No job may
+ * publish Entity Authority in production until it lands.
  */
-export function judgeNameMatch(match: { alias: string; span: string; before?: string; after?: string }): "about_brand" | "not_about_brand" {
-  // A span that is not the alias once folded the way the matcher folds is a misread offset, never evidence of a false positive.
-  if (fold(match.span).folded !== fold(match.alias).folded) return "about_brand";
+export function judgeNameMatch(match: { alias: string; span: string; before?: string; after?: string }): "about_brand" | "not_about_brand" | "unjudged" {
+  // A span that is not the alias once folded the way the matcher folds is a misread offset: no evidence either way.
+  if (fold(match.span).folded !== fold(match.alias).folded) return "unjudged";
+  // No uppercase letter in the cased spelling: the case heuristic has no signal ("monday" the brand vs the weekday).
+  if (match.alias === match.alias.toLowerCase()) return "unjudged";
   // A span inside a domain or URL ("notion.so", "https://www.notion.so/x", a markdown link target) is the brand's own address, written lowercase by convention.
   if (insideUrlOrDomain(match.before ?? "", match.after ?? "")) return "about_brand";
-  const aliasIsCased = match.alias !== match.alias.toLowerCase();
   const spanIsLower = match.span !== "" && match.span === match.span.toLowerCase() && match.span !== match.span.toUpperCase();
-  return aliasIsCased && spanIsLower ? "not_about_brand" : "about_brand";
+  return spanIsLower ? "not_about_brand" : "about_brand";
 }
 
 /** True when the span is part of a domain token (a TLD follows it), markdown link text, or a URL (a scheme or `www.` precedes it in the same token). */
@@ -546,10 +551,11 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     const text = c.text === null ? null : normalize(c.text);
     for (const [alias, start, end] of c.mentions) {
       nameMatches += 1;
-      // A span that cannot be read (answer text no longer held) is counted as a match, reported as unjudged, and never as a false positive.
+      // A span that cannot be read (answer text no longer held), or that the case heuristic cannot judge, is counted as a match, reported as unjudged, and never as a false positive.
       const ctx = text === null ? null : contextOfNormalised(text, start, end);
-      if (ctx === null) unjudged += 1;
-      else if (judgeNameMatch({ alias: cased.get(fold(alias).folded) ?? alias, ...ctx }) === "not_about_brand") notAboutBrand += 1;
+      const verdict = ctx === null ? "unjudged" : judgeNameMatch({ alias: cased.get(fold(alias).folded) ?? alias, ...ctx });
+      if (verdict === "unjudged") unjudged += 1;
+      else if (verdict === "not_about_brand") notAboutBrand += 1;
     }
   }
 

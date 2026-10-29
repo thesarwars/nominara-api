@@ -102,6 +102,18 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
     expect(a.actions.some((x) => /aliases/iu.test(x.label))).toBe(true);
   });
 
+  it("hazard · a lowercase-only brand ('monday', no aliases) with 100 weekday matches is UNMEASURED and its score is withheld, never low risk", async () => {
+    await db.query("UPDATE projects SET name = 'monday', brand_aliases = '{}' WHERE id = $1", [projectId]);
+    await inTx((tx) => writeEntityNodes(tx, projectId, ALL_PRESENT, SAMEAS));
+    await matchesIn(100, "See you on monday for the review.", "monday");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ level: "unmeasured", risk: null, name_matches: 100, unjudged: 100, not_about_brand: 0 });
+    expect(detail.authority).toMatchObject({ score: null, suppressed: true });
+    expect((await row()).score).toBeNull();
+    expect((await row()).suppression_reason).toMatch(/cannot be measured/iu);
+  });
+
   it("hazard · raw CRLF, a triple blank line, a zero-width and an astral character before a capitalised mention do not shift its span into a false positive", async () => {
     const raw = "\u{1F680} Launch week\r\n\n\n\u200B\u{1F680}\u{1F680} We like Notion a lot.";
     await matchesIn(30, raw, "Notion");

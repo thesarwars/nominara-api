@@ -141,6 +141,13 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
     expect(disambiguationLevel(1)).toBe("high");
   });
 
+  it("100 matches all unjudged (a lowercase-only brand) is UNMEASURED, the score is withheld, and entity-ready is not emitted", () => {
+    const { write, detail } = buildEntity(input({ nameMatches: 100, unjudged: 100, notAboutBrand: 0 }));
+    expect(detail!.disambiguation).toMatchObject({ risk: null, level: "unmeasured", name_matches: 100, unjudged: 100 });
+    expect(write.score).toBeNull();
+    expect(write.findings.some((f) => f.id === "entity-ready")).toBe(false);
+  });
+
   it("fewer than the minimum name matches leaves risk UNMEASURED (null, not 0) and the score is WITHHELD with a stated reason, even when most matches look like false positives", () => {
     const { write, detail } = buildEntity(input({ nameMatches: ENTITY_MIN_NAME_MATCHES - 1, notAboutBrand: 20 }));
     expect(detail!.disambiguation).toMatchObject({ risk: null, level: "unmeasured", minimum_matches: ENTITY_MIN_NAME_MATCHES });
@@ -282,13 +289,20 @@ describe("STORY-060 · entity node records and name-match judging (pure)", () =>
     expect(judgeNameMatch({ alias: "Notion", span: "Notion" })).toBe("about_brand");
     expect(judgeNameMatch({ alias: "Notion", span: "NOTION" })).toBe("about_brand");
     // an alias that is itself lowercase carries no case signal: never guessed to be a false positive
-    expect(judgeNameMatch({ alias: "acme", span: "acme" })).toBe("about_brand");
-    expect(judgeNameMatch({ alias: "Notion", span: "" })).toBe("about_brand");
-    // a span that is not the alias once folded is a misread offset, never a false positive
-    expect(judgeNameMatch({ alias: "Notion", span: "otion " })).toBe("about_brand");
-    expect(judgeNameMatch({ alias: "Notion", span: "ion" })).toBe("about_brand");
+    expect(judgeNameMatch({ alias: "Notion", span: "" })).toBe("unjudged");
+    // a span that is not the alias once folded is a misread offset: unjudged, neither a false positive nor evidence it is the brand
+    expect(judgeNameMatch({ alias: "Notion", span: "otion " })).toBe("unjudged");
+    expect(judgeNameMatch({ alias: "Notion", span: "ion" })).toBe("unjudged");
     // diacritic folding is the matcher's: "Café" matched as "cafe" is still the same name
     expect(judgeNameMatch({ alias: "Café", span: "café" })).toBe("not_about_brand");
+  });
+
+  it("judgeNameMatch: a brand whose cased spelling has no uppercase letter gives the case heuristic no signal, so every match is unjudged (never about_brand)", () => {
+    const mc = (raw: string, span: string) => mentionContext(raw, raw.indexOf(span), raw.indexOf(span) + span.length)!;
+    for (const span of ["monday", "Monday", "MONDAY"]) expect(judgeNameMatch({ alias: "monday", ...mc(`See you on ${span} then.`, span) }), span).toBe("unjudged");
+    expect(judgeNameMatch({ alias: "acme", span: "acme" })).toBe("unjudged");
+    // even a domain-shaped use: the heuristic has no signal for this brand, so it is not counted as judged
+    expect(judgeNameMatch({ alias: "monday", ...mc("Visit monday.com now.", "monday") })).toBe("unjudged");
   });
 
   it("spanOfMention: offsets index the NORMALISED text, so a raw CRLF, triple blank line, zero-width or astral character before the mention cannot shift the span", () => {
