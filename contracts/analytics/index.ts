@@ -9,3 +9,4 @@ export * from "./displacement-event.schema.js";
 export * from "./displacement-response.schema.js";
 export * from "./rendering-quality-response.schema.js";
 export * from "./recovery-plan-response.schema.js";
+export * from "./geo-alignment.schema.js";
