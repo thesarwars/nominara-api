@@ -187,12 +187,17 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
   const sameasCoverage = !allChecked || presentNodes.length === 0 ? null : presentNodes.filter((n) => n.inBrandSameas).length / presentNodes.length;
   const authority = allChecked ? round3(100 * (0.75 * weighted + 0.25 * (sameasCoverage ?? 0))) : null;
 
-  const suppressed = highRisk;
+  // Unmeasured risk withholds too: a score we cannot show is free of false positives is not a score we can trust.
+  const unmeasuredRisk = level === "unmeasured";
+  const suppressed = highRisk || unmeasuredRisk;
+  const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(input.nameMatches)} of the ${String(ENTITY_MIN_NAME_MATCHES)} brand-name matches it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
   const reason = highRisk
     ? `Disambiguation risk is high (${pct(riskRaw!)} of ${String(input.nameMatches)} name matches are not about this brand), so the Entity Authority score would be computed over false positives and is withheld. Tune the brand's aliases first.${allChecked ? "" : ` ${notCheckedReason}`}`
-    : allChecked
-      ? null
-      : notCheckedReason;
+    : unmeasuredRisk
+      ? `${unmeasuredReason}${allChecked ? "" : ` ${notCheckedReason}`}`
+      : allChecked
+        ? null
+        : notCheckedReason;
   const score = suppressed ? null : authority;
 
   const detailNodes = nodes.map((n) => {
@@ -302,7 +307,7 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
   // The detail rides on the first finding, so a row with none would drop it: a brand with nothing to act on gets an explicit no-action verdict.
   if (findings.length === 0) {
     findings.push(
-      allChecked
+      allChecked && !unmeasuredRisk
         ? {
             id: "entity-ready",
             severity: "info",
@@ -315,10 +320,12 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
         : {
             id: "entity-nodes-unchecked",
             severity: "info",
-            headline: `Disambiguation risk is ${level === "unmeasured" ? "not yet measurable" : level}; the Entity Authority score waits for the authoritative profiles to be checked.`,
-            detail: notCheckedReason,
-            evidence: [{ url: home, snippet: `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
-            metric: { name: "unchecked_nodes", value: unchecked.length },
+            headline: unmeasuredRisk
+              ? "Disambiguation risk is not yet measurable; the Entity Authority score waits for enough brand-name matches."
+              : `Disambiguation risk is ${level}; the Entity Authority score waits for the authoritative profiles to be checked.`,
+            detail: unmeasuredRisk ? unmeasuredReason : notCheckedReason,
+            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(input.nameMatches)} brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
+            metric: unmeasuredRisk ? { name: "name_matches", value: input.nameMatches, target: ENTITY_MIN_NAME_MATCHES } : { name: "unchecked_nodes", value: unchecked.length },
             no_action: true,
           },
     );
@@ -417,9 +424,11 @@ export function judgeNameMatch(match: { alias: string; span: string; before?: st
   return aliasIsCased && spanIsLower ? "not_about_brand" : "about_brand";
 }
 
-/** True when the span is part of a domain token (a TLD follows it) or of a URL (a scheme or `www.` precedes it in the same token). */
+/** True when the span is part of a domain token (a TLD follows it), markdown link text, or a URL (a scheme or `www.` precedes it in the same token). */
 export function insideUrlOrDomain(before: string, after: string): boolean {
   if (/^\.[a-z]{2,}(?![a-z])/iu.test(after)) return true;
+  // Markdown link text: `[notion](https://notion.so)` is the brand being linked.
+  if (after.startsWith("](")) return true;
   const token = /\S*$/u.exec(before)?.[0] ?? "";
   return /:\/\/|^www\.|\]\(/iu.test(token);
 }
@@ -489,7 +498,7 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     `SELECT min(ac.payload ->> 'text') AS text,
             json_agg(json_build_array(mf.matched_alias, mf.char_start, mf.char_end)) AS mentions
        FROM mention_facts mf
-       JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at
+       LEFT JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at
       WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $4
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)

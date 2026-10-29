@@ -138,12 +138,18 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
     expect(disambiguationLevel(1)).toBe("high");
   });
 
-  it("fewer than the minimum name matches leaves risk UNMEASURED (null, not 0): the score is published and says so", () => {
+  it("fewer than the minimum name matches leaves risk UNMEASURED (null, not 0) and the score is WITHHELD with a stated reason, even when most matches look like false positives", () => {
     const { write, detail } = buildEntity(input({ nameMatches: ENTITY_MIN_NAME_MATCHES - 1, notAboutBrand: 20 }));
     expect(detail!.disambiguation).toMatchObject({ risk: null, level: "unmeasured", minimum_matches: ENTITY_MIN_NAME_MATCHES });
-    expect(write.score).toBe(66.3);
-    // exactly the minimum IS measured
-    expect(buildEntity(input({ nameMatches: ENTITY_MIN_NAME_MATCHES, notAboutBrand: 0 })).detail!.disambiguation).toMatchObject({ risk: 0, level: "low" });
+    expect(write.score).toBeNull();
+    expect(write.suppression_reason).toMatch(/cannot be measured/u);
+    expect(detail!.authority).toMatchObject({ score: null, suppressed: true });
+    expect(detail!.authority.reason).toMatch(/cannot be measured/u);
+    expect(write.findings.some((f) => f.id === "entity-ready")).toBe(false);
+    // exactly the minimum IS measured, and is published
+    const atMin = buildEntity(input({ nameMatches: ENTITY_MIN_NAME_MATCHES, notAboutBrand: 0 }));
+    expect(atMin.detail!.disambiguation).toMatchObject({ risk: 0, level: "low" });
+    expect(atMin.write.score).toBe(66.3);
   });
 
   it("#6 · a missing high-weight node (weight >= 0.18) raises a finding carrying the TG-ENTITY-NODE rule code (no task is generated here); a missing low-weight node does not", () => {
@@ -328,5 +334,7 @@ describe("STORY-060 hazard · a brand written as its domain or URL is the brand,
     expect(judgeNameMatch({ alias: "Notion", ...ctx("That is a notion. So we left.", "notion") })).toBe("not_about_brand");
     expect(judgeNameMatch({ alias: "Notion", ...ctx("A vague notion of safety.", "notion") })).toBe("not_about_brand");
     expect(insideUrlOrDomain("a ", ". So")).toBe(false);
+    // markdown link text is the brand being linked
+    expect(insideUrlOrDomain("see [", "](https://notion.so)")).toBe(true);
   });
 });

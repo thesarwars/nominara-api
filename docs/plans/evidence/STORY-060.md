@@ -68,10 +68,23 @@ The unit test "#6" asserts the finding and its rule code. It does not assert a g
 - `judgeNameMatch` now treats a span inside a domain (TLD follows) or URL (scheme or `www.` earlier in the same token, or a markdown link target) as about the brand; hazard tests added.
 
 ### Owner questions recorded (constants and readings not in any reference)
-1. `ENTITY_MIN_NAME_MATCHES = 30` and `ENTITY_MIN_CATEGORY_PASSAGES = 8` (reuses A1's passage minimum): confirm.
+1. `ENTITY_MIN_NAME_MATCHES = 30` and `ENTITY_MIN_CATEGORY_PASSAGES = 8` (reuses A1's passage minimum): confirm. Below 30 the disambiguation risk is "unmeasured" and the Entity Authority score is WITHHELD with a stated reason (round 3; previously published). Decide whether instead the score should publish when the raw ratio is <= 0.20 despite the thin count.
 2. Rule codes `TG-ENTITY-ALIAS` and `TG-STRUCTURE-TEMPLATE`: approve and add as `task_generation_rules` rows; enable `TG-ENTITY-NODE`.
 3. Category terms are derived from `category_slug` and `verticals`: confirm.
 4. Name-match judging is the v1 case heuristic (lowercase span of a capitalised alias, minus domains/URLs): confirm, or fund a model-assisted judge behind the same signature.
 5. Entity risk does not separate demo-seed `mention_facts` from live ones (structure does, via `data_source`): decide whether demo-derived risk must be flagged.
 6. Co-occurrence is not windowed and is recomputed once per window (3x per rollup, same result): a single computation per rollup is a cheap follow-up, not done here.
 7. Process: Entity Authority (scoring-models §10) and the A2 suppression logic are a scoring function; `dangerous-area-auditor` must review as second engineer before merge.
+
+### Review round 3 fixes
+- Major: `buildEntity` now withholds the authority score (score null, `authority.suppressed` true, reason names the 30-match minimum) whenever disambiguation is "unmeasured"; the "entity-ready" verdict is not emitted in that state (it would claim risk is not high). The unit test was rewritten to assert score null and the reason, and fails without the fix (66.3 published).
+- `loadEntityInput` joins `answer_captures` with LEFT JOIN: a mention whose capture is gone is still a name match. New integration test fails without it (25 of 30 counted, below the minimum).
+- `insideUrlOrDomain`: a span followed by `](` (markdown link text) is the brand; hazard case added.
+- Follow-up for L33: when the page source is wired, it must be per cluster (cluster to landing page), NOT a union; today `structure.ts` aggregates page forms across all pages, so a table on any page would suppress the gap for every cluster.
+- L25/L33 stay task-pending until `TG-ENTITY-ALIAS` / `TG-STRUCTURE-TEMPLATE` are approved; until then the high-risk alias finding ranks as a lever whose task is null. `dangerous-area-auditor` review is still owed; the STORY-060 status block is to be updated on merge.
+
+| Gate (round 3, HEAD after this commit) | Result |
+|---|---|
+| `pnpm test:unit` | EXIT 0, 438 files passed + 1 skipped, 5649 tests passed + 1 skipped (`060-r3-unit.log`) |
+| `pnpm lint` / `pnpm typecheck` | EXIT 0 / EXIT 0 |
+| integration geo-entity 11, geo-freshness 5, geo-lever-rank 16, geo-insights 16, rollups-aux-tasks-geo-tools 46 | all EXIT 0 (`060-r3-*.log`) |

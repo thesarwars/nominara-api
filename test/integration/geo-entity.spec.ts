@@ -110,6 +110,14 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
     expect(detail.disambiguation).toMatchObject({ level: "low", risk: 0, name_matches: 30, not_about_brand: 0 });
   });
 
+  it("a mention whose capture row is gone is still a name match (never a false positive), so the count is not undercounted", async () => {
+    await matches(30, "Notion");
+    await db.query("DELETE FROM answer_captures WHERE id IN (SELECT result_id FROM mention_facts WHERE project_id = $1 LIMIT 5)", [projectId]);
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ level: "low", name_matches: 30, not_about_brand: 0 });
+  });
+
   it("no profile check recorded: persisted as insufficient with its reason, and the read has no detail", async () => {
     await refresh();
     expect(await row()).toMatchObject({ sufficient: false, score: null });
