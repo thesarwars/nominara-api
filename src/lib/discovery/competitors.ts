@@ -32,12 +32,32 @@ const PLACEHOLDERS = new Set([
 
 const norm = (s: string): string => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
 
+const tokens = (s: string): string[] => s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t !== "");
+
+/** A stored placeholder name is the domain ("hubspot.com"): the brand is its first label, never the whole string run together. */
+const brandForm = (brand: string): string => (/^[^\s.]+(?:\.[^\s.]+)+$/.test(brand.trim()) ? brand.trim().split(".")[0]! : brand);
+
+/** Whole tokens, in order, somewhere inside `haystack`. Never a substring: "force" is not inside "salesforce", "spot" not inside "hubspot". */
+function containsTokens(haystack: readonly string[], needle: readonly string[]): boolean {
+  if (needle.length === 0) return false;
+  for (let i = 0; i + needle.length <= haystack.length; i++) {
+    if (needle.every((token, j) => haystack[i + j] === token)) return true;
+  }
+  return false;
+}
+
+/**
+ * Is `name` the brand, or the brand plus a descriptor ("HubSpot CRM")? Compared by whole name or whole tokens. It used to be two-way
+ * substring containment, which dropped real rivals ("Salesforce" contains the stem "force") and treated "Hub" as "hubspot.com".
+ */
 function isBrand(name: string, brands: readonly string[]): boolean {
   const n = norm(name);
   if (n === "") return false;
+  const nameTokens = tokens(name);
   return brands.some((b) => {
-    const nb = norm(b);
-    return nb.length >= 3 && (n === nb || n.includes(nb) || (n.length >= 3 && nb.includes(n)));
+    const form = brandForm(b);
+    const nb = norm(form);
+    return nb.length >= 3 && (n === nb || containsTokens(nameTokens, tokens(form)));
   });
 }
 

@@ -67,4 +67,17 @@ describe("STORY-043 · proposeCompetitors", () => {
   it("empty input yields an empty list", () => {
     expect(proposeCompetitors({ brandNames: [], links: [] })).toEqual([]);
   });
+
+  // Review round 1 (minor): the brand test compares WHOLE names/tokens, not substrings.
+  it("a rival whose name merely CONTAINS the domain stem is still proposed (force.com vs Salesforce)", () => {
+    const out = proposeCompetitors({ brandNames: ["force", "Force"], links: [link("Force vs Salesforce")] });
+    expect(out.map((c) => c.name)).toEqual(["Salesforce"]);
+  });
+
+  it("the stored URL-only placeholder name ('hubspot.com') is the brand 'hubspot', not a bag of substrings", () => {
+    const brands = ["hubspot.com"];
+    expect(proposeCompetitors({ brandNames: brands, links: [link("Spot vs HubSpot"), link("Hub vs HubSpot")] }).map((c) => c.name)).toEqual(["Spot", "Hub"]);
+    // ... and it still recognises the brand itself, with or without a descriptor.
+    expect(proposeCompetitors({ brandNames: brands, links: [link("HubSpot vs Zoho"), link("HubSpot CRM vs Pipedrive")] }).map((c) => c.name)).toEqual(["Zoho", "Pipedrive"]);
+  });
 });
