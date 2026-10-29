@@ -16,7 +16,7 @@ interface Stored {
   text_hash: Buffer;
 }
 
-function tx(opts: { project?: Record<string, unknown> | null; existing?: Stored[]; hashes?: Stored[] } = {}) {
+function tx(opts: { project?: Record<string, unknown> | null; existing?: (Stored & { origin?: string | null })[]; hashes?: Stored[] } = {}) {
   const inserts: unknown[][] = [];
   const sqls: string[] = [];
   const project = opts.project === undefined ? { name: "HubSpot", category_slug: "crm", verticals: ["saas"], locale: null } : opts.project;
@@ -28,7 +28,8 @@ function tx(opts: { project?: Record<string, unknown> | null; existing?: Stored[
         inserts.push(params);
         return { rows: [] };
       }
-      if (sql.includes("generator_meta->>'origin'")) return { rows: opts.existing ?? [] };
+      // Every live GENERATED row, whoever wrote it: an `origin` of "discovery" marks discovery's own, anything else is another writer's.
+      if (sql.includes("generation_source = 'generated'")) return { rows: (opts.existing ?? []).map((row) => ({ origin: "discovery", ...row })) };
       if (sql.includes("FROM tracked_prompts")) return { rows: opts.hashes ?? opts.existing ?? [] };
       return { rows: [] };
     }),
@@ -43,7 +44,7 @@ const COL = { source: 4, text: 5, meta: 9, priority: 10, status: 11 };
 describe("STORY-043 · generateFreeAllowance", () => {
   it("generates the allowance — ten prompts — and returns them in the §4.5 wire shape", async () => {
     const { client, inserts } = tx();
-    const out = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+    const { prompts: out } = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
 
     expect(inserts).toHaveLength(10);
     expect(out).toHaveLength(10);
@@ -85,7 +86,7 @@ describe("STORY-043 · generateFreeAllowance", () => {
 
   it("is idempotent: a redelivered job that finds the allowance already generated inserts nothing and returns the same prompts", async () => {
     const first = tx();
-    const generated = await generateFreeAllowance(first.client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+    const generated = (await generateFreeAllowance(first.client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 })).prompts;
     const existing: Stored[] = generated.map((p, i) => ({
       id: p.prompt_id,
       text: p.text,
@@ -95,14 +96,14 @@ describe("STORY-043 · generateFreeAllowance", () => {
     }));
 
     const second = tx({ existing });
-    const again = await generateFreeAllowance(second.client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+    const again = (await generateFreeAllowance(second.client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 })).prompts;
     expect(second.inserts).toHaveLength(0);
     expect(again.map((p) => p.prompt_id)).toEqual(generated.map((p) => p.prompt_id));
   });
 
   it("tops up a partial earlier run to the allowance, never past it", async () => {
     const seed = tx();
-    const four = (await generateFreeAllowance(seed.client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 4 })).map((p) => ({
+    const four = (await generateFreeAllowance(seed.client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 4 })).prompts.map((p) => ({
       id: p.prompt_id,
       text: p.text,
       intent_archetype: p.intent_archetype,
@@ -112,28 +113,30 @@ describe("STORY-043 · generateFreeAllowance", () => {
     expect(four).toHaveLength(4);
 
     const { client, inserts } = tx({ existing: four });
-    const out = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+    const { prompts: out, remaining } = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
     expect(inserts).toHaveLength(6);
     expect(out).toHaveLength(10);
+    expect(remaining).toBe(0);
   });
 
   it("a thin context (a brand and nothing else) generates only what the grammar can fill, and reports exactly that: no padding, no invented category", async () => {
     const { client, inserts } = tx({ project: { name: "HubSpot", category_slug: null, verticals: null, locale: null } });
-    const out = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+    const { prompts: out, remaining } = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
     expect(out.length).toBeGreaterThan(0);
     expect(out.length).toBeLessThan(10);
     expect(inserts).toHaveLength(out.length);
+    expect(remaining).toBe(10 - out.length);
   });
 
   it("an allowance of 0 generates nothing — 0 stays 0", async () => {
     const { client, inserts } = tx();
-    expect(await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 0 })).toEqual([]);
+    expect(await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 0 })).toEqual({ prompts: [], remaining: 0 });
     expect(inserts).toHaveLength(0);
   });
 
   it("a project that no longer exists generates nothing", async () => {
     const { client, inserts } = tx({ project: null });
-    expect(await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 })).toEqual([]);
+    expect(await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 })).toEqual({ prompts: [], remaining: 10 });
     expect(inserts).toHaveLength(0);
   });
 
@@ -147,5 +150,59 @@ describe("STORY-043 · generateFreeAllowance", () => {
     const { client, sqls } = tx();
     await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
     for (const sql of sqls.filter((s) => s.trimStart().startsWith("SELECT"))) expect(sql).not.toContain("workspace_id");
+  });
+
+  // STORY-043 review (round 1), finding 3 — the onboarding step calls POST /prompts/generate right after creation. Those rows are
+  // generated prompts too: the free ten is ONE allowance (STORY-046 counts generated rows), so discovery must not add ten more.
+  describe("shares the allowance with prompts someone else generated", () => {
+    const held = (n: number, origin: string | null): (Stored & { origin: string | null })[] =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `p${String(i)}`,
+        text: `explicit ${String(i)}`,
+        intent_archetype: "recommendation",
+        funnel_stage: "consideration",
+        text_hash: Buffer.from(`explicit ${String(i)}`),
+        origin,
+      }));
+
+    it("adds none when the project already holds a full allowance of generated prompts (from the explicit generate call)", async () => {
+      const { client, inserts } = tx({ existing: held(10, null) });
+      const out = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+      expect(inserts).toHaveLength(0);
+      expect(out.prompts).toEqual([]);
+      expect(out.remaining).toBe(0);
+    });
+
+    it("adds only the shortfall when the explicit call produced some, and reports what is left of the ten", async () => {
+      const { client, inserts } = tx({ existing: held(6, null) });
+      const out = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+      expect(inserts).toHaveLength(4);
+      expect(out.prompts).toHaveLength(4);
+      expect(out.remaining).toBe(0);
+    });
+
+    it("more than the allowance already generated elsewhere still leaves 0 remaining, never a negative", async () => {
+      const { client } = tx({ existing: held(15, null) });
+      expect((await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 })).remaining).toBe(0);
+    });
+  });
+
+  // Finding 2 — the real URL-only row: projects.service inserts name = root_domain, no category, no verticals.
+  describe("a URL-only project (the placeholder row projects.service inserts)", () => {
+    const URL_ONLY = { name: "hubspot.com", root_domain: "hubspot.com", category_slug: null, verticals: [], locale: null };
+
+    it("never writes the domain placeholder into a prompt as though it were the brand's name", async () => {
+      const { client, inserts } = tx({ project: URL_ONLY });
+      await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+      for (const params of inserts) expect(String(params[COL.text]).toLowerCase()).not.toContain("hubspot.com");
+    });
+
+    it("generates only what the thin context fills, and `remaining` is exactly the unused part of the ten", async () => {
+      const { client, inserts } = tx({ project: URL_ONLY });
+      const out = await generateFreeAllowance(client, { workspaceId: WORKSPACE, projectId: PROJECT, allowance: 10 });
+      expect(out.prompts.length).toBeLessThan(10);
+      expect(inserts).toHaveLength(out.prompts.length);
+      expect(out.remaining).toBe(10 - out.prompts.length);
+    });
   });
 });

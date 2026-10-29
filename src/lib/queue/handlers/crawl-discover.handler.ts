@@ -7,7 +7,7 @@ import { discover, FREE_PROMPT_ALLOWANCE, type DiscoverDeps } from "../../discov
 import { generateFreeAllowance } from "../../discovery/free-prompts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure } from "../worker-factory.js";
 
 // STORY-043 — the first real entry in STORY-124's registry, and the one its
 // own comment named: "crawl.discover with STORY-043".
@@ -35,6 +35,8 @@ const payloadSchema = z
 interface Prepared {
   readonly payload: z.infer<typeof payloadSchema>;
   readonly rootDomain: string;
+  /** When the project (and so the job) was submitted: AC15's clock starts here, not when `discover()` does. */
+  readonly submittedAt: Date | null;
   readonly knownBrandNames: readonly string[];
   /** Field names a person decided: skipped by `discover`, then carried forward verbatim. */
   readonly humanDecided: readonly string[];
@@ -57,8 +59,8 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       // A job payload is a snapshot from enqueue time; the row is the truth, and
       // reading it also confirms the project still exists — it may have been
       // deleted between creation and this job being picked up.
-      const project = await tx.query<{ root_domain: string; discovery: unknown; name?: string | null; brand_aliases?: string[] | null }>(
-        "SELECT root_domain, discovery, name, brand_aliases FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      const project = await tx.query<{ root_domain: string; discovery: unknown; name?: string | null; brand_aliases?: string[] | null; created_at?: Date | string | null }>(
+        "SELECT root_domain, discovery, name, brand_aliases, created_at FROM projects WHERE id = $1 AND deleted_at IS NULL",
         [payload.projectId],
       );
       const row = project.rows[0];
@@ -78,6 +80,7 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       return {
         payload,
         rootDomain: row.root_domain,
+        submittedAt: toDate(row.created_at),
         knownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? [])],
         humanDecided: userEditedFields(row.discovery),
         preserved: preservedFields(row.discovery),
@@ -101,10 +104,12 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       const { payload } = prepared;
 
       // AC12 (first half) — the free allowance, generated and charged nothing. A caller who supplied prompts at creation has
-      // already chosen them: supplied wins, so nothing is generated and the allowance is untouched.
-      const generated = payload.fieldsSupplied.includes("prompts")
-        ? []
+      // already chosen them: supplied wins, so nothing is generated and the allowance is untouched. (Whether supplied prompts should
+      // use up part of the ten is a product question, reported to the owner rather than decided here.)
+      const allowance = payload.fieldsSupplied.includes("prompts")
+        ? { prompts: [], remaining: FREE_PROMPT_ALLOWANCE }
         : await generateFreeAllowance(tx, { workspaceId: payload.workspaceId, projectId: payload.projectId, allowance: FREE_PROMPT_ALLOWANCE });
+      const generated = allowance.prompts;
 
       // The overridden entries are carried forward verbatim: `discover` skipped them, so without this they would vanish from the
       // payload and the NEXT pass would re-derive them.
@@ -112,7 +117,7 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
         ...result,
         fields: { ...result.fields, ...(prepared.preserved as DiscoveryResponse["fields"]) },
         prompts_generated: generated,
-        prompts_free_remaining: FREE_PROMPT_ALLOWANCE - generated.length,
+        prompts_free_remaining: allowance.remaining,
       };
 
       // The whole review payload into `discovery`, and only the STATUS onto its own column. Nothing here writes name, description,
@@ -123,8 +128,17 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
         merged.discovery_status,
       ]);
 
-      // AC15 — the duration, so the p50/p95 objective can be read off a real distribution (meetsLatencyObjective judges it).
-      observeValue("nominara_discovery_duration_ms", merged.duration_ms ?? 0, { status: merged.discovery_status });
+      // AC15 / edge-cases-and-slos.md row 33 — the objective is "URL submitted -> confidence-scored payload", so the clock starts at
+      // SUBMISSION (the project row's created_at) and stops here, after the queue wait, the prepare transaction and the commit above.
+      // A row with no submission time is no observation: `0` would read as an instant pass. `discover()`'s own timer stays as a
+      // sub-measure, so a slow site can be told apart from a backlog.
+      const now = (deps?.now ?? Date.now)();
+      if (prepared.submittedAt !== null) {
+        observeValue("nominara_discovery_duration_seconds", Math.max(0, now - prepared.submittedAt.getTime()) / 1000, { status: merged.discovery_status });
+      }
+      if (merged.duration_ms !== null && merged.duration_ms !== undefined) {
+        observeValue("nominara_discovery_run_seconds", merged.duration_ms / 1000, { status: merged.discovery_status });
+      }
       incrementCounter("nominara_discovery_completed_total", { status: merged.discovery_status });
 
       // Counts and IDs only: never the brand, a competitor or prompt text, none of which belongs in a log line.
@@ -135,7 +149,41 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
           `${String(prepared.humanDecided.length)} preserved from a human decision`,
       );
     },
+
+    // `prepare` commits 'running' BEFORE the fetch, so a job that then fails until its retries run out would leave the project
+    // 'running' for ever. AC13: failed or partial, still usable. On the LAST attempt only (an earlier one is the queue's retry
+    // ladder), mark it partial and keep whatever the run obtained. `IN ('pending','running')` so a completed payload that another
+    // delivery wrote is never clobbered. Runs in a fresh tenant transaction, after signature verification.
+    async recover(tx: ClientBase, job: Job, failure: PhaseFailure<Prepared, DiscoveryResponse>) {
+      if (!isFinalAttempt(job)) return false;
+      const payload = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
+      if (!payload.success) return false;
+
+      const kept: DiscoveryResponse | undefined =
+        failure.fetched === undefined ? undefined : { ...failure.fetched, discovery_status: "partial" };
+      await tx.query(
+        `UPDATE projects SET discovery_status = 'partial', discovery = COALESCE($2::jsonb, discovery), updated_at = now()
+          WHERE id = $1 AND deleted_at IS NULL AND discovery_status IN ('pending', 'running')`,
+        [payload.data.projectId, kept === undefined ? null : JSON.stringify(kept)],
+      );
+      incrementCounter("nominara_discovery_completed_total", { status: "partial" });
+      logger.warn(`workspace ${payload.data.workspaceId} project ${payload.data.projectId}: discovery gave up after ${failure.phase} failed; marked partial`);
+      return true;
+    },
   });
+}
+
+/** BullMQ increments `attemptsMade` when an attempt fails, so during attempt N it is N-1. An unknown attempt count is "not known to be final". */
+function isFinalAttempt(job: Pick<Job, "attemptsMade" | "opts">): boolean {
+  const attempts = job.opts?.attempts;
+  if (attempts === undefined) return false;
+  return (job.attemptsMade ?? 0) + 1 >= attempts;
+}
+
+function toDate(value: Date | string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 interface StoredDiscovery {

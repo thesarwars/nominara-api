@@ -33,6 +33,7 @@ import type { PaginationRequest } from "../../../contracts/common/pagination.sch
 import type { PortalProjectEngines } from "../../lib/portal/portal-facts.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
+import { generateFreeAllowance } from "../../lib/discovery/free-prompts.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
@@ -510,7 +511,34 @@ export class ProjectsService {
     // stale. `rollup.metric_daily` is the job that recomputes it.
     if (categoryChanged) this.requestRecompute(workspaceId, projectId);
 
-    return nextPayload;
+    // STORY-043 AC12 — the top-up. A URL-only project's first discovery pass had no brand, category or verticals to fill the prompt
+    // templates from; the confirmed values are what it was waiting for. AFTER the columns above are written (the generator reads the
+    // project row), and idempotent: it generates only what the allowance is still short of.
+    const toppedUp = changesPromptContext(input) ? await this.topUpFreeAllowance(client, workspaceId, projectId, nextPayload) : null;
+    if (toppedUp === null) return nextPayload;
+    await client.query("UPDATE projects SET discovery = $2, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(toppedUp)]);
+    return toppedUp;
+  }
+
+  /**
+   * Null when there is nothing to change. A caller who supplied prompts at creation had the allowance suppressed by crawl.discover
+   * ("supplied wins"): a payload that generated none while manual prompts exist is that case, and confirming must not undo it.
+   */
+  private async topUpFreeAllowance(
+    client: ClientBase,
+    workspaceId: string,
+    projectId: string,
+    payload: DiscoveryResponse,
+  ): Promise<DiscoveryResponse | null> {
+    if (payload.prompts_generated.length === 0) {
+      const manual = await client.query(
+        "SELECT 1 FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL AND generation_source = 'manual' LIMIT 1",
+        [projectId],
+      );
+      if (manual.rows.length > 0) return null;
+    }
+    const allowance = await generateFreeAllowance(client, { workspaceId, projectId, allowance: FREE_PROMPT_ALLOWANCE });
+    return { ...payload, prompts_generated: allowance.prompts, prompts_free_remaining: allowance.remaining };
   }
 
   /**
@@ -828,6 +856,12 @@ function toEngineScores(byEngine: unknown): ProjectListItem["engine_scores"] {
   return Object.entries(parsed)
     .map(([engineKey, value]) => ({ engine_key: engineKey, score: value.score, delta_30d: value.delta_30d }))
     .sort((a, b) => b.score - a.score);
+}
+
+/** Confirming a brand name, category or vertical changes what the prompt templates can be filled from; nothing else does. */
+function changesPromptContext(input: ConfirmDiscoveryRequest): boolean {
+  const confirmed = Object.keys(input.fields ?? {});
+  return confirmed.some((name) => name === "brand_name" || name === "category" || name === "verticals");
 }
 
 /** The honest empty payload for a project whose discovery has written nothing yet. */

@@ -224,15 +224,18 @@ const COMPARISON_PAGE = `<html><head><title>HubSpot | CRM</title></head><body>
   <a href="/compare/hubspot-vs-salesforce">HubSpot vs Salesforce</a></body></html>`;
 
 /** A transaction stub rich enough for the commit phase's prompt generation: a real project row, no prior prompts. */
-function richTx(calls: { sql: string; params: unknown[] }[], opts: { existingDiscoveryPrompts?: unknown[] } = {}) {
+function richTx(
+  calls: { sql: string; params: unknown[] }[],
+  opts: { existingDiscoveryPrompts?: unknown[]; projectRow?: Record<string, unknown> } = {},
+) {
   return {
     query: vi.fn(async (sql: string, params: unknown[] = []) => {
       calls.push({ sql, params });
-      if (sql.includes("SELECT root_domain")) return { rows: [{ root_domain: "hubspot.com", discovery: {} }] };
+      if (sql.includes("SELECT root_domain")) return { rows: [{ root_domain: "hubspot.com", discovery: {}, ...opts.projectRow }] };
       if (sql.includes("FROM projects") && sql.includes("FOR NO KEY UPDATE")) {
-        return { rows: [{ name: "HubSpot", category_slug: "crm", verticals: ["saas"], locale: null }] };
+        return { rows: [{ name: "HubSpot", root_domain: "hubspot.com", category_slug: "crm", verticals: ["saas"], locale: null }] };
       }
-      if (sql.includes("generator_meta->>'origin'")) return { rows: opts.existingDiscoveryPrompts ?? [] };
+      if (sql.includes("generation_source = 'generated'")) return { rows: opts.existingDiscoveryPrompts ?? [] };
       return { rows: [] };
     }),
   } as unknown as ClientBase;
@@ -332,20 +335,115 @@ describe("STORY-043 · crawl.discover writes competitors and the free allowance 
   });
 });
 
+describe("STORY-043 · crawl.discover and the explicit generate share ONE allowance", () => {
+  it("AC12 — a project already holding generated prompts (onboarding's generate call) gets none from discovery, and reports 0 remaining", async () => {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const held = Array.from({ length: 10 }, (_, i) => ({
+      id: `p${String(i)}`, text: `t${String(i)}`, intent_archetype: "recommendation", funnel_stage: "consideration", origin: null,
+    }));
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+    await handler(richTx(calls, { existingDiscoveryPrompts: held }), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    expect(calls.some((c) => c.sql.includes("INSERT INTO tracked_prompts"))).toBe(false);
+    const write = calls.find((c) => c.sql.includes("SET discovery = $2"))!;
+    const payload = JSON.parse(write.params[1] as string) as { prompts_generated: unknown[]; prompts_free_remaining: number };
+    expect(payload.prompts_generated).toEqual([]);
+    expect(payload.prompts_free_remaining).toBe(0);
+  });
+});
+
+describe("STORY-043 · crawl.discover recovers a job whose retries ran out", () => {
+  const FAILED = { error: new Error("boom"), phase: "commit" as const };
+
+  function recovering(attemptsMade: number, attempts: number | undefined) {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const phases = phasesOf(createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE)))!;
+    const job = {
+      attemptsMade,
+      ...(attempts === undefined ? {} : { opts: { attempts } }),
+      data: { payload: { workspaceId: WORKSPACE, kid: "k1", projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] } },
+    } as unknown as Job;
+    return { calls, phases, job, tx: txRecording(calls) };
+  }
+
+  it("is defined — without it a failed commit leaves the project 'running' for ever", () => {
+    expect(phasesOf(createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE)))!.recover).toBeDefined();
+  });
+
+  it("AC13 — on the LAST attempt it marks the project partial (still usable) and settles the job", async () => {
+    const { calls, phases, job, tx } = recovering(3, 4);
+    await expect(phases.recover!(tx, job, FAILED as never)).resolves.toBe(true);
+    const write = calls.find((c) => c.sql.includes("UPDATE projects"))!;
+    expect(write.sql).toContain("discovery_status = 'partial'");
+    // Only a pass still in flight is touched: a completed payload a redelivery wrote is never clobbered.
+    expect(write.sql).toMatch(/discovery_status IN \('pending', ?'running'\)/);
+  });
+
+  it("AC13 — keeps whatever the run obtained: a failed COMMIT writes the fetched payload, marked partial", async () => {
+    const { calls, phases, job, tx } = recovering(3, 4);
+    const fetched = { discovery_status: "completed", duration_ms: 10, fields: { brand_name: { value: "HubSpot", confidence: 0.9, source: "x", user_edited: false } },
+      competitors_proposed: [], prompts_generated: [], prompts_free_remaining: 10, credits_charged: 0, low_confidence_fields: [] };
+    await phases.recover!(tx, job, { ...FAILED, fetched } as never);
+    const write = calls.find((c) => c.sql.includes("UPDATE projects"))!;
+    const payload = JSON.parse(write.params[1] as string) as { discovery_status: string; fields: Record<string, unknown> };
+    expect(payload.discovery_status).toBe("partial");
+    expect(payload.fields.brand_name).toBeDefined();
+  });
+
+  it("an earlier attempt is left to the queue's retry ladder: nothing written, not settled", async () => {
+    const { calls, phases, job, tx } = recovering(1, 4);
+    await expect(phases.recover!(tx, job, FAILED as never)).resolves.toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("a job with no known attempt count is not known to be final", async () => {
+    const { calls, phases, job, tx } = recovering(9, undefined);
+    await expect(phases.recover!(tx, job, FAILED as never)).resolves.toBe(false);
+    expect(calls).toEqual([]);
+  });
+});
+
 describe("STORY-043 · crawl.discover observability", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("AC15 — records the duration as nominara_discovery_duration_ms, labelled by status, and counts the outcome", async () => {
+  it("AC15 — records the end-to-end duration as nominara_discovery_duration_seconds, labelled by status, and counts the outcome", async () => {
     const observe = vi.mocked(observeValue);
     const count = vi.mocked(incrementCounter);
     observe.mockClear();
     count.mockClear();
     const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
 
+    await handler(richTx([], { projectRow: { created_at: new Date() } }), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    expect(observe).toHaveBeenCalledWith("nominara_discovery_duration_seconds", expect.any(Number), { status: "completed" });
+    expect(count).toHaveBeenCalledWith("nominara_discovery_completed_total", { status: "completed" });
+  });
+
+  // edge-cases-and-slos.md row 33: "URL submitted -> confidence-scored payload". The queue wait (crawl.discover runs at concurrency 3), the
+  // prepare transaction and the commit all sit inside that, and none of them is inside `discover()`'s own timer.
+  it("AC15 — the objective is measured from SUBMISSION: time spent waiting in the queue is in the observed value", async () => {
+    const observe = vi.mocked(observeValue);
+    observe.mockClear();
+    const submittedAt = new Date(Date.now() - 30_000); // the project row was created 30 s before the worker picked the job up
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+
+    await handler(richTx([], { projectRow: { created_at: submittedAt } }), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
+
+    const total = observe.mock.calls.find(([name]) => name === "nominara_discovery_duration_seconds")![1];
+    expect(total).toBeGreaterThanOrEqual(30);
+    // discover()'s own run is a sub-measure and stays small: a backlog must not hide inside it.
+    const run = observe.mock.calls.find(([name]) => name === "nominara_discovery_run_seconds")![1];
+    expect(run).toBeLessThan(5);
+  });
+
+  it("AC15 — no submission time (a row without created_at) is no observation, not a 0-second one", async () => {
+    const observe = vi.mocked(observeValue);
+    observe.mockClear();
+    const handler = createCrawlDiscoverHandler(CONTEXT, depsServing(PAGE));
+
     await handler(richTx([]), jobWith({ projectId: PROJECT, rootUrl: "https://hubspot.com", fieldsSupplied: [] }));
 
-    expect(observe).toHaveBeenCalledWith("nominara_discovery_duration_ms", expect.any(Number), { status: "completed" });
-    expect(count).toHaveBeenCalledWith("nominara_discovery_completed_total", { status: "completed" });
+    expect(observe.mock.calls.some(([name]) => name === "nominara_discovery_duration_seconds")).toBe(false);
   });
 
   it("logs the workspace ID and never the brand name, a competitor or prompt text", async () => {

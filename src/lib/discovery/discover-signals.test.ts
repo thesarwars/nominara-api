@@ -113,7 +113,7 @@ describe("STORY-043 · AC15 latency objective", () => {
     expect(meetsLatencyObjective([])).toBeNull();
   });
 
-  it("scenario 18 — a typical site (a slow 4 s root fetch) is measured inside the objective", async () => {
+  it("scenario 18 (sub-measure only) — discover()'s own run of a slow 4 s root fetch is reported as 4 s; the objective itself is judged from submission in the crawl.discover handler test", async () => {
     let t = 0;
     const deps: DiscoverDeps = {
       fetch: vi.fn(async () => { t += 4000; return { status: 200, headers: {}, body: Buffer.from(COMPARISONS), finalUrl: "https://hubspot.com/" }; }),
