@@ -82,6 +82,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "source.verify_presence",
       "task.generate",
       "task.resurface",
+      "topic.cluster",
     ]);
     // Topology order, not alphabetical — `liveQueueNames` filters
     // QUEUE_TOPOLOGY, and the capture queues are declared before the crawl
@@ -96,6 +97,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       // STORY-133 - the embed group's first handler, declared after crawl.audit and before rollup.metric_daily in topology.ts.
       "embed.batch",
       "rollup.metric_daily",
+      // STORY-047 - topic.cluster, the embed group's second handler, declared after rollup.metric_daily and before task.generate in topology.ts.
+      "topic.cluster",
       // STORY-063 — declared after topic.cluster in topology.ts, i.e. between the rollup and credit entries.
       "task.generate",
       "credit.reconcile",

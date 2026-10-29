@@ -4,6 +4,7 @@ import { createBillingAutoTopupHandler } from "./handlers/billing-auto-topup.han
 import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-email.handler.js";
 import { createBillingDowngradeNoticeHandler } from "./handlers/billing-downgrade-notice.handler.js";
 import { createEmbedBatchHandler } from "./handlers/embed-batch.handler.js";
+import { createTopicClusterHandler } from "./handlers/topic-cluster.handler.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
 import type { DirtyEntry } from "../rollup/dirty-dates.js";
@@ -104,6 +105,9 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * `embed.batch` lands with STORY-133: it writes the vectors L2, generation dedupe and clustering read. Its producers are prompt activation
  * (embed-batch request, after commit) today and parse/geo/crawl later. It is the only caller of the embedding provider port.
  *
+ * `topic.cluster` lands with STORY-047: it groups one project's embedded prompts into clusters and writes them with their membership in one
+ * transaction. Its producer is the topic-cluster sweep (src/lib/topics/sweep.ts), not a cron: `schedule.ts` keeps it at the stated weekly cron.
+ *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
@@ -132,6 +136,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "notify.dispatch": (context) => createNotifyDispatchHandler(context),
   "report.build": (context) => createReportBuildHandler(context),
   "embed.batch": (context) => createEmbedBatchHandler(context),
+  "topic.cluster": (context) => createTopicClusterHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */
