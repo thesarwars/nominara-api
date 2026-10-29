@@ -4,6 +4,7 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { GeoAnalysisWrite } from "../../../contracts/analytics/index.js";
 import { writeGeoAnalysis } from "../geo/persist-analysis.js";
 import { rankGeoLevers } from "../geo/lever-rank.js";
+import { buildEntity, loadEntityInput } from "../geo/entity.js";
 import { buildSentiment, loadSentimentInput } from "../geo/sentiment.js";
 import { buildStructure, loadStructureInput, windowStartFor } from "../geo/structure.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -11,7 +12,7 @@ import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 
 // STORY-060/061 — recompute a project's GEO analyses and persist them to
 // `geo_analyses` (through the one write path, `writeGeoAnalysis`). `structure`
-// (A3) and `sentiment` (A6) exist so far; the other analyses join this
+// (A3), `entity` (A2) and `sentiment` (A6) exist so far; the other analyses join this
 // function in their own stories. Nothing here is metered: no credit guard, no ledger.
 
 const logger = new Logger("rollup.geo");
@@ -65,6 +66,24 @@ export async function refreshProjectGeo(
     value: Math.round(performance.now() - sentimentStarted),
     sufficient: sentiment.sufficient,
     brand_mentions: sentiment.evidence_cells,
+    window_days: windowDays,
+  });
+
+  // STORY-060 — A2 entity readiness, same window, same transaction. Reads rows only: no profile probe happens here.
+  const entityStarted = performance.now();
+  const entity = await writeGeoAnalysis(
+    tx,
+    projectId,
+    buildEntity(await loadEntityInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays)).write,
+  );
+  incrementCounter("nominara_geo_entity_recompute_total", { sufficient: String(entity.sufficient) });
+  logger.log({
+    event: "geo_entity_recomputed",
+    project_id: projectId,
+    metric: "nominara_geo_entity_recompute_duration_ms",
+    value: Math.round(performance.now() - entityStarted),
+    sufficient: entity.sufficient,
+    name_matches: entity.evidence_cells,
     window_days: windowDays,
   });
 
