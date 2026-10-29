@@ -40,3 +40,38 @@ Anything needing a running real API (HTTP-level permission, 0-credit header) is 
 ## Checkpoint-3 fix pass (branch 7day/c-geo-4, from integration/7day fee788e)
 Finding: purge recompute must clear rows even when purge runs on a later day. Already on the merged tree: `purge.ts` deletes the project's `geo_analyses` before `refreshProjectGeoWindows` (4179d3b) and the test "STORY-060 audit · --purge on a LATER day deletes the seed's geo_analyses rows outright ..." (Date faked +24 h, PRE-EXISTING project) is present. No code change needed.
 - Mutation re-run (replace the `DELETE FROM geo_analyses` in `purgeOneProject` with a comment, restored after): `-t STORY-060` -> 1 failed, 3 passed, "no sufficient (demo-derived) row survives: expected 6 to be +0". Unmutated: all 4 STORY-060 tests pass.
+
+## D2 entity (A2) and structure-match (A3) lane, review round 2 (branch story/060-entity-structure)
+
+Status of each story AC after this lane. "Met" means data flows end to end in production; "pure only" means the logic and its persistence exist but nothing yet supplies the input.
+
+| AC (story line) | Status | What flips the open ones |
+|---|---|---|
+| Entity: each node checked, URL and missing fields recorded (L20) | **Open, pure only** | `writeEntityNodes` / `deriveNodeRecord` have no caller: no profile-probe job exists and no source of the brand's `sameAs` exists, so `entity_nodes` stays empty and no score is published. Needs an owner decision on probe sources and their access terms, then a probe job behind a port, run outside any transaction (ADR-0003). |
+| Presence and completeness separate (L21) | Met (unit + integration, over rows written by `writeEntityNodes`) | n/a |
+| sameAs link coverage recorded (L22) | **Open, pure only** | Same as L20: needs the brand's `sameAs` source. |
+| Authority score exactly §10 (L23) | Met for the formula (hand-computed 66.3); published only once all seven nodes are checked, so **open in production** | Probe job (L20). |
+| Disambiguation risk separate (L24) | Met (computed from `mention_facts`; no profile data needed) | Judging is the v1 case heuristic, an owner-confirmable reading. |
+| High risk suppresses the score, surfaces the alias task (L25) | Met as a finding carrying `TG-ENTITY-ALIAS` and a suppressed score | A task is not generated: `TG-ENTITY-ALIAS` is not yet a `task_generation_rules` row. Needs owner approval of the code, then the rule row. |
+| Missing high-weight node: alert and task (L26) | **Open** | The finding carries `TG-ENTITY-NODE`, which is a disabled `pending_analysis` row; `entity_node_missing` appears only in the alert catalog and deep links and is never evaluated. Needs the rule enabled and alert-rule evaluation for `entity_node_missing`, plus the probe job. |
+| Category co-occurrence vs competitors (L27) | Met over `corpus_passages` (real once STORY-058 passages exist; stand-in passages in tests) | Real embeddings are not involved; real cited-corpus volume is. |
+| Structure: form distribution per cluster/engine (L31), position-class movement (L32) | Met (from the earlier lane) | n/a |
+| Structure-match gap with template (L33) | **Open** | `loadStructureInput` never supplies `pages`, so the gap never fires. Needs a page source from STORY-050 wired in, a cluster-to-landing-page map, a spec-list template alternative, and `TG-STRUCTURE-TEMPLATE` approved and inserted as a rule row. |
+| Evidence base and self-suppression (L34), free and unmetered (L35) | Met | n/a |
+
+The unit test "#6" asserts the finding and its rule code. It does not assert a generated task or an alert, and must not be read as meeting L26.
+
+### Review round 2 fixes
+- Shared refresh path: `refreshProjectGeoWindows` now persists 9 rows per project (structure + entity + sentiment, three windows). The three counts in `geo-freshness` (two) and `geo-lever-rank` were updated 6 to 9, the `entity` rows are not filtered out. Every integration spec calling the refresh was run: geo-entity, geo-freshness, geo-lever-rank, geo-sentiment, geo-structure, geo-structure-wiring, geo-insights, seed-demo, rollups-aux-tasks-geo-tools (logs `plans-7day/logs/060-int-r2-*.log`).
+- `termPattern`: now escapes only regex metacharacters and bounds by lookaround (`(?<![[:alnum:]_])...(?![[:alnum:]_])`), so ".NET" and "C++" match and non-ASCII letters are never backslash-escaped. Evidence against the finding's stated mechanism: on pgvector:pg18 the OLD pattern did NOT throw "invalid escape" for `\é`; the mutation run (old pattern) failed the integration hazard test with "expected 3 to be 5", i.e. the ".NET Hub" brand alias never matched. The throw could not be reproduced here, the symbol-edge miss was. The unit hazard test still forbids a backslash before any letter or digit, as protection against the theory.
+- Per-analysis isolation inside the rollup transaction was NOT added: a failed statement aborts a Postgres transaction, so a try/catch around one analysis would leave the rest of the rollup running on an aborted transaction. It would need a savepoint per analysis; left as a follow-up decision.
+- `judgeNameMatch` now treats a span inside a domain (TLD follows) or URL (scheme or `www.` earlier in the same token, or a markdown link target) as about the brand; hazard tests added.
+
+### Owner questions recorded (constants and readings not in any reference)
+1. `ENTITY_MIN_NAME_MATCHES = 30` and `ENTITY_MIN_CATEGORY_PASSAGES = 8` (reuses A1's passage minimum): confirm.
+2. Rule codes `TG-ENTITY-ALIAS` and `TG-STRUCTURE-TEMPLATE`: approve and add as `task_generation_rules` rows; enable `TG-ENTITY-NODE`.
+3. Category terms are derived from `category_slug` and `verticals`: confirm.
+4. Name-match judging is the v1 case heuristic (lowercase span of a capitalised alias, minus domains/URLs): confirm, or fund a model-assisted judge behind the same signature.
+5. Entity risk does not separate demo-seed `mention_facts` from live ones (structure does, via `data_source`): decide whether demo-derived risk must be flagged.
+6. Co-occurrence is not windowed and is recomputed once per window (3x per rollup, same result): a single computation per rollup is a cheap follow-up, not done here.
+7. Process: Entity Authority (scoring-models §10) and the A2 suppression logic are a scoring function; `dangerous-area-auditor` must review as second engineer before merge.

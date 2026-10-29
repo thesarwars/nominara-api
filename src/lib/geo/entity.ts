@@ -407,12 +407,21 @@ export async function writeEntityNodes(tx: ClientBase, projectId: string, checks
  * alias with no uppercase letter carries no such signal and is never guessed to be a false positive. A model-assisted
  * judge would sit behind this same signature, run outside the transaction, and is not built.
  */
-export function judgeNameMatch(match: { alias: string; span: string }): "about_brand" | "not_about_brand" {
+export function judgeNameMatch(match: { alias: string; span: string; before?: string; after?: string }): "about_brand" | "not_about_brand" {
   // A span that is not the alias once folded the way the matcher folds is a misread offset, never evidence of a false positive.
   if (fold(match.span).folded !== fold(match.alias).folded) return "about_brand";
+  // A span inside a domain or URL ("notion.so", "https://www.notion.so/x", a markdown link target) is the brand's own address, written lowercase by convention.
+  if (insideUrlOrDomain(match.before ?? "", match.after ?? "")) return "about_brand";
   const aliasIsCased = match.alias !== match.alias.toLowerCase();
   const spanIsLower = match.span !== "" && match.span === match.span.toLowerCase() && match.span !== match.span.toUpperCase();
   return aliasIsCased && spanIsLower ? "not_about_brand" : "about_brand";
+}
+
+/** True when the span is part of a domain token (a TLD follows it) or of a URL (a scheme or `www.` precedes it in the same token). */
+export function insideUrlOrDomain(before: string, after: string): boolean {
+  if (/^\.[a-z]{2,}(?![a-z])/iu.test(after)) return true;
+  const token = /\S*$/u.exec(before)?.[0] ?? "";
+  return /:\/\/|^www\.|\]\(/iu.test(token);
 }
 
 /**
@@ -427,6 +436,14 @@ export function spanOfMention(rawText: string | null, charStart: number, charEnd
   return text.slice(charStart, charEnd);
 }
 
+/** The span with a little text each side, for judging; null under the same conditions as `spanOfMention`. */
+export function mentionContext(rawText: string | null, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
+  const span = spanOfMention(rawText, charStart, charEnd);
+  if (span === null) return null;
+  const text = normalize(rawText!);
+  return { span, before: text.slice(Math.max(0, charStart - 64), charStart), after: text.slice(charEnd, charEnd + 16) };
+}
+
 // ------------------------------------------------------------------ loader
 
 interface NodeRow {
@@ -438,8 +455,13 @@ interface NodeRow {
   in_brand_sameas: boolean;
 }
 
-/** A word-bounded, case-insensitive POSIX pattern for a literal term. Bound as a parameter, never concatenated into SQL. */
-const termPattern = (term: string): string => `\\m${term.replace(/[^A-Za-z0-9\s]/gu, "\\$&")}\\M`;
+/**
+ * A word-bounded POSIX ARE for a literal term, matched case-insensitively (`~*`). Bound as a parameter, never concatenated
+ * into SQL. Only regex metacharacters are escaped: a backslash before a LETTER (`\é`) is an ARE escape or an error, and
+ * non-ASCII letters are alphanumeric under the database's UTF-8 locale. The boundary is lookaround rather than `\m`/`\M`,
+ * so a term that starts or ends in a symbol (".NET", "C++") still has one: no word character may touch either end.
+ */
+export const termPattern = (term: string): string => `(?<![[:alnum:]_])${term.replace(/[.^$|?*+()[\]{}\\]/gu, "\\$&")}(?![[:alnum:]_])`;
 
 /** Category terms from the project's own category and verticals; empty when it set neither. */
 export function categoryTerms(categorySlug: string | null, verticals: readonly string[]): string[] {
@@ -482,8 +504,8 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     for (const [alias, start, end] of c.mentions) {
       nameMatches += 1;
       // A span that cannot be read (answer text no longer held) is counted as a match and never as a false positive.
-      const span = spanOfMention(c.text, start, end);
-      if (span !== null && judgeNameMatch({ alias: cased.get(alias.toLowerCase()) ?? alias, span }) === "not_about_brand") notAboutBrand += 1;
+      const ctx = mentionContext(c.text, start, end);
+      if (ctx !== null && judgeNameMatch({ alias: cased.get(alias.toLowerCase()) ?? alias, ...ctx }) === "not_about_brand") notAboutBrand += 1;
     }
   }
 

@@ -183,4 +183,23 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
   it("a project that does not exist is a not_found on a node write", async () => {
     await expect(inTx((tx) => writeEntityNodes(tx, randomUUID(), ALL_PRESENT, SAMEAS))).rejects.toMatchObject({ code: "not_found" });
   });
+
+  it("hazard · non-ASCII brand alias, competitor, vertical and symbol-edged aliases do not abort the refresh, and they match", async () => {
+    await db.query("UPDATE projects SET brand_aliases = '{Café Müller,.NET Hub}', verticals = '{Ünïcode Küche,C++ tools}' WHERE id = $1", [projectId]);
+    await db.query("INSERT INTO competitors (workspace_id,project_id,name,root_domain,aliases) VALUES ($1,$2,'Яндекс','ya.example','{東京 Ltd}')", [workspaceId, projectId]);
+    const texts = ["Café Müller leads Ünïcode Küche.", "Яндекс and 東京 Ltd are rivals in Ünïcode Küche.", "Try .NET Hub for C++ tools.", "ASP.NET Hub is unrelated to C++ tools."];
+    for (let i = 0; i < 10; i++) {
+      await db.query(
+        `INSERT INTO corpus_passages (workspace_id,project_id,citation_url_hash,url,domain,passage_index,text,token_count,content_hash,embedding_model,expires_at)
+         VALUES ($1,$2,$3,'https://x.example/'||$4,'x.example',0,$5,10,$3,'stub',now()+interval '30 days')`,
+        [workspaceId, projectId, Buffer.from(`u${i}`), String(i), texts[i % 4]],
+      );
+    }
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail ?? (await row()).findings[0].entity);
+    expect(detail.cooccurrence.category_passages).toBe(10);
+    // Brand: "Café Müller" in passages 0,4,8 and ".NET Hub" in 2,6 (not inside "ASP.NET Hub" at 3,7) = 5.
+    expect(detail.cooccurrence.entities.find((e) => e.is_brand)?.passages).toBe(5);
+    expect(detail.cooccurrence.entities.find((e) => e.name === "Яндекс")?.passages).toBe(3);
+  });
 });

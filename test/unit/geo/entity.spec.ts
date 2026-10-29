@@ -8,8 +8,11 @@ import {
   ENTITY_MIN_CATEGORY_PASSAGES,
   ENTITY_MIN_NAME_MATCHES,
   ENTITY_NODE_TASK_RULE,
+  insideUrlOrDomain,
   judgeNameMatch,
+  mentionContext,
   spanOfMention,
+  termPattern,
   type EntityInput,
   type EntityNodeRecord,
 } from "../../../src/lib/geo/entity.js";
@@ -143,7 +146,7 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
     expect(buildEntity(input({ nameMatches: ENTITY_MIN_NAME_MATCHES, notAboutBrand: 0 })).detail!.disambiguation).toMatchObject({ risk: 0, level: "low" });
   });
 
-  it("#6 · a missing high-weight node (weight >= 0.18) raises a finding that generates a task; a missing low-weight node does not", () => {
+  it("#6 · a missing high-weight node (weight >= 0.18) raises a finding carrying the TG-ENTITY-NODE rule code (no task is generated here); a missing low-weight node does not", () => {
     const missingWikidata = buildEntity(input({ nodes: KNOWN.map((n) => (n.node === "wikidata" ? absent("wikidata") : n)) }));
     const f = missingWikidata.write.findings.find((x) => x.id === "entity-node-missing-wikidata")!;
     expect(f.task_rule_code).toBe(ENTITY_NODE_TASK_RULE);
@@ -289,5 +292,41 @@ describe("STORY-060 · entity node records and name-match judging (pure)", () =>
     expect(spanOfMention(null, 0, 3)).toBeNull();
     expect(spanOfMention("abc", 2, 9)).toBeNull();
     expect(spanOfMention("abc", 2, 2)).toBeNull();
+  });
+});
+
+describe("STORY-060 hazard · termPattern is a Postgres ARE for a literal term", () => {
+  it("never backslash-escapes a letter or digit of any script (a backslash before an alphanumeric is an ARE escape or an error)", () => {
+    for (const term of ["Café", "Müller", "Año", "Яндекс", "東京", "naïve co"]) {
+      expect(termPattern(term), term).not.toMatch(/\\[\p{L}\p{N}]/u);
+      expect(termPattern(term), term).toContain(term);
+    }
+  });
+  it("escapes every regex metacharacter", () => {
+    expect(termPattern("C++")).toContain("C\\+\\+");
+    expect(termPattern("a.b|c(d)[e]{f}^$?*\\")).toContain("a\\.b\\|c\\(d\\)\\[e\\]\\{f\\}\\^\\$\\?\\*\\\\");
+  });
+  it("bounds by lookaround, not \\m...\\M, so a term starting or ending in a non-word character still has a boundary", () => {
+    expect(termPattern(".NET")).not.toMatch(/\\m|\\M/u);
+    expect(termPattern("C++")).not.toMatch(/\\m|\\M/u);
+  });
+});
+
+describe("STORY-060 hazard · a brand written as its domain or URL is the brand, not a common word", () => {
+  const ctx = (raw: string, span: string) => mentionContext(raw, raw.indexOf(span), raw.indexOf(span) + span.length)!;
+  it("a lowercase span followed by a TLD, or inside a URL or markdown link target, is about the brand", () => {
+    for (const [raw, span] of [
+      ["Try notion.so for notes.", "notion"],
+      ["See https://www.notion.so/pricing today.", "notion"],
+      ["See [the docs](notion.so/docs) now.", "notion"],
+      ["Visit www.notion.com now.", "notion"],
+    ] as const) {
+      expect(judgeNameMatch({ alias: "Notion", ...ctx(raw, span) }), raw).toBe("about_brand");
+    }
+  });
+  it("a lowercase common-word use is still not about the brand, including before a full stop and a space", () => {
+    expect(judgeNameMatch({ alias: "Notion", ...ctx("That is a notion. So we left.", "notion") })).toBe("not_about_brand");
+    expect(judgeNameMatch({ alias: "Notion", ...ctx("A vague notion of safety.", "notion") })).toBe("not_about_brand");
+    expect(insideUrlOrDomain("a ", ". So")).toBe(false);
   });
 });
