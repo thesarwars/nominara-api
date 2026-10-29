@@ -15,9 +15,10 @@ import { lockNodeScope } from "./scope-lock.js";
 // embed jobs are enqueued AFTER the commit; a failed enqueue FAILS OPEN (owner decision 7): the nodes are stored and wait at
 // `embedding IS NULL` (no vector, no model), and the next extraction re-requests them.
 //
-// REPLACEMENT. A node set is one project-and-cluster's: it is deleted and rewritten, so a concept that fell below the threshold since
-// the last run leaves with it. Sibling clusters' nodes are untouched. (`ux_semantic_nodes` treats a NULL cluster as distinct, so an
-// upsert would stack duplicates for a cluster-less session; delete-and-insert has no such hole.)
+// RECONCILIATION. A node set is one project-and-cluster's: a concept that fell below the threshold since the last run is deleted, a
+// concept that is still there keeps its row and its vector, a new one is inserted. Sibling clusters' nodes are untouched. (`ux_semantic_nodes`
+// treats a NULL cluster as distinct, so an ON CONFLICT upsert would stack duplicates for a cluster-less session; update-then-insert
+// under the scope lock has no such hole.) Only nodes still at `embedding IS NULL` are requested from embed.batch.
 //
 // EVERY node carries `evidence_url` and `evidence_snippet`, both NOT NULL in the table: an unevidenced node cannot be stored.
 // `embedding_model` stays NULL until embed.batch writes it WITH the vector (owner decision 2026-10-28 #4).
@@ -73,7 +74,7 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
         ORDER BY centroid_weight DESC, url, passage_index`,
       [s.project_id, s.prompt_cluster_id, s.embedding_model],
     );
-    return { projectId: s.project_id, clusterId: s.prompt_cluster_id, passages: passages.rows };
+    return { projectId: s.project_id, clusterId: s.prompt_cluster_id, model: s.embedding_model, passages: passages.rows };
   });
   if (read === undefined) return { found: false, documents: 0, nodes: 0, embedJobs: 0, embedEnqueueFailures: 0 };
 
@@ -85,27 +86,52 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
 
   const written = await deps.runInTx(async (tx) => {
     await lockNodeScope(tx, read.projectId, read.clusterId);
-    await tx.query(
-      `DELETE FROM semantic_nodes WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2`,
-      [read.projectId, read.clusterId],
-    );
-    if (candidates.length === 0) return [] as string[];
+    // The scope's nodes are RECONCILED, not replaced: a phrase that did not change keeps its row and its vector (and its model), so a
+    // repeated extraction does not pay to embed the same text again. Only a phrase that is new, or whose vector is from another model, waits
+    // at NULL and is requested. The per-session analysis columns are reset: they are recomputed by `analyseNodes`.
     const typed = candidates.map((c) => ({ c, type: classifyNodeType(c.phrase) }));
-    const inserted = await tx.query<{ id: string }>(
+    const norms = typed.map((t) => t.c.normalized);
+    await tx.query(
+      `DELETE FROM semantic_nodes
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND NOT (phrase_normalized = ANY($3::text[]))`,
+      [read.projectId, read.clusterId, norms],
+    );
+    if (typed.length === 0) return [] as string[];
+    const values = [
+      typed.map((t) => t.c.phrase), norms, typed.map((t) => t.type), typed.map((t) => t.c.frequency),
+      typed.map((t) => t.c.docRatio), typed.map((t) => t.c.evidenceUrl), typed.map((t) => t.c.evidenceSnippet), typed.map((t) => requiresHumanReview(t.type)),
+    ];
+    const rows = `unnest($3::text[], $4::text[], $5::text[], $6::int[], $7::real[], $8::text[], $9::text[], $10::boolean[])
+                  AS v(phrase, norm, type, freq, ratio, url, snippet, review)`;
+    await tx.query(
+      `UPDATE semantic_nodes n
+          SET phrase = v.phrase, node_type = v.type, corpus_frequency = v.freq, corpus_doc_ratio = v.ratio, evidence_url = v.url,
+              evidence_snippet = v.snippet, requires_human_review = v.review, present_in_content = false, projected_gain = NULL,
+              priority_rank = NULL, computed_at = now(),
+              embedding = CASE WHEN n.embedding_model = $11 THEN n.embedding END,
+              embedding_model = CASE WHEN n.embedding_model = $11 THEN n.embedding_model END
+         FROM ${rows}
+        WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2 AND n.phrase_normalized = v.norm`,
+      [read.projectId, read.clusterId, ...values, read.model],
+    );
+    await tx.query(
       `INSERT INTO semantic_nodes
          (workspace_id, project_id, prompt_cluster_id, phrase, phrase_normalized, node_type, corpus_frequency, corpus_doc_ratio,
           evidence_url, evidence_snippet, requires_human_review)
        SELECT app.current_workspace(), $1, $2, v.phrase, v.norm, v.type, v.freq, v.ratio, v.url, v.snippet, v.review
-         FROM unnest($3::text[], $4::text[], $5::text[], $6::int[], $7::real[], $8::text[], $9::text[], $10::boolean[])
-              AS v(phrase, norm, type, freq, ratio, url, snippet, review)
-       RETURNING id`,
-      [
-        read.projectId, read.clusterId,
-        typed.map((t) => t.c.phrase), typed.map((t) => t.c.normalized), typed.map((t) => t.type), typed.map((t) => t.c.frequency),
-        typed.map((t) => t.c.docRatio), typed.map((t) => t.c.evidenceUrl), typed.map((t) => t.c.evidenceSnippet), typed.map((t) => requiresHumanReview(t.type)),
-      ],
+         FROM ${rows}
+        WHERE NOT EXISTS (
+          SELECT 1 FROM semantic_nodes n
+           WHERE n.workspace_id = app.current_workspace() AND n.project_id = $1 AND n.prompt_cluster_id IS NOT DISTINCT FROM $2 AND n.phrase_normalized = v.norm
+        )`,
+      [read.projectId, read.clusterId, ...values],
     );
-    return inserted.rows.map((row) => row.id).sort();
+    const waiting = await tx.query<{ id: string }>(
+      `SELECT id FROM semantic_nodes
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND embedding IS NULL`,
+      [read.projectId, read.clusterId],
+    );
+    return waiting.rows.map((row) => row.id).sort();
   });
 
   let embedJobs = 0;
@@ -123,8 +149,8 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
     }
   }
 
-  incrementCounter("nominara_geo_alignment_nodes_extracted_total", { outcome: written.length > 0 ? "nodes" : "none" });
+  incrementCounter("nominara_geo_alignment_nodes_extracted_total", { outcome: candidates.length > 0 ? "nodes" : "none" });
   // Workspace ID and counts only: no phrase, no URL, no snippet (competitor text is not ours to log).
-  logger.log({ event: "geo.alignment.nodes_extracted", workspace_id: deps.workspaceId, documents: documents.length, candidates: candidates.length, nodes: written.length, embed_jobs: embedJobs });
-  return { found: true, documents: documents.length, nodes: written.length, embedJobs, embedEnqueueFailures };
+  logger.log({ event: "geo.alignment.nodes_extracted", workspace_id: deps.workspaceId, documents: documents.length, candidates: candidates.length, nodes_waiting: written.length, embed_jobs: embedJobs });
+  return { found: true, documents: documents.length, nodes: candidates.length, embedJobs, embedEnqueueFailures };
 }

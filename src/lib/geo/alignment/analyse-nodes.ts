@@ -39,6 +39,9 @@ import { lockNodeScope } from "./scope-lock.js";
 // until the owner chooses where those vectors are stored. Until then a close
 // paraphrase reads as ABSENT, which errs toward recommending a concept the page may already express - never toward hiding a gap.
 //
+// THE BLEND IS OF UNIT VECTORS (the reference's v and e): both are l2-normalised before the weights apply, so halfvec rounding or a provider
+// that returns un-normalised vectors does not skew the effective alpha.
+//
 // THE GAIN is the best chunk's. The reference defines the gain of "this chunk"; a node is reported at the chunk it helps most, which is
 // where inserting it would be done. Token counts for the phrase are the embedding model's (the `tokenizer` port); the chunk's are
 // the ones stored when it was chunked.
@@ -179,8 +182,8 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
      ), pairs AS (
        SELECT n.id AS node_id,
               (e.embedding::vector(1536) <=> s.centroid::vector(1536))
-              - (l2_normalize(e.embedding::vector(1536) * array_fill((1 - a.alpha)::real, ARRAY[1536])::vector(1536)
-                              + n.embedding::vector(1536) * array_fill(a.alpha::real, ARRAY[1536])::vector(1536))
+              - (l2_normalize(l2_normalize(e.embedding::vector(1536)) * array_fill((1 - a.alpha)::real, ARRAY[1536])::vector(1536)
+                              + l2_normalize(n.embedding::vector(1536)) * array_fill(a.alpha::real, ARRAY[1536])::vector(1536))
                  <=> s.centroid::vector(1536)) AS gain
          FROM s
          JOIN semantic_nodes n ON n.workspace_id = app.current_workspace() AND n.project_id = $2 AND n.prompt_cluster_id IS NOT DISTINCT FROM $3

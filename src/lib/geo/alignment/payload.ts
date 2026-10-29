@@ -11,7 +11,7 @@ import { isLowConfidence } from "../corpus/weights.js";
 import { ALIGNMENT } from "./constants.js";
 import { diminishedSum } from "./gain.js";
 
-// STORY-059 AC9 / AC12 / AC13 - the session as the API would return it, validated against the contract on the way out.
+// STORY-059 AC10 / AC12 / AC13 - the session as the API would return it, validated against the contract on the way out.
 //
 // Validation here is the point: the estimate label, `generation: "disabled"` and `auto_insert: false` are literals of the schema, so a
 // payload that dropped one cannot be built. The recommendations are read from the column `analyseNodes` wrote (already suppressed

@@ -263,7 +263,9 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     const page = (300 * a1 + 100 * a2) / 400;
     expect(figures.currentAlignment).toBeCloseTo(page, 2);
     const row = await sessionRow(session);
-    expect(row.baseline_alignment as number).toBeCloseTo(page, 2);
+    expect(figures.pending).toBe(1);
+    // round 2: with a chunk still pending the figure is shown but the write-once BASELINE is not taken (it would describe a part of the page)
+    expect(row.baseline_alignment).toBeNull();
     expect(row.current_alignment as number).toBeCloseTo(page, 2);
   }, 60_000);
 
@@ -430,7 +432,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await expect(extractSemanticNodes(deps(), session)).resolves.toMatchObject({ nodes: 0, embedJobs: 0 });
   }, 60_000);
 
-  it("AC7 - scenario 7 - a node with no evidence cannot be stored (the columns are NOT NULL)", async () => {
+  it("AC8 - scenario 7 - a node with no evidence cannot be stored (the columns are NOT NULL)", async () => {
     await expect(db.query(`INSERT INTO semantic_nodes (workspace_id, project_id, phrase, phrase_normalized, node_type) VALUES ($1,$2,'x y','x y','capability')`, [workspaceId, projectId])).rejects.toThrow(/evidence_(url|snippet)/);
   }, 60_000);
 
@@ -495,7 +497,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
 
   // ---- scenario 6: presence ----------------------------------------------------------------------------------------------
 
-  it("scenario 6 - AC8 - a phrase present in the content, however it is cased or punctuated, is present; an absent one is not", async () => {
+  it("scenario 6 - AC7 - a phrase present in the content, however it is cased or punctuated, is present; an absent one is not", async () => {
     await addNode("audit logging", { embedding: vec({ 0: 1 }) });
     await addNode("single sign-on", { embedding: vec({ 3: 1 }) });
     await addNode("data residency", { embedding: vec({ 4: 1 }) });
@@ -530,14 +532,14 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await nodeByPhrase("audit logging")).present_in_content).toBe(false);
   }, 60_000);
 
-  // OPEN - AC8's other half. "present_in_content = the normalised phrase, OR A PHRASE WITH COSINE >= 0.90 TO IT, appears in the draft
+  // OPEN - AC7's other half. "present_in_content = the normalised phrase, OR A PHRASE WITH COSINE >= 0.90 TO IT, appears in the draft
   // content" needs a vector for every phrase of the CONTENT, and no table holds one (content_chunks are 512-token chunks, and a chunk
   // is never within 0.90 of a 4-word phrase). Storing them is a schema change the story did not name. See the report.
-  it.todo("scenario 6 - AC8 - a close paraphrase (cosine >= 0.90 to the node's phrase) is treated as present");
+  it.todo("scenario 6 - AC7 - a close paraphrase (cosine >= 0.90 to the node's phrase) is treated as present");
 
   // ---- coverage ----------------------------------------------------------------------------------------------------------
 
-  it("AC8 - coverage_ratio = nodes present / nodes required", async () => {
+  it("AC7 - coverage_ratio = nodes present / nodes required", async () => {
     await addNode("audit logging", { embedding: vec({ 0: 1 }) });
     await addNode("single sign on", { embedding: vec({ 3: 1 }) });
     await addNode("data residency", { embedding: vec({ 4: 1 }) });
@@ -548,7 +550,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await sessionRow(session)).coverage_ratio).toBeCloseTo(0.5, 5);
   }, 60_000);
 
-  it("AC8 - no required node is coverage NULL, not 0 and not 1; all present is 1; none present is 0", async () => {
+  it("AC7 - no required node is coverage NULL, not 0 and not 1; all present is 1; none present is 0", async () => {
     const empty = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "x" });
     const summary = await inTx((tx) => analyseNodes(tx, empty, words));
     expect(summary.coverageRatio).toBeNull();
@@ -629,7 +631,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
 
   // ---- priority and the projection ---------------------------------------------------------------------------------------
 
-  it("AC13 - priority_rank orders by projected_gain x corpus_doc_ratio x multiplier, and compliance/metric carry 1.15", async () => {
+  it("AC14 - priority_rank orders by projected_gain x corpus_doc_ratio x multiplier, and compliance/metric carry 1.15", async () => {
     // e1, e2, e3 are each at the same angle to the chunk (e0) and the centroid, so the gain is identical for all three and ONLY the
     // ratio and the multiplier decide. They are mutually orthogonal, so none collapses into another.
     const c = unit(vec({ 0: 1, 1: 1, 2: 1, 3: 1 }));
@@ -675,7 +677,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
 
   // ---- scenario 10, 12: the payload ---------------------------------------------------------------------------------------
 
-  it("scenario 10 - AC9/AC12 - the payload validates against the contract, carries the estimate labelling, and declares generation disabled", async () => {
+  it("scenario 10 - AC10/AC12 - the payload validates against the contract, carries the estimate labelling, and declares generation disabled", async () => {
     await seedCorpus();
     const session = await addSession();
     await addChunk(session, 0, vec({ 0: 1 }), 100);
@@ -724,7 +726,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
 
   // ---- low confidence: suppression -----------------------------------------------------------------------------------------
 
-  it("AC13 - a low-confidence session (fewer than 8 passages) keeps recommendations to ranks 1-3; 8 passages keeps them all", async () => {
+  it("AC14 - a low-confidence session (fewer than 8 passages) keeps recommendations to ranks 1-3; 8 passages keeps them all", async () => {
     for (const [sourceCount, expected] of [[7, 3], [8, 5]] as const) {
       await db.query("TRUNCATE semantic_nodes");
       const session = await addSession({ centroid: unit(vec({ 0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1 })), sourceCount, live: "unrelated" });
@@ -738,7 +740,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     }
   }, 60_000);
 
-  it("AC13 - fail closed: under low confidence a missing node with no modeled gain (no rank) is dropped, not shown", async () => {
+  it("AC14 - fail closed: under low confidence a missing node with no modeled gain (no rank) is dropped, not shown", async () => {
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 3, live: "unrelated" });
     await addNode("waiting for vector", { embedding: null });
     await inTx((tx) => analyseNodes(tx, session, words));
@@ -829,7 +831,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(draft.baseline_alignment).toBe(live.baseline_alignment);
   }, 60_000);
 
-  it("review - AC13 - a missing node modeled to move the page AWAY from the centroid (gain <= 0) is not recommended, and has no rank", async () => {
+  it("review - AC14 - a missing node modeled to move the page AWAY from the centroid (gain <= 0) is not recommended, and has no rank", async () => {
     const c = unit(vec({ 0: 1, 1: 1 }));
     const session = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
     await addChunk(session, 0, unit(vec({ 0: 1, 1: 1 })), 100);
@@ -888,17 +890,140 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     }
   }, 90_000);
 
-  it("review - concurrency - an analysis holds the scope's advisory lock until it commits (so two analyses of one scope cannot interleave)", async () => {
+  it("review round 2 - concurrency - an analysis holds THIS scope's advisory lock until it commits, and a second analysis of the scope waits for it", async () => {
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "unrelated" });
     await addNode("alpha beta gamma delta", { embedding: vec({ 1: 1 }) });
-    const before = Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory'")).rows[0]!.n);
-    let during = -1;
-    await inTx(async (tx) => {
-      await analyseNodes(tx, session, words);
-      during = Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND granted")).rows[0]!.n);
-    });
-    expect(during).toBeGreaterThan(before);
+    const key = `((classid::bigint << 32) | objid::bigint) = hashtextextended($1::text || ':' || $2::text, 0)`;
+    const second = new Client({ host: container.getHost(), port: container.getMappedPort(5432), database: container.getDatabase(), user: "nominara_app", password: resolvePassword("nominara_app", {}) });
+    await second.connect();
+    try {
+      const held = async (granted: boolean): Promise<number> =>
+        Number((await db.query(`SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND granted = $3 AND ${key}`, [projectId, clusterId, granted])).rows[0]!.n);
+      expect(await held(true)).toBe(0);
+      let secondDone = false;
+      let secondRun: Promise<unknown> = Promise.resolve();
+      await inTx(async (tx) => {
+        await analyseNodes(tx, session, words);
+        expect(await held(true), "the lock held is this scope's key").toBe(1);
+        secondRun = withTenantContext(second, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx2) => analyseNodes(tx2, session, words)).then(() => { secondDone = true; });
+        for (let i = 0; i < 100 && (await held(false)) === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(await held(false), "the second analysis is waiting on the same key").toBe(1);
+        expect(secondDone).toBe(false);
+      });
+      await secondRun;
+      expect(secondDone).toBe(true);
+      expect(await held(true)).toBe(0);
+    } finally {
+      await second.end();
+    }
   }, 60_000);
+
+  // ---- review round 2 ---------------------------------------------------------------------------------------------------------
+
+  it("review round 2 - AC4 - the live baseline is NOT frozen from a part-embedded page: it stays NULL until no live chunk is pending, then covers them all", async () => {
+    await seedCorpus();
+    const x = unit(vec({ 0: 1, 1: 0.2 }));
+    const y = unit(vec({ 3: 1, 0: 0.5 }));
+    const s1 = await addSession();
+    await addChunk(s1, 0, x, 100, false, "shared boilerplate paragraph");
+    const s2 = await addSession();
+    await addChunk(s2, 0, null, 100, false, "shared boilerplate paragraph"); // resolves through s1's vector at once
+    const changed = await addChunk(s2, 1, null, 100, false, "the paragraph that changed"); // waits in its embed.batch job
+    await inTx((tx) => computeCentroid(tx, s2));
+    const partial = await inTx((tx) => computeAlignment(tx, s2));
+    expect(partial.chunks).toBe(1);
+    expect(partial.pending, "the caller is told a chunk is still waiting").toBe(1);
+    expect(partial.currentAlignment).not.toBeNull();
+    expect((await sessionRow(s2)).baseline_alignment, "a baseline over a part of the page would be wrong for every later delta").toBeNull();
+    await db.query("UPDATE content_chunks SET embedding = $2::halfvec, embedding_model = $3 WHERE id = $1", [changed, lit(y), MODEL]);
+    const full = await inTx((tx) => computeAlignment(tx, s2));
+    expect(full.pending).toBe(0);
+    const row = await sessionRow(s2);
+    const centroid = expectedCentroid();
+    expect(row.baseline_alignment as number).toBeCloseTo((cos(x, centroid) + cos(y, centroid)) / 2, 2);
+    expect(row.baseline_alignment).toBe(row.current_alignment);
+  }, 60_000);
+
+  it("review round 2 - AC3 - a chunk whose vector source has gone is NOT averaged on its old alignment: it is cleared and counted as pending", async () => {
+    await seedCorpus();
+    const session = await addSession();
+    const orphan = await addChunk(session, 0, null, 100, false, "text nobody has embedded");
+    await db.query("UPDATE content_chunks SET alignment = 0.9 WHERE id = $1", [orphan]); // measured against an earlier centroid, its source row since deleted
+    await inTx((tx) => computeCentroid(tx, session));
+    const figures = await inTx((tx) => computeAlignment(tx, session));
+    expect(figures.chunks).toBe(0);
+    expect(figures.pending).toBe(1);
+    expect(figures.currentAlignment, "NULL, not the stale 0.9").toBeNull();
+    expect((await db.query("SELECT alignment FROM content_chunks WHERE id = $1", [orphan])).rows[0]).toEqual({ alignment: null });
+  }, 60_000);
+
+  describe("review round 2 - tenancy - a vector is never read from another workspace's row of the same text", () => {
+    const TEXT = "the very same boilerplate paragraph";
+    async function seedForeignEmbeddedChunk(): Promise<string> {
+      const bProject = randomUUID();
+      const bSession = randomUUID();
+      const bChunk = randomUUID();
+      await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1, $2, 'PB', $3, 'https://b.test', 'b.test')`, [bProject, otherWorkspaceId, `p-${randomUUID().slice(0, 8)}`]);
+      await db.query(
+        `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, centroid, centroid_source_count)
+         VALUES ($1,$2,$3,'https://b.test/p',$4,'{chatgpt}',$5,$6::halfvec,9)`,
+        [bSession, otherWorkspaceId, bProject, clusterId, MODEL, lit(vec({ 0: 1 }))],
+      );
+      await db.query(
+        `INSERT INTO content_chunks (id, workspace_id, project_id, session_id, url, chunk_index, text, token_count, content_hash, embedding, embedding_model, is_draft)
+         VALUES ($1,$2,$3,$4,'https://b.test/p',0,$5,100,$6,$7::halfvec,$8,false)`,
+        [bChunk, otherWorkspaceId, bProject, bSession, TEXT, createHash("sha256").update(TEXT).digest(), lit(vec({ 0: 1 })), MODEL],
+      );
+      return bChunk;
+    }
+    const onSuperuser = <T,>(fn: (tx: ClientBase) => Promise<T>): Promise<T> => withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, fn);
+
+    for (const [label, run] of [["the RLS-forced runtime role", inTx], ["a connection that bypasses RLS (the explicit predicate is the defence)", onSuperuser]] as const) {
+      it(`alignment and projected gain ignore workspace B's embedded chunk with the same hash - ${label}`, async () => {
+        const bChunk = await seedForeignEmbeddedChunk();
+        const c = unit(vec({ 0: 1, 1: 1 }));
+        const session = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
+        const mine = await addChunk(session, 0, null, 100, false, TEXT); // same sha256 as B's embedded chunk, unembedded here
+        await addNode("alpha beta gamma delta", { embedding: vec({ 1: 1 }) });
+        const figures = await run((tx) => computeAlignment(tx, session));
+        expect(figures.chunks).toBe(0);
+        expect(figures.pending).toBe(1);
+        expect(figures.currentAlignment).toBeNull();
+        await run((tx) => analyseNodes(tx, session, words));
+        expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain, "no chunk of THIS workspace has a vector to model against").toBeNull();
+        expect((await db.query("SELECT alignment FROM content_chunks WHERE id = $1", [mine])).rows[0]).toEqual({ alignment: null });
+        expect((await db.query("SELECT alignment, embedding IS NOT NULL AS embedded FROM content_chunks WHERE id = $1", [bChunk])).rows[0]).toEqual({ alignment: null, embedded: true });
+      }, 60_000);
+    }
+  });
+
+  it("review round 2 - AC9 - the blend works on UNIT vectors: a provider that returns un-normalised vectors does not skew alpha", async () => {
+    const c = unit(vec({ 0: 1, 1: 1 }));
+    const chunkRaw = vec({ 0: 2 }); // norm 2
+    const phraseRaw = vec({ 1: 3 }); // norm 3
+    const session = await addSession({ centroid: c, sourceCount: 9, live: "unrelated" });
+    await addChunk(session, 0, chunkRaw, 100);
+    await addNode("alpha beta gamma delta", { embedding: phraseRaw });
+    await inTx((tx) => analyseNodes(tx, session, words));
+    expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain as number).toBeCloseTo(expectedGain(unit(chunkRaw), c, unit(phraseRaw), 4, 100), 3);
+  }, 60_000);
+
+  it("review round 2 - AC5 - a re-extraction keeps the vector of a phrase that did not change and requests only the new ones", async () => {
+    await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
+    const session = await addSession();
+    await extractSemanticNodes(deps(), session);
+    await drainEmbedQueue();
+    const before = await nodeByPhrase("audit logging");
+    expect(before.embedding).not.toBeNull();
+    const again = await extractSemanticNodes(deps(), session);
+    expect(again.embedJobs, "nothing is re-embedded when nothing changed").toBe(0);
+    expect(enqueued).toHaveLength(0);
+    const after = await nodeByPhrase("audit logging");
+    expect(after.id).toBe(before.id);
+    expect(after.embedding).not.toBeNull();
+    expect(after.embedding_model).toBe(MODEL);
+    expect(again.nodes).toBe((await nodeRows()).length);
+  }, 90_000);
 
   it("RLS - workspace B's passages never become workspace A's nodes, and A cannot read B's session or nodes", async () => {
     await addPassage(0, { text: "We provide hidden telemetry. We provide hidden telemetry.", ws: otherWorkspaceId, embedding: null });

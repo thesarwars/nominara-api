@@ -51,9 +51,11 @@ export interface AlignmentFigures {
   readonly bandHigh: number | null;
   readonly percentile: number | null;
   readonly chunks: number;
+  /** Chunks of the measured kind still waiting for a vector: neither averaged nor counted. The live baseline is not set while any is pending. */
+  readonly pending: number;
 }
 
-const NOT_MEASURED: AlignmentFigures = { measured: false, baselineAlignment: null, currentAlignment: null, bandLow: null, bandHigh: null, percentile: null, chunks: 0 };
+const NOT_MEASURED: AlignmentFigures = { measured: false, baselineAlignment: null, currentAlignment: null, bandLow: null, bandHigh: null, percentile: null, chunks: 0, pending: 0 };
 
 export async function computeAlignment(tx: ClientBase, sessionId: string, options: { readonly draft?: boolean } = {}): Promise<AlignmentFigures> {
   return tracer.startActiveSpan("geo.alignment.compute", async (span) => {
@@ -72,6 +74,21 @@ export async function computeAlignment(tx: ClientBase, sessionId: string, option
 }
 
 async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<AlignmentFigures> {
+  // 0. a chunk that has NO vector source any more (its hash has no embedded row of this workspace and model) must not keep an alignment
+  //    computed against an earlier centroid: clear it, so step 2 does not average it and it counts as pending.
+  await tx.query(
+    `UPDATE content_chunks c SET alignment = NULL
+       FROM geo_alignments g
+      WHERE g.id = $1 AND g.workspace_id = app.current_workspace() AND g.centroid IS NOT NULL
+        AND c.session_id = g.id AND c.workspace_id = app.current_workspace() AND c.is_draft = $2 AND c.alignment IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM content_chunks x
+           WHERE x.workspace_id = app.current_workspace() AND x.content_hash = c.content_hash AND x.is_draft = c.is_draft
+             AND x.embedding_model = g.embedding_model AND x.embedding IS NOT NULL
+        )`,
+    [sessionId, draft],
+  );
+
   // 1. per chunk. Only chunks that are embedded, of THIS session, of the measured kind.
   const chunked = await tx.query<{ n: number }>(
     `WITH g AS (
@@ -104,6 +121,7 @@ async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<A
     target_band_low: number | null;
     target_band_high: number | null;
     percentile_vs_corpus: number | null;
+    pending: number;
   }>(
     `WITH s AS (
        SELECT id, project_id, prompt_cluster_id, embedding_model, centroid
@@ -113,6 +131,14 @@ async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<A
        SELECT sum(c.token_count::double precision * c.alignment) / NULLIF(sum(c.token_count), 0) AS a
          FROM s JOIN content_chunks c
            ON c.session_id = s.id AND c.workspace_id = app.current_workspace() AND c.is_draft = $2 AND c.alignment IS NOT NULL
+     ), pend AS (
+       SELECT count(*)::int AS n
+         FROM s JOIN content_chunks c ON c.session_id = s.id AND c.workspace_id = app.current_workspace() AND c.is_draft = $2
+        WHERE NOT EXISTS (
+          SELECT 1 FROM content_chunks x
+           WHERE x.workspace_id = app.current_workspace() AND x.content_hash = c.content_hash AND x.is_draft = c.is_draft
+             AND x.embedding_model = s.embedding_model AND x.embedding IS NOT NULL
+        )
      ), docs AS (
        SELECT sum(cp.token_count::double precision * (1 - (cp.embedding <=> s.centroid))) / NULLIF(sum(cp.token_count), 0) AS a
          FROM s JOIN corpus_passages cp
@@ -129,14 +155,14 @@ async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<A
          FROM docs CROSS JOIN page WHERE docs.a IS NOT NULL AND page.a IS NOT NULL
      )
      UPDATE geo_alignments g
-        SET baseline_alignment = CASE WHEN $2 THEN g.baseline_alignment ELSE COALESCE(g.baseline_alignment, page.a) END,
+        SET baseline_alignment = CASE WHEN $2 THEN g.baseline_alignment ELSE COALESCE(g.baseline_alignment, CASE WHEN pend.n = 0 THEN page.a END) END,
             current_alignment = page.a,
             target_band_low = band.lo, target_band_high = band.hi,
             percentile_vs_corpus = pct.p,
             updated_at = now()
-       FROM s, page, band, pct
+       FROM s, page, band, pct, pend
       WHERE g.id = s.id AND g.workspace_id = app.current_workspace()
-     RETURNING g.baseline_alignment, g.current_alignment, g.target_band_low, g.target_band_high, g.percentile_vs_corpus`,
+     RETURNING g.baseline_alignment, g.current_alignment, g.target_band_low, g.target_band_high, g.percentile_vs_corpus, pend.n AS pending`,
     [sessionId, draft, ALIGNMENT.bandLowPercentile, ALIGNMENT.bandHighPercentile],
   );
   const row = result.rows[0];
@@ -150,6 +176,7 @@ async function run(tx: ClientBase, sessionId: string, draft: boolean): Promise<A
     bandHigh: row.target_band_high,
     percentile: row.percentile_vs_corpus,
     chunks,
+    pending: row.pending,
   };
 }
 

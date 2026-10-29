@@ -2,13 +2,13 @@ import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-// STORY-059 AC9 / NFR-OPT-02 - "ranking-guarantee language is prohibited". There is no repository-wide copy lint yet, so this is the
-// guard for the code that WRITES the strings customers read: no string literal in the alignment library (comments excluded) may
+// STORY-059 AC10 / NFR-OPT-02 - "ranking-guarantee language is prohibited". There is no repository-wide copy lint yet, so this is the
+// guard (AC10 stays PARTIAL on its "lint-prohibited" half: this is a scoped vitest scan, not an ESLint rule, and covers no other module or client copy) for the code that WRITES the strings customers read: no string literal in the alignment library (comments excluded) may
 // promise a ranking, a citation or an outcome. The contract's own caveat is scanned in contracts/analytics/geo-alignment.schema.test.ts.
 
 const BANNED = /\b(guarantee[sd]?|will\s+(?:rank|be\s+cited|appear)|rank(?:s|ing)?\s+(?:higher|#?1|first)|ensures?\s+(?:citation|ranking|visibility)|boosts?\s+your\s+rank|#1\s+rank)/i;
 
-describe("STORY-059 AC9 - no ranking-guarantee wording in the alignment library", () => {
+describe("STORY-059 AC10 - no ranking-guarantee wording in the alignment library", () => {
   const dir = import.meta.dirname;
   const files = readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
 
