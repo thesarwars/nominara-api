@@ -89,3 +89,12 @@ The unit test "#6" asserts the finding and its rule code. It does not assert a g
 | `pnpm test:unit` | EXIT 0, 438 files passed + 1 skipped, 5649 tests passed + 1 skipped (`060-r3-unit.log`) |
 | `pnpm lint` / `pnpm typecheck` | EXIT 0 / EXIT 0 |
 | integration geo-entity 11, geo-freshness 5, geo-lever-rank 16, geo-insights 16, rollups-aux-tasks-geo-tools 46 | all EXIT 0 (`060-r3-*.log`) |
+
+### Round 6
+- Brand spelling: `casedSpellings` keys by the matcher's fold and prefers a spelling with an uppercase letter, so a project named "Notion" with alias "notion" is still judged as a cased brand (was: the lowercase alias replaced the cased name and risk fell to 0).
+- Co-occurrence casing: a cased alias is matched as spelled, in ALL CAPS and Capitalised (`casedVariants`); the lowercase common word stays excluded. Informational only, not a score input. Residual limit: a mixed-case variant that is none of those three ("hubSpot") is missed.
+- `corpus_passages.expires_at` is compared with `now()` (the transaction's instant), not `clock_timestamp()`, so the three window recomputes of one rollup read one passage set.
+- `answer_captures` self-join: the `ac` join now carries the same workspace/project predicates as the `src` join.
+- DECLINED (minor, needs measurement): bounding the `src` lookup by partition (`src.captured_at <= ac.captured_at`). It rests on an invariant (a source is never newer than its reuse) that no reference states, and the parser's own `reusedTextOf` is id-only too. Measure at production volume first; if it scans, resolve reused text in one query keyed by (captured_at, id).
+- Still OPEN for the owner: question 1 (the constants 30 and 8 and the "unmeasured withholds" reading) and question 4 (the v1 case heuristic undercounts false positives, so risk is biased low); the model-assisted judge or treating sentence-initial and markup-wrapped capitalised spans as unjudged must land before a probe job lets the score publish.
+- Follow-up story for L33: STORY-050 page source plus a cluster-to-landing-page map.

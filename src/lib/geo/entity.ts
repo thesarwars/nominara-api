@@ -438,6 +438,27 @@ export function insideUrlOrDomain(before: string, after: string): boolean {
 }
 
 /**
+ * The spelling to judge each folded alias by. Keyed by the fold the matcher compares with, and a spelling that holds an uppercase letter
+ * wins over an all-lowercase one of the same fold: a project with name "Notion" and alias "notion" is still a cased brand, so a lowercase
+ * span is still a suspect common word. (A Map keyed by plain lowercase let the later lowercase entry replace the cased one.)
+ */
+export function casedSpellings(names: readonly string[]): Map<string, string> {
+  const spellings = new Map<string, string>();
+  for (const name of names) {
+    const key = fold(name).folded;
+    const held = spellings.get(key);
+    if (held === undefined || (held === held.toLowerCase() && name !== name.toLowerCase())) spellings.set(key, name);
+  }
+  return spellings;
+}
+
+/** The casings a CASED alias is accepted in when matching corpus passages: as spelled, ALL CAPS, and Capitalised. Never the lowercase form. */
+export function casedVariants(alias: string): string[] {
+  const capitalised = alias.charAt(0).toUpperCase() + alias.slice(1).toLowerCase();
+  return [...new Set([alias, alias.toUpperCase(), capitalised])];
+}
+
+/**
  * The matched span of a stored mention. `mention_facts.char_start/char_end` are UTF-16 offsets into the NORMALISED text
  * (parser/normalize.ts), while `answer_captures.payload.text` is the raw adapter text: normalise it first, then slice.
  * Null when no text is held or the offsets fall outside it (unreadable, which the caller never counts as a false positive).
@@ -507,7 +528,7 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     `SELECT min(COALESCE(NULLIF(ac.payload ->> 'text', ''), NULLIF(src.payload ->> 'text', ''))) AS text,
             json_agg(json_build_array(mf.matched_alias, mf.char_start, mf.char_end)) AS mentions
        FROM mention_facts mf
-       LEFT JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at
+       LEFT JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.workspace_id = mf.workspace_id AND ac.project_id = mf.project_id
        LEFT JOIN answer_captures src ON src.id = ac.source_result_id AND src.workspace_id = ac.workspace_id AND src.project_id = ac.project_id
       WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $4
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
@@ -516,7 +537,7 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     [projectId, windowStart, windowDays, SCORING_VERSION],
   );
   // The parser may store the folded alias; judge against the cased spelling the project actually holds.
-  const cased = new Map([p.name, ...p.brand_aliases].map((a) => [a.toLowerCase(), a]));
+  const cased = casedSpellings([p.name, ...p.brand_aliases]);
   let nameMatches = 0;
   let unjudged = 0;
   let notAboutBrand = 0;
@@ -528,7 +549,7 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
       // A span that cannot be read (answer text no longer held) is counted as a match, reported as unjudged, and never as a false positive.
       const ctx = text === null ? null : contextOfNormalised(text, start, end);
       if (ctx === null) unjudged += 1;
-      else if (judgeNameMatch({ alias: cased.get(alias.toLowerCase()) ?? alias, ...ctx }) === "not_about_brand") notAboutBrand += 1;
+      else if (judgeNameMatch({ alias: cased.get(fold(alias).folded) ?? alias, ...ctx }) === "not_about_brand") notAboutBrand += 1;
     }
   }
 
@@ -547,14 +568,19 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
   const patCased: boolean[] = [];
   entities.forEach((e, i) => {
     // A capitalised alias ("Notion") is matched case-SENSITIVELY: folding it would count the common word ("notion") as the brand and inflate the rate.
-    for (const a of e.aliases) if (a.trim() !== "") { patIdx.push(i); patText.push(termPattern(a)); patCased.push(a !== a.toLowerCase()); }
+    // Its casing variants (all caps, title case) are accepted too: they are written as headings and brand marks, and are not the common word.
+    for (const a of e.aliases) {
+      if (a.trim() === "") continue;
+      const isCased = a !== a.toLowerCase();
+      for (const variant of isCased ? casedVariants(a) : [a]) { patIdx.push(i); patText.push(termPattern(variant)); patCased.push(isCased); }
+    }
   });
   const counts = new Map<number, number>();
   if (termPatterns.length > 0) {
     const res = await tx.query<{ idx: number; n: number }>(
       `WITH cat AS (
          SELECT row_number() OVER () AS rn, cp.text FROM corpus_passages cp
-          WHERE cp.project_id = $1 AND cp.expires_at > clock_timestamp() AND cp.text ~* ANY($2::text[])
+          WHERE cp.project_id = $1 AND cp.expires_at > now() AND cp.text ~* ANY($2::text[])
        )
        SELECT -1 AS idx, count(*)::int AS n FROM cat
        UNION ALL

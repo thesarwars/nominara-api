@@ -175,6 +175,37 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
     expect(detail.disambiguation).toMatchObject({ name_matches: 35, unjudged: 0, not_about_brand: 15, level: "high" });
   });
 
+  it("hazard · an L2 row whose source_result_id points into ANOTHER project of the same workspace reads no text: its mentions are unjudged, not judged against foreign text", async () => {
+    const other = randomUUID();
+    await db.query(`INSERT INTO projects (id,workspace_id,name,slug,root_url,root_domain) VALUES ($1,$2,'Other',$3,'https://o.example','o.example')`, [other, workspaceId, `o-${randomUUID().slice(0, 8)}`]);
+    const foreign = randomUUID();
+    const raw = "We looked at notion for teams.";
+    await db.query(
+      `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,status)
+       VALUES ($1,$2,$3,$4,$5,'gemini','2026-08-01T10:00:00Z','api','v1','v1','\\x00',$6::jsonb,'parsed')`,
+      [foreign, workspaceId, other, randomUUID(), randomUUID(), JSON.stringify({ format: "markdown", text: raw })],
+    );
+    const start = normalize(raw).indexOf("notion");
+    for (let i = 0; i < 5; i++) {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,status,cache_layer,source_result_id)
+         VALUES ($1,$2,$3,$4,$5,'gemini',$6,'api','v1','v1','\\x00','{}'::jsonb,'parsed','l2',$7)`,
+        [id, workspaceId, projectId, randomUUID(), randomUUID(), IN_WINDOW, foreign],
+      );
+      await db.query(
+        `INSERT INTO mention_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_label,matched_alias,
+           occurrence_index,char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,position_class,answer_form)
+         VALUES ($1,$2,$3,$4,'gemini',$5,'brand','Notion','notion',0,$6,$7,0,0.5,'neutral',0,0.5,'lexicon','recommendation','narrative')`,
+        [workspaceId, projectId, id, randomUUID(), IN_WINDOW, start, start + 6],
+      );
+    }
+    await matches(30, "Notion");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await db.query("SELECT findings FROM geo_analyses WHERE project_id=$1 AND analysis='entity' AND window_days=30", [projectId])).rows[0].findings[0].entity);
+    expect(detail.disambiguation).toMatchObject({ name_matches: 35, unjudged: 5, not_about_brand: 0 });
+  });
+
   it("no profile check recorded: persisted as insufficient with its reason, and the read has no detail", async () => {
     await refresh();
     expect(await row()).toMatchObject({ sufficient: false, score: null });
@@ -250,6 +281,52 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
     await refresh();
     const detail = geoEntityDetailSchema.parse((await read()).detail);
     expect(detail.cooccurrence.entities.find((e) => e.is_brand)).toMatchObject({ passages: 2, rate: 0.2 });
+  });
+
+  const passage = (i: number, text: string, expires = "now()+interval '30 days'") =>
+    db.query(
+      `INSERT INTO corpus_passages (workspace_id,project_id,citation_url_hash,url,domain,passage_index,text,token_count,content_hash,embedding_model,expires_at)
+       VALUES ($1,$2,$3,'https://x.example/'||$4,'x.example',0,$5,10,$3,'stub',${expires})`,
+      [workspaceId, projectId, Buffer.from(`k${i}-${randomUUID()}`), String(i), text],
+    );
+
+  it("hazard · a project whose name is 'Notion' and whose alias list ALSO holds 'notion' keeps the cased spelling: 15 lowercase of 35 matches is HIGH, score withheld", async () => {
+    await db.query("UPDATE projects SET brand_aliases = '{notion}' WHERE id = $1", [projectId]);
+    await inTx((tx) => writeEntityNodes(tx, projectId, ALL_PRESENT, SAMEAS));
+    await matches(20, "Notion");
+    await matches(15, "notion");
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.disambiguation).toMatchObject({ level: "high", name_matches: 35, not_about_brand: 15 });
+    expect(detail.authority).toMatchObject({ score: null, suppressed: true });
+    expect((await row()).score).toBeNull();
+  });
+
+  it("hazard · co-occurrence keeps the casing variants a cased alias is written in (all-caps, title-case) and still excludes the lowercase common word", async () => {
+    await db.query("UPDATE projects SET brand_aliases = '{HubSpot}' WHERE id = $1", [projectId]);
+    await db.query("INSERT INTO competitors (workspace_id,project_id,name,root_domain,aliases) VALUES ($1,$2,'Salesforce','sf.example','{}')", [workspaceId, projectId]);
+    const texts = [
+      "SALESFORCE leads the CRM market.", "SALESFORCE CRM pricing.", "Salesforce is a CRM.", // 3 competitor passages (caps, caps, exact)
+      "The salesforce of a CRM team.", // lowercase common word: not the competitor
+      "HUBSPOT CRM.", "Hubspot CRM.", // 2 brand passages (caps, title-case); HubSpot spelling not present
+      "A CRM guide.", "A CRM guide.", "A CRM guide.", "A CRM guide.",
+    ];
+    for (const [i, t] of texts.entries()) await passage(i, t);
+    await refresh();
+    const detail = geoEntityDetailSchema.parse((await db.query("SELECT findings FROM geo_analyses WHERE project_id=$1 AND analysis='entity' AND window_days=30", [projectId])).rows[0].findings[0].entity);
+    expect(detail.cooccurrence.entities.find((e) => e.name === "Salesforce")?.passages).toBe(3);
+    expect(detail.cooccurrence.entities.find((e) => e.is_brand)?.passages).toBe(2);
+  });
+
+  it("hazard · the unexpired corpus is read AS OF the transaction: a passage that expires mid-refresh is still counted, so a recompute of one instant is reproducible", async () => {
+    await inTx(async (tx) => {
+      for (let i = 0; i < 10; i++) await db.query(`INSERT INTO corpus_passages (workspace_id,project_id,citation_url_hash,url,domain,passage_index,text,token_count,content_hash,embedding_model,expires_at)
+         VALUES ($1,$2,$3,'https://x.example/'||$4,'x.example',0,'A CRM guide.',10,$3,'stub',now()+interval '1 second')`, [workspaceId, projectId, Buffer.from(`e${i}`), String(i)]);
+      await tx.query("SELECT pg_sleep(1.6)");
+      await refreshProjectGeo(tx, projectId, { asOf: AS_OF });
+    });
+    const detail = geoEntityDetailSchema.parse((await read()).detail ?? (await row()).findings[0].entity);
+    expect(detail.cooccurrence.category_passages).toBe(10);
   });
 
   it("#11 · free and unmetered: no credit ledger entry", async () => {

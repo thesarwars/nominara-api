@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { geoAnalysisWriteSchema, geoEntityDetailSchema } from "../../../contracts/analytics/index.js";
 import {
   buildEntity,
+  casedSpellings,
+  casedVariants,
   deriveNodeRecord,
   disambiguationLevel,
   ENTITY_ALIAS_TASK_RULE,
@@ -337,5 +339,17 @@ describe("STORY-060 hazard · a brand written as its domain or URL is the brand,
     expect(insideUrlOrDomain("a ", ". So")).toBe(false);
     // markdown link text is the brand being linked
     expect(insideUrlOrDomain("see [", "](https://notion.so)")).toBe(true);
+  });
+});
+
+describe("STORY-060 · cased spellings", () => {
+  it("a lowercase alias never replaces the cased spelling of the same name, in either order", () => {
+    expect(casedSpellings(["Notion", "notion"]).get("notion")).toBe("Notion");
+    expect(casedSpellings(["notion", "Notion"]).get("notion")).toBe("Notion");
+    expect(casedSpellings(["notion"]).get("notion")).toBe("notion");
+  });
+  it("a cased alias is accepted as spelled, in capitals and capitalised, never lowercase", () => {
+    expect(casedVariants("HubSpot")).toEqual(["HubSpot", "HUBSPOT", "Hubspot"]);
+    expect(casedVariants("Notion")).toEqual(["Notion", "NOTION"]);
   });
 });
