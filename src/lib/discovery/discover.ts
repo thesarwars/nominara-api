@@ -52,34 +52,22 @@ export interface DiscoverDeps {
   readonly now: () => number;
 }
 
-/** product-spec.md FR-ONB-02a / edge-cases-and-slos.md row 33 — "p50 <= 20 s, p95 <= 45 s". */
+/**
+ * product-spec.md FR-ONB-02a / edge-cases-and-slos.md row 33 — "p50 <= 20 s, p95 <= 45 s".
+ *
+ * MEASURED, NOT ENFORCED. The objective is evidenced by `nominara_discovery_duration_seconds` (from submission, emitted by the
+ * crawl.discover handler); no alert or recording rule judges it yet, so AC15 is not "met" until one does. An earlier in-process
+ * `meetsLatencyObjective` helper had no production caller and was removed rather than left to imply enforcement.
+ */
 export const DISCOVERY_LATENCY_OBJECTIVE = { p50Ms: 20_000, p95Ms: 45_000 } as const;
 
 /** A pass that outlives the upper-percentile objective is cut off and finishes as a partial project. */
 export const DISCOVERY_BUDGET_MS = DISCOVERY_LATENCY_OBJECTIVE.p95Ms;
 
 /**
- * The value at zero-based index ceil(p * n), clamped: deliberately the CONSERVATIVE percentile, so one slow pass in twenty is the p95
- * rather than being averaged away (nearest-rank would call 1-in-20 "the 19th value" and hide it).
+ * Rejects after `ms`, clearing its timer when the race is settled either way. It does not abort `work`: the fetch behind it is
+ * `guardedFetch`, which destroys its own request at TOTAL_TIMEOUT_MS (20 s, shorter than this budget), so an abandoned fetch is bounded.
  */
-function conservativePercentile(sorted: readonly number[], p: number): number {
-  return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length))]!;
-}
-
-/**
- * Whether measured durations meet the objective at the median AND the upper percentile, each judged on its own (<=).
- * `null` when nothing was measured: no data is not "met", and it is not "missed" either.
- */
-export function meetsLatencyObjective(durationsMs: readonly number[]): boolean | null {
-  if (durationsMs.length === 0) return null;
-  const sorted = [...durationsMs].sort((a, b) => a - b);
-  return (
-    conservativePercentile(sorted, 0.5) <= DISCOVERY_LATENCY_OBJECTIVE.p50Ms &&
-    conservativePercentile(sorted, 0.95) <= DISCOVERY_LATENCY_OBJECTIVE.p95Ms
-  );
-}
-
-/** Rejects after `ms`, clearing its timer when the race is settled either way. */
 async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const budget = new Promise<never>((_, reject) => {

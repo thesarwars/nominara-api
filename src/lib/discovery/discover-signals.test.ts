@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { discover, DISCOVERY_BUDGET_MS, DISCOVERY_LATENCY_OBJECTIVE, meetsLatencyObjective, type DiscoverDeps } from "./discover.js";
+import { discover, DISCOVERY_BUDGET_MS, DISCOVERY_LATENCY_OBJECTIVE, type DiscoverDeps } from "./discover.js";
 import { LOW_CONFIDENCE_THRESHOLD } from "../../../contracts/projects/index.js";
 
 // STORY-043 AC10 (hero / nav / logo alt), AC11 (competitors with a basis), AC15 (latency objective).
@@ -99,20 +99,6 @@ describe("STORY-043 · AC15 latency objective", () => {
     expect(DISCOVERY_LATENCY_OBJECTIVE).toEqual({ p50Ms: 20_000, p95Ms: 45_000 });
   });
 
-  it("meetsLatencyObjective judges the median and the upper percentile separately", () => {
-    expect(meetsLatencyObjective([1000, 2000, 3000, 4000, 5000])).toBe(true);
-    // Median fine, p95 blown.
-    expect(meetsLatencyObjective([...Array<number>(19).fill(1000), 60_000])).toBe(false);
-    // p95 fine, median blown.
-    expect(meetsLatencyObjective(Array<number>(10).fill(25_000))).toBe(false);
-    // Exactly on the limits is inside the objective (<=).
-    expect(meetsLatencyObjective([20_000])).toBe(true);
-  });
-
-  it("no measurements is not 'met' — null is not zero", () => {
-    expect(meetsLatencyObjective([])).toBeNull();
-  });
-
   it("scenario 18 (sub-measure only) — discover()'s own run of a slow 4 s root fetch is reported as 4 s; the objective itself is judged from submission in the crawl.discover handler test", async () => {
     let t = 0;
     const deps: DiscoverDeps = {
@@ -121,7 +107,7 @@ describe("STORY-043 · AC15 latency objective", () => {
     };
     const result = await discover(BASE, deps);
     expect(result.duration_ms).toBe(4000);
-    expect(meetsLatencyObjective([result.duration_ms!])).toBe(true);
+    expect(result.duration_ms!).toBeLessThanOrEqual(DISCOVERY_LATENCY_OBJECTIVE.p50Ms);
   });
 
   it("scenario 13 — a fetch that outlives the budget ends the pass as a partial project, not a hang", async () => {
