@@ -73,7 +73,13 @@ export const toolRunConversionSchema = z
     /** Converting costs nothing, and neither does tracking thereafter (FR-TL-09). */
     credits: z.literal(0),
     prefill: z
-      .object({ project_name: z.string().nullable(), root_url: z.string().nullable(), prompts: z.array(z.string()) })
+      .object({
+        project_name: z.string().nullable(),
+        root_url: z.string().nullable(),
+        prompts: z.array(z.string()),
+        /** The competitor names the run found (`result_json.competitors`); empty for a tool that finds none, and once the payload has expired. */
+        competitors: z.array(z.string()),
+      })
       .strict(),
   })
   .strict();
@@ -83,6 +89,8 @@ export const toolRunConversionPreviewSchema = toolRunConversionSchema
   .extend({
     project_slot: z.object({ used: z.number().int().nonnegative(), max: z.number().int().nonnegative().nullable(), free: z.boolean() }).strict(),
     prompt_slots: z.object({ carried: z.number().int().nonnegative(), cap: z.number().int().nonnegative().nullable() }).strict(),
+    /** `carried` is what will be created: the competitors found, up to `competitors.max_per_project`. */
+    competitor_slots: z.object({ carried: z.number().int().nonnegative(), cap: z.number().int().nonnegative().nullable() }).strict(),
   })
   .strict();
 
@@ -95,7 +103,7 @@ export const toolRunSchema = z
     created_at: z.iso.datetime(),
     /** Set at insert from the plan's retention; never computed at read time. */
     expires_at: z.iso.datetime(),
-    /** Ordering only. A pinned run still expires. */
+    /** A pinned run surfaces through the `?pinned=true` filter (a separate section, not a re-sort of the timeline); it still expires. */
     pinned: z.boolean(),
     inputs: toolRunInputsSchema,
     headline: toolRunHeadlineSchema,

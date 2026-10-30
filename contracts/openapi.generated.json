@@ -56636,12 +56636,19 @@
                                   "items": {
                                     "type": "string"
                                   }
+                                },
+                                "competitors": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
                                 }
                               },
                               "required": [
                                 "project_name",
                                 "root_url",
-                                "prompts"
+                                "prompts",
+                                "competitors"
                               ],
                               "additionalProperties": false
                             }
@@ -57732,12 +57739,19 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "competitors": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           },
                           "required": [
                             "project_name",
                             "root_url",
-                            "prompts"
+                            "prompts",
+                            "competitors"
                           ],
                           "additionalProperties": false
                         },
@@ -57798,6 +57812,33 @@
                             "cap"
                           ],
                           "additionalProperties": false
+                        },
+                        "competitor_slots": {
+                          "type": "object",
+                          "properties": {
+                            "carried": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "cap": {
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "carried",
+                            "cap"
+                          ],
+                          "additionalProperties": false
                         }
                       },
                       "required": [
@@ -57806,7 +57847,8 @@
                         "credits",
                         "prefill",
                         "project_slot",
-                        "prompt_slots"
+                        "prompt_slots",
+                        "competitor_slots"
                       ],
                       "additionalProperties": false
                     },
@@ -58156,6 +58198,33 @@
                               ],
                               "additionalProperties": false
                             },
+                            "competitor_slots": {
+                              "type": "object",
+                              "properties": {
+                                "carried": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "cap": {
+                                  "anyOf": [
+                                    {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "carried",
+                                "cap"
+                              ],
+                              "additionalProperties": false
+                            },
                             "credits": {
                               "type": "number",
                               "const": 0
@@ -58164,6 +58233,7 @@
                           "required": [
                             "project_slot",
                             "prompt_slots",
+                            "competitor_slots",
                             "credits"
                           ],
                           "additionalProperties": false

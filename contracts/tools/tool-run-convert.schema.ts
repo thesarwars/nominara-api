@@ -19,7 +19,7 @@ export const convertToolRunResponseSchema = z
     converted_at: z.iso.datetime(),
     already_converted: z.boolean(),
     /** The slot cost of the conversion that created the project; a repeat creates nothing and charges nothing. */
-    slot_cost: toolRunConversionPreviewSchema.pick({ project_slot: true, prompt_slots: true, credits: true }),
+    slot_cost: toolRunConversionPreviewSchema.pick({ project_slot: true, prompt_slots: true, competitor_slots: true, credits: true }),
     poll: z.object({ discovery: z.string() }).strict(),
   })
   .strict();
