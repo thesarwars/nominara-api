@@ -1,4 +1,5 @@
 import { Test } from "@nestjs/testing";
+import type { ClientBase } from "pg";
 import { Logger } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
@@ -11,6 +12,7 @@ import { PromptListService } from "./prompt-list.service.js";
 import { PromptsController } from "./prompts.controller.js";
 import { PromptsModule } from "./prompts.module.js";
 import { PromptsService } from "./prompts.service.js";
+import { withTenantContext } from "../../tenancy/tenant-context.js";
 
 // STORY-022's compiles-test, extended by STORY-045. The module now imports
 // CacheModule, which validates the full env schema at .compile() time, so
@@ -71,5 +73,53 @@ describe("STORY-022 · PromptsModule compiles", () => {
     // PROVIDED fails only at the first request.
     expect(moduleRef.get(PromptListService)).toBeInstanceOf(PromptListService);
     await moduleRef.close();
+  });
+});
+
+// STORY-043 review (round 2), finding 1 — the project-row lock serialises generate with crawl.discover's free allowance, but it must
+// cover ONLY the database tail. Held across the naturaliser (a provider call, 8 s hard timeout) it would block every non-key UPDATE of
+// the row (discovery prepare/commit, confirm, PATCH) for the whole call and break the queue-boundary rule.
+describe("STORY-043 · PromptsService.generate takes the project lock only around the DB tail", () => {
+  const originalEnv = { ...process.env };
+  beforeEach(() => applyFakeApiEnv());
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  it("naturalises on an UNLOCKED snapshot; locks after the provider call, then re-reads the hashes, then inserts", async () => {
+    const events: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (/FOR NO KEY UPDATE/.test(sql)) events.push("LOCK");
+        else if (sql.includes("FROM projects")) events.push("PROJECT");
+        else if (sql.includes("SELECT id, text_hash FROM tracked_prompts")) events.push("HASHES");
+        else if (sql.includes("INSERT INTO tracked_prompts")) events.push("INSERT");
+        if (sql.includes("FROM projects")) {
+          return { rows: [{ name: "HubSpot", root_domain: "hubspot.com", category_slug: "crm", verticals: [], locale: null, brand_aliases: [] }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as ClientBase;
+    const naturaliser = {
+      naturalise: async (request: { lines: readonly string[] }) => {
+        events.push("NATURALISE");
+        return request.lines;
+      },
+    };
+    const cache = { get: async () => undefined, set: async () => undefined } as never;
+    const service = new PromptsService(cache, naturaliser, null);
+
+    await withTenantContext(client, { workspaceId: "11111111-1111-7111-8111-111111111111", actorId: "22222222-2222-7222-8222-222222222222" }, () =>
+      service.generate("0f9e2a7c-1b3d-4e5f-8a9b-0c1d2e3f4a5b", {} as never),
+    );
+
+    const naturalise = events.indexOf("NATURALISE");
+    const lock = events.indexOf("LOCK");
+    expect(naturalise).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeGreaterThan(naturalise);
+    expect(events.indexOf("HASHES", lock)).toBeGreaterThan(lock);
+    expect(events.indexOf("INSERT")).toBeGreaterThan(events.indexOf("HASHES", lock));
+    // Nothing before the provider call took the lock.
+    expect(events.slice(0, naturalise)).not.toContain("LOCK");
   });
 });

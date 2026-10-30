@@ -33,6 +33,7 @@ import type { PaginationRequest } from "../../../contracts/common/pagination.sch
 import type { PortalProjectEngines } from "../../lib/portal/portal-facts.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
+import { generateFreeAllowance } from "../../lib/discovery/free-prompts.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
@@ -510,7 +511,33 @@ export class ProjectsService {
     // stale. `rollup.metric_daily` is the job that recomputes it.
     if (categoryChanged) this.requestRecompute(workspaceId, projectId);
 
-    return nextPayload;
+    // STORY-043 AC12 — the top-up. A URL-only project's first discovery pass had no brand, category or verticals to fill the prompt
+    // templates from; the confirmed values are what it was waiting for. AFTER the columns above are written (the generator reads the
+    // project row), and idempotent: it generates only what the allowance is still short of.
+    const toppedUp = changesPromptContext(input) ? await this.topUpFreeAllowance(client, workspaceId, projectId, nextPayload) : null;
+    if (toppedUp === null) return nextPayload;
+    await client.query("UPDATE projects SET discovery = $2, updated_at = now() WHERE id = $1", [projectId, JSON.stringify(toppedUp)]);
+    return toppedUp;
+  }
+
+  /**
+   * Null when there is nothing to change. A caller who supplied prompts at creation had the allowance suppressed by crawl.discover
+   * ("supplied wins"), and confirming must not undo it. That is read from the rows the creation marked (`generator_meta.origin`),
+   * NOT inferred from "nothing generated and some manual prompt exists": a manual prompt typed after creation says nothing about it.
+   */
+  private async topUpFreeAllowance(
+    client: ClientBase,
+    workspaceId: string,
+    projectId: string,
+    payload: DiscoveryResponse,
+  ): Promise<DiscoveryResponse | null> {
+    const supplied = await client.query(
+      "SELECT 1 FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL AND generation_source = 'manual' AND generator_meta->>'origin' = 'creation' LIMIT 1",
+      [projectId],
+    );
+    if (supplied.rows.length > 0) return null;
+    const allowance = await generateFreeAllowance(client, { workspaceId, projectId, allowance: FREE_PROMPT_ALLOWANCE });
+    return { ...payload, prompts_generated: allowance.prompts, prompts_free_remaining: allowance.remaining };
   }
 
   /**
@@ -672,12 +699,17 @@ export class ProjectsService {
   }
 }
 
+/** `generator_meta.origin` of a prompt the CREATION request supplied. */
+const CREATION_ORIGIN = "creation";
+
 /** The supplied prompts as rows, DEDUPED BY HASH (see `insertSuppliedSeeds`): the rows a creation inserts, in order. */
 function distinctSuppliedPrompts(workspaceId: string, projectId: string, input: CreateProjectRequest): PromptRow[] {
   const seen = new Set<string>();
   const rows: PromptRow[] = [];
   for (const prompt of input.prompts ?? []) {
-    const row = manualPromptRow({ workspaceId, projectId, text: prompt.text });
+    const base = manualPromptRow({ workspaceId, projectId, text: prompt.text });
+    // The creation-time supplied set, recorded on the row: `topUpFreeAllowance` reads it back instead of inferring it.
+    const row: PromptRow = { ...base, generatorMeta: { ...base.generatorMeta, origin: CREATION_ORIGIN } };
     const key = row.textHash.toString("hex");
     if (seen.has(key)) continue;
     seen.add(key);
@@ -828,6 +860,12 @@ function toEngineScores(byEngine: unknown): ProjectListItem["engine_scores"] {
   return Object.entries(parsed)
     .map(([engineKey, value]) => ({ engine_key: engineKey, score: value.score, delta_30d: value.delta_30d }))
     .sort((a, b) => b.score - a.score);
+}
+
+/** Confirming a brand name, category or vertical changes what the prompt templates can be filled from; nothing else does. */
+function changesPromptContext(input: ConfirmDiscoveryRequest): boolean {
+  const confirmed = Object.keys(input.fields ?? {});
+  return confirmed.some((name) => name === "brand_name" || name === "category" || name === "verticals");
 }
 
 /** The honest empty payload for a project whose discovery has written nothing yet. */

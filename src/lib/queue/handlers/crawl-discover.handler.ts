@@ -2,9 +2,12 @@ import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
 import { z } from "zod";
-import { discover, type DiscoverDeps } from "../../discovery/discover.js";
+import type { DiscoveryResponse } from "../../../../contracts/projects/index.js";
+import { discover, FREE_PROMPT_ALLOWANCE, type DiscoverDeps } from "../../discovery/discover.js";
+import { generateFreeAllowance } from "../../discovery/free-prompts.js";
+import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import type { JobProcessor } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure } from "../worker-factory.js";
 
 // STORY-043 — the first real entry in STORY-124's registry, and the one its
 // own comment named: "crawl.discover with STORY-043".
@@ -29,74 +32,166 @@ const payloadSchema = z
   })
   .strict();
 
+interface Prepared {
+  readonly payload: z.infer<typeof payloadSchema>;
+  readonly rootDomain: string;
+  /** When the project (and so the job) was submitted: AC15's clock starts here, not when `discover()` does. */
+  readonly submittedAt: Date | null;
+  readonly knownBrandNames: readonly string[];
+  /** Field names a person decided: skipped by `discover`, then carried forward verbatim. */
+  readonly humanDecided: readonly string[];
+  readonly preserved: Record<string, unknown>;
+}
+
+// ADR-0003 / NFR-ARCH-04 — a PHASED job. The middle of this handler is a fetch of a site we do not control, so it must not hold a
+// tenant transaction (or the pooled connection under it) across that await.
+//   prepare  short tenant transaction: confirm the project, mark it running (committed BEFORE the fetch, so a poll mid-flight says so).
+//   run      NO transaction: the guarded fetch and the pure parsing.
+//   commit   short tenant transaction: the free allowance and the review payload, written together.
 export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?: DiscoverDeps): JobProcessor {
   const logger = new Logger("crawl.discover");
 
-  return async (tx: ClientBase, job: Job): Promise<void> => {
-    const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
+  return phasedProcessor<Prepared, DiscoveryResponse>({
+    async prepare(tx: ClientBase, job: Job) {
+      const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
 
-    // The project's own root_domain, read back rather than carried on the job.
-    // A job payload is a snapshot from enqueue time; the row is the truth, and
-    // reading it also confirms the project still exists — it may have been
-    // deleted between creation and this job being picked up.
-    const project = await tx.query<{ root_domain: string; discovery: unknown }>(
-      "SELECT root_domain, discovery FROM projects WHERE id = $1 AND deleted_at IS NULL",
-      [payload.projectId],
-    );
-    if (project.rows.length === 0) {
-      // Deleted, or in another tenant and invisible to RLS. Either way there
-      // is nothing to enrich and nothing wrong — returning is correct, and
-      // throwing would send a job down the retry ladder for a project that no
-      // longer exists.
-      logger.log(`project ${payload.projectId} is gone; skipping discovery`);
-      return;
-    }
+      // The project's own root_domain, read back rather than carried on the job.
+      // A job payload is a snapshot from enqueue time; the row is the truth, and
+      // reading it also confirms the project still exists — it may have been
+      // deleted between creation and this job being picked up.
+      const project = await tx.query<{ root_domain: string; discovery: unknown; name?: string | null; brand_aliases?: string[] | null; created_at?: Date | string | null }>(
+        "SELECT root_domain, discovery, name, brand_aliases, created_at FROM projects WHERE id = $1 AND deleted_at IS NULL",
+        [payload.projectId],
+      );
+      const row = project.rows[0];
+      if (row === undefined) {
+        // Deleted, or in another tenant and invisible to RLS. Either way there
+        // is nothing to enrich and nothing wrong — returning is correct, and
+        // throwing would send a job down the retry ladder for a project that no
+        // longer exists.
+        logger.log(`project ${payload.projectId} is gone; skipping discovery`);
+        return PHASES_DONE;
+      }
 
-    await tx.query("UPDATE projects SET discovery_status = 'running' WHERE id = $1", [payload.projectId]);
+      await tx.query("UPDATE projects SET discovery_status = 'running' WHERE id = $1", [payload.projectId]);
 
-    // `discover` does not throw for a site-side problem — it returns `partial`
-    // or `failed` with whatever it obtained (AC13). A throw here would be OUR
-    // bug, and should reach the retry ladder.
-    // STORY-044 AC4/scenario 5 — a field a human overrode is NEVER overwritten
-    // by a later pass. Folded into the same `fieldsSupplied` skip list that
-    // makes "supplied wins" work, rather than added as a second mechanism:
-    // both mean "a person decided this, do not derive it", and one code path
-    // cannot drift out of step with itself. Without this a re-crawl silently
-    // reverts the customer's correction and they have no way to tell.
-    const humanDecided = userEditedFields(project.rows[0]!.discovery);
-    const result = await discover(
-      {
-        rootUrl: payload.rootUrl,
-        rootDomain: project.rows[0]!.root_domain,
-        fieldsSupplied: [...payload.fieldsSupplied, ...humanDecided],
-      },
-      deps,
-    );
+      // STORY-044 AC4/scenario 5 — a field a human overrode is NEVER overwritten by a later pass. Folded into the same
+      // `fieldsSupplied` skip list that makes "supplied wins" work: both mean "a person decided this, do not derive it".
+      return {
+        payload,
+        rootDomain: row.root_domain,
+        submittedAt: toDate(row.created_at),
+        knownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? [])],
+        humanDecided: userEditedFields(row.discovery),
+        preserved: preservedFields(row.discovery),
+      };
+    },
 
-    // The overridden entries are carried forward verbatim. `discover` skipped
-    // them, so without this they would simply vanish from the payload — the
-    // value would survive on the project column but the record that a human
-    // set it would not, and the NEXT pass would happily re-derive it.
-    const merged = { ...result, fields: { ...result.fields, ...preservedFields(project.rows[0]!.discovery) } };
+    // `discover` does not throw for a site-side problem — it returns `partial` or `failed` with whatever it obtained (AC13). A
+    // throw here would be OUR bug, and should reach the retry ladder.
+    run: (prepared) =>
+      discover(
+        {
+          rootUrl: prepared.payload.rootUrl,
+          rootDomain: prepared.rootDomain,
+          fieldsSupplied: [...prepared.payload.fieldsSupplied, ...prepared.humanDecided],
+          knownBrandNames: prepared.knownBrandNames,
+        },
+        deps,
+      ),
 
-    // The whole review payload into `discovery`, and only the STATUS onto its
-    // own column. Nothing here writes name, description, category or aliases:
-    // §4.5's "never silent" means a discovered value is applied by STORY-044's
-    // confirm step, not by the pass that found it. There is deliberately no
-    // code path from this handler to those columns.
-    await tx.query("UPDATE projects SET discovery = $2, discovery_status = $3, updated_at = now() WHERE id = $1", [
-      payload.projectId,
-      JSON.stringify(merged),
-      merged.discovery_status,
-    ]);
+    async commit(tx: ClientBase, prepared: Prepared, result: DiscoveryResponse) {
+      const { payload } = prepared;
 
-    logger.log(
-      `project ${payload.projectId}: ${merged.discovery_status} in ${String(merged.duration_ms ?? 0)}ms, ` +
-        `${String(Object.keys(merged.fields).length)} field(s), ` +
-        `${String(merged.low_confidence_fields.length)} low-confidence, ` +
-        `${String(humanDecided.length)} preserved from a human decision`,
-    );
-  };
+      // AC12 (first half) — the free allowance, generated and charged nothing. A caller who supplied prompts at creation has
+      // already chosen them: supplied wins, so nothing is generated and the allowance is untouched. (Whether supplied prompts should
+      // use up part of the ten is a product question, reported to the owner rather than decided here.)
+      const allowance = payload.fieldsSupplied.includes("prompts")
+        ? { prompts: [], remaining: FREE_PROMPT_ALLOWANCE }
+        : await generateFreeAllowance(tx, { workspaceId: payload.workspaceId, projectId: payload.projectId, allowance: FREE_PROMPT_ALLOWANCE });
+      const generated = allowance.prompts;
+
+      // The overridden entries are carried forward verbatim: `discover` skipped them, so without this they would vanish from the
+      // payload and the NEXT pass would re-derive them.
+      const merged: DiscoveryResponse = {
+        ...result,
+        fields: { ...result.fields, ...(prepared.preserved as DiscoveryResponse["fields"]) },
+        prompts_generated: generated,
+        prompts_free_remaining: allowance.remaining,
+      };
+
+      // The whole review payload into `discovery`, and only the STATUS onto its own column. Nothing here writes name, description,
+      // category or aliases: a discovered value is applied by STORY-044's confirm step, not by the pass that found it.
+      await tx.query("UPDATE projects SET discovery = $2, discovery_status = $3, updated_at = now() WHERE id = $1", [
+        payload.projectId,
+        JSON.stringify(merged),
+        merged.discovery_status,
+      ]);
+
+      // AC15 / edge-cases-and-slos.md row 33 — the objective is "URL submitted -> confidence-scored payload", so the clock starts at
+      // SUBMISSION (the project row's created_at) and stops here, after the queue wait, the prepare transaction and the commit above.
+      // A row with no submission time is no observation: `0` would read as an instant pass. `discover()`'s own timer stays as a
+      // sub-measure, so a slow site can be told apart from a backlog.
+      const now = (deps?.now ?? Date.now)();
+      if (prepared.submittedAt !== null) {
+        observeValue("nominara_discovery_duration_seconds", Math.max(0, now - prepared.submittedAt.getTime()) / 1000, { status: merged.discovery_status });
+      }
+      if (merged.duration_ms !== null && merged.duration_ms !== undefined) {
+        observeValue("nominara_discovery_run_seconds", merged.duration_ms / 1000, { status: merged.discovery_status });
+      }
+      incrementCounter("nominara_discovery_completed_total", { status: merged.discovery_status });
+
+      // Counts and IDs only: never the brand, a competitor or prompt text, none of which belongs in a log line.
+      logger.log(
+        `workspace ${payload.workspaceId} project ${payload.projectId}: ${merged.discovery_status} in ${String(merged.duration_ms ?? 0)}ms, ` +
+          `${String(Object.keys(merged.fields).length)} field(s), ${String(merged.low_confidence_fields.length)} low-confidence, ` +
+          `${String(merged.competitors_proposed.length)} competitor(s), ${String(generated.length)} prompt(s) generated, ` +
+          `${String(prepared.humanDecided.length)} preserved from a human decision`,
+      );
+    },
+
+    // `prepare` commits 'running' BEFORE the fetch, so a job that then fails until its retries run out would leave the project
+    // 'running' for ever. AC13: failed or partial, still usable. On the LAST attempt only (an earlier one is the queue's retry
+    // ladder), mark it partial and keep whatever the run obtained. `IN ('pending','running')` so a completed payload that another
+    // delivery wrote is never clobbered. Runs in a fresh tenant transaction, after signature verification.
+    async recover(tx: ClientBase, job: Job, failure: PhaseFailure<Prepared, DiscoveryResponse>) {
+      if (!isFinalAttempt(job)) return false;
+      const payload = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
+      if (!payload.success) return false;
+
+      const kept: DiscoveryResponse | undefined =
+        failure.fetched === undefined
+          ? undefined
+          : {
+              ...failure.fetched,
+              // The same carry-forward `commit` does: `discover` skipped the human-decided fields, so without this a failed commit
+              // would drop them from the stored payload and the next pass would re-derive them (STORY-044 AC4).
+              fields: { ...failure.fetched.fields, ...((failure.prepared?.preserved ?? {}) as DiscoveryResponse["fields"]) },
+              discovery_status: "partial",
+            };
+      await tx.query(
+        `UPDATE projects SET discovery_status = 'partial', discovery = COALESCE($2::jsonb, discovery), updated_at = now()
+          WHERE id = $1 AND deleted_at IS NULL AND discovery_status IN ('pending', 'running')`,
+        [payload.data.projectId, kept === undefined ? null : JSON.stringify(kept)],
+      );
+      incrementCounter("nominara_discovery_completed_total", { status: "partial" });
+      logger.warn(`workspace ${payload.data.workspaceId} project ${payload.data.projectId}: discovery gave up after ${failure.phase} failed; marked partial`);
+      return true;
+    },
+  });
+}
+
+/** BullMQ increments `attemptsMade` when an attempt fails, so during attempt N it is N-1. An unknown attempt count is "not known to be final". */
+function isFinalAttempt(job: Pick<Job, "attemptsMade" | "opts">): boolean {
+  const attempts = job.opts?.attempts;
+  if (attempts === undefined) return false;
+  return (job.attemptsMade ?? 0) + 1 >= attempts;
+}
+
+function toDate(value: Date | string | null | undefined): Date | null {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 interface StoredDiscovery {

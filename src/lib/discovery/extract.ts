@@ -1,30 +1,15 @@
 // STORY-043 — pulling brand facts out of a fetched page.
 //
-// SCOPE, AND WHY IT IS THIS SHAPE. product-spec.md §2.1 lists eight things
-// discovery derives. Three of them cannot be built yet and are NOT
-// half-implemented here:
-//
-//   Business category — "classification against a 180-category taxonomy".
-//     That taxonomy is named once in the whole specification and exists
-//     nowhere: not a table, not a seed, not a data file, and no story owns
-//     it. Guessing a category is worse than not proposing one, because
-//     `category_slug` is the benchmark join key and every category-relative
-//     comparison would then be silently wrong.
-//   Competitors — "the site's own comparison/alternatives pages, then
-//     category peers". That needs multi-page selection, which is STORY-049.
-//   Prompts — the free allowance comes from the archetype grammar, which is
-//     STORY-045 and is explicitly DOWNSTREAM of this story.
+// SCOPE. Business category is NOT derived and not faked: "classification against a 180-category taxonomy" names a taxonomy that
+// exists nowhere (no table, seed or owning story), and `category_slug` is the benchmark join key, so a guessed category would make
+// every category-relative comparison silently wrong. Competitors are proposed in competitors.ts and the free prompt allowance is
+// generated in free-prompts.ts (both now unblocked by STORY-049/045).
 //
 // What IS here is everything derivable from one fetch of the root document:
 // JSON-LD, Open Graph, <title>, meta description, and the lang attribute.
 //
-// NO HTML PARSER. Adding one is a dependency decision, and it is not needed
-// for these five: JSON-LD is JSON once the script tag is located, and the
-// rest are single well-defined tags in <head>. Deeper extraction — hero copy,
-// nav structure, logo alt text — genuinely does need a parser, and belongs
-// with STORY-049's crawl pipeline, which will need one for its own reasons.
-// Regex over a whole document to find arbitrary content would be the wrong
-// tool; regex to find <head>'s meta tags is the right size of hammer.
+// <head> tags are read here with single regexes (the right size of hammer). Deeper extraction — hero copy, nav structure, logo alt
+// text, comparison links — needs a parser and lives in html-signals.ts (parse5, already a dependency since STORY-050).
 
 /**
  * Confidence attached to each source, highest first. §4.5 renders these to the
@@ -74,6 +59,14 @@ export const CONFIDENCE = {
    * merely being wrong. The lowest tier, and the most important one to flag.
    */
   derived: 0.45,
+  /** A brand name the page title (or og:title) gave AND the logo's alt text independently repeats. Two readings agreeing. */
+  corroborated: 0.7,
+  /** The logo's alt text with nothing else to check it against: a guess at the name, below the line. */
+  logoAlt: 0.5,
+  /** Hero headline + lede standing in for a description the page never declared. Marketing copy, not a statement of what it is. */
+  heroCopy: 0.4,
+  /** Names under a Products/Solutions menu. Navigation labels are not always products. */
+  navStructure: 0.5,
 } as const;
 
 export interface Extracted {

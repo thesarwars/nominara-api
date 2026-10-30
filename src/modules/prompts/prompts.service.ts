@@ -4,12 +4,13 @@ import type {
   GeneratePromptsRequest,
   GeneratePromptsResponse,
   GeneratedVariant,
+  RejectedCandidate,
 } from "../../../contracts/prompts/index.js";
 import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { l5TemplateCacheKey } from "../../lib/promptgen/cache-key.js";
 import type { Candidate } from "../../lib/promptgen/emit.js";
-import { generatePass, type ExistingHashes, type TemplateCache } from "../../lib/promptgen/generate.js";
+import { generatePass, type TemplateCache } from "../../lib/promptgen/generate.js";
 import { insertPromptStatement, type PromptRow } from "../../lib/promptgen/persist.js";
 import type { SlotContext } from "../../lib/promptgen/slots.js";
 import { promptTextHash } from "../../lib/promptgen/text-hash.js";
@@ -102,17 +103,51 @@ export class PromptsService {
         : {}),
     });
 
-    for (const row of pass.rows) {
+    // THE DATABASE TAIL, and the only part that holds the project-row lock. The lock is taken AFTER the naturaliser and the embedder
+    // have answered (a provider call must never run under a row lock: it would block discovery's prepare/commit, confirm and PATCH for
+    // its whole duration), then the hashes are re-read so a prompt another writer committed in the meantime is not inserted twice.
+    await this.lockProject(client, projectId);
+    const committed = await this.loadExistingHashes(client, projectId);
+    const kept: number[] = [];
+    const raced: RejectedCandidate[] = [];
+    pass.rows.forEach((row, index) => {
+      const owner = committed.get(row.textHash.toString("hex"));
+      if (owner === undefined) kept.push(index);
+      else {
+        const candidate = pass.candidates[index]!;
+        raced.push({
+          text: row.text,
+          text_hash: promptTextHash(row.text).wire,
+          intent_archetype: candidate.archetype,
+          template_id: candidate.templateId,
+          reason: "rejected_duplicate",
+          conflicting_prompt_id: owner,
+        });
+      }
+    });
+    const rows = kept.map((index) => pass.rows[index]!);
+    const candidates = kept.map((index) => pass.candidates[index]!);
+
+    for (const row of rows) {
       const { sql, params } = insertPromptStatement(row);
       await client.query(sql, [...params]);
     }
 
     return {
       generation_batch_id: pass.rows[0]?.generationBatchId ?? uuidV7(),
-      variants: pass.rows.map((row, index) => this.toVariant(row, pass.candidates[index]!.slots, pass.candidates[index]!.novelty)),
-      rejected: [...pass.rejected],
+      variants: rows.map((row, index) => this.toVariant(row, candidates[index]!.slots, candidates[index]!.novelty)),
+      rejected: [...pass.rejected, ...raced],
       coverage: [...pass.coverage],
-      summary: pass.summary,
+      summary:
+        raced.length === 0
+          ? pass.summary
+          : {
+              ...pass.summary,
+              generated: candidates.length,
+              accepted: candidates.length,
+              rejected_duplicate: pass.summary.rejected_duplicate + raced.length,
+              priority_flagged: rows.filter((row) => row.isPriority).length,
+            },
       cached: pass.cached,
     };
   }
@@ -178,6 +213,16 @@ export class PromptsService {
     };
   }
 
+  /**
+   * FOR NO KEY UPDATE is the lock crawl.discover's free-allowance writer takes on the same row (src/lib/discovery/free-prompts.ts).
+   * Taken here, after the provider calls and before the hashes are RE-READ, two writers of generated prompts cannot both see "nothing
+   * yet" and collide on the project's text-hash index. It does not block readers or the foreign-key checks a prompt insert makes.
+   */
+  private async lockProject(client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> }, projectId: string): Promise<void> {
+    const result = await client.query<{ id: string }>(`SELECT id FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE`, [projectId]);
+    if (result.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
+  }
+
   private async loadProjectContext(
     client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> },
     projectId: string,
@@ -208,7 +253,7 @@ export class PromptsService {
   private async loadExistingHashes(
     client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> },
     projectId: string,
-  ): Promise<ExistingHashes> {
+  ): Promise<ReadonlyMap<string, string>> {
     const result = await client.query<{ id: string; text_hash: Buffer }>(
       `SELECT id, text_hash FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL`,
       [projectId],
