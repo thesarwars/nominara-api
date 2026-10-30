@@ -376,7 +376,8 @@ describe("STORY-029 · scenario 9 · a malformed payload is classified malformed
   });
 
   it("a vendor error string on a 200 is a retryable upstream failure, never an answer", async () => {
-    const outcome = await adapterFor("google_ai_mode", fetchSequence(errorBody).fetchImpl)
+    // Hand-built: a generic vendor fault. (The "no results" message is NOT a fault - see the review-round-1 block below.)
+    const outcome = await adapterFor("google_ai_mode", fetchSequence({ search_metadata: { status: "Error" }, error: "Internal error, please retry." }).fetchImpl)
       .capture({ ...input, requestMode: "live" }, makeCtx().ctx)
       .then(
         () => undefined,
@@ -494,5 +495,131 @@ describe("STORY-029 · failure classification and credential hygiene", () => {
     expect(all).not.toMatch(/serpapi\.com\/searches\/(?!REDACTED)[0-9a-f]{8,}/);
     expect(all).not.toMatch(/"search_(id|parameters)"/);
     expect(all).not.toMatch(/@gmail\.com/);
+  });
+});
+
+// ---- Review round 1 · written from the hazards, before the fixes ----
+const vendorFault = { search_metadata: { status: "Error" }, error: "Internal error, please retry." };
+const settle = (promise: Promise<unknown>): Promise<unknown> => promise.then(() => undefined, (error: unknown) => error);
+
+describe("STORY-029 review 1 · a vendor-cached response can never stand in for an independent sample or a fresh page_token", () => {
+  it("sample 1+ is always fetched live (no_cache) even when the caller asked for queued", async () => {
+    const { fetchImpl, urls } = fetchSequence(aiModeQueuedResult);
+    await adapterFor("google_ai_mode", fetchImpl).capture({ ...input, sampleIndex: 1, requestMode: "queued" }, makeCtx().ctx);
+    expect(urls[0]?.searchParams.get("no_cache")).toBe("true");
+    expect(urls[0]?.searchParams.has("async")).toBe(false);
+  });
+
+  it("sample 1+ with no requestMode is live too; sample 0 keeps the queued default", async () => {
+    const one = fetchSequence(aiModeQueuedResult);
+    await adapterFor("google_ai_mode", one.fetchImpl).capture({ ...input, sampleIndex: 2 }, makeCtx().ctx);
+    expect(one.urls[0]?.searchParams.get("no_cache")).toBe("true");
+    const zero = fetchSequence(aiModeQueuedResult);
+    await adapterFor("google_ai_mode", zero.fetchImpl).capture({ ...input, sampleIndex: 0 }, makeCtx().ctx);
+    expect(zero.urls[0]?.searchParams.get("async")).toBe("true");
+  });
+
+  it("a queued organic body whose page_token is stale is re-fetched live and followed at once, not retried against the cache", async () => {
+    // submit (cached body, stale token) -> follow-up fails -> fresh no_cache search -> its token -> follow-up succeeds
+    const { fetchImpl, urls } = fetchSequence(aioDeferred, { status: 200, body: vendorFault }, aioDeferred, aioFollowUp);
+    const raw = await adapterFor("google_aio", fetchImpl).capture({ ...input, requestMode: "queued" }, makeCtx().ctx);
+    expect(urls.map((url) => url.searchParams.get("engine"))).toEqual(["google", "google_ai_overview", "google", "google_ai_overview"]);
+    expect(urls[0]?.searchParams.get("async")).toBe("true");
+    expect(urls[2]?.searchParams.get("no_cache")).toBe("true");
+    expect(urls[2]?.searchParams.has("async")).toBe(false);
+    expect(raw.text.length).toBeGreaterThan(0);
+    expect(raw.asyncGenerated).toBe(true);
+  });
+
+  it("the fresh re-fetch happens once: a second failed follow-up is a retryable timeout", async () => {
+    const { fetchImpl, urls } = fetchSequence(aioDeferred, { status: 200, body: vendorFault }, aioDeferred, { status: 200, body: vendorFault });
+    const outcome = await settle(adapterFor("google_aio", fetchImpl).capture({ ...input, requestMode: "queued" }, makeCtx().ctx));
+    expect((outcome as CaptureFailureError).code).toBe("timeout");
+    expect(urls).toHaveLength(4);
+  });
+});
+
+describe("STORY-029 review 1 · a search the vendor billed is metered even when the capture then fails (E2E-B6)", () => {
+  it("a malformed completed search records one search", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const outcome = await settle(adapterFor("google_ai_mode", fetchSequence(malformedBody).fetchImpl).capture({ ...input, requestMode: "live" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("malformed_response");
+    expect(recordCost).toHaveBeenCalledTimes(1);
+    expect(recordCost).toHaveBeenCalledWith(0.015);
+  });
+
+  it("a malformed organic body on google_aio records one search", async () => {
+    const { ctx, recordCost } = makeCtx();
+    await settle(adapterFor("google_aio", fetchSequence({ search_metadata: { status: "Success" }, ai_overview: { text_blocks: "x" } }).fetchImpl).capture({ ...input, requestMode: "live" }, ctx));
+    expect(recordCost).toHaveBeenCalledWith(0.015);
+  });
+
+  it("a billed first search followed by a failed token follow-up records the first search", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const outcome = await settle(adapterFor("google_aio", fetchSequence(aioDeferred, { status: 200, body: vendorFault }).fetchImpl).capture({ ...input, requestMode: "live" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("timeout");
+    expect(recordCost).toHaveBeenCalledTimes(1);
+    expect(recordCost).toHaveBeenCalledWith(0.015);
+  });
+
+  it("an HTTP error response is not a billed search: nothing is recorded", async () => {
+    const { ctx, recordCost } = makeCtx();
+    await settle(adapterFor("google_ai_mode", fetchSequence({ status: 500, body: { error: "x" } }).fetchImpl).capture({ ...input, requestMode: "live" }, ctx));
+    expect(recordCost).not.toHaveBeenCalled();
+  });
+
+  it("a queued submit accepted and then timed out is metered", async () => {
+    const { fetchImpl } = fetchSequence(aiModeSubmitProcessing);
+    const adapter = new LicensedSerpAdapter("google_ai_mode", {
+      provider: new SerpApiProvider({ apiKey: FAKE_KEY, fetchImpl, pollIntervalMs: 5, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }),
+      timeoutMs: 40,
+    });
+    const { ctx, recordCost } = makeCtx();
+    const outcome = await settle(adapter.capture({ ...input, requestMode: "queued" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("timeout");
+    expect(recordCost).toHaveBeenCalledWith(0.015);
+  });
+
+  it("the stale-token recovery bills every completed search it made (3), once, on success", async () => {
+    const { fetchImpl } = fetchSequence(aioDeferred, { status: 200, body: vendorFault }, aioDeferred, aioFollowUp);
+    const { ctx, recordCost } = makeCtx();
+    await adapterFor("google_aio", fetchImpl).capture({ ...input, requestMode: "queued" }, ctx);
+    expect(recordCost).toHaveBeenCalledTimes(1);
+    expect(recordCost.mock.calls[0]?.[0]).toBeCloseTo(0.045, 10);
+  });
+});
+
+describe("STORY-029 review 1 · the vendor's no-results message is a genuine absence, other errors stay retryable", () => {
+  it("google_aio: no results is no_ai_overview_for_query, async false, nothing billed", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const raw = await adapterFor("google_aio", fetchSequence(errorBody).fetchImpl).capture({ ...input, requestMode: "live" }, ctx);
+    expect(raw.text).toBe("");
+    expect(raw.flags).toEqual(["no_ai_overview_for_query"]);
+    expect(raw.asyncGenerated).toBe(false);
+    expect(recordCost).toHaveBeenCalledWith(0);
+  });
+
+  it("google_ai_mode: no results is empty_answer, async null", async () => {
+    const raw = await adapterFor("google_ai_mode", fetchSequence(errorBody).fetchImpl).capture({ ...input, requestMode: "live" }, makeCtx().ctx);
+    expect(raw.text).toBe("");
+    expect(raw.flags).toEqual(["empty_answer"]);
+    expect(raw.asyncGenerated).toBeNull();
+  });
+
+  it("the match is narrow: a different error that merely mentions results stays upstream_5xx", async () => {
+    for (const surface of ["google_aio", "google_ai_mode"] as const) {
+      const body = { search_metadata: { status: "Error" }, error: "Results could not be returned, try again." };
+      const outcome = await settle(adapterFor(surface, fetchSequence(body).fetchImpl).capture({ ...input, requestMode: "live" }, makeCtx().ctx));
+      expect((outcome as CaptureFailureError).code).toBe("upstream_5xx");
+    }
+  });
+});
+
+describe("STORY-029 review 1 · a product shown only as a top-level priced card is in the text the parser matches", () => {
+  it("its line is in the markdown as well as in the elements", async () => {
+    const { mapSerpAnswer } = await import("./serp-mapper.js");
+    const mapped = mapSerpAnswer({ text_blocks: [{ type: "paragraph", snippet: "Some intro." }], shopping_results: [{ title: "Zephyr Buds Pro", price: "$59.00" }] });
+    expect(mapped.elements.some((element) => element.kind === "product")).toBe(true);
+    expect(mapped.markdown).toContain("Zephyr Buds Pro - $59.00");
   });
 });

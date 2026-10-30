@@ -1,7 +1,7 @@
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { CaptureFailureError, type CaptureFailureCode } from "../failure-taxonomy.js";
 import type { EngineKey } from "../contract.js";
-import type { LicensedFetchResult, LicensedSerpProvider, LicensedSerpRequest } from "./licensed-serp.js";
+import type { LicensedFetchResult, LicensedRequestMode, LicensedSerpProvider, LicensedSerpRequest } from "./licensed-serp.js";
 import { mapSerpAnswer } from "./serp-mapper.js";
 import {
   serpAiModeResponseSchema,
@@ -24,9 +24,10 @@ import {
 // token is a defect (`malformed_response`), never an absence. AI Mode has no such token; its flag is asserted all the same and
 // changes nothing on the wire. See STORY-029 Implementation decisions.
 //
-// MODES. live  -> one synchronous request, no_cache=true (a fresh answer; fidelity beats the free cached copy).
+// MODES. A sample after the first is always live (see buildLicensedRequest). live  -> one synchronous request, no_cache=true (a fresh answer; fidelity beats the free cached copy).
 //        queued -> async=true: submit, then read the finished search back from the Searches Archive. The vendor forbids async
-//                  together with no_cache, so a queued request may be served from its 1-hour cache (free, still a real answer).
+//                  together with no_cache, so a queued request may be served from its 1-hour cache. A cached response is free but is NOT an independent sample, which is why
+//                  sample 1+ is live, and why a stale page_token from it is re-fetched fresh (see fetchOverview).
 // The follow-up for an overview is always synchronous: its token expires within a minute of the search.
 
 const BASE_URL = "https://serpapi.com";
@@ -59,6 +60,11 @@ function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+/** SerpApi's message when Google returned nothing for the query. Matched narrowly: any other error string stays a retryable vendor fault. */
+function isNoResultsMessage(message: string): boolean {
+  return /^Google hasn['\u2019]t returned any results for this query\.?$/iu.test(message.trim());
 }
 
 function codeForStatus(status: number, body: unknown): CaptureFailureCode {
@@ -111,12 +117,25 @@ export class SerpApiProvider implements LicensedSerpProvider {
   }
 
   /** One search in the requested mode. A queued search is submitted, then read back until it is no longer queued or processing. */
-  private async search(params: Record<string, string>, request: LicensedSerpRequest, signal: AbortSignal, engineKey: EngineKey): Promise<unknown> {
+  private async search(
+    params: Record<string, string>,
+    mode: LicensedRequestMode,
+    signal: AbortSignal,
+    engineKey: EngineKey,
+    onSearchBilled: () => void,
+  ): Promise<unknown> {
     const sleep = this.config.sleep ?? defaultSleep;
-    if (request.mode === "live") {
-      return this.getJson(this.searchUrl({ ...params, no_cache: "true" }), signal, engineKey);
+    /** An accepted search without an `error` is billable; an error (including "no results") is not. */
+    const billIfAccepted = (candidate: unknown): void => {
+      if (typeof (candidate as { error?: unknown } | null)?.error !== "string") onSearchBilled();
+    };
+    if (mode === "live") {
+      const live = await this.getJson(this.searchUrl({ ...params, no_cache: "true" }), signal, engineKey);
+      billIfAccepted(live);
+      return live;
     }
     let body = await this.getJson(this.searchUrl({ ...params, async: "true" }), signal, engineKey);
+    billIfAccepted(body); // billed at submit: a timeout while polling still spent it
     for (;;) {
       signal.throwIfAborted();
       const envelope = serpEnvelopeSchema.safeParse(body);
@@ -130,8 +149,8 @@ export class SerpApiProvider implements LicensedSerpProvider {
     }
   }
 
-  async fetchAnswer(request: LicensedSerpRequest, signal: AbortSignal): Promise<LicensedFetchResult> {
-    return request.surface === "google_ai_mode" ? this.fetchAiMode(request, signal) : this.fetchOverview(request, signal);
+  async fetchAnswer(request: LicensedSerpRequest, signal: AbortSignal, onSearchBilled: () => void = () => undefined): Promise<LicensedFetchResult> {
+    return request.surface === "google_ai_mode" ? this.fetchAiMode(request, signal, onSearchBilled) : this.fetchOverview(request, signal, onSearchBilled);
   }
 
   private malformed(engineKey: EngineKey): CaptureFailureError {
@@ -139,13 +158,17 @@ export class SerpApiProvider implements LicensedSerpProvider {
     return failure("malformed_response", engineKey);
   }
 
-  private async fetchAiMode(request: LicensedSerpRequest, signal: AbortSignal): Promise<LicensedFetchResult> {
+  private async fetchAiMode(request: LicensedSerpRequest, signal: AbortSignal, onSearchBilled: () => void): Promise<LicensedFetchResult> {
     const engineKey = "google_ai_mode";
-    const body = await this.search({ engine: "google_ai_mode", q: request.query, ...this.localeParams(request.locale) }, request, signal, engineKey);
+    const body = await this.search({ engine: "google_ai_mode", q: request.query, ...this.localeParams(request.locale) }, request.mode, signal, engineKey, onSearchBilled);
     const parsed = serpAiModeResponseSchema.safeParse(body);
     if (!parsed.success) throw this.malformed(engineKey);
-    // An error string is not an answer and not an absence: it fails (retryably) so no data point is stored for it.
-    if (parsed.data.error !== undefined) throw failure("upstream_5xx", engineKey);
+    // "Google hasn't returned any results" is Google's answer about the query, not a vendor fault: a genuine absence (empty_answer),
+    // not billed. Any other error string is not an answer and not an absence: it fails (retryably) so no data point is stored for it.
+    if (parsed.data.error !== undefined) {
+      if (!isNoResultsMessage(parsed.data.error)) throw failure("upstream_5xx", engineKey);
+      return { answer: null, asyncGenerated: null, searchesBilled: 0 };
+    }
     const requestId = parsed.data.search_metadata?.id;
     // AI Mode reports no on-demand flag, so the persisted value is null, not false.
     return {
@@ -156,41 +179,66 @@ export class SerpApiProvider implements LicensedSerpProvider {
     };
   }
 
-  private async fetchOverview(request: LicensedSerpRequest, signal: AbortSignal): Promise<LicensedFetchResult> {
+  private async fetchOverview(request: LicensedSerpRequest, signal: AbortSignal, onSearchBilled: () => void): Promise<LicensedFetchResult> {
     const engineKey = "google_aio";
-    const body = await this.search({ engine: "google", q: request.query, ...this.localeParams(request.locale) }, request, signal, engineKey);
-    const first = serpOrganicResponseSchema.safeParse(body);
-    if (!first.success) throw this.malformed(engineKey);
-    if (first.data.error !== undefined) throw failure("upstream_5xx", engineKey);
+    let billed = 0;
+    const bill = (): void => {
+      billed += 1;
+      onSearchBilled();
+    };
+    const params = { engine: "google", q: request.query, ...this.localeParams(request.locale) };
+    let body = await this.search(params, request.mode, signal, engineKey, bill);
 
-    const overview = first.data.ai_overview;
-    const requestId = first.data.search_metadata?.id;
-    // No ai_overview at all: Google showed none for this query. Genuine - this request carried the async-load parameter.
-    if (overview === undefined) return { answer: null, asyncGenerated: false, searchesBilled: 1, ...(requestId !== undefined ? { vendorRequestId: requestId } : {}) };
-    // Inline: the first response already holds the overview.
-    if (overview.text_blocks !== undefined) {
+    // A queued search can be answered from the vendor's 1-hour cache, whose page_token is long dead. A follow-up that fails therefore
+    // gets ONE fresh (no_cache) search and an immediate follow-up, never a retry against the same cached entry (which would fail until
+    // the cache expired). A live search is already fresh, so there is nothing to redo.
+    let freshAvailable = request.mode === "queued";
+    for (;;) {
+      const first = serpOrganicResponseSchema.safeParse(body);
+      if (!first.success) throw this.malformed(engineKey);
+      if (first.data.error !== undefined) {
+        // Google showed nothing for the query: a genuine absence, not a fault.
+        if (isNoResultsMessage(first.data.error)) return { answer: null, asyncGenerated: false, searchesBilled: billed };
+        throw failure("upstream_5xx", engineKey);
+      }
+
+      const overview = first.data.ai_overview;
+      const requestId = first.data.search_metadata?.id;
+      // No ai_overview at all: Google showed none for this query. Genuine - this request carried the async-load parameter.
+      if (overview === undefined) return { answer: null, asyncGenerated: false, searchesBilled: billed, ...(requestId !== undefined ? { vendorRequestId: requestId } : {}) };
+      // Inline: the first response already holds the overview.
+      if (overview.text_blocks !== undefined) {
+        return {
+          answer: mapSerpAnswer({ text_blocks: overview.text_blocks, ...(overview.references !== undefined ? { references: overview.references } : {}) }),
+          asyncGenerated: false,
+          searchesBilled: billed,
+          ...(requestId !== undefined ? { vendorRequestId: requestId } : {}),
+        };
+      }
+      // Only a page_token. Without the async-load parameter this is the false absence NFR-SIM-11 exists to prevent.
+      if (overview.page_token === undefined || !request.asyncLoad) throw this.malformed(engineKey);
+
+      const followUp = await this.getJson(this.searchUrl({ engine: "google_ai_overview", page_token: overview.page_token }), signal, engineKey);
+      const second = serpAiOverviewResponseSchema.safeParse(followUp);
+      if (!second.success) throw this.malformed(engineKey);
+      if (second.data.error === undefined) bill();
+      // An expired token or a vendor error is not evidence the query has no overview: never store a false absence.
+      if (second.data.error !== undefined || second.data.ai_overview === undefined) {
+        if (freshAvailable) {
+          freshAvailable = false;
+          body = await this.search(params, "live", signal, engineKey, bill);
+          continue;
+        }
+        throw failure("timeout", engineKey);
+      }
+      const followRequestId = second.data.search_metadata?.id ?? requestId;
       return {
-        answer: mapSerpAnswer({ text_blocks: overview.text_blocks, ...(overview.references !== undefined ? { references: overview.references } : {}) }),
-        asyncGenerated: false,
-        searchesBilled: 1,
-        ...(requestId !== undefined ? { vendorRequestId: requestId } : {}),
+        answer: mapSerpAnswer(second.data.ai_overview),
+        asyncGenerated: true,
+        searchesBilled: billed,
+        ...(followRequestId !== undefined ? { vendorRequestId: followRequestId } : {}),
       };
     }
-    // Only a page_token. Without the async-load parameter this is the false absence NFR-SIM-11 exists to prevent.
-    if (overview.page_token === undefined || !request.asyncLoad) throw this.malformed(engineKey);
-
-    const followUp = await this.getJson(this.searchUrl({ engine: "google_ai_overview", page_token: overview.page_token }), signal, engineKey);
-    const second = serpAiOverviewResponseSchema.safeParse(followUp);
-    if (!second.success) throw this.malformed(engineKey);
-    // An expired token or a vendor error is not evidence the query has no overview: fail retryably rather than store a false absence.
-    if (second.data.error !== undefined || second.data.ai_overview === undefined) throw failure("timeout", engineKey);
-    const followRequestId = second.data.search_metadata?.id ?? requestId;
-    return {
-      answer: mapSerpAnswer(second.data.ai_overview),
-      asyncGenerated: true,
-      searchesBilled: 2,
-      ...(followRequestId !== undefined ? { vendorRequestId: followRequestId } : {}),
-    };
   }
 
   /** The Account API: free, and proves the key and reachability without spending a search. */

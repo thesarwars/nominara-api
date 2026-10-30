@@ -27,7 +27,17 @@ guard, the engine key, the failure flags, the cost and the metrics.
 Queued mode submits with `async=true` and reads the finished search back from the
 Searches Archive; live mode is one synchronous request with `no_cache=true`.
 SerpApi's own docs forbid `async` together with `no_cache`, so a queued request may
-be served from the vendor's 1-hour cache.
+be served from the vendor's 1-hour cache. A cached response is free but is not an
+independent sample and carries a dead `page_token`, so: every sample after the first
+is live (`no_cache`), and a queued overview whose token follow-up fails is re-searched
+once live and followed at once. A first sample repeated within the hour can still be a
+cached copy of the previous run's (the vendor gives no cache marker in the response);
+that is an owner decision recorded against STORY-032. A search the vendor accepted is
+metered even when the capture then fails; a cached search is billed at list price in
+`usage_ledger` (a conservative over-read, since the response cannot say it was cached).
+Google's "hasn't returned any results" message is an absence (`no_ai_overview_for_query`
+or `empty_answer`), not a fault. Its exact shape for AI Mode is from the vendor's
+documented message, not a recording.
 
 ## Switching to a fallback
 

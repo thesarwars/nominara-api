@@ -65,6 +65,8 @@ export interface LicensedSerpRequest {
   readonly query: string;
   readonly locale: string;
   readonly mode: LicensedRequestMode;
+  /** Which sample of the cell this is. A sample after the first is never allowed to be served from a vendor cache. */
+  readonly sampleIndex: number;
   /** The async-load parameter (NFR-SIM-11). `false` is representable ONLY so the guard has something to refuse. */
   readonly asyncLoad: boolean;
 }
@@ -73,7 +75,11 @@ export interface LicensedSerpProvider {
   /** Recorded in `adapterVersion`. */
   readonly id: string;
   readonly version: string;
-  fetchAnswer(request: LicensedSerpRequest, signal: AbortSignal): Promise<LicensedFetchResult>;
+  /**
+   * `onSearchBilled` is called once per vendor search that was accepted and is billable, AT THE MOMENT it is, so that a capture which
+   * then fails still reports what it spent (E2E-B6: a call the vendor billed is spend even when its answer is unusable).
+   */
+  fetchAnswer(request: LicensedSerpRequest, signal: AbortSignal, onSearchBilled?: () => void): Promise<LicensedFetchResult>;
   healthProbe(): Promise<{ ok: boolean; latencyMs: number; detail?: string }>;
 }
 
@@ -91,7 +97,10 @@ export function assertAsyncLoad(request: LicensedSerpRequest): void {
 
 /** The only constructor of a request the adapter sends. The parameter is set here, once, for both surfaces. */
 export function buildLicensedRequest(surface: LicensedSurface, input: CaptureInput): LicensedSerpRequest {
-  return { surface, query: input.promptText, locale: input.locale, mode: input.requestMode ?? "queued", asyncLoad: true };
+  // A vendor cache answers a repeated request with the earlier response, so a sample after the first would be a byte-identical copy of
+  // sample 0 stored as an independent observation. Independence outranks the caller's mode: samples after the first are always live.
+  const mode: LicensedRequestMode = input.sampleIndex > 0 ? "live" : (input.requestMode ?? "queued");
+  return { surface, query: input.promptText, locale: input.locale, mode, sampleIndex: input.sampleIndex, asyncLoad: true };
 }
 
 /**
@@ -158,14 +167,26 @@ export class LicensedSerpAdapter extends BaseCaptureAdapter {
     assertAsyncLoad(request);
 
     const timeout = new AbortController();
+    let billed = 0;
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       timeout.abort(new Error("licensed-serp capture timeout"));
     }, this.config.timeoutMs);
     try {
-      return await this.config.provider.fetchAnswer(request, AbortSignal.any([ctx.signal, timeout.signal]));
+      return await this.config.provider.fetchAnswer(request, AbortSignal.any([ctx.signal, timeout.signal]), () => {
+        billed += 1;
+      });
     } catch (error) {
+      // E2E-B6: searches the vendor already billed are spend even though the capture fails. Metered here, before the rethrow, so the
+      // spend meter and its ceiling see them. A failing meter must not mask the capture's own failure.
+      if (billed > 0) {
+        try {
+          await ctx.recordCost(billed * (this.config.costPerSearchUsd ?? DEFAULT_COST_PER_SEARCH_USD));
+        } catch {
+          logger.warn({ event: "capture.serp.failure_cost_unrecorded", engine_key: this.engineKey, searches_billed: billed });
+        }
+      }
       if (error instanceof CaptureFailureError) throw error;
       if (timedOut) throw new CaptureFailureError("timeout", this.engineKey);
       throw error; // caller-initiated abort or an unclassifiable transport fault: never swallowed

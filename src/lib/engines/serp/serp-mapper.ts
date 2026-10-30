@@ -147,7 +147,8 @@ export function mapSerpAnswer(body: SerpAnswerBody): LicensedAnswer {
   // The top-level shopping_results repeat the products the list items already carry; only a product seen nowhere else is added.
   for (const result of body.shopping_results ?? []) {
     if (result.title !== undefined && seenProducts.has(result.title)) continue;
-    addProduct(result, []);
+    const line = addProduct(result, []);
+    if (line !== "") markdown.push(`- ${line}`);
   }
 
   return { markdown: markdown.join("\n").replace(/\n{3,}/gu, "\n\n").trim(), elements, references };
