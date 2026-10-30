@@ -425,6 +425,9 @@ export const envSchema = z
     // NEW-A-4 — optional: absent leaves Gemini honestly not capture-ready (registry.ts), it
     // does not fail boot. Never logged, never echoed in an error.
     GEMINI_API_KEY: requiredString.optional(),
+    // STORY-029 - SerpApi key for the google_aio and google_ai_mode surfaces. Optional like GEMINI_API_KEY: absent leaves both surfaces
+    // honestly not capture-ready, it does not fail boot. Never logged, never echoed in an error.
+    SERP_API_KEY: requiredString.optional(),
     // STORY-133 - optional: absent leaves the embedding port on the deterministic stand-in outside production (and refusing in
     // production), it does not fail boot. Selecting the real adapter is this one variable. Never logged, never echoed in an error.
     OPENAI_API_KEY: requiredString.optional(),
@@ -432,6 +435,10 @@ export const envSchema = z
     // the free tier of gemini-2.5-flash; raise it with the paid quota. It builds a ONE-token bucket
     // (no burst above the rate) and takes precedence over ENGINE_TOKEN_BUCKETS.gemini.
     GEMINI_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
+    // STORY-029 - the pace the capture dispatcher holds EACH Google surface to, in requests per minute (a one-token bucket per engine key,
+    // overriding ENGINE_TOKEN_BUCKETS for google_aio and google_ai_mode). Default 1: the Free plan is 250 searches a month, and an
+    // overview that loads on demand costs two. Raise it with the plan. The two surfaces draw separate buckets, so the vendor sees up to twice this.
+    SERP_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(1),
     // STORY-045 AC3 (owner decision 2026-10-28 #3) - which model naturalises generated prompt text (tracking-engine.md section 4 step 4).
     // `none` (the default) is the template-only path. `gemini` binds a Flash-class Gemini model using GEMINI_API_KEY; with no key it falls
     // back to template-only rather than failing boot. NOT YET BOUND ON THE REQUEST PATH: the generate route's transaction is open (ADR-0003),

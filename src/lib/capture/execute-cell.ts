@@ -419,8 +419,8 @@ async function insertCell(
        (id, workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
         capture_mode, adapter_version, normalizer_version, model_fingerprint, latency_ms,
         response_tokens_est, truncated, content_hash, response_excerpt, payload, raw_object_key,
-        flags, cache_layer, status, error_code, scoring_version)
-     VALUES ($22,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$23,$18::text[],'live',$19,$20,$21)`,
+        flags, cache_layer, status, error_code, scoring_version, async_generated)
+     VALUES ($22,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$23,$18::text[],'live',$19,$20,$21,$24)`,
     [
       input.workspaceId,
       input.projectId,
@@ -448,6 +448,8 @@ async function insertCell(
       SCORING_VERSION,
       resultId,
       rawObjectKey,
+      // STORY-029 NFR-SIM-12 - persisted on every capture that reports it; NULL for an engine with no async notion.
+      captured ? (write.raw.asyncGenerated ?? null) : null,
     ],
   );
 }

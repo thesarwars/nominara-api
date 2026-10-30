@@ -63,13 +63,13 @@ export function geminiPacingConfig(requestsPerMinute: number): TokenBucketConfig
  * tenant a job runs as; a payload with no valid engine key fails the job here, before any context.
  */
 export function captureEngineLeaseOptions(
-  env: { readonly ENGINE_TOKEN_BUCKETS: string; readonly GEMINI_REQUESTS_PER_MINUTE: number },
+  env: { readonly ENGINE_TOKEN_BUCKETS: string; readonly GEMINI_REQUESTS_PER_MINUTE: number; readonly SERP_REQUESTS_PER_MINUTE?: number },
   tokenBucket: TokenBucket,
 ): EngineLeaseOptions {
   const buckets = engineTokenBucketsSchema.parse(JSON.parse(env.ENGINE_TOKEN_BUCKETS));
   return {
     tokenBucket,
-    configFor: configForFromEnv(buckets, env.GEMINI_REQUESTS_PER_MINUTE),
+    configFor: configForFromEnv(buckets, env.GEMINI_REQUESTS_PER_MINUTE, env.SERP_REQUESTS_PER_MINUTE),
     resolveEngineKey: (job) => engineKeySchema.parse((job.data as { payload?: { engineKey?: unknown } }).payload?.engineKey),
     rateLimitDeferral: { maxDeferrals: MAX_RATE_LIMIT_DEFERRALS },
   };
@@ -126,9 +126,11 @@ export function withEngineLease(
 }
 
 /** Adapts the parsed ENGINE_TOKEN_BUCKETS (D7) into a `configFor` callback. A missing entry is a config defect — fails loud (EngineLeaseConfigError), never a silent default (distinct from D19's store-outage fail-open, which is about the STORE being unreachable, not the config being absent). */
-export function configForFromEnv(buckets: EngineTokenBuckets, geminiRequestsPerMinute?: number): (engineKey: EngineKey) => TokenBucketConfig {
+export function configForFromEnv(buckets: EngineTokenBuckets, geminiRequestsPerMinute?: number, serpRequestsPerMinute?: number): (engineKey: EngineKey) => TokenBucketConfig {
   return (engineKey: EngineKey): TokenBucketConfig => {
     if (engineKey === "gemini" && geminiRequestsPerMinute !== undefined) return geminiPacingConfig(geminiRequestsPerMinute);
+    // STORY-029 - the two Google surfaces share one vendor quota knob, the way gemini has its own: a one-token bucket, no burst.
+    if ((engineKey === "google_aio" || engineKey === "google_ai_mode") && serpRequestsPerMinute !== undefined) return geminiPacingConfig(serpRequestsPerMinute);
     const config = buckets[engineKey];
     if (!config) {
       throw new EngineLeaseConfigError(engineKey);

@@ -2,6 +2,8 @@ import type { CaptureAdapter, EngineKey } from "./contract.js";
 import { engineKeySchema } from "./contract.js";
 import { FIXTURE_ADAPTERS } from "./fixtures/index.js";
 import { GeminiApiAdapter } from "./gemini/gemini-api-adapter.js";
+import { LicensedSerpAdapter, type LicensedSurface } from "./serp/licensed-serp.js";
+import { SerpApiProvider } from "./serp/serpapi-provider.js";
 
 // STORY-027 — mirrors src/lib/auth/oauth-providers.ts's static-map shape and
 // src/modules/identity/ports/oauth-client.ts's interface-only port shape. No
@@ -71,7 +73,8 @@ const REGISTRY: Record<EngineKey, EngineRegistration> = {
   google_ai_mode: { status: "active", adapter: FIXTURE_ADAPTERS.google_ai_mode, captureReady: false },
   perplexity: { status: "active", adapter: FIXTURE_ADAPTERS.perplexity, captureReady: false },
   chatgpt: { status: "active", adapter: FIXTURE_ADAPTERS.chatgpt, captureReady: false },
-  // NEW-A-4: gemini is the one real adapter. Its binding is resolved per call (see geminiBinding)
+  // STORY-029: google_aio and google_ai_mode are real when SERP_API_KEY is set (registrationFor), like gemini with its key.
+  // NEW-A-4: gemini is the first real adapter. Its binding is resolved per call (see geminiBinding)
   // because it exists only when GEMINI_API_KEY does; this static entry is the keyless fallback.
   gemini: { status: "active", adapter: FIXTURE_ADAPTERS.gemini, captureReady: false },
   claude: { status: "active", adapter: FIXTURE_ADAPTERS.claude, captureReady: false },
@@ -85,8 +88,28 @@ const REGISTRY: Record<EngineKey, EngineRegistration> = {
 const GEMINI_CAPTURE_TIMEOUT_MS = 30_000;
 let geminiAdapterCache: { readonly key: string; readonly adapter: GeminiApiAdapter } | undefined;
 
-/** The real Gemini registration when a key is configured; otherwise the honest keyless fallback. */
+// STORY-029 - hard per-capture timeout for the licensed-SERP adapters. A queued capture waits on the vendor's queue and an overview
+// is two requests, so this is well above the documented p95 (15 s queued).
+const SERP_CAPTURE_TIMEOUT_MS = 60_000;
+const serpAdapterCache = new Map<LicensedSurface, { readonly key: string; readonly adapter: LicensedSerpAdapter }>();
+
+/** The licensed-SERP adapter for a surface when SERP_API_KEY is configured. THE PROVIDER IS CHOSEN HERE: a fallback vendor is a different provider on this line (docs/licensed-serp-fallback.md). */
+function serpAdapterFor(surface: LicensedSurface, key: string): LicensedSerpAdapter {
+  const cached = serpAdapterCache.get(surface);
+  if (cached?.key === key) return cached.adapter;
+  const adapter = new LicensedSerpAdapter(surface, { provider: new SerpApiProvider({ apiKey: key }), timeoutMs: SERP_CAPTURE_TIMEOUT_MS });
+  serpAdapterCache.set(surface, { key, adapter });
+  return adapter;
+}
+
+/** The real registration when a key is configured; otherwise the honest keyless fallback. */
 function registrationFor(engineKey: EngineKey): EngineRegistration {
+  if (engineKey === "google_aio" || engineKey === "google_ai_mode") {
+    const key = process.env.SERP_API_KEY;
+    if (key !== undefined && key.trim().length > 0) {
+      return { status: "active", adapter: serpAdapterFor(engineKey, key), captureReady: true };
+    }
+  }
   if (engineKey === "gemini") {
     const key = process.env.GEMINI_API_KEY;
     if (key !== undefined && key.trim().length > 0) {
@@ -125,8 +148,8 @@ export async function healthProbeEngine(engineKey: string): Promise<{ ok: boolea
 /**
  * The engine keys a capture may actually be attempted on.
  *
- * ⚠ EMPTY WITHOUT A KEY, DELIBERATELY. Only gemini has a real adapter (NEW-A-4), and only when
- * GEMINI_API_KEY is set. The other five are fixture-backed; none can answer a real prompt. Planning a
+ * ⚠ EMPTY WITHOUT A KEY, DELIBERATELY. Gemini (NEW-A-4, GEMINI_API_KEY) and the two Google surfaces (STORY-029, SERP_API_KEY) have
+ * real adapters, each only when its key is set. The rest are fixture-backed; none can answer a real prompt. Planning a
  * cell for one would manufacture a failure out of a thing we never tried.
  *
  * Derived from REGISTRY rather than listed, so an adapter story cannot bind a
