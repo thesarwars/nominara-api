@@ -1394,10 +1394,13 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       );
       const auditId = randomUUID();
       const { debitInTransaction } = await import("../../src/lib/credits/debit.js");
+      // The debit and the refund use savepoints, which need a transaction: the producer's request and the job's tenant context are both one.
+      await db.query("BEGIN");
       await debitInTransaction(db as never, {
         workspaceId, actorId: null, actorType: "system", actionCode: "aux_manual", credits: 10, idempotencyKey: ["aux_audit", auditId].join(":"),
         projectId, referenceType: "aux_audit", referenceId: auditId, includedGrant: 0,
       });
+      await db.query("COMMIT");
       await db.query(
         `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, rule_version, tokenizer, status)
          VALUES ($1,$2,$3,'manual','key_pages','{}','2026.10.1','cl100k','queued')`,
@@ -1406,10 +1409,21 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       return auditId;
     }
     const manualJob = (auditId: string): Job => job({ trigger: "manual", auditId, scope: "key_pages" });
+    /** The job runs in a tenant transaction in production (withTenantJob); the harness hands the handler a bare client, so wrap the run in one. */
+    const runTx = async (j: Job, deps: CrawlAuditDeps): Promise<void> => {
+      await db.query("BEGIN");
+      try {
+        await run(j, deps);
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK");
+        throw error;
+      }
+    };
 
     it("AUXLIVE-3 · a manual audit takes over the queued row its producer made: same id, now completed, and the charge STANDS", async () => {
       const auditId = await chargedManualAudit();
-      await run(manualJob(auditId), depsServing(healthy(OPEN)));
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
       const all = await audits();
       expect(all).toHaveLength(1);
       expect(all[0]).toMatchObject({ id: auditId, trigger: "manual", status: "completed" });
@@ -1419,7 +1433,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
 
     it("AUXLIVE-3 · a manual audit where NO site file can be reached ends failed and the charge is refunded in full, naming the audit", async () => {
       const auditId = await chargedManualAudit();
-      await run(manualJob(auditId), depsServing({}));
+      await runTx(manualJob(auditId), depsServing({}));
       const [a] = await audits();
       expect(a).toMatchObject({ id: auditId, status: "failed" });
       expect(await refunds()).toEqual([{ credits: 10, reference_type: "aux_audit", reference_id: auditId }]);
@@ -1428,8 +1442,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
 
     it("AUXLIVE-3 · redelivering the failed job refunds nothing more", async () => {
       const auditId = await chargedManualAudit();
-      await run(manualJob(auditId), depsServing({}));
-      await run(manualJob(auditId), depsServing({}));
+      await runTx(manualJob(auditId), depsServing({}));
+      await runTx(manualJob(auditId), depsServing({}));
       expect(await refunds()).toHaveLength(1);
       expect(await wallet()).toMatchObject({ included: 100 });
     });
@@ -1437,7 +1451,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     it("AUXLIVE-3 · a PARTIAL manual audit (a page failed, the site files answered) is charged in full: no refund", async () => {
       const auditId = await chargedManualAudit();
       await verifyDomain();
-      await run(manualJob(auditId), depsServing({ ...withSitemap(SITEMAP_PAGES), "/pricing": { status: 500, body: "" } }));
+      await runTx(manualJob(auditId), depsServing({ ...withSitemap(SITEMAP_PAGES), "/pricing": { status: 500, body: "" } }));
       const [a] = await audits();
       expect(a.status).toBe("partial");
       expect(await refunds()).toEqual([]);
@@ -1450,7 +1464,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
          VALUES ($1,100,(now() AT TIME ZONE 'UTC')::date,(now() AT TIME ZONE 'UTC')::date + 30)`,
         [workspaceId],
       );
-      await run(job({ trigger: "onboarding" }), depsServing({}));
+      await runTx(job({ trigger: "onboarding" }), depsServing({}));
       expect((await audits())[0].status).toBe("failed");
       expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
     });
@@ -1459,7 +1473,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const auditId = await chargedManualAudit();
       await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projectId]);
       const requested: string[] = [];
-      await run(manualJob(auditId), depsServing(healthy(OPEN), requested));
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN), requested));
       expect(requested).toEqual([]);
       expect((await audits())[0]).toMatchObject({ id: auditId, status: "failed" });
       expect((await audits())[0].error_summary).toEqual({ reason: "project_deleted" });
@@ -1469,7 +1483,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
 
     it("AUXLIVE-3 · the audit counter carries the manual trigger", async () => {
       const auditId = await chargedManualAudit();
-      await run(manualJob(auditId), depsServing(healthy(OPEN)));
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
       expect(counters).toContainEqual({ name: "nominara_aux_audits_total", labels: { status: "completed", trigger: "manual" } });
     });
   });
