@@ -96,6 +96,11 @@ export const sentimentReasonClassSchema = z
     mention_count: z.number().int().positive(),
     /** The task this class will generate; the task engine is deferred, so there is a title and no task id. */
     task_title: z.string().min(1),
+    /**
+     * The same class's non-positive mentions in the PRIOR window (the trend). `null` when the prior window held no parsed answer:
+     * nothing was measured, which is not a count of zero. Optional only because a detail persisted before the trend has none.
+     */
+    prior_mention_count: z.number().int().nonnegative().nullable().optional(),
   })
   .strict();
 
@@ -113,9 +118,181 @@ export const geoSentimentDetailSchema = z
     clusters: z.array(sentimentClusterSchema),
     reason_classes: z.array(sentimentReasonClassSchema),
     factual_error_reason: z.string().min(1),
+    /**
+     * FR-GEO-A6c: `negative_cell_rate` (answers with any negative brand mention / parsed answers) against the alert threshold with
+     * its sample floor. Tasks (one per reason class) exist only while `crossed` is true. Optional only for a pre-trend detail.
+     */
+    threshold: z
+      .object({
+        cells: z.number().int().nonnegative(),
+        negative_cells: z.number().int().nonnegative(),
+        /** `null` with no parsed answers: nothing measured, not a rate of zero. */
+        negative_cell_rate: z.number().min(0).max(1).nullable(),
+        prior_negative_cell_rate: z.number().min(0).max(1).nullable(),
+        rate_threshold: z.number(),
+        min_cells: z.number().int().positive(),
+        crossed: z.boolean(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 export type GeoSentimentDetail = z.infer<typeof geoSentimentDetailSchema>;
+
+// ------------------------------------------------------ A4 divergence detail
+
+/**
+ * `GET /geo-insights/divergence` -> `detail` (STORY-061, A4; scoring-models.md section 10).
+ *
+ * Only LIVE engine results are scored (owner question on demo engines is open): a demo result is counted in `excluded`, never in
+ * the mean. `project_divergence` is `null` when nothing qualified (not measured), `0` when the engines agree.
+ *
+ * Citation COUNTS are never compared across engines. Attribution names the domains the winning engine cited and the losing one did
+ * not (a set difference, ranked by `context_weight`); the affinity map and the surface comparison use the share of an engine's
+ * ANSWERS that cite a domain, which a query fan-out cannot inflate.
+ */
+export const divergenceDomainSchema = z.object({ domain: z.string().min(1), context_weight: z.number().min(0) }).strict();
+
+export const divergencePromptSchema = z
+  .object({
+    prompt_id: z.string().min(1),
+    divergence: z.number().min(0).max(1),
+    stability_score: z.number().min(0).max(1),
+    winning_engine: z.string().min(1),
+    losing_engine: z.string().min(1),
+    /** Winner's citation domains absent from the loser's, by `context_weight` desc. Empty when the loser cited a superset. */
+    missing_domains: z.array(divergenceDomainSchema),
+  })
+  .strict();
+
+export const divergenceTargetSchema = z
+  .object({
+    losing_engine: z.string().min(1),
+    domain: z.string().min(1),
+    context_weight: z.number().min(0),
+    prompts: z.number().int().positive(),
+    winning_engines: z.array(z.string().min(1)),
+  })
+  .strict();
+
+export const divergenceAffinitySchema = z
+  .object({
+    engine: z.string().min(1),
+    /** Live answers on this engine in the window: the denominator of every rate below. */
+    answers: z.number().int().positive(),
+    domains: z.array(
+      z
+        .object({
+          domain: z.string().min(1),
+          answers_citing: z.number().int().positive(),
+          presence_rate: z.number().min(0).max(1),
+          source_class: z.string().nullable(),
+        })
+        .strict(),
+    ),
+    /** Share of this engine's citations by source class. */
+    source_classes: z.array(z.object({ source_class: z.string().min(1), share: z.number().min(0).max(1) }).strict()),
+  })
+  .strict();
+
+export const surfaceComparisonSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("normalised"),
+      engines: z.tuple([z.string().min(1), z.string().min(1)]),
+      basis: z.literal("answers_citing_domain / answers"),
+      domains: z.array(z.object({ domain: z.string().min(1), rate_a: z.number().min(0).max(1), rate_b: z.number().min(0).max(1) }).strict()),
+    })
+    .strict(),
+  z.object({ status: z.literal("refused"), reason: z.string().min(1) }).strict(),
+]);
+export type SurfaceComparison = z.infer<typeof surfaceComparisonSchema>;
+
+export const geoDivergenceDetailSchema = z
+  .object({
+    slug: z.literal("divergence"),
+    data_source: dataSourceSchema.nullable(),
+    project_divergence: z.number().min(0).max(1).nullable(),
+    qualifying_prompts: z.number().int().nonnegative(),
+    excluded: z
+      .object({
+        fewer_than_two_live_engines: z.number().int().nonnegative(),
+        no_stability: z.number().int().nonnegative(),
+        unscored_results: z.number().int().nonnegative(),
+        demo_results: z.number().int().nonnegative(),
+      })
+      .strict(),
+    alert: z.object({ threshold: z.number(), min_prompts: z.number().int().positive(), crossed: z.boolean() }).strict(),
+    /** Most divergent first, capped; `qualifying_prompts` is the uncapped count. */
+    prompts: z.array(divergencePromptSchema),
+    /** Engine-targeted work: the losing engine and the domain it lacks, ranked. */
+    targets: z.array(divergenceTargetSchema),
+    affinity: z.array(divergenceAffinitySchema),
+    /** The two licensed Google surfaces, compared only on a normalised basis; `null` when either has no live answers. */
+    surface_comparison: surfaceComparisonSchema.nullable(),
+  })
+  .strict();
+export type GeoDivergenceDetail = z.infer<typeof geoDivergenceDetailSchema>;
+
+// -------------------------------------------------------- A5 topics detail
+
+/**
+ * `GET /geo-insights/topics` -> `detail` (STORY-061, A5; scoring-models.md section 10).
+ *
+ * `achievability` is `null` when no alignment was measured for the topic: that is not a score of zero, and the topic is not
+ * recommended (fail closed). A topic below `min_achievability` is listed with the reason and is never recommended.
+ */
+export const topicAuthoritySchema = z
+  .object({
+    entity_type: z.enum(["brand", "competitor"]),
+    entity_label: z.string().min(1),
+    sov: z.number().min(0).max(1),
+    presence_rate: z.number().min(0).max(1),
+    authority: z.number().min(0).max(1),
+  })
+  .strict();
+
+export const topicRowSchema = z
+  .object({
+    cluster_id: z.string().min(1),
+    label: z.string(),
+    answers: z.number().int().positive(),
+    commercial_intent: z.number().min(0).max(1),
+    /** argmax over the tracked entities (ties go to the brand, then the label). */
+    owner: topicAuthoritySchema,
+    brand_authority: z.number().min(0).max(1),
+    authorities: z.array(topicAuthoritySchema),
+    current_alignment: z.number().nullable(),
+    target_alignment: z.number().nullable(),
+    achievability: z.number().min(0).max(1).nullable(),
+    /** `null` when achievability is unmeasured. 0 when the brand owns the topic. */
+    gap_priority: z.number().min(0).nullable(),
+    recommended: z.boolean(),
+    not_recommended_reason: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const topicGapContentSchema = z
+  .object({
+    cluster_id: z.string().min(1),
+    label: z.string(),
+    required_concepts: z.array(z.object({ phrase: z.string().min(1), node_type: z.string().min(1), corpus_doc_ratio: z.number().min(0).max(1) }).strict()),
+    /** The answer form the cluster's answers use most; `null` when none was classified. */
+    structure: z.string().nullable(),
+  })
+  .strict();
+
+export const geoTopicsDetailSchema = z
+  .object({
+    slug: z.literal("topics"),
+    data_source: dataSourceSchema.nullable(),
+    answers: z.number().int().nonnegative(),
+    min_achievability: z.number().min(0).max(1),
+    topics: z.array(topicRowSchema),
+    gaps: z.array(topicGapContentSchema),
+  })
+  .strict();
+export type GeoTopicsDetail = z.infer<typeof geoTopicsDetailSchema>;
 
 // -------------------------------------------------------- A2 entity detail
 
@@ -297,6 +474,10 @@ export const geoFindingSchema = z
     lever_rank: z.number().int().min(1).max(3).optional(),
     /** The A6 detail, carried by the one finding that speaks for the analysis (STORY-061). */
     sentiment: geoSentimentDetailSchema.optional(),
+    /** The A4 detail, carried by the analysis's first finding (STORY-061). */
+    divergence: geoDivergenceDetailSchema.optional(),
+    /** The A5 detail, carried by the analysis's first finding (STORY-061). */
+    topics: geoTopicsDetailSchema.optional(),
     /** The A3 detail, persisted on the analysis's one finding so a read never re-aggregates (STORY-062). */
     structure: geoStructureDetailSchema.optional(),
     /** The A2 detail, persisted on the analysis's first finding (STORY-060). */
