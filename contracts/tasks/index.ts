@@ -12,3 +12,4 @@ export * from "./create-goal-request.schema.js";
 export * from "./goal-response.schema.js";
 export * from "./task-generation.schema.js";
 export * from "./task-generate-job.schema.js";
+export * from "./task-verification-payload.schema.js";
