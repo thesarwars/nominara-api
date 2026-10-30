@@ -79,6 +79,7 @@ function auditRow(over: Record<string, unknown> = {}) {
     llms_txt_present: false,
     sitemap_url_count: 0,
     excluded: [{ rule_code: "AUX-R-010", title: "Product schema" }],
+    excluded_by_category: { structured_data: ["AUX-R-010"], crawler_access: ["AUX-R-005"] },
     previous_score: "60.000",
     in_scope: true,
     ...over,
@@ -170,8 +171,8 @@ describe("NEW-C-10 · controller", () => {
 
   it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the reads and the one finding action (a patch is read, never written, by a client)", () => {
     const routes = Object.getOwnPropertyNames(AuxController.prototype).filter((n) => n !== "constructor").sort();
-    // + triggerAudit (AUXLIVE-3): it creates an audit, it cannot touch a finding.
-    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "triggerAudit", "updateFinding"]);
+    // + triggerAudit and previewAudit (AUXLIVE-3): one creates an audit, the other quotes it; neither can touch a finding.
+    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "previewAudit", "triggerAudit", "updateFinding"]);
   });
 
   it("AUXLIVE-3 · POST /projects/{id}/aux-audits requires aux:trigger, is project-scoped, audited, idempotent and in the project_aux_audits rate class (10/hour per user, burst 3)", () => {
@@ -184,10 +185,18 @@ describe("NEW-C-10 · controller", () => {
     expect(meta(CREDITS_KEY, "triggerAudit")).toBeUndefined();
   });
 
+  it("AUXLIVE-3 (decision 39) · POST /projects/{id}/aux-audits/preview needs the same permission, is project-scoped, audited, free (no credits guard) and carries no Idempotency-Key requirement", () => {
+    expect(meta(REQUIRE_PERMISSION_KEY, "previewAudit")).toBe("aux:trigger");
+    expect(meta(PROJECT_PARAM_KEY, "previewAudit")).toBe("id");
+    expect(meta(AUDIT_METADATA_KEY, "previewAudit")).toMatchObject({ action: "aux_audit.previewed", resourceType: "project" });
+    expect(meta(IDEMPOTENT_KEY, "previewAudit")).toBeUndefined();
+    expect(meta(CREDITS_KEY, "previewAudit")).toBeUndefined();
+  });
+
   it("AUXLIVE-3 · the service refuses to charge when it was built without the queue or the pool (fail closed, before any debit)", async () => {
     const query = vi.fn();
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: "w", actorId: "a" } } as never);
-    await expect(new AuxService().triggerAudit(PROJECT_ID, {}, { id: "a", type: "user" })).rejects.toThrow(/queue producer/);
+    await expect(new AuxService().triggerAudit(PROJECT_ID, {}, { id: "a", type: "user" }, { idempotencyKey: "k", confirmedCredits: "10" })).rejects.toThrow(/queue producer/);
     expect(query).not.toHaveBeenCalled();
   });
 });
@@ -213,9 +222,22 @@ describe("NEW-C-10 · AuxService.getAudit", () => {
   it("[NEW-C-10 AC4] the breakdown becomes weighted categories; a subscore of 0 is kept, an absent category is not invented", async () => {
     const audit = await serviceWith(() => [auditRow()]).getAudit(AUDIT_ID);
     expect(audit.categories).toEqual([
-      { category: "crawler_access", weight: 0.28, subscore: 0.4 },
-      { category: "freshness", weight: 0.06, subscore: 0 },
+      { category: "crawler_access", weight: 0.28, subscore: 0.4, rules_not_evaluated: ["AUX-R-005"] },
+      { category: "freshness", weight: 0.06, subscore: 0, rules_not_evaluated: [] },
     ]);
+  });
+
+  it("AUXLIVE-5 (decision 38) · a score over fewer than six categories is labelled partial and names the categories left out; a null score is not partial", async () => {
+    const partial = await serviceWith(() => [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 0.9, context_fitness: 1, render_mode: 1, freshness: 1 } })]).getAudit(AUDIT_ID);
+    expect(partial).toMatchObject({ aux_score: 68.5, score_partial: true, unmeasured_categories: ["entity_clarity"] });
+    const none = await serviceWith(() => [auditRow({ aux_score: null, score_breakdown: {} })]).getAudit(AUDIT_ID);
+    expect(none).toMatchObject({ aux_score: null, score_partial: false });
+    expect(none.unmeasured_categories).toHaveLength(6);
+  });
+
+  it("AUXLIVE-5 (decision 38) · all six categories published: a full score, partial false, nothing unmeasured", async () => {
+    const full = await serviceWith(() => [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 0.5, freshness: 1 } })]).getAudit(AUDIT_ID);
+    expect(full).toMatchObject({ score_partial: false, unmeasured_categories: [] });
   });
 
   it("[NEW-C-10 AC4] a real site-file audit: aux_score null stays null, delta null, no breakdown beyond what ran, 0 and null distinguished", async () => {
@@ -227,7 +249,7 @@ describe("NEW-C-10 · AuxService.getAudit", () => {
     expect(audit.status).toBe("partial");
     expect(audit.llms_txt_present).toBeNull();
     expect(audit.sitemap_url_count).toBeNull();
-    expect(audit.categories).toEqual([{ category: "crawler_access", weight: 0.28, subscore: 1 }]);
+    expect(audit.categories).toEqual([{ category: "crawler_access", weight: 0.28, subscore: 1, rules_not_evaluated: ["AUX-R-005"] }]);
   });
 
   it("[NEW-C-10 AC4] a score of 0 is 0, not null; a null breakdown is no categories", async () => {

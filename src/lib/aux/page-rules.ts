@@ -5,8 +5,9 @@ import { buildAuxDocument, type AuxDocument } from "./document-model.js";
 import { loadDocumentSnapshot, type ReadStoredObject } from "./document-snapshot.js";
 import { findingFingerprint } from "./lifecycle.js";
 import { byCodePoint } from "./rules/helpers.js";
-import { evaluateDocuments } from "./rules/engine.js";
+import { AuxRuleEvaluationError, evaluateDocument } from "./rules/engine.js";
 import { AUX_RULES } from "./rules/index.js";
+import type { AuxRule } from "./rules/types.js";
 import { cl100kTokenizer } from "./tokenizer-cl100k.js";
 
 // STORY-051 AC13 - the page rule engine over a crawl's stored pages (aux-and-geo-analysis.md section 1, step 6, EVALUATE).
@@ -52,7 +53,7 @@ export interface PageRulesResult {
   /** Per page that was modelled: the rules that could be decided on it. A page absent here was NOT looked at by the page rules. */
   readonly evaluated: Map<string, ReadonlySet<string>>;
   /** A stored page that could not be read back or modelled. Reason codes only; never the content or the error text. */
-  readonly unmodelled: { readonly url: string; readonly reason: "snapshot_unreadable" }[];
+  readonly unmodelled: { readonly url: string; readonly reason: "snapshot_unreadable" | `rule_error:${string}` }[];
 }
 
 export async function runPageRules(
@@ -60,6 +61,8 @@ export async function runPageRules(
   read: ReadStoredObject,
   catalog: AuxCatalog,
   ctx: { readonly projectId: string },
+  /** The rules to run: the engine's own by default. Injectable so a test can make a rule crash on one page. */
+  rules: readonly AuxRule[] = AUX_RULES,
 ): Promise<PageRulesResult> {
   const documents: AuxDocument[] = [];
   const unmodelled: PageRulesResult["unmodelled"] = [];
@@ -79,16 +82,22 @@ export async function runPageRules(
     if (document !== null) documents.push(document);
   }
 
-  // A rule that cannot run (no catalog row, a threshold that does not parse) is a configuration fault: it fails the evaluation, and the job,
-  // closed. It is never turned into "that page is fine".
-  const perPage = await evaluateDocuments(documents, catalog, AUX_RULES, ctx);
-
+  // A rule that cannot RUN (no catalog row, a threshold that does not parse) is a configuration fault: it fails the evaluation, and the job,
+  // closed. It is never turned into "that page is fine". A rule that CRASHES on one page's markup (AuxRuleEvaluationError) is that page's problem, and a
+  // deterministic one - every retry would fail the same way and the whole audit, onboarding and scheduled ones too, would never publish. So the page is
+  // reported as unmodelled with the rule code (never the error text, never the content) and the audit ends partial.
   const evaluated = new Map<string, ReadonlySet<string>>();
   const findings: AuxRuleFinding[] = [];
-  documents.forEach((document, i) => {
-    evaluated.set(document.url, evaluablePageRules(document));
-    findings.push(...perPage[i]!);
-  });
+  for (const document of documents) {
+    try {
+      findings.push(...(await evaluateDocument(document, catalog, rules, ctx)));
+      evaluated.set(document.url, evaluablePageRules(document));
+    } catch (error) {
+      if (!(error instanceof AuxRuleEvaluationError)) throw error;
+      logger.warn({ event: "aux.page_rules.rule_error", project_id: ctx.projectId, rule_code: error.ruleCode });
+      unmodelled.push({ url: document.url, reason: `rule_error:${error.ruleCode}` });
+    }
+  }
   findings.sort((a, b) => byCodePoint(a.url, b.url) || byCodePoint(a.rule_code, b.rule_code) || byCodePoint(a.evidence.locator, b.evidence.locator));
   return { findings, evaluated, unmodelled };
 }

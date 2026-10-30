@@ -95,6 +95,13 @@ export interface AuxScoreInput {
    * fallback invented here.
    */
   readonly categoryMaxPenalty?: Partial<Record<AuxCategory, number>>;
+  /**
+   * OWNER DECISION 38 (2026-10-30). The categories at least one rule of which was MEASURED. When given, the headline is computed over these only:
+   * `100 * sum(W_cat * sub_cat) / sum(W_cat)` for the listed categories, so a category no rule could measure neither adds points nor costs them, and
+   * the result is labelled `partial`. Absent = all six categories (the reference's formula, unchanged). An empty list is refused: there is no
+   * score of nothing, and `null` (not measured) must never be turned into `0` here.
+   */
+  readonly evaluatedCategories?: readonly AuxCategory[];
 }
 
 export interface AuxScoreResult {
@@ -103,6 +110,10 @@ export interface AuxScoreResult {
   /** True only when the hard cap actually changed the value. */
   readonly capped: boolean;
   readonly subscores: Readonly<Record<AuxCategory, number>>;
+  /** True when `score` leaves categories out (`evaluatedCategories` named fewer than six). */
+  readonly partial: boolean;
+  /** The categories left out of `score`, in the reference's order. */
+  readonly unmeasured: readonly AuxCategory[];
 }
 
 const AUX_CATEGORIES = Object.keys(AUX_CATEGORY_WEIGHTS) as readonly AuxCategory[];
@@ -118,11 +129,15 @@ const AUX_CATEGORIES = Object.keys(AUX_CATEGORY_WEIGHTS) as readonly AuxCategory
  * the rounded figure, not the raw one, matching §7's own statement order.
  */
 export function auxScore(input: AuxScoreInput): AuxScoreResult {
+  const evaluated = input.evaluatedCategories === undefined ? AUX_CATEGORIES : AUX_CATEGORIES.filter((c) => input.evaluatedCategories!.includes(c));
+  if (evaluated.length === 0) throw new RangeError("auxScore needs at least one evaluated category: there is no score of nothing");
+  const unmeasured = AUX_CATEGORIES.filter((c) => !evaluated.includes(c));
   const subscores = {} as Record<AuxCategory, number>;
   let hasCriticalCrawlerAccess = false;
 
   for (const category of AUX_CATEGORIES) {
     const categoryFindings = input.findings.filter((finding) => finding.category === category);
+    // A finding in a category nobody measured does not move the score (the category is out of it); its subscore is still reported, as it always was.
     const maxPenalty = input.categoryMaxPenalty?.[category] ?? 1;
     const penalty = categoryFindings.reduce(
       (total, finding) =>
@@ -131,14 +146,16 @@ export function auxScore(input: AuxScoreInput): AuxScoreResult {
     );
     subscores[category] = clamp01(1 - penalty / maxPenalty);
 
-    if (category === "crawler_access" && categoryFindings.some((finding) => finding.severity === "critical")) {
+    if (category === "crawler_access" && evaluated.includes(category) && categoryFindings.some((finding) => finding.severity === "critical")) {
       hasCriticalCrawlerAccess = true;
     }
   }
 
-  const weighted = AUX_CATEGORIES.reduce((total, category) => total + AUX_CATEGORY_WEIGHTS[category] * subscores[category], 0);
-  const rounded = Number((100 * weighted).toFixed(1));
+  const weighted = evaluated.reduce((total, category) => total + AUX_CATEGORY_WEIGHTS[category] * subscores[category], 0);
+  // With all six evaluated the sum is 1.000 by construction (a unit test pins it): use 1 itself so the full score is the reference's formula to the bit.
+  const weightSum = unmeasured.length === 0 ? 1 : evaluated.reduce((total, category) => total + AUX_CATEGORY_WEIGHTS[category], 0);
+  const rounded = Number(((100 * weighted) / weightSum).toFixed(1));
   const score = hasCriticalCrawlerAccess ? Math.min(rounded, AUX_HARD_CAP) : rounded;
 
-  return { score, capped: hasCriticalCrawlerAccess && rounded > AUX_HARD_CAP, subscores };
+  return { score, capped: hasCriticalCrawlerAccess && rounded > AUX_HARD_CAP, subscores, partial: unmeasured.length > 0, unmeasured };
 }

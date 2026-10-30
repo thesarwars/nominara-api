@@ -1373,7 +1373,9 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(line).toMatchObject({ workspace_id: workspaceId, pages_evaluated: 1, page_findings: expect.any(Number) });
       expect(line.page_findings as number).toBeGreaterThanOrEqual(1);
       expect(JSON.stringify(lines)).not.toContain("Pipeline analytics");
-      expect(counters.some((c) => c.name === "nominara_aux_page_rules_evaluated_total")).toBe(true);
+      // review round 1: ONE observation per audit carrying the count (not one counter line per page)
+      const observed = lines.filter((l) => (l as { metric?: string }).metric === "nominara_aux_pages_evaluated_count");
+      expect(observed).toEqual([{ metric: "nominara_aux_pages_evaluated_count", value: 1, trigger: "onboarding" }]);
     });
   });
 

@@ -1,10 +1,11 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Req } from "@nestjs/common";
 import {
   auxAuditListQuerySchema,
   auxAuditSchema,
   auxFindingListQuerySchema,
   auxFindingSchema,
   auxPatchSchema,
+  triggerAuxAuditPreviewResponseSchema,
   triggerAuxAuditRequestSchema,
   triggerAuxAuditResponseSchema,
   updateAuxFindingRequestSchema,
@@ -13,6 +14,7 @@ import {
   type AuxFinding,
   type AuxFindingListQuery,
   type AuxPatch,
+  type TriggerAuxAuditPreviewResponse,
   type TriggerAuxAuditRequest,
   type TriggerAuxAuditResponse,
   type UpdateAuxFindingRequest,
@@ -21,6 +23,7 @@ import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
+import { CONFIRMED_CREDITS_HEADER } from "../../lib/credits/confirmed-credits.js";
 import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
 import { RateLimitClass } from "../../api/rate-limit/route-class.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
@@ -60,8 +63,9 @@ export class AuxController {
   }
 
   // `¢ ✚` in api-specification.md "AUX": priced and idempotent. 202, not 200: the audit is queued and its row exists, but nothing has been read yet.
-  // The price is variable (FR-TL-03: first page band flat, then per page), so it is computed in the service from the plan and shown in the response;
-  // `@Credits('...')` is the flat-price path and does not fit. §12's `project_aux_audits` (10/hour per user, 60/hour per workspace, burst 3) applies.
+  // The price is variable (FR-TL-03: first page band flat, then per page), so it is computed in the service from the plan; `@Credits('...')` is the
+  // flat-price path and does not fit. Owner decision 39: it charges ONLY with `X-Nominara-Confirmed-Credits` equal to the price recomputed there (the figure
+  // `aux-audits/preview` quotes), the same flow as prompt activation. §12's `project_aux_audits` (10/hour per user, 60/hour per workspace, burst 3) applies.
   @Post("projects/:id/aux-audits")
   @HttpCode(202)
   @Idempotent()
@@ -74,8 +78,27 @@ export class AuxController {
     @Req() req: RbacScopedRequest,
     @Param("id") id: string,
     @Body(new ZodValidationPipe(triggerAuxAuditRequestSchema)) body: TriggerAuxAuditRequest,
+    @Headers("idempotency-key") idempotencyKey?: string,
+    @Headers(CONFIRMED_CREDITS_HEADER) confirmed?: string | string[],
   ): Promise<TriggerAuxAuditResponse> {
-    return this.service.triggerAudit(id, body, { id: req.auth?.sub ?? null, type: "user" });
+    return this.service.triggerAudit(id, body, { id: req.auth?.sub ?? null, type: "user" }, { idempotencyKey, confirmedCredits: confirmed });
+  }
+
+  // Owner decision 39 - the QUOTE half of the priced-action flow. Free, read-only (no reservation, no ledger row, no write, no job), same body as the
+  // trigger; `credits` is the figure to echo in `X-Nominara-Confirmed-Credits`. A POST because it carries a body, like `activate/preview`; no
+  // `@Idempotent()` for the same reason that route has none (a repeated quote is a repeated read). Audited because the interceptor refuses any mutating
+  // method without it, and "what was the operator quoted" is the question a disputed charge asks.
+  @Post("projects/:id/aux-audits/preview")
+  @HttpCode(200)
+  @RequirePermission("aux:trigger")
+  @ProjectParam("id")
+  @Audit({ action: "aux_audit.previewed", resourceType: "project" })
+  @ApiContract({ operationId: "previewAuxAudit", requestSchema: triggerAuxAuditRequestSchema, responseSchema: triggerAuxAuditPreviewResponseSchema })
+  previewAudit(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(triggerAuxAuditRequestSchema)) body: TriggerAuxAuditRequest,
+  ): Promise<TriggerAuxAuditPreviewResponse> {
+    return this.service.previewAudit(id, body);
   }
 
   @Get("projects/:id/aux-findings")

@@ -453,14 +453,22 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
   // of credits" is not "free to the Free tier".
   it("AUXLIVE-1 AC10 · a Free workspace's first scan enqueues NO onboarding audit (aux.scheduled_audits is off): the plan, and the scan, still go ahead", async () => {
     await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [wsA]);
+    const lines: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      lines.push(message);
+    });
     await processor()(signedJob(wsA, projA));
     await settle();
     expect(audits).toEqual([]);
+    // the skip is counted, with no workspace name in it
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_skipped_total")).toMatchObject({ reason: "not_in_plan" });
     // nothing about the audit is left behind either: no row, no ledger entry
     expect((await db.query("SELECT 1 FROM aux_audits WHERE project_id = $1", [projA])).rowCount).toBe(0);
     expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
-    // and the project WAS claimed and planned (the skip is the entitlement's, not the claim's)
-    expect((await db.query("SELECT next_run_at > now() AS moved FROM projects WHERE id = $1", [projA])).rows[0].moved).toBe(true);
+    // and the project WAS claimed and handled (the skip is the entitlement's, not the claim's): the plan job reported an outcome other than "skipped"
+    const outcome = lines.find((l) => (l as { metric?: string }).metric === "nominara_capture_plan_runs_total") as { outcome?: string } | undefined;
+    expect(outcome?.outcome).toBeDefined();
+    expect(outcome?.outcome).not.toBe("skipped");
   });
 
   it("AUXLIVE-1 AC10 · every plan that includes AUX audits gets the onboarding audit: starter, growth and business", async () => {

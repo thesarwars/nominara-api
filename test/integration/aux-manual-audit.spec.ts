@@ -484,6 +484,33 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
       expect(await wallet()).toMatchObject({ included: 100 });
     });
 
+    it("AUXLIVE-3 AC16 · observability: a counter and a log line with the workspace id and the audit id - no domain, no workspace name, no URL", async () => {
+      const lines: unknown[] = [];
+      vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => { lines.push(m); });
+      const res = await trigger({ scope: "single_url", target_urls: ["https://acme.com/secret-path"] });
+      await age(res.audit_id, 90);
+      await reapStaleManualAudits(db, new Date());
+      expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_stale_audits_reaped_total")).toBeDefined();
+      expect(lines.find((l) => (l as { event?: string }).event === "aux.audit.reaped_stale")).toMatchObject({ workspace_id: workspaceId, audit_id: res.audit_id });
+      expect(JSON.stringify(lines.filter((l) => (l as { event?: string }).event === "aux.audit.reaped_stale"))).not.toMatch(/acme\.com|secret-path/);
+    });
+
+    it("AUXLIVE-3 AC16 · the scheduler sweep runs the reaper: a stale manual audit is failed and refunded by a tick, with no other caller", async () => {
+      const res = await trigger();
+      await age(res.audit_id, 90);
+      const { SchedulerSweepRuntime } = await import("../../src/lib/capture/scheduler-sweep.js");
+      const runtime = new SchedulerSweepRuntime({
+        connect: () => {
+          const client = new Client({ connectionString: container.getConnectionUri() });
+          return client.connect().then(() => client);
+        },
+        enqueue: () => Promise.resolve(),
+      });
+      await runtime.tick();
+      expect((await audits())[0].status).toBe("failed");
+      expect(await wallet()).toMatchObject({ included: 100 });
+    });
+
     it("AUXLIVE-3 AC16 · one tenant's stale audits are settled in THEIR OWN context: two workspaces, each refunded to its own wallet", async () => {
       const first = await trigger();
       await age(first.audit_id, 90);

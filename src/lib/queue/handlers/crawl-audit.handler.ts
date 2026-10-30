@@ -36,6 +36,7 @@ import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } fro
 import { unavailableRenderer, type Renderer } from "../../aux/renderer.js";
 import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../../aux/robots.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../aux/audit-constants.js";
+import { failManualAudit } from "../../aux/fail-manual-audit.js";
 import { refundAuxAuditCharge } from "../../credits/aux-audit-refund.js";
 import { sanitiseText } from "../../aux/sanitise.js";
 import { AI_CRAWLER_AGENTS, evaluateSiteFiles, type SiteFile } from "../../aux/site-files.js";
@@ -48,7 +49,7 @@ import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
 import { TenantObjectStore } from "../../storage/tenant-object-store.js";
-import { incrementCounter } from "../../telemetry/metrics.js";
+import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import { afterCommit, currentTenantStore } from "../../../tenancy/tenant-context.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -80,9 +81,15 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // edge rules) CANNOT be evaluated at all: OWNER DECISION 2026-10-22, Nominara sends every request as NominaraBot and never under
 // another crawler's name, so a firewall or CDN rule that blocks by user agent is not observable here. AI-bot access is judged
 // from what robots.txt publishes for each AI crawler token (`ai_bot_access` in the manifest; AUX-R-001/002 as findings).
-// `excluded_rules` names all of this and `aux_score` stays null: one category
-// is not an AUX score. The `crawler_access` subscore is published in `score_breakdown`, and `score_capped` is set whenever
-// a critical crawler_access finding is open.
+// `excluded_rules` names all of this. THE HEADLINE (owner decision 38): when pages were judged, `aux_score` is computed over the categories that were
+// evaluated (every one but entity_clarity today: AUX-R-032/033/034 are not evaluated), renormalised to 100 and capped at 72 by a critical crawler_access
+// finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
+// (site files only) it stays null: one category's subscore is published, but that is not a headline. `score_capped` is set whenever a critical
+// crawler_access finding is open.
+//
+// A JOB THAT FAILS (review round 1). A rule that crashes on one page's markup is that page's problem (page-rules.ts: unmodelled, `rule_error:<code>`), so the audit
+// ends `partial` instead of never publishing. Anything else that throws walks the retry ladder; on the LAST attempt a MANUAL audit is failed and its charge
+// refunded in full (`recover`), and a manual audit whose job never finishes at all is failed and refunded by the 60-minute reaper (aux/stale-audit-reaper.ts).
 //
 // THE TRANSACTIONS (KAD-06, ADR-0003). This is a PHASED job (`phasedProcessor`): `prepare` and `commit` are each ONE SHORT tenant
 // transaction, and `run`, where every request to the target, every render and every object-store write happens, holds NO
@@ -348,7 +355,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     );
     if (project.rows.length === 0) {
       logger.log(`project ${payload.projectId} is gone; skipping audit`);
-      await failManualAudit(tx, payload, "project_deleted");
+      await failUnrunManualAudit(tx, payload, "project_deleted");
       return PHASES_DONE;
     }
     const { root_domain: rootDomain, root_url: rootUrl, plan_key: planKey } = project.rows[0]!;
@@ -636,7 +643,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       }
     });
     pageCopies.clear();
-    for (let i = 0; i < pageRules.evaluated.size; i += 1) incrementCounter("nominara_aux_page_rules_evaluated_total", {});
+    observeValue("nominara_aux_pages_evaluated_count", pageRules.evaluated.size, { trigger: payload.trigger });
     // The rules that ran on at least one page, and of those the ones that ran on an interim reading (AUX_RULES_PARTIAL): they get their own annotation.
     const decidedAnywhere = new Set<string>();
     for (const rules of pageRules.evaluated.values()) for (const code of rules) decidedAnywhere.add(code);
@@ -661,6 +668,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
           }
         : {}),
       ...(rulesPartial.length > 0 ? { rules_partial: rulesPartial } : {}),
+      // Which pages the page rules looked at: what a LATER audit reads to tell "the page was fine" from "nobody looked" (per-URL staleness, STORY-052 AC8).
+      ...(pageRules.evaluated.size > 0 ? { pages_modelled: [...pageRules.evaluated.keys()].filter((u) => u.length <= 2048).sort().slice(0, 500) } : {}),
       ...(partialPages.length > 0 ? { pages_partial: partialPages.length } : {}),
       ...(delayLimited
         ? {
@@ -779,7 +788,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     if (project.rows.length === 0) {
       incrementCounter("nominara_aux_crawl_commit_total", { outcome: "project_gone" });
       logger.log(`project ${payload.projectId} was deleted during audit ${payload.auditId}; writing nothing`);
-      await failManualAudit(tx, payload, "project_deleted");
+      await failUnrunManualAudit(tx, payload, "project_deleted");
       return;
     }
     const claimed = await claimAudit(tx, prepared, outcome);
@@ -835,17 +844,27 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // of which rules had no answer from their input file (a site file that did not respond, or an audit that reached nothing), so it
     // is read, not re-derived: no new column. Counted back from the latest and stopping at the first audit that DID observe it, so two
     // CONSECUTIVE audits are required, never two in a window. Only audits that finished count, and only those strictly BEFORE this one: a redelivered older job must not read a newer audit as its predecessor.
-    const history = await tx.query<{ excluded_rules: string[] }>(
-      `SELECT excluded_rules FROM aux_audits
+    const history = await tx.query<{ excluded_rules: string[]; error_summary: { pages_modelled?: string[] } | null }>(
+      `SELECT excluded_rules, error_summary FROM aux_audits
         WHERE project_id = $1 AND id <> $2 AND status = ANY($3::text[])
           AND (created_at, id) < (SELECT created_at, id FROM aux_audits WHERE id = $2)
         ORDER BY created_at DESC, id DESC LIMIT $4`,
       [payload.projectId, payload.auditId, TERMINAL_STATUSES, STALE_AFTER_AUDITS - 1],
     );
+    // A SITE-FILE finding lives in a file: an audit did not observe it when its rule is in that audit's `excluded_rules`. A PAGE finding lives on a URL, and its rule
+    // is excluded only when it ran on NO page, so `excluded_rules` cannot say the page was missed (a 404, a page no longer in the sitemap) while the rule ran
+    // elsewhere: an earlier audit did not observe it when that audit did not model the URL. `pages_modelled` is that record. An audit with no record (one that
+    // failed before it ran) is NOT counted as a miss: nobody looked, but nobody could have seen it gone either, so it breaks the run rather than extending it.
+    const observedIn = (audit: (typeof history.rows)[number], row: ExistingFinding): boolean => {
+      if (audit.excluded_rules.includes(row.ruleCode)) return false;
+      if (!pageRuleCodes.has(row.ruleCode)) return true;
+      const modelled = audit.error_summary?.pages_modelled;
+      return modelled === undefined || row.url === null ? true : modelled.includes(row.url);
+    };
     const unobservedBefore = (row: ExistingFinding): number => {
       let run = 0;
       for (const audit of history.rows) {
-        if (!audit.excluded_rules.includes(row.ruleCode)) break;
+        if (observedIn(audit, row)) break;
         run += 1;
       }
       return run;
@@ -948,6 +967,16 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     const counts = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const d of detected) if (d.severity in counts) counts[d.severity as keyof typeof counts] += 1;
 
+    // STORY-052 AC9: the pages a page rule's findings are open on are RECORDED on each of its rows (the distinct URLs, across every audit's findings that are still
+    // scored), so the column a client reads agrees with what the score counts. A site-file finding is domain-wide and keeps its 1.
+    await tx.query(
+      `UPDATE aux_findings f SET affected_pages = s.n
+         FROM (SELECT rule_code, count(DISTINCT url)::int AS n FROM aux_findings
+                WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[]) GROUP BY rule_code) s
+        WHERE f.project_id = $1 AND f.rule_code = s.rule_code AND f.status = ANY($2::text[]) AND f.affected_pages IS DISTINCT FROM s.n`,
+      [payload.projectId, SCORED_STATUSES, [...PAGE_RULE_CODES]],
+    );
+
     // THE SCORE (scoring-models.md section 7) over every finding still open for the project - including ones whose page or file this audit could not
     // re-observe, and stale ones: stale is not fixed. A site-file finding is domain-wide, so it affects every page crawled (scope 1). A page finding
     // affects the distinct pages it is open on (STORY-052 AC9), never more than the pages this audit crawled; the scope factor is floored at 0.25.
@@ -974,11 +1003,13 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       perRule.set(r.rule_code, seen);
     }
     for (const [code, { severity, urls }] of perRule) {
-      counted.push({ category: asCategory(code), severity, ruleWeight: catalog.byCode.get(code)?.weight ?? 0, affectedPages: Math.min(pagesForScore, urls.size) });
+      // Only the pages THIS audit modelled: a finding open on a page not looked at now still counts (stale is not fixed), but at the scope floor, never as a
+      // page the audit crawled. (Otherwise the ratio would mix two page sets: pages of past audits over the pages of this one.)
+      const lookedAt = [...urls].filter((u) => pageEvaluated.has(u)).length;
+      counted.push({ category: asCategory(code), severity, ruleWeight: catalog.byCode.get(code)?.weight ?? 0, affectedPages: Math.min(pagesForScore, lookedAt) });
     }
-    const scored = auxScore({ findings: counted, pagesCrawled: pagesForScore });
-    // A category is PUBLISHED only when something in it was actually evaluated in this audit; the headline score only when every category was.
-    // crawler_access always was (the site files answered, or the audit would have failed).
+    // A category is PUBLISHED only when something in it was actually evaluated in this audit. crawler_access always was (the site files answered, or the audit
+    // would have failed). OWNER DECISION 38: the headline is computed over the categories that WERE evaluated, renormalised to 100, and the API labels it partial.
     const categoriesRan = new Set<AuxCategory>(["crawler_access"]);
     for (const rules of pageEvaluated.values()) {
       for (const code of rules) {
@@ -986,9 +1017,9 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         if (category !== undefined) categoriesRan.add(category);
       }
     }
+    const scored = auxScore({ findings: counted, pagesCrawled: pagesForScore, evaluatedCategories: [...categoriesRan] });
     const breakdown: Partial<Record<AuxCategory, number>> = {};
     for (const category of Object.keys(AUX_CATEGORY_WEIGHTS) as AuxCategory[]) if (categoriesRan.has(category)) breakdown[category] = scored.subscores[category];
-    const allCategoriesRan = categoriesRan.size === Object.keys(AUX_CATEGORY_WEIGHTS).length;
     const capped = counted.some((c) => c.category === "crawler_access" && c.severity === "critical");
 
     const status = outcome.siteFilesFailed + outcome.pagesFailed + outcome.partialPages + outcome.unmodelledPages + skippedSiteFileCount(outcome) > 0 || outcome.manifestStored === false ? "partial" : "completed";
@@ -1021,8 +1052,9 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         outcome.llmsPresent, outcome.sitemapCount, capped, JSON.stringify(breakdown),
         counts.critical, counts.high, counts.medium, counts.low, finishedAt,
         [...new Set(outcome.allSiteFileUrls)], excluded, outcome.domObjectPrefix, outcome.errorSummary,
-        // null = not every category ran, so there is no headline score; 0 would be a measured zero.
-        allCategoriesRan ? scored.score : null,
+        // null = no page was judged, so the site files alone are not a headline score; 0 would be a measured zero. With pages judged it is the partial score of
+        // owner decision 38 (the API serves `score_partial` and `unmeasured_categories`, derived from this breakdown).
+        pageEvaluated.size > 0 ? scored.score : null,
       ],
     );
 
@@ -1083,25 +1115,41 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     outcome.kind !== "crawled" ? 0 : [outcome.robots, outcome.llms, outcome.llmsWellKnown, outcome.sitemap].filter((f) => !f.responded && f.skipped !== undefined).length;
 
   /**
-   * A manual audit whose project is gone will never run: fail the row the producer queued and give the charge back. Any other trigger
-   * has no row and no charge, so there is nothing to do. Idempotent: the update only moves a row that is still queued or running, and the refund
-   * is idempotent in the ledger.
+   * A manual audit that will never run (its project is gone): fail the row the producer queued and give the charge back. Any other trigger has no row and no charge.
+   * The refund FOLLOWS the row (aux/fail-manual-audit.ts): an audit that already finished is not touched and not refunded, however late this redelivery is.
    */
-  async function failManualAudit(tx: ClientBase, payload: { auditId: string; workspaceId: string; trigger: string }, reason: "project_deleted"): Promise<void> {
+  async function failUnrunManualAudit(tx: ClientBase, payload: { auditId: string; workspaceId: string; trigger: string }, reason: "project_deleted"): Promise<void> {
     if (payload.trigger !== "manual") return;
-    await tx.query(
-      "UPDATE aux_audits SET status = 'failed', error_summary = $2::jsonb, finished_at = $3 WHERE id = $1 AND status IN ('queued','running')",
-      [payload.auditId, JSON.stringify(auxErrorSummarySchema.parse({ reason })), now()],
-    );
-    await refundAuxAuditCharge(tx, { workspaceId: payload.workspaceId, auditId: payload.auditId, reason });
-    incrementCounter("nominara_aux_audits_total", { status: "failed", trigger: payload.trigger });
+    await failManualAudit(tx, { workspaceId: payload.workspaceId, auditId: payload.auditId, reason, at: now() });
   }
 
   return phasedProcessor<Prepared, Outcome>({
     prepare: (tx, job) => prepare(tx, job),
     run: (prepared) => run(prepared),
     commit: (tx, prepared, outcome) => commit(tx, prepared, outcome),
+    // A job that throws walks the retry ladder into the DLQ, and a MANUAL audit's row is `queued` (it is claimed only in `commit`) with the credits taken. On the LAST
+    // attempt only (an earlier one is the queue's retry ladder), fail the audit and refund it in full, in a fresh tenant transaction after signature verification.
+    // Only a row that is still queued or running moves, so an audit another delivery finished keeps its charge and the original error reaches the queue. An
+    // onboarding or scheduled job has no charge and no row: nothing to settle, so the failure stays visible in the DLQ.
+    async recover(tx: ClientBase, job: Job, failure) {
+      if (!isFinalAttempt(job)) return false;
+      const parsed = crawlAuditJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload);
+      if (!parsed.success || parsed.data.trigger !== "manual") return false;
+      const settled = await failManualAudit(tx, { workspaceId: parsed.data.workspaceId, auditId: parsed.data.auditId, reason: "job_failed", at: now() });
+      if (settled) {
+        incrementCounter("nominara_aux_audit_job_recovered_total", { phase: failure.phase });
+        logger.warn({ event: "aux.audit.job_failed", workspace_id: parsed.data.workspaceId, audit_id: parsed.data.auditId, phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });
+      }
+      return settled;
+    },
   });
+}
+
+/** True on the job's last attempt: the queue has no ladder left, so whatever this job owes has to be settled now. */
+function isFinalAttempt(job: Pick<Job, "attemptsMade" | "opts">): boolean {
+  const attempts = job.opts?.attempts;
+  if (attempts === undefined) return false;
+  return (job.attemptsMade ?? 0) + 1 >= attempts;
 }
 
 function toManifestPage(p: PageRecord): CrawlManifest["pages"][number] {

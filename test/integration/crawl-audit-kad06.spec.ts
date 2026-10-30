@@ -44,9 +44,10 @@ vi.mock("../../src/lib/aux/rules/engine.js", async () => {
   const actual = await vi.importActual<typeof import("../../src/lib/aux/rules/engine.js")>("../../src/lib/aux/rules/engine.js");
   return {
     ...actual,
-    evaluateDocuments: async (...args: Parameters<typeof actual.evaluateDocuments>) => {
+    // Review round 1: `runPageRules` evaluates page by page (so a rule that crashes on one page cannot take the others down), so the hook sits on the per-page entry.
+    evaluateDocument: async (...args: Parameters<typeof actual.evaluateDocument>) => {
       if (engineHook.onEvaluate !== null) await engineHook.onEvaluate();
-      return actual.evaluateDocuments(...args);
+      return actual.evaluateDocument(...args);
     },
   };
 });
@@ -198,7 +199,7 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
       engineHook.onEvaluate = null;
     }
     const evaluations = observed.filter((o) => o.what === "evaluate");
-    expect(evaluations).toHaveLength(1); // once per audit, over every crawled page together
+    expect(evaluations).toHaveLength(3); // once per crawled page (3 pages), every one of them outside a transaction
     for (const o of evaluations) {
       expect(o.idleInTx).toBe(0);
       expect(o.checkedOut).toBe(0);

@@ -5,6 +5,7 @@ import type { EnqueueDowngradeNotice } from "../billing/downgrade-notice-outbox.
 import { relayUnsentDowngradeNotices } from "../billing/downgrade-notice-relay.js";
 import { claimDueProjectRefs } from "./scheduler.js";
 import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
+import { reapStaleManualAudits } from "../aux/stale-audit-reaper.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
 import { reapStuckRuns } from "./stuck-run-reaper.js";
 import { sweepEngineSkipRefunds } from "./engine-skip-refund-sweep.js";
@@ -349,6 +350,11 @@ export class SchedulerSweepRuntime {
       // `queued` runs (checkpoint-4) must never hold up, or fail, the sweep.
       await reapStaleQueuedRuns(client, this.clock()).catch((error: unknown) => {
         logger.error({ event: "capture.scheduler.reap_failed", error: error instanceof Error ? error.name : "unknown" });
+      });
+      // AUXLIVE-3 (owner decision 40) - a manual AUX audit still queued or running after 60 minutes is failed and refunded in full. Best-effort and after the
+      // claim, the same discipline: it must never hold up, or fail, the sweep.
+      await reapStaleManualAudits(client, this.clock()).catch((error: unknown) => {
+        logger.error({ event: "capture.scheduler.reap_stale_audits_failed", error: error instanceof Error ? error.name : "unknown" });
       });
       // SCANFIX D4 - the same discipline for runs that STARTED and never finished: finalise them, settle
       // the money, request the rollup. Skipped without an enqueuer, because finishing a run without

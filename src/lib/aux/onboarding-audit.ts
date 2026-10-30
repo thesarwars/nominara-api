@@ -17,6 +17,19 @@ import type { ClientBase } from "pg";
 // Scope is NOT chosen here. `crawl.audit` decides it from the verification state (STORY-048): an unverified domain gets the supplied
 // URL and the site files at public-surface scope, whatever a producer says, and names the rules that could not run.
 
+/** The entitlement that says whether a plan has AUX audits at all (plans-and-entitlements.md: Free is off; the paid tiers are a quota or `configurable`). */
+export const AUX_AUDITS_ENTITLEMENT = "aux.scheduled_audits";
+
+/**
+ * Whether a plan includes AUX audits. `false`, `null` and an absent entry all mean no: fail closed. The one reading, shared by the manual route (403
+ * `feature_not_in_plan`) and the onboarding producer (no audit), so the two can never disagree about who has the feature. "Free of credits" is not "free to the
+ * Free tier": a Free workspace's first scan crawls nothing.
+ */
+export function auxAuditsIncluded(entitlements: Readonly<Record<string, { readonly value: unknown } | undefined>>): boolean {
+  const value = entitlements[AUX_AUDITS_ENTITLEMENT]?.value;
+  return !(value === false || value === null || value === undefined);
+}
+
 /** Namespace for the derived id: changing it changes every project's onboarding audit id. */
 const ONBOARDING_AUDIT_NAMESPACE = "nominara.aux.onboarding-audit.v1";
 

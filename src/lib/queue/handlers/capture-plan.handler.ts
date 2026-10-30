@@ -5,7 +5,7 @@ import { capturePlanJobSchema } from "../../../../contracts/tracking/capture-pla
 import type { Cache } from "../../cache/cache.port.js";
 import { ValkeyCacheAdapter } from "../../cache/valkey-cache.adapter.js";
 import { cacheKeyNamespace } from "../../cache/key-namespace.js";
-import { crawlAuditIdempotencyKey, onboardingAuditId, onboardingAuditWanted, type EnqueueCrawlAudit } from "../../aux/onboarding-audit.js";
+import { auxAuditsIncluded, crawlAuditIdempotencyKey, onboardingAuditId, onboardingAuditWanted, type EnqueueCrawlAudit } from "../../aux/onboarding-audit.js";
 import { releaseFairUseCapacity } from "../../capture/fair-use.js";
 import { claimDueProject, planScheduledRun, priorityVariantFor, type ScheduledRun } from "../../capture/scheduler.js";
 import { resolveEntitlements } from "../../entitlements/resolution.js";
@@ -112,7 +112,12 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
    * the project has no audit at all. The enqueue is after COMMIT and its failure never fails the scan: the audit is retried by the next call
    * that finds the project still without one (a manual audit, or the next scheduled scan).
    */
-  const requestOnboardingAudit = async (tx: ClientBase, workspaceId: string, projectId: string): Promise<void> => {
+  const requestOnboardingAudit = async (tx: ClientBase, workspaceId: string, projectId: string, auxIncluded: boolean): Promise<void> => {
+    // A plan without AUX audits (Free) gets none: the audit is free of CREDITS, not free to the tier, and it would cost real crawl egress.
+    if (!auxIncluded) {
+      incrementCounter("nominara_aux_onboarding_audit_skipped_total", { reason: "not_in_plan" });
+      return;
+    }
     if (!(await onboardingAuditWanted(tx, projectId))) return;
     const auditId = onboardingAuditId(projectId);
     afterCommit(() => {
@@ -190,10 +195,9 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
       return;
     }
 
-    await requestOnboardingAudit(tx, project.workspaceId, project.projectId);
-
     cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
     const resolved = await resolveEntitlements(tx, project.workspaceId);
+    await requestOnboardingAudit(tx, project.workspaceId, project.projectId, auxAuditsIncluded(resolved.entitlements));
     const runId = uuidV7();
     const periodStart = (await resolveBillingPeriod(tx, project.workspaceId, now)).start;
     const scheduled = await planScheduledRun(
