@@ -89,6 +89,14 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
 
   const written = await deps.runInTx(async (tx) => {
     await lockNodeScope(tx, read.projectId, read.clusterId);
+    // Re-extraction invalidates every judgement of the scope: the nodes below are reset to "absent, unranked", so no alignment of the
+    // scope may keep a coverage_ratio that says they were judged. `coverage_ratio IS NOT NULL` is what STORY-057's concept gap reads as
+    // "judged", and only `analyseNodes` sets it again.
+    await tx.query(
+      `UPDATE geo_alignments SET coverage_ratio = NULL, recommendations = '[]'::jsonb, updated_at = now()
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2`,
+      [read.projectId, read.clusterId],
+    );
     // The scope's nodes are RECONCILED, not replaced: a phrase that did not change keeps its row and its vector (and its model), so a
     // repeated extraction does not pay to embed the same text again. Only a phrase that is new, or whose vector is from another model, waits
     // at NULL and is requested. The per-session analysis columns are reset: they are recomputed by `analyseNodes`.

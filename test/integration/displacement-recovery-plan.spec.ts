@@ -253,11 +253,71 @@ describe("NEW-C-6 · displacement recovery plan", () => {
     expect(item!.recovery_task_count).toBe(tasks.length);
   });
 
-  it("STORY-057 / NEW-C-6 AC2 — concept tasks are zero until STORY-058: a concept gap alone yields an empty plan, and task_id stays null", async () => {
-    const id = await displacement({ conceptGap: [{ concept: "pricing", prevalence: 0.6, evidence_url: "https://e.com" }] });
-    expect(await plan(id)).toEqual([]);
+  const concept = (name: string, extra: Record<string, unknown> = {}) => ({ concept: name, prevalence: 0.6, evidence_url: `https://e.com/${name.replace(/\s+/g, "-")}`, ...extra });
+
+  it("STORY-057 #9 — one content task per concept gap AND one authority task per seedable citation gap, both linked to the displacement", async () => {
+    await actionable("seed.com");
+    const id = await displacement({ citationGap: [gapEntry("seed.com")], conceptGap: [concept("pricing tiers"), concept("soc 2 report")] });
+    const tasks = await plan(id);
+    expect(recoveryPlanResponseSchema.safeParse(tasks).success).toBe(true);
+    expect(tasks).toHaveLength(3);
+    const rows = await taskRows();
+    expect(rows.map((r) => r.kind).sort()).toEqual(["authority", "content", "content"]);
+    for (const row of rows) {
+      expect(row.source_displacement_id).toBe(id);
+      expect(row.origin).toBe("auto");
+      expect(row.status).toBe("todo");
+    }
+    const content = rows.filter((r) => r.kind === "content");
+    expect(content.map((r) => r.affected_url), "a third-party evidence page is not the page to change").toEqual([null, null]);
+    expect(content.map((r) => r.description).join("\n")).toContain("https://e.com/pricing-tiers");
+    const pricing = content.find((r) => r.title.includes("pricing tiers"))!;
+    expect(Buffer.from(pricing.dedupe_fingerprint).equals(createHash("sha256").update(`content:${projectId}:pricing tiers`).digest())).toBe(true);
+    expect(pricing.description).toContain("60%");
+    expect(pricing.description).toContain("https://e.com/pricing-tiers");
+    expect(pricing.description).toMatch(/only if it is true of your product/i);
+  });
+
+  it("STORY-057 #9 — a concept gap alone makes content tasks and links the displacement to the first", async () => {
+    const id = await displacement({ conceptGap: [concept("pricing")] });
+    const tasks = await plan(id);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.kind).toBe("content");
+    expect((await db.query("SELECT task_id FROM displacement_events WHERE id = $1", [id])).rows[0].task_id).toBe(tasks[0]!.id);
+  });
+
+  it("STORY-057 #12 — a repeat call, and a second displacement naming the same concept, make no duplicate content task", async () => {
+    const first = await displacement({ conceptGap: [concept("pricing")] });
+    const [a] = await plan(first);
+    const again = await plan(first);
+    expect(again.map((t) => t.id)).toEqual([a!.id]);
+    const second = await displacement({ conceptGap: [concept("Pricing", { evidence_url: "https://other.com/p" })] });
+    const reused = await plan(second);
+    expect(reused.map((t) => t.id)).toEqual([a!.id]);
+    expect((await taskRows()).filter((r) => r.kind === "content")).toHaveLength(1);
+  });
+
+  it("STORY-057 #11 — the count on the feed equals the plan: distinct concepts plus seedable domains, nothing else", async () => {
+    await actionable("seed.com");
+    const id = await displacement({
+      citationGap: [gapEntry("seed.com"), gapEntry("closed.com")],
+      conceptGap: [concept("pricing"), concept("PRICING"), concept("soc 2")],
+    });
+    const item = await feedItem();
+    const tasks = await plan(id);
+    expect(item.recovery_task_count).toBe(3);
+    expect(tasks).toHaveLength(3);
+  });
+
+  it("STORY-057 #10 — a non-seedable gap beside concepts still makes no authority task", async () => {
+    const id = await displacement({ citationGap: [gapEntry("closed.com")], conceptGap: [concept("pricing")] });
+    expect((await plan(id)).map((t) => t.kind)).toEqual(["content"]);
+  });
+
+  it("STORY-057 — a stored concept entry without evidence is not planned (a hand-written row cannot smuggle one in; like citationGapSchema.parse, the violation surfaces as an unmapped throw - accepted precedent)", async () => {
+    const id = await displacement({ conceptGap: [{ concept: "pricing", prevalence: 0.6 }] });
+    await expect(plan(id)).rejects.toThrow();
     expect(await taskRows()).toHaveLength(0);
-    expect((await db.query("SELECT task_id FROM displacement_events WHERE id = $1", [id])).rows[0].task_id).toBeNull();
   });
 
   it("NEW-C-6 AC2 — no gaps at all is an empty plan, not an error", async () => {

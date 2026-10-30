@@ -6,6 +6,7 @@ import {
   conceptGapSchema,
   displacedBySchema,
   type CitationGapEntry,
+  type ConceptGapEntry,
 } from "../../../contracts/analytics/displacement-event.schema.js";
 import {
   detectDisplacement,
@@ -15,8 +16,11 @@ import {
   type SnapshotCitation,
   type SnapshotEntity,
 } from "../analytics/displacement.js";
+import { deriveConceptGap, type ConceptCandidate } from "../analytics/concept-gap.js";
+import { isLowConfidence, suppressRecommendations } from "../geo/corpus/weights.js";
 import { classifyDomain } from "../parser/citation-url.js";
 import { displacementImpactForEvent, type FunnelStage } from "../scoring/displacement-impact.js";
+import { lockNodeScopesShared } from "../geo/alignment/scope-lock.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 import { datesWithFacts, measurementStatusSql } from "./aggregate-day.js";
@@ -37,7 +41,9 @@ import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js
 // A slot is attributed to a displacing entity only when it is a tracked
 // competitor whose `root_domain` the slot's domain matches. There is no stored
 // link from an UNTRACKED entity to a slot, so none is guessed: its gap is empty.
-// `concept_gap` is `[]` — no corpus exists (STORY-058).
+// `concept_gap` (STORY-057 AC4/AC5/AC10) comes from the prompt's cluster's JUDGED semantic nodes (`loadConceptNodes`): at or above the
+// prevalence threshold, absent from the page, evidenced by a source the displacers cited, thin-corpus suppressed. It is written when the event is first stored and never
+// replaced once non-empty, so a returning customer sees the same diagnosis (an empty gap is filled by a later run, once a corpus exists).
 //
 // A recovery that follows a COMPLETED task (ANY task reachable from the event — its linked
 // `task_id` (the plan's first task, or a deduped task shared from another displacement) or a task
@@ -89,12 +95,12 @@ export async function refreshProjectDisplacements(
   projectId: string,
   date: string,
   timezone: string,
-  options: { readonly observeLag?: boolean } = {},
+  options: { readonly observeLag?: boolean; readonly scopesLocked?: boolean } = {},
 ): Promise<number> {
   return tracer.startActiveSpan("displacement.refresh", async (span) => {
     try {
       const lags: number[] = [];
-      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true, lags);
+      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true, lags, options.scopesLocked ?? false);
       emitLagObservations(lags);
       span.setAttribute("nominara.project_id", projectId);
       span.setAttribute("nominara.displacement.events", persisted);
@@ -130,6 +136,7 @@ async function refreshProjectDisplacementsInner(
   timezone: string,
   observeLag: boolean,
   lags: number[],
+  scopesLocked: boolean,
 ): Promise<number> {
   const project = await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId]);
   const workspaceId = project.rows[0]?.workspace_id;
@@ -147,6 +154,8 @@ async function refreshProjectDisplacementsInner(
     )
   ).rows;
   if (captures.length === 0) return 0;
+  // The concept read needs every cluster's scope quiet: take the shared locks once, up front, in the embed handler's order.
+  if (!scopesLocked) await lockProjectNodeScopes(tx, workspaceId, projectId);
 
   const competitorDomains = new Map(
     (
@@ -184,8 +193,10 @@ async function refreshProjectDisplacementsInner(
 
     const context = await cellContext(tx, projectId, after, maxEngineWeight);
     const afterCitations = await loadCitationSlots(tx, after.id);
+    const conceptNodes = await loadConceptNodes(tx, workspaceId, projectId, after.prompt_id);
     for (const event of detected) {
       const gap = await citationGap(tx, workspaceId, event, afterCitations);
+      const conceptGap = conceptGapFor(conceptNodes, gap.map((g) => g.url));
       const impact = displacementImpactForEvent({
         kind: event.kind,
         beforePosition: event.beforePosition,
@@ -205,13 +216,14 @@ async function refreshProjectDisplacementsInner(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16)
          ON CONFLICT (project_id, prompt_id, engine_key, kind, before_result_id, after_result_id) DO UPDATE
            SET displaced_by = EXCLUDED.displaced_by, citation_gap = EXCLUDED.citation_gap,
+               concept_gap = CASE WHEN jsonb_array_length(displacement_events.concept_gap) = 0 THEN EXCLUDED.concept_gap ELSE displacement_events.concept_gap END,
                impact_score = EXCLUDED.impact_score, scoring_version = EXCLUDED.scoring_version
          RETURNING (xmax = 0) AS inserted, extract(epoch FROM (detected_at - $17::timestamptz))::float8 AS lag_seconds`,
         [
           workspaceId, projectId, after.prompt_id, after.engine_key, event.kind, event.beforeResultId, event.afterResultId,
           event.beforePosition, event.afterPosition, event.beforePositionClass, event.afterPositionClass,
           JSON.stringify(displacedBySchema.parse(event.displacedBy.map(toStoredEntity))),
-          JSON.stringify(citationGapSchema.parse(gap)), JSON.stringify(conceptGapSchema.parse([])), impact, SCORING_VERSION,
+          JSON.stringify(citationGapSchema.parse(gap)), JSON.stringify(conceptGapSchema.parse(conceptGap)), impact, SCORING_VERSION,
           after.captured_at,
         ],
       );
@@ -235,9 +247,13 @@ export async function backfillProjectDisplacements(
   toDate: string,
 ): Promise<number> {
   let total = 0;
+  const workspaceId = (await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId])).rows[0]?.workspace_id;
+  if (workspaceId === undefined) return 0; // not visible to this tenant context
+  // Once per transaction, not once per date: the locks are held to commit anyway, and one up-front pass keeps the lock order fixed.
+  await lockProjectNodeScopes(tx, workspaceId, projectId);
   for (const date of await datesWithFacts(tx, projectId, timezone, fromDate, toDate)) {
     // A backfill writes events long after their captures: its lag is not the live pipeline, so it is not observed.
-    total += await refreshProjectDisplacements(tx, projectId, date, timezone, { observeLag: false });
+    total += await refreshProjectDisplacements(tx, projectId, date, timezone, { observeLag: false, scopesLocked: true });
   }
   return total;
 }
@@ -435,6 +451,94 @@ async function citationGap(
     });
   }
   return gap.sort((a, b) => a.url.localeCompare(b.url));
+}
+
+/**
+ * STORY-057 AC4/AC5 - the concepts the displacing entities' cited sources cover (FR-CO-03(d)) that the page lacks.
+ *
+ * Candidates: `semantic_nodes` of the prompt's cluster (STORY-059), live (not collapsed into a near-duplicate), absent from the
+ * content, and JUDGED. `present_in_content` defaults to false, so an unjudged node would read as "absent". A node is judged iff an
+ * alignment of its scope has `coverage_ratio IS NOT NULL`: `analyseNodes` sets it, and `extractSemanticNodes` clears it on every
+ * alignment of the scope in the transaction that resets the nodes (so a recompute of a centroid or an alignment, which touch
+ * `updated_at` but not this column, cannot make a freshly extracted node look judged). Fail closed.
+ *
+ * Then three filters, in this order, none of which invents a concept:
+ *   1. low confidence: a centroid built from fewer than the minimum passages keeps only priority_rank <= 3, a null rank dropped
+ *      (the GEO panel's own rule, `suppressRecommendations`). The thinnest judging alignment decides.
+ *   2. cited: the evidence URL must be one of the stored `citation_gap` URLs of this event (`deriveConceptGap`).
+ *   3. threshold and evidence (`deriveConceptGap`).
+ *
+ * BUILDER READING (open with the owner): "the brand's page" is whatever page the latest analysis of the cluster read; the reference
+ * names none for a displacement. OPEN: `analyseNodes(draft: true)` also sets `present_in_content` and `coverage_ratio` from an UNSAVED
+ * draft, which would count as "judged" here; no caller passes draft today. Before draft analysis ships, exclude draft-judged
+ * alignments (needs a marker of the analysis source) or keep draft presence off the shared nodes.
+ * WIRING: nothing in src calls `openAlignmentSession` / `extractSemanticNodes` / `analyseNodes` yet (no `geo.analyze` handler, no
+ * session route), so in production no scope is ever judged and the gap is always [] until STORY-059's pipeline is wired. ACCEPTED LIMITATION: the gap is written when the event is first stored (or filled while empty), so a
+ * backfill over an old date describes today's corpus; the cited-source filter bounds that to sources that capture actually cited.
+ */
+interface ConceptNode extends ConceptCandidate {
+  readonly priorityRank: number | null;
+}
+interface ConceptNodes {
+  readonly nodes: readonly ConceptNode[];
+  readonly lowConfidence: boolean;
+}
+
+/** Every cluster scope of the project's prompts (and the unclustered scope), shared-locked in the one order embed-batch uses. */
+async function lockProjectNodeScopes(tx: ClientBase, workspaceId: string, projectId: string): Promise<void> {
+  const scopes = await tx.query<{ cluster_id: string | null }>(
+    `SELECT DISTINCT cluster_id FROM tracked_prompts WHERE workspace_id = $1 AND project_id = $2`,
+    [workspaceId, projectId],
+  );
+  await lockNodeScopesShared(tx, projectId, scopes.rows.map((r) => r.cluster_id));
+}
+
+async function loadConceptNodes(tx: ClientBase, workspaceId: string, projectId: string, promptId: string): Promise<ConceptNodes> {
+  const clusterId =
+    (await tx.query<{ cluster_id: string | null }>(`SELECT cluster_id FROM tracked_prompts WHERE id = $1 AND workspace_id = $2 AND project_id = $3`, [promptId, workspaceId, projectId]))
+      .rows[0]?.cluster_id ?? null;
+  // The judged check and the node read are two statements with two snapshots (READ COMMITTED); the scope's shared lock, taken up front
+  // by `lockProjectNodeScopes`, stops a commit between them pairing "judged" with freshly reset (all-absent) nodes.
+  const judging = (
+    await tx.query<{ min_sources: number | null }>(
+      `SELECT min(centroid_source_count)::int AS min_sources
+         FROM geo_alignments
+        WHERE workspace_id = $1 AND project_id = $2 AND prompt_cluster_id IS NOT DISTINCT FROM $3 AND coverage_ratio IS NOT NULL`,
+      [workspaceId, projectId, clusterId],
+    )
+  ).rows[0];
+  // No judging alignment: nothing has been judged, so there is no claim to make.
+  if (judging?.min_sources === null || judging === undefined) return { nodes: [], lowConfidence: true };
+  const rows = (
+    await tx.query<{ phrase: string; prevalence: number; evidence_url: string | null; priority_rank: number | null }>(
+      `SELECT n.phrase, n.corpus_doc_ratio::float8 AS prevalence, n.evidence_url, n.priority_rank::int AS priority_rank
+         FROM semantic_nodes n
+        WHERE n.workspace_id = $1 AND n.project_id = $2 AND n.prompt_cluster_id IS NOT DISTINCT FROM $3
+          AND n.collapsed_into_id IS NULL AND NOT n.present_in_content
+        ORDER BY n.priority_rank NULLS LAST, n.corpus_doc_ratio DESC, n.phrase_normalized, n.id`,
+      [workspaceId, projectId, clusterId],
+    )
+  ).rows;
+  return {
+    nodes: rows.map((r) => ({ phrase: r.phrase, prevalence: r.prevalence, evidenceUrl: r.evidence_url, priorityRank: r.priority_rank })),
+    lowConfidence: isLowConfidence(judging.min_sources),
+  };
+}
+
+function conceptGapFor(loaded: ConceptNodes, citedUrls: readonly string[]): ConceptGapEntry[] {
+  const kept = suppressRecommendations(
+    loaded.nodes.map((n) => ({ ...n, priority_rank: n.priorityRank })),
+    loaded.lowConfidence,
+  );
+  const suppressed = loaded.nodes.length - kept.length;
+  const result = deriveConceptGap(kept, citedUrls);
+  // Counts only: never a phrase or a URL (log hygiene). Zero is a measurement and is emitted.
+  observeValue("nominara_displacement_concept_gap_entries", result.entries.length, { outcome: "kept" });
+  observeValue("nominara_displacement_concept_gap_entries", result.droppedBelowThreshold, { outcome: "dropped_below_threshold" });
+  observeValue("nominara_displacement_concept_gap_entries", result.droppedNoEvidence, { outcome: "dropped_no_evidence" });
+  observeValue("nominara_displacement_concept_gap_entries", result.droppedNotCited, { outcome: "dropped_not_cited" });
+  observeValue("nominara_displacement_concept_gap_entries", suppressed, { outcome: "suppressed_low_confidence" });
+  return result.entries;
 }
 
 /** From the verified index only; `null` when never verified — absence is not assumed. */

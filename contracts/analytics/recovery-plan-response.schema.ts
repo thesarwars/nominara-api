@@ -11,7 +11,7 @@ import { taskSchema } from "../tasks/task-response.schema.js";
 // The array is the plan as it stands after the call: tasks this call created
 // plus any open task the same plan already made (a repeat call creates nothing
 // new and returns the same tasks). An EMPTY array is a real answer: no seedable
-// citation gap, and concept tasks are zero until STORY-058.
+// citation gap and no concept gap.
 export const recoveryPlanResponseSchema = z.array(taskSchema);
 
 export type RecoveryPlanResponse = z.infer<typeof recoveryPlanResponseSchema>;

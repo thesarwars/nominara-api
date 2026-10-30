@@ -1015,6 +1015,26 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain as number).toBeCloseTo(expectedGain(unit(chunkRaw), c, unit(phraseRaw), 4, 100), 3);
   }, 60_000);
 
+  it("STORY-057 review 1 - a re-extraction clears coverage_ratio and recommendations on every alignment of the scope (the 'judged' signal)", async () => {
+    await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
+    const session = await addSession();
+    const sibling = await addSession();
+    await extractSemanticNodes(deps(), session);
+    await drainEmbedQueue();
+    for (const id of [session, sibling]) {
+      await db.query(`UPDATE geo_alignments SET coverage_ratio = 0.5, recommendations = '[{"x":1}]'::jsonb WHERE id = $1`, [id]);
+    }
+    const stamp = async (id: string): Promise<number> => ((await sessionRow(id)).updated_at as Date).getTime();
+    const stampsBefore = [await stamp(session), await stamp(sibling)];
+    await extractSemanticNodes(deps(), session);
+    for (const [i, id] of [session, sibling].entries()) {
+      expect(await stamp(id), "the reset bumps updated_at so the GEO panel sees the change").toBeGreaterThan(stampsBefore[i]!);
+      const row = await sessionRow(id);
+      expect(row.coverage_ratio, "no alignment of the scope still claims a judgement").toBeNull();
+      expect(row.recommendations).toEqual([]);
+    }
+  }, 60_000);
+
   it("review round 2 - AC5 - a re-extraction keeps the vector of a phrase that did not change and requests only the new ones", async () => {
     await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
     const session = await addSession();
