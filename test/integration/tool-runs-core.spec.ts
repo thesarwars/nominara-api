@@ -442,12 +442,27 @@ describe("STORY-078 · shared tool core", () => {
     expect((await harness.db().query("SELECT status, result_json FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ status: "expired", result_json: null });
   });
 
-  it("scenario 14 - the sweep expires only finished runs: an aged run still `running` is left for the reaper, never expired with its charge unsettled", async () => {
+  it("scenario 14 - a direct sweep of a workspace settles a `running` run past expires_at first: refunded in full, then expired, never expired with its charge unsettled", async () => {
     const a = await owner("starter");
+    const before = await wallet(a.workspaceId);
     const run = await start(a, scan({ credits: 10 }));
     await age(run.id);
+    expect(await sweep(a.workspaceId)).toBe(1);
+    expect((await harness.db().query("SELECT status, result_json, credits_charged, error_code FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ status: "expired", result_json: null, credits_charged: 0, error_code: "run_abandoned" });
+    const after = await wallet(a.workspaceId);
+    expect((after?.included_balance ?? 0) + (after?.purchased_balance ?? 0)).toBe((before?.included_balance ?? 450) + (before?.purchased_balance ?? 0));
+    const entries = await harness.db().query<{ entry_type: string; credits: number }>("SELECT entry_type, credits FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 ORDER BY seq", [a.workspaceId, run.id]);
+    expect(entries.rows.map((r) => [r.entry_type, r.credits])).toEqual(expect.arrayContaining([["commit", 10], ["refund", 10]]));
+    // idempotent: a second direct sweep expires nothing and refunds nothing more
     expect(await sweep(a.workspaceId)).toBe(0);
-    expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ status: "running" });
+    expect(await wallet(a.workspaceId)).toEqual(after);
+  });
+
+  it("scenario 14 - a `running` run not yet past expires_at is left alone by the sweep (still in flight)", async () => {
+    const a = await owner("starter");
+    const run = await start(a, scan({ credits: 10 }));
+    expect(await sweep(a.workspaceId)).toBe(0);
+    expect((await harness.db().query("SELECT status, credits_charged FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ status: "running", credits_charged: 10 });
   });
 
   it("scenario 9 - a paid run whose worker died is reaped as failed and refunded in full: wallet restored, ledger shows commit plus refund (KAD-12)", async () => {

@@ -630,7 +630,9 @@ export interface ToolSnapshotSweepOptions {
  * BOUNDED (a workspace gets at most `maxBatches` batches a pass; the rest wait for the next night). `FOR UPDATE SKIP LOCKED`: a run being
  * finished, pinned or converted at this moment is skipped and expires on the next pass, never blocks the sweep, and is never raced.
  * Pinning is not read: a pinned run still expires. ONLY A FINISHED RUN EXPIRES (the database trigger agrees): a run still `running` has an
- * unsettled charge, and expiring it would strand the debit; `reapStaleToolRuns` settles it first.
+ * unsettled charge, and expiring it would strand the debit, so a run still `running` past its own expires_at is settled first by
+ * `reapStaleToolRuns` (refunded through the same path) INSIDE this function: a direct caller gets the same answer as the nightly sweep,
+ * which also reaps first. Reaping is idempotent, so doing it in both places is safe.
  */
 export async function expireToolSnapshotsForWorkspace(
   client: ClientBase,
@@ -640,6 +642,9 @@ export async function expireToolSnapshotsForWorkspace(
 ): Promise<number> {
   const batchSize = options.batchSize ?? TOOL_SNAPSHOT_SWEEP_BATCH_SIZE;
   const maxBatches = options.maxBatches ?? TOOL_SNAPSHOT_SWEEP_MAX_BATCHES;
+  for (let pass = 0; pass < maxBatches; pass += 1) {
+    if ((await reapStaleToolRuns(client, workspaceId, referenceDate)) < TOOL_RUN_REAP_BATCH_SIZE) break;
+  }
   let total = 0;
   for (let batch = 0; batch < maxBatches; batch += 1) {
     const expired = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
@@ -667,7 +672,7 @@ export async function expireToolSnapshotsForWorkspace(
   return total;
 }
 
-/** A run still `running` after this long has lost its worker: the engine fan-out is bounded at about a minute (api-specification section 9). */
+/** Owner decision 31 (2026-10-30): 60 minutes. A run still `running` after this long has lost its worker: the engine fan-out is bounded at about a minute (api-specification section 9). */
 export const TOOL_RUN_STALE_AFTER_MINUTES = 60;
 export const TOOL_RUN_REAP_BATCH_SIZE = 200;
 
@@ -687,11 +692,11 @@ export async function reapStaleToolRuns(
   const reaped = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
     const due = await tx.query<{ id: string; credits_charged: number }>(
       `SELECT id, credits_charged FROM tool_runs
-        WHERE workspace_id = $1 AND status = 'running' AND created_at <= $2
+        WHERE workspace_id = $1 AND status = 'running' AND (created_at <= $2 OR expires_at <= $4)
         ORDER BY created_at, id
         LIMIT $3
           FOR UPDATE SKIP LOCKED`,
-      [workspaceId, cutoff.toISOString(), options.batchSize ?? TOOL_RUN_REAP_BATCH_SIZE],
+      [workspaceId, cutoff.toISOString(), options.batchSize ?? TOOL_RUN_REAP_BATCH_SIZE, referenceDate.toISOString()],
     );
     for (const run of due.rows) {
       const refunded = run.credits_charged > 0 ? (await settleFinishedRunCredits(tx, { workspaceId, runId: run.id, deliveredCells: 0, referenceType: "tool_run" })).refunded : 0;

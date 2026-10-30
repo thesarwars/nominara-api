@@ -387,7 +387,7 @@ export class ToolsService {
     return toDetail(row);
   }
 
-  /** AC10 - pinning is a flag that the `?pinned=` filter selects on (the timeline is not re-sorted by it; owner to confirm that reading). It touches no retention column: `expires_at` is not in this statement. */
+  /** AC10 - pinning is a flag that the `?pinned=` filter selects on (the timeline is not re-sorted by it). Owner decision 32 (2026-10-30). It touches no retention column: `expires_at` is not in this statement. */
   async setPinned(id: string, pinned: boolean): Promise<ToolRun> {
     const { client } = this.store();
     const updated = await client.query<RunRow>(`UPDATE tool_runs SET pinned = $2 WHERE workspace_id = app.current_workspace() AND id = $1 RETURNING ${COLUMNS}`, [id, pinned]);
@@ -463,7 +463,7 @@ export class ToolsService {
         );
         const convertedAt = stamped.rows[0]?.converted_at;
         if (convertedAt === undefined) throw new ConflictError({ message: "the run was converted while this request was creating its project", details: { current_state: "converted" } });
-        // AC19 (open) - this is the conversion COUNTER, with the tool as a label, not a product-analytics funnel event: that sink is not decided.
+        // AC19 - Owner decision 33 (2026-10-30): the nominara_tools_conversions_total counter (tool as a label) plus the log line below IS the funnel event.
         // Counted once, after the stamp, in the transaction that created the project.
         incrementCounter("nominara_tools_conversions_total", { tool_key: row.tool_key });
         logger.log({ event: "tools.run.converted", workspace_id: workspaceId, run_id: id, tool_key: row.tool_key, project_id: created.project_id });
