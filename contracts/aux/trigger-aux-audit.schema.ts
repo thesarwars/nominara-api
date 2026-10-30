@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AUX_AUDIT_STATUSES } from "./aux-audit.schema.js";
 import { CRAWL_AUDIT_REQUESTED_SCOPES } from "./crawl-audit-job.schema.js";
 
 // STORY-194 / owner decision 34 (item 3) - `POST /projects/{id}/aux-audits`, the manual re-audit (api-specification.md "AUX":
@@ -51,13 +52,15 @@ export const auxAuditPricingSchema = z
 export const triggerAuxAuditResponseSchema = z
   .object({
     audit_id: z.string().uuid(),
-    /** The audit is queued; it is read at `GET /aux-audits/{id}`. */
-    status: z.literal("queued"),
+    /** The audit's REAL status: `queued` on the first answer; a replay reports where the audit has got to (`completed`, `partial`, `failed`). Read at `GET /aux-audits/{id}`. */
+    status: z.enum(AUX_AUDIT_STATUSES),
     trigger: z.literal("manual"),
     /** The scope that was asked for (`key_pages` by default). The scope that APPLIES is on the audit once it runs. */
     requested_scope: z.enum(CRAWL_AUDIT_REQUESTED_SCOPES),
     /** What this request debited, 0 never (a manual audit is the one priced trigger). Refunded in full if the audit fails outright. */
     credits_charged: z.number().int().min(1),
+    /** Credits returned since (a failed audit is refunded in full). 0 on the first answer. The net cost is `credits_charged - credits_refunded`. */
+    credits_refunded: z.number().int().min(0),
     pricing: auxAuditPricingSchema,
   })
   .strict();

@@ -46,12 +46,20 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits response and job payload",
     trigger: "manual",
     requested_scope: "key_pages",
     credits_charged: 10,
+    credits_refunded: 0,
     pricing: { pages_priced: 25, base_credits: 10, base_page_band: 25, extra_page_credits: 1 },
   };
 
   it("a priced response parses and always names a charge of at least one credit", () => {
     expect(triggerAuxAuditResponseSchema.parse(ok).credits_charged).toBe(10);
     expect(triggerAuxAuditResponseSchema.safeParse({ ...ok, credits_charged: 0 }).success).toBe(false);
+  });
+
+  it("a replay may report the audit's real status and what has been refunded (review round 2)", () => {
+    for (const status of ["running", "completed", "partial", "failed"]) expect(triggerAuxAuditResponseSchema.safeParse({ ...ok, status }).success).toBe(true);
+    expect(triggerAuxAuditResponseSchema.safeParse({ ...ok, status: "failed", credits_refunded: 10 }).success).toBe(true);
+    expect(triggerAuxAuditResponseSchema.safeParse({ ...ok, status: "bogus" }).success).toBe(false);
+    expect(triggerAuxAuditResponseSchema.safeParse({ ...ok, credits_refunded: -1 }).success).toBe(false);
   });
 
   it("the response is strict", () => {
