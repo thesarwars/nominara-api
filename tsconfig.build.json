@@ -15,7 +15,10 @@
   // src/api/filters/problem.filter.http.spec.ts — and those import from
   // test/support. Dropping `test` without dropping them fails the build on a
   // missing module, and shipping them would put testcontainers in the image.
+  // `**/*.test.ts` likewise: STORY-051 keeps rule tests beside the rules
+  // (src/lib/aux/**/*.test.ts) and they import test/support, which the image
+  // does not copy.
   "extends": "./tsconfig.json",
   "include": ["contracts", "src"],
-  "exclude": ["**/*.spec.ts"]
+  "exclude": ["**/*.spec.ts", "**/*.test.ts"]
 }
