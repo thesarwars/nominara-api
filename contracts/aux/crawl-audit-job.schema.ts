@@ -5,14 +5,14 @@ import { z } from "zod";
 // POST /projects/{id}/aux-audits, is a separate story), but `.strict()` all the
 // same so an unexpected key fails at the queue boundary, not three frames in.
 //
-// `trigger` is limited to the two free triggers this stage serves: 'onboarding'
-// and 'scheduled'. 'manual' and 'post_fix' are credited or user-initiated and
-// belong to the endpoint story.
+// `trigger` is 'onboarding' and 'scheduled' (free) and 'manual' (the priced
+// `POST /projects/{id}/aux-audits`, STORY-194: the producer has already debited
+// it, and a failed audit refunds it). 'post_fix' is not produced yet.
 //
 // `auditId` is minted by the producer (idempotency key `aux:{project}:{audit}`)
 // so a redelivered job addresses the same row.
 
-export const CRAWL_AUDIT_TRIGGERS = ["onboarding", "scheduled"] as const;
+export const CRAWL_AUDIT_TRIGGERS = ["onboarding", "scheduled", "manual"] as const;
 export const crawlAuditTriggerSchema = z.enum(CRAWL_AUDIT_TRIGGERS);
 
 /**

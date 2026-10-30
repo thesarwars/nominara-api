@@ -55,6 +55,11 @@ export const auxErrorSummarySchema = z
       })
       .strict()
       .optional(),
+    /**
+     * STORY-051 AC13: the rules that ran on an INTERIM reading (`AUX_RULES_PARTIAL`), so the audit does not read as having fully checked them.
+     * Only rules that ran on at least one page are listed; a rule that did not run is in `aux_audits.excluded_rules` instead. Absent = none.
+     */
+    rules_partial: z.array(z.string().regex(/^AUX-R-\d{3}$/)).optional(),
     /** Written only as `false`: the manifest could not be stored, so the audit cannot be reproduced from storage. */
     manifest_stored: z.literal(false).optional(),
   })
