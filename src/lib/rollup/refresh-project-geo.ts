@@ -5,14 +5,16 @@ import type { GeoAnalysisWrite } from "../../../contracts/analytics/index.js";
 import { writeGeoAnalysis } from "../geo/persist-analysis.js";
 import { rankGeoLevers } from "../geo/lever-rank.js";
 import { buildEntity, loadEntityInput } from "../geo/entity.js";
+import { buildDivergence, loadDivergenceInput } from "../geo/divergence.js";
 import { buildSentiment, loadSentimentInput } from "../geo/sentiment.js";
+import { buildTopics, loadTopicsInput } from "../geo/topics.js";
 import { buildStructure, loadStructureInput, windowStartFor } from "../geo/structure.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 
 // STORY-060/061 — recompute a project's GEO analyses and persist them to
 // `geo_analyses` (through the one write path, `writeGeoAnalysis`). `structure`
-// (A3), `entity` (A2) and `sentiment` (A6) exist so far; the other analyses join this
+// (A3), `entity` (A2), `sentiment` (A6), `divergence` (A4) and `topics` (A5) exist so far; the other analyses join this
 // function in their own stories. Nothing here is metered: no credit guard, no ledger.
 
 const logger = new Logger("rollup.geo");
@@ -35,7 +37,9 @@ export async function refreshProjectGeo(
 ): Promise<GeoAnalysisWrite> {
   const windowDays = options.windowDays ?? GEO_WINDOW_DAYS;
   const started = performance.now();
-  const input = await loadStructureInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays);
+  // One clock read: every analysis of this refresh, and the lever ranking, share the same window even across UTC midnight.
+  const windowStart = windowStartFor(options.asOf ?? new Date(), windowDays);
+  const input = await loadStructureInput(tx, projectId, windowStart, windowDays);
   const { write } = buildStructure(input);
   const persisted = await writeGeoAnalysis(tx, projectId, write);
   incrementCounter("nominara_geo_structure_recompute_total", { sufficient: String(persisted.sufficient) });
@@ -56,7 +60,7 @@ export async function refreshProjectGeo(
   const sentiment = await writeGeoAnalysis(
     tx,
     projectId,
-    buildSentiment(await loadSentimentInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays)).write,
+    buildSentiment(await loadSentimentInput(tx, projectId, windowStart, windowDays)).write,
   );
   incrementCounter("nominara_geo_sentiment_recompute_total", { sufficient: String(sentiment.sufficient) });
   logger.log({
@@ -74,7 +78,7 @@ export async function refreshProjectGeo(
   const entity = await writeGeoAnalysis(
     tx,
     projectId,
-    buildEntity(await loadEntityInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays)).write,
+    buildEntity(await loadEntityInput(tx, projectId, windowStart, windowDays)).write,
   );
   incrementCounter("nominara_geo_entity_recompute_total", { sufficient: String(entity.sufficient) });
   logger.log({
@@ -84,6 +88,32 @@ export async function refreshProjectGeo(
     value: Math.round(performance.now() - entityStarted),
     sufficient: entity.sufficient,
     name_matches: entity.evidence_cells,
+    window_days: windowDays,
+  });
+
+  // STORY-061 — A4 divergence and A5 topical authority, same window, same transaction. Reads rows only: no engine, no embedding call.
+  const divergenceStarted = performance.now();
+  const divergence = await writeGeoAnalysis(tx, projectId, buildDivergence(await loadDivergenceInput(tx, projectId, windowStart, windowDays)).write);
+  incrementCounter("nominara_geo_divergence_recompute_total", { sufficient: String(divergence.sufficient) });
+  logger.log({
+    event: "geo_divergence_recomputed",
+    project_id: projectId,
+    metric: "nominara_geo_divergence_recompute_duration_ms",
+    value: Math.round(performance.now() - divergenceStarted),
+    sufficient: divergence.sufficient,
+    qualifying_prompts: divergence.evidence_cells,
+    window_days: windowDays,
+  });
+  const topicsStarted = performance.now();
+  const topics = await writeGeoAnalysis(tx, projectId, buildTopics(await loadTopicsInput(tx, projectId, windowStart, windowDays)).write);
+  incrementCounter("nominara_geo_topics_recompute_total", { sufficient: String(topics.sufficient) });
+  logger.log({
+    event: "geo_topics_recomputed",
+    project_id: projectId,
+    metric: "nominara_geo_topics_recompute_duration_ms",
+    value: Math.round(performance.now() - topicsStarted),
+    sufficient: topics.sufficient,
+    answers: topics.evidence_cells,
     window_days: windowDays,
   });
 

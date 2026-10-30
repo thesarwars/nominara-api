@@ -47,6 +47,8 @@ export interface FiredDraft {
   readonly taskId: string;
   readonly title: string;
   readonly description: string;
+  /** What the generator did with the draft: `created`, or an existing task refreshed / deduplicated / suppressed. */
+  readonly outcome?: string;
 }
 
 export interface GenerationHooks {
@@ -143,7 +145,7 @@ async function generate(tx: ClientBase, tasks: TasksService, request: GenerateRe
       const input = await toTaskInput(tx, rule, draft, ctx, evidenceAt, baselines);
       const result = await tasks.createGeneratedTask(input);
       summary[result.outcome === "created" ? "created" : result.outcome] += 1;
-      hooks.onFired?.({ ruleCode: rule.code, draft, taskId: result.task.id, title: input.title, description: input.description });
+      hooks.onFired?.({ ruleCode: rule.code, draft, taskId: result.task.id, title: input.title, description: input.description, outcome: result.outcome });
       incrementCounter("nominara_taskgen_tasks_total", { outcome: result.outcome });
       if (draft.displacementId !== undefined && result.outcome !== "suppressed") {
         // The displacement points at its task, so it is planned once. The first task wins and is never replaced.

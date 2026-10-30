@@ -172,11 +172,27 @@ export function sentimentBand(score: number | null): "positive" | "neutral" | "n
   return "negative";
 }
 
-/** §6 — `negative_cell_rate` crossing 0.05 with `n ≥ 30` fires the alert. */
+/**
+ * §6 — `negative_cell_rate` crossing 0.05 with `n ≥ 30` is the LEVEL of the negative-sentiment alert; §15 (`negative_spike`) adds the
+ * RISE: up ≥ 0.03 against the prior window, which must meet its own `n ≥ 30`. Both are `≥` (owner decision 22, 2026-10-30; the level
+ * was a strict `>` before, which the reference does not say).
+ */
 export const NEGATIVE_CELL_RATE_ALERT = 0.05;
 export const NEGATIVE_ALERT_MIN_CELLS = 30;
+export const NEGATIVE_CELL_RATE_RISE_ALERT = 0.03;
 
+/** The §6 level alone: `negative_cell_rate ≥ 0.05` with `n ≥ 30`. */
 export function shouldAlertOnNegativeSentiment(cells: number, negativeCells: number): boolean {
   if (cells < NEGATIVE_ALERT_MIN_CELLS) return false;
-  return negativeCells / cells > NEGATIVE_CELL_RATE_ALERT;
+  return negativeCells / cells >= NEGATIVE_CELL_RATE_ALERT;
+}
+
+/**
+ * The §15 rise: the rate is up ≥ 0.03 against the prior window, and the prior window meets its own sample floor. A prior window below
+ * the floor (or empty) has no rate to rise from, so it is not a rise.
+ */
+export function negativeSentimentRose(cells: number, negativeCells: number, priorCells: number, priorNegativeCells: number): boolean {
+  if (cells <= 0 || priorCells < NEGATIVE_ALERT_MIN_CELLS) return false;
+  // rate - priorRate >= 0.03, cross-multiplied into integers: 100 * (n * P - p * C) >= 3 * C * P. No float subtraction, no tolerance.
+  return 100 * (negativeCells * priorCells - priorNegativeCells * cells) >= 3 * cells * priorCells;
 }

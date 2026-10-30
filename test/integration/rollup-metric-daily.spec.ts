@@ -8,6 +8,7 @@ import { AGGREGATE_ATTRIBUTE_CAPABLE_ENGINES } from "../../src/lib/rollup/aggreg
 import { CROSS_ENGINE_KEY, rollUpDay } from "../../src/lib/rollup/roll-up-day.js";
 import { denormalizeProject } from "../../src/lib/rollup/denormalize.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
+import { asTenantJob, setTenantLocal } from "../support/tenant-job.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { ATTRIBUTE_CAPABLE_ENGINES } from "../../src/lib/parser/rendering.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -670,7 +671,7 @@ describe("STORY-042 · rollup.metric_daily", () => {
     );
 
     await db.query("DELETE FROM metric_daily");
-    await handler()(db, job({ fromDate: "2026-09-01", toDate: "2026-09-30" }));
+    await asTenantJob(db, workspaceId, () => handler()(db, job({ fromDate: "2026-09-01", toDate: "2026-09-30" })));
 
     const rebuilt = await db.query<Record<string, string>>(
       "SELECT metric_date::text, visibility_score::text FROM metric_daily WHERE engine_key = 'google_ai_mode' AND entity_type='brand' ORDER BY metric_date",
@@ -694,7 +695,7 @@ describe("STORY-042 · rollup.metric_daily", () => {
     const cell = await addCell({ capturedAt: at, brandPresent: true, sov: 1 });
     await addCitation(cell, at, false);
 
-    await handler()(db, job({ metricDate: at.slice(0, 10) }));
+    await asTenantJob(db, workspaceId, () => handler()(db, job({ metricDate: at.slice(0, 10) })));
     const r = await db.query("SELECT count(*)::int AS n FROM project_source_index WHERE project_id = $1", [projectId]);
     expect(r.rows[0].n).toBeGreaterThan(0);
   });
@@ -707,13 +708,13 @@ describe("STORY-042 · rollup.metric_daily", () => {
     const cell = await addCell({ capturedAt: at, brandPresent: true, sov: 1 });
     await addMention(cell, at);
 
-    await handler()(db, job({ metricDate: "2026-09-11" }));
+    await asTenantJob(db, workspaceId, () => handler()(db, job({ metricDate: "2026-09-11" })));
     expect((await metricRow())!.cells_total).toBe("1");
   });
 
   it("skips a project that no longer exists", async () => {
     await expect(
-      handler()(db, { data: { payload: { workspaceId, kid: "k", projectId: randomUUID() } } } as unknown as Job),
+      asTenantJob(db, workspaceId, () => handler()(db, { data: { payload: { workspaceId, kid: "k", projectId: randomUUID() } } } as unknown as Job)),
     ).resolves.toBeUndefined();
   });
 
@@ -726,6 +727,7 @@ describe("STORY-042 · rollup.metric_daily", () => {
     await addMention(cell, at);
 
     await db.query("BEGIN");
+    await setTenantLocal(db, workspaceId); // as the job transaction has it; the lock check below needs the transaction still open
     await handler()(db, job({ metricDate: "2026-09-10" }));
     const locks = await db.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
