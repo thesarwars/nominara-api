@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { taskSchema } from "./task-response.schema.js";
 
-// STORY-064 (step D) — POST /v1/tasks/{id}/complete. There is no request body.
+// STORY-064 (step D) — POST /v1/tasks/{id}/complete.
+//
+// Owner decision 30 / STORY-055: a SEEDING task (playbook or source class) is completed WITH a `url` (see
+// complete-task-request.schema.ts). It goes `in_review`, not `done`: no milestone exists yet, so `milestone` is null and
+// `task.verification.state` is `pending`. Every other task completes exactly as before.
 //
 // Completing a task is a workflow event, not a status flip: it sets the task
 // `done`, pins a `task_completed` milestone at that instant, and writes the
@@ -29,7 +33,8 @@ export const completeTaskVerificationSchema = z
 export const completeTaskResponseSchema = z
   .object({
     task: taskSchema,
-    milestone: completeTaskMilestoneSchema,
+    /** Null while a seeding task is `in_review`: the `task_completed` milestone is pinned when the URL verifies. */
+    milestone: completeTaskMilestoneSchema.nullable(),
     verification: completeTaskVerificationSchema.nullable(),
   })
   .strict();

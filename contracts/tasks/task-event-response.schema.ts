@@ -16,6 +16,8 @@ export const TASK_EVENT_KINDS = [
   "dismissed",
   "evidence_refreshed",
   "due_changed",
+  "verification_submitted",
+  "verification_failed",
 ] as const;
 export const taskEventKindSchema = z.enum(TASK_EVENT_KINDS);
 export type TaskEventKind = z.infer<typeof taskEventKindSchema>;

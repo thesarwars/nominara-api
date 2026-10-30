@@ -128,8 +128,8 @@ export const portalTasksResponseSchema = z
           title: z.string(),
           /** Null when the task has no measured severity (a manual task, or a gap not yet verified) — never invented. */
           severity: z.enum(["critical", "high", "medium", "low"]).nullable(),
-          /** Open means not yet done and not dismissed. */
-          status: z.enum(["todo", "in_progress"]),
+          /** Open means not yet done and not dismissed; a task in review (contribution submitted, not yet verified) is still open. */
+          status: z.enum(["todo", "in_progress", "in_review"]),
         })
         .strict(),
     ),

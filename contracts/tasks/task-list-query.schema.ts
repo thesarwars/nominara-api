@@ -18,7 +18,9 @@ export const TASK_SORTS = ["impact", "priority", "age", "goal"] as const;
 export const taskSortSchema = z.enum(TASK_SORTS);
 export type TaskSort = z.infer<typeof taskSortSchema>;
 
-export const TASK_STATUSES = ["todo", "in_progress", "done", "dismissed"] as const;
+// Owner decision 30 (2026-10-30, STORY-055): `in_review` is the fifth status, a SEEDING task whose contribution URL has been
+// submitted and not yet verified (or failed verification, with its reason). Only the system sets it, never PATCH or bulk.
+export const TASK_STATUSES = ["todo", "in_progress", "in_review", "done", "dismissed"] as const;
 export const taskStatusSchema = z.enum(TASK_STATUSES);
 export type TaskStatus = z.infer<typeof taskStatusSchema>;
 

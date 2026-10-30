@@ -41,9 +41,9 @@ describe("STORY-064 · task contract", () => {
     }
   });
 
-  it("[STORY-064 #2] exactly four sorts and four statuses", () => {
+  it("[STORY-064 #2] exactly four sorts; five statuses since owner decision 30 added in_review", () => {
     expect(taskSortSchema.options).toEqual(["impact", "priority", "age", "goal"]);
-    expect(taskStatusSchema.options).toEqual(["todo", "in_progress", "done", "dismissed"]);
+    expect(taskStatusSchema.options).toEqual(["todo", "in_progress", "in_review", "done", "dismissed"]);
   });
 
   it("the list query is strict and defaults to impact", () => {
