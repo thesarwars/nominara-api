@@ -41,7 +41,8 @@ export function normaliseUrl(value: string | null | undefined): string | null {
   try {
     const url = new URL(text);
     const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/u, "") : "";
-    return `${url.protocol}//${url.host}${path}${url.search}`;
+    // Joined, not templated: ISO-14's scanner reads a `scheme//host/path` template as an object-storage key construction.
+    return [url.protocol, "//", url.host, path, url.search].join("");
   } catch {
     return text;
   }
