@@ -1,7 +1,7 @@
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { CaptureFailureError, type CaptureFailureCode } from "../failure-taxonomy.js";
 import type { EngineKey } from "../contract.js";
-import type { LicensedFetchResult, LicensedRequestMode, LicensedSerpProvider, LicensedSerpRequest } from "./licensed-serp.js";
+import { LICENSED_SERP_ADAPTER_VERSION, type LicensedFetchResult, type LicensedRequestMode, type LicensedSerpProvider, type LicensedSerpRequest } from "./licensed-serp.js";
 import { mapSerpAnswer } from "./serp-mapper.js";
 import {
   serpAiModeResponseSchema,
@@ -169,7 +169,7 @@ export class SerpApiProvider implements LicensedSerpProvider {
   }
 
   private malformed(engineKey: EngineKey, reason?: string): CaptureFailureError {
-    incrementCounter("nominara_capture_malformed_response_total", { engine_key: engineKey, adapter_version: `${this.id}.${this.version}`, ...(reason !== undefined ? { reason } : {}) });
+    incrementCounter("nominara_capture_malformed_response_total", { engine_key: engineKey, adapter_version: `${LICENSED_SERP_ADAPTER_VERSION}+${this.id}.${this.version}`, ...(reason !== undefined ? { reason } : {}) });
     return failure("malformed_response", engineKey);
   }
 
@@ -185,6 +185,9 @@ export class SerpApiProvider implements LicensedSerpProvider {
       if (isNoResultsMessage(parsed.data.error)) throw this.malformed(engineKey, "no_results");
       throw failure("upstream_5xx", engineKey);
     }
+    // An absent text_blocks (with no shopping_results) is a body with no answer field at all: the same false-absence path, a capture defect.
+    // An explicit [] stays a successful-but-empty answer (empty_answer).
+    if (parsed.data.text_blocks === undefined && parsed.data.shopping_results === undefined) throw this.malformed(engineKey, "missing_answer");
     const requestId = parsed.data.search_metadata?.id;
     // AI Mode reports no on-demand flag, so the persisted value is null, not false.
     return {

@@ -23,6 +23,7 @@ import {
   type LicensedSerpProvider,
   type LicensedSerpRequest,
 } from "./licensed-serp.js";
+import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { SerpApiProvider } from "./serpapi-provider.js";
 
 // STORY-029 - the scenarios table, one test per row, named with the row. Every body below is a RECORDED SerpApi response
@@ -619,6 +620,23 @@ describe("STORY-029 review 1 · the vendor's no-results message is a genuine abs
     expect((outcome as CaptureFailureError).code).toBe("malformed_response");
     expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_capture_malformed_response_total", expect.objectContaining({ engine_key: "google_ai_mode", reason: "no_results" }));
     expect(recordCost).not.toHaveBeenCalled();
+  });
+
+  it("STORY-029 review 3: google_ai_mode with no text_blocks field at all is a terminal malformed_response (missing_answer), labelled with the full adapter version; an explicit [] stays empty_answer", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const body = { search_metadata: { status: "Success" }, references: [] };
+    const outcome = await settle(adapterFor("google_ai_mode", fetchSequence(body).fetchImpl).capture({ ...input, requestMode: "live" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("malformed_response");
+    expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_capture_malformed_response_total", expect.objectContaining({ engine_key: "google_ai_mode", reason: "missing_answer", adapter_version: "0.1.0+serpapi.1" }));
+    // the vendor ran and billed the search even though no row is stored (E2E-B6, review 1 rule 8c)
+    expect(recordCost.mock.calls[0]?.[0]).toBeCloseTo(0.015, 10);
+  });
+
+  it("STORY-029 review 3: with a key and no ENGINE_SPEND_CEILINGS_USD entry, both Google surfaces still get a ceiling", () => {
+    const ceilings = resolveEngineSpendCeilings(undefined);
+    expect(ceilings.google_aio).toBeGreaterThan(0);
+    expect(ceilings.google_ai_mode).toBeGreaterThan(0);
+    expect(resolveEngineSpendCeilings('{"google_aio":9}').google_aio).toBe(9);
   });
 
   it("queued google_aio: a search that finishes with no results is not billed, same as live", async () => {

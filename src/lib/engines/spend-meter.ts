@@ -229,7 +229,7 @@ export class SpendMeter {
 export function warnMissingSpendCeilings(ceilingsUsd: Partial<Record<EngineKey, number>>, activeEngineKeys: readonly EngineKey[]): EngineKey[] {
   const missing = activeEngineKeys.filter((key) => ceilingsUsd[key] === undefined);
   for (const engineKey of missing) {
-    logger.warn(`no ENGINE_SPEND_CEILINGS_USD entry for engine '${engineKey}' — metering and 80%/95% alerts still run, but its 100% hard stop is disabled`);
+    logger.warn(`no ENGINE_SPEND_CEILINGS_USD entry for engine '${engineKey}' — its spend is not alerted at 80%/95% and has no 100% hard stop`);
   }
   return missing;
 }

@@ -89,7 +89,7 @@ const GEMINI_CAPTURE_TIMEOUT_MS = 30_000;
 let geminiAdapterCache: { readonly key: string; readonly adapter: GeminiApiAdapter } | undefined;
 
 // STORY-029 - hard per-capture timeout for the licensed-SERP adapters. A queued capture waits on the vendor's queue and an overview
-// is two requests, so this is well above the documented p95 (15 s queued).
+// is two requests, so this is well above the documented p95 (15 s queued). tracking-engine.md section 3 allows queued turnaround up to 5 minutes; 60 s is a recorded departure (story decision 13).
 const SERP_CAPTURE_TIMEOUT_MS = 60_000;
 const serpAdapterCache = new Map<LicensedSurface, { readonly key: string; readonly adapter: LicensedSerpAdapter }>();
 

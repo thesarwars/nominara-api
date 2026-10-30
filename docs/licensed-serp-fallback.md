@@ -62,3 +62,7 @@ registry's callers, the parser, or storage.
 
 No fallback vendor is named or implemented yet: choosing one, and its contract, is
 an owner decision (see STORY-029 Implementation decisions).
+
+## Known metering errors (review 3)
+
+The meter can read too low when a page_token follow-up the vendor accepted is aborted by our timeout mid-flight (not metered). It can read too high when a queued submit is answered from SerpApi's free 1-hour cache (metered as billed). Both are small; the ceilings stay roughly right and nothing is billed twice.

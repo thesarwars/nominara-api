@@ -60,12 +60,14 @@ export const engineSpendCeilingsSchema = z.partialRecord(engineKeySchema, z.numb
 export type EngineSpendCeilings = z.infer<typeof engineSpendCeilingsSchema>;
 
 /**
- * E2E-B6 — the ceilings that apply when ENGINE_SPEND_CEILINGS_USD does not name an engine. Only
- * gemini has one: it is the sole engine with a real adapter, so it is the only one that spends
- * real money (NEW-A-4; USD/month, 100 is the dev placeholder pending owner decision O9). A
- * configured entry always wins; engines without a default keep D13's ceiling-absent posture.
+ * E2E-B6 — the ceilings that apply when ENGINE_SPEND_CEILINGS_USD does not name an engine. The
+ * engines with a real adapter (gemini, and the two SerpApi Google surfaces of STORY-029) are the
+ * ones that spend real money, so each gets a placeholder (USD/month): gemini 100 pending owner
+ * decision O9; google_aio / google_ai_mode 5 each pending the owner's figure (250 Free-plan
+ * searches at the metered $0.015 is $3.75 across both). A configured entry always wins; an engine
+ * with no default has NO alerts and NO hard stop (spend-meter.ts computes both only when a ceiling exists).
  */
-export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100 };
+export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100, google_aio: 5, google_ai_mode: 5 };
 
 /** The effective ceilings: defaults, overridden per engine by the configured JSON (already validated at boot). */
 export function resolveEngineSpendCeilings(configuredJson: string | undefined): EngineSpendCeilings {
@@ -436,8 +438,8 @@ export const envSchema = z
     // (no burst above the rate) and takes precedence over ENGINE_TOKEN_BUCKETS.gemini.
     GEMINI_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
     // STORY-029 - the pace the capture dispatcher holds EACH Google surface to, in requests per minute (a one-token bucket per engine key,
-    // overriding ENGINE_TOKEN_BUCKETS for google_aio and google_ai_mode). Default 1: the Free plan is 250 searches a month, and an
-    // overview that loads on demand costs two. Raise it with the plan. The two surfaces draw separate buckets, so the vendor sees up to twice this.
+    // overriding ENGINE_TOKEN_BUCKETS for google_aio and google_ai_mode). Default 1. This paces throughput only; it does NOT bound the
+    // monthly quota (1/min per surface is thousands of searches a day). The monthly limit is the spend ceiling (DEFAULT_ENGINE_SPEND_CEILINGS_USD). The two surfaces draw separate buckets, so the vendor sees up to twice this.
     SERP_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(1),
     // STORY-045 AC3 (owner decision 2026-10-28 #3) - which model naturalises generated prompt text (tracking-engine.md section 4 step 4).
     // `none` (the default) is the template-only path. `gemini` binds a Flash-class Gemini model using GEMINI_API_KEY; with no key it falls
