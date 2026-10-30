@@ -7,6 +7,11 @@ import { taskGenerationConditionSchema } from "../../contracts/tasks/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { refreshProjectGeo } from "../../src/lib/rollup/refresh-project-geo.js";
 import { generateTasksForProject } from "../../src/lib/taskgen/generate.js";
+import { createTaskGenerateHandler } from "../../src/lib/queue/handlers/task-generate.handler.js";
+import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import type { NotifyDispatchPayload } from "../../src/lib/notifications/routing.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import type { Job } from "bullmq";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { GeoService } from "../../src/modules/geo/geo.service.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
@@ -26,6 +31,8 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
   let db: Client;
   let workspaceId: string;
   let projectId: string;
+  /** The three rule rows exactly as migration 0152 left them, before any test touches them. */
+  let migratedRules: { code: string; enabled: boolean; enabled_since: Date | null; condition: unknown; cooldown_days: number }[];
   const tasks = new TasksService(new NoopRealtimePublisher());
 
   beforeAll(async () => {
@@ -33,6 +40,7 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
     await migrateUp(db);
+    migratedRules = (await db.query("SELECT code, enabled, enabled_since, condition, cooldown_days FROM task_generation_rules WHERE code IN ('TG-DIVERGENCE','TG-TOPIC-CONTENT','TG-SENTIMENT-REASON','TG-SENTIMENT-NEGATIVE') ORDER BY code")).rows;
   }, 300_000);
 
   afterAll(async () => {
@@ -50,9 +58,8 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
 
   beforeEach(async () => {
     await db.query(
-      "TRUNCATE tasks, ref_counters, geo_analyses, citation_facts, mention_facts, answer_captures, geo_alignments, semantic_nodes, project_source_index, source_domains, competitors, tracked_prompts, topic_clusters, credit_ledger, projects, workspaces CASCADE",
+      "TRUNCATE notification_emails, notification_reads, notifications, tasks, ref_counters, geo_analyses, citation_facts, mention_facts, answer_captures, geo_alignments, semantic_nodes, project_source_index, source_domains, competitors, tracked_prompts, topic_clusters, credit_ledger, projects, workspaces CASCADE",
     );
-    await db.query("UPDATE task_generation_rules SET enabled = false, enabled_since = NULL WHERE code IN ('TG-DIVERGENCE','TG-TOPIC-CONTENT','TG-SENTIMENT-REASON')");
     ({ ws: workspaceId, project: projectId } = await seedWorkspace());
   });
 
@@ -148,20 +155,24 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
 
   // ------------------------------------------------------------------------------------------------ the rule rows
 
-  it("[0152] seeds the three rules disabled with a condition the closed grammar accepts, and the retargeted ones keep their cooldowns", async () => {
-    const rows = (await db.query("SELECT * FROM task_generation_rules WHERE code IN ('TG-DIVERGENCE','TG-TOPIC-CONTENT','TG-SENTIMENT-REASON','TG-SENTIMENT-NEGATIVE') ORDER BY code")).rows;
-    expect(rows.map((r) => r.code)).toEqual(["TG-DIVERGENCE", "TG-SENTIMENT-NEGATIVE", "TG-SENTIMENT-REASON", "TG-TOPIC-CONTENT"]);
-    for (const r of rows) {
-      expect(r.enabled, r.code).toBe(false);
-      expect(taskGenerationConditionSchema.safeParse(r.condition).success, r.code).toBe(true);
+  it("[0152 / D20] migration 0152 leaves TG-DIVERGENCE, TG-TOPIC-CONTENT and TG-SENTIMENT-REASON ENABLED with a condition the closed grammar accepts; the retargeted ones keep their cooldowns", () => {
+    // Read from the rows as the migration left them (snapshot in beforeAll): no test setup runs before this, and none can enable a rule for it.
+    expect(migratedRules.map((r) => r.code)).toEqual(["TG-DIVERGENCE", "TG-SENTIMENT-NEGATIVE", "TG-SENTIMENT-REASON", "TG-TOPIC-CONTENT"]);
+    const by = Object.fromEntries(migratedRules.map((r) => [r.code, r]));
+    for (const code of ["TG-DIVERGENCE", "TG-TOPIC-CONTENT", "TG-SENTIMENT-REASON"]) {
+      expect(by[code]!.enabled, code).toBe(true);
+      // enabling stamps the non-retroactive watermark: a row computed before the migration generates nothing.
+      expect(by[code]!.enabled_since, code).not.toBeNull();
+      expect(taskGenerationConditionSchema.safeParse(by[code]!.condition).success, code).toBe(true);
     }
-    const by = Object.fromEntries(rows.map((r) => [r.code, r]));
-    expect(by["TG-DIVERGENCE"].condition).toEqual({ kind: "geo_finding", analysis: "divergence", finding_id_prefix: "divergence-" });
-    expect(by["TG-DIVERGENCE"].cooldown_days).toBe(14);
-    expect(by["TG-TOPIC-CONTENT"].condition).toEqual({ kind: "geo_finding", analysis: "topics", finding_id_prefix: "topic-gap-" });
-    expect(by["TG-TOPIC-CONTENT"].cooldown_days).toBe(30);
-    // The cell-rate alert rule is untouched: it still waits for its own evaluator.
-    expect(by["TG-SENTIMENT-NEGATIVE"].condition).toEqual({ kind: "pending_analysis", analysis: "negative_cell_rate" });
+    expect(by["TG-DIVERGENCE"]!.condition).toEqual({ kind: "geo_finding", analysis: "divergence", finding_id_prefix: "divergence-" });
+    expect(by["TG-DIVERGENCE"]!.cooldown_days).toBe(14);
+    expect(by["TG-TOPIC-CONTENT"]!.condition).toEqual({ kind: "geo_finding", analysis: "topics", finding_id_prefix: "topic-gap-" });
+    expect(by["TG-TOPIC-CONTENT"]!.cooldown_days).toBe(30);
+    expect(by["TG-SENTIMENT-REASON"]!.condition).toEqual({ kind: "geo_finding", analysis: "sentiment", finding_id_prefix: "sentiment-reason-" });
+    // The cell-rate alert rule is untouched: still pending and disabled (the alert is raised through TG-SENTIMENT-REASON, D21).
+    expect(by["TG-SENTIMENT-NEGATIVE"]!.condition).toEqual({ kind: "pending_analysis", analysis: "negative_cell_rate" });
+    expect(by["TG-SENTIMENT-NEGATIVE"]!.enabled).toBe(false);
   });
 
   // ------------------------------------------------------------------------------------------------ A4 divergence
@@ -200,15 +211,11 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     expect((await read("divergence")).detail).toBeNull();
   });
 
-  it("[#5/AC5] the divergence finding generates an ENGINE-TARGETED task naming the losing engine and the missing domain, once, and never while the rule is off", async () => {
+  it("[#5/AC5] the divergence finding generates an ENGINE-TARGETED task naming the losing engine and the missing domain, once; its affected URL is the brand's page, never the competitor's domain", async () => {
     await weight("docs.acme.com", 0.9);
     await divergentPrompts(10);
     await refresh();
-    await generate();
-    expect(await taskRows("TG-DIVERGENCE")).toHaveLength(0); // BUILDER PROPOSAL: disabled until the owner approves it
-
-    await enable("TG-DIVERGENCE");
-    await refresh(); // the rule's non-retroactive watermark: a row computed after enabling
+    // The rule is enabled by the migration: no setup step. (Switched off, it makes nothing - covered below.)
     await generate();
     await generate();
     const rows = await taskRows("TG-DIVERGENCE");
@@ -217,8 +224,39 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     expect(rows[0]).toMatchObject({ source_geo_analysis: "divergence", affected_engines: ["perplexity"] });
     expect(rows[0].description).toContain("perplexity");
     expect(rows[0].description).toContain("docs.acme.com");
+    // review-3: the third-party domain is evidence, not the task's target.
+    expect(rows[0].affected_url).toBe("https://acme.com/");
     // review-1: the action surface carries the losing engine too, not a generic empty list.
     expect((await read("divergence")).actions[0]!.engines).toEqual(["perplexity"]);
+  });
+
+  it("[#5/D20] a rule switched off generates nothing, and nothing made before it was switched back on is retroactive", async () => {
+    await divergentPrompts(10);
+    await db.query("UPDATE task_generation_rules SET enabled = false WHERE code = 'TG-DIVERGENCE'");
+    try {
+      await refresh();
+      await generate();
+      expect(await taskRows("TG-DIVERGENCE")).toHaveLength(0);
+      await enable("TG-DIVERGENCE"); // restamps enabled_since: the row computed while it was off is not read
+      await generate();
+      expect(await taskRows("TG-DIVERGENCE")).toHaveLength(0);
+      await refresh();
+      await generate();
+      expect(await taskRows("TG-DIVERGENCE")).toHaveLength(1);
+    } finally {
+      await enable("TG-DIVERGENCE");
+    }
+  });
+
+  it("[review-3 / D23-adjacent] a LIVE capture is not lost behind a LATER demo capture of the same prompt and engine; demo results are counted apart", async () => {
+    await divergentPrompts(10);
+    const prompts = (await db.query("SELECT DISTINCT prompt_id FROM answer_captures WHERE project_id = $1", [projectId])).rows.map((r) => r.prompt_id as string);
+    for (const prompt of prompts) await capture({ prompt, engine: "gemini", brand: null, cites: [], demo: true, at: "2026-09-25T10:00:00Z" });
+    await refresh();
+    expect(await stored("divergence")).toMatchObject({ sufficient: true, evidence_cells: 10 });
+    const d = geoDivergenceDetailSchema.parse((await read("divergence")).detail);
+    expect(d.project_divergence).toBe(1);
+    expect(d.excluded.demo_results).toBe(10);
   });
 
   it("[AC4] the engine-source affinity map is learned from the project's own live capture history", async () => {
@@ -291,10 +329,10 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     );
   }
   /** 15 answers in a cluster where the competitor dominates the brand. */
-  async function rivalAnswers(clusterId: string, rivalId: string, n = 15): Promise<void> {
+  async function rivalAnswers(clusterId: string, rivalId: string, n = 15, demo = false): Promise<void> {
     const prompt = await addPrompt({ cluster: clusterId });
     for (let i = 0; i < n; i++) {
-      await capture({ prompt, engine: "gemini", brand: "ranked", brandProminence: 0.2, answerForm: "comparison_table", others: [{ type: "competitor", id: rivalId, label: "Rival", prominence: 0.8 }] });
+      await capture({ prompt, engine: "gemini", demo, brand: "ranked", brandProminence: 0.2, answerForm: "comparison_table", others: [{ type: "competitor", id: rivalId, label: "Rival", prominence: 0.8 }] });
     }
   }
   async function competitor(): Promise<string> {
@@ -338,6 +376,47 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     expect(rows[0].description).toContain("usage based pricing");
     expect(rows[0].description).toContain("a comparison table");
     expect(rows[0]).toMatchObject({ source_geo_analysis: "topics" });
+    // review-3: the competitors' cited documents are evidence, not the task's target; the target is the brand's page.
+    expect(rows[0].affected_url).toBe("https://acme.com/");
+  });
+
+  it("[review-3] the structure a gap names comes from the same prompts and parsed answers as the cells: a deleted prompt's answers and an unparsed capture do not decide it", async () => {
+    const rival = await competitor();
+    const a = await cluster("A");
+    const b = await cluster("B");
+    await alignment(a, 0.62, 0.7);
+    await rivalAnswers(a, rival);
+    await rivalAnswers(b, rival);
+    // 20 answers framed as a narrative: on a deleted prompt in the cluster, and on a capture that never parsed.
+    const gone = await addPrompt({ cluster: a });
+    for (let i = 0; i < 10; i++) await capture({ prompt: gone, engine: "gemini", brand: "ranked", answerForm: "narrative" });
+    await db.query("UPDATE tracked_prompts SET deleted_at = now() WHERE id = $1", [gone]);
+    const live = await addPrompt({ cluster: a });
+    for (let i = 0; i < 10; i++) {
+      const id = await capture({ prompt: live, engine: "gemini", brand: "ranked", answerForm: "narrative" });
+      await db.query("UPDATE answer_captures SET status = 'failed' WHERE id = $1", [id]);
+    }
+    await refresh();
+    const d = geoTopicsDetailSchema.parse((await read("topics")).detail);
+    expect(d.gaps.find((g) => g.cluster_id === a)!.structure).toBe("comparison_table");
+  });
+
+  it("[D23] demo data: the topics analysis is computed and labelled demo, and NO task is made", async () => {
+    const rival = await competitor();
+    const a = await cluster("A");
+    const b = await cluster("B");
+    await alignment(a, 0.62, 0.7);
+    await rivalAnswers(a, rival, 15, true);
+    await rivalAnswers(b, rival, 15, true);
+    await refresh();
+    const view = await read("topics");
+    const d = geoTopicsDetailSchema.parse(view.detail);
+    expect(d.data_source).toBe("demo");
+    expect(d.gaps).toHaveLength(1);
+    await generate();
+    await generate();
+    expect(await taskRows("TG-TOPIC-CONTENT")).toHaveLength(0);
+    expect(view.actions).toEqual([]);
   });
 
   it("[#8] with no alignment measured, a dominated topic is not recommended and the reason says why", async () => {
@@ -383,18 +462,26 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
 
   // ------------------------------------------------------------------------------------------------ A6 threshold and tasks
 
-  async function sentimentFixture(positive: number, negative: { reasons: string[] }[]): Promise<void> {
+  async function sentimentFixture(positive: number, negative: { reasons: string[] }[], demo = false): Promise<void> {
     const prompt = await addPrompt();
-    for (let i = 0; i < positive; i++) await capture({ prompt, engine: "gemini", brand: "ranked", sentiment: { label: "positive" } });
-    for (const n of negative) await capture({ prompt, engine: "gemini", brand: "ranked", sentiment: { label: "negative", reasons: n.reasons }, cites: ["reddit.com"] });
+    for (let i = 0; i < positive; i++) await capture({ prompt, engine: "gemini", demo, brand: "ranked", sentiment: { label: "positive" } });
+    for (const n of negative) await capture({ prompt, engine: "gemini", demo, brand: "ranked", sentiment: { label: "negative", reasons: n.reasons }, cites: ["reddit.com"] });
+  }
+  /** The prior window (2026-08-03 .. 2026-09-01): `answers` parsed answers of which `negative` carry a negative brand mention. */
+  async function priorWindow(answers: number, negative: number): Promise<void> {
+    const prompt = await addPrompt();
+    for (let i = 0; i < answers; i++) {
+      const bad = i < negative;
+      await capture({ prompt, engine: "gemini", at: "2026-08-15T10:00:00Z", brand: "ranked", sentiment: bad ? { label: "negative", reasons: ["pricing_objection"] } : { label: "positive" } });
+    }
   }
 
-  it("[#11] a negative theme past the threshold with the sample floor met: one task per reason class, once", async () => {
+  it("[#11/D22] a negative theme past BOTH the level and the rise, sample floors met: one task per reason class, once", async () => {
     await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }]);
-    await enable("TG-SENTIMENT-REASON");
+    await priorWindow(30, 0);
     await refresh();
     const d = geoSentimentDetailSchema.parse((await read("sentiment")).detail);
-    expect(d.threshold).toMatchObject({ cells: 33, negative_cells: 3, crossed: true });
+    expect(d.threshold).toMatchObject({ cells: 33, negative_cells: 3, prior_cells: 30, rose: true, crossed: true });
     await generate();
     await generate();
     const rows = await taskRows("TG-SENTIMENT-REASON");
@@ -405,13 +492,108 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
 
   it("[#11] under the threshold the themes are reported but no task and no action is made", async () => {
     await sentimentFixture(40, [{ reasons: ["pricing_objection"] }]);
-    await enable("TG-SENTIMENT-REASON");
+    await priorWindow(30, 0);
     await refresh();
     const a = await read("sentiment");
     expect(geoSentimentDetailSchema.parse(a.detail).threshold).toMatchObject({ crossed: false });
     expect(a.actions).toEqual([]);
     await generate();
     expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+  });
+
+  it("[D22] a level that did not RISE (a chronic 9%) or a prior window under its own floor is reported, not assigned: no task", async () => {
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }]);
+    await priorWindow(33, 3); // 3/33 = 9.1% before, 3/33 now: the level holds, nothing rose
+    await refresh();
+    let d = geoSentimentDetailSchema.parse((await read("sentiment")).detail);
+    expect(d.threshold).toMatchObject({ rose: false, crossed: false });
+    await generate();
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+
+    await db.query("TRUNCATE geo_analyses, tasks CASCADE");
+    await db.query("DELETE FROM mention_facts WHERE captured_at < '2026-09-01'");
+    await db.query("DELETE FROM answer_captures WHERE captured_at < '2026-09-01'");
+    await priorWindow(29, 0); // one short of the floor
+    await refresh();
+    d = geoSentimentDetailSchema.parse((await read("sentiment")).detail);
+    expect(d.threshold).toMatchObject({ prior_cells: 29, rose: false, crossed: false });
+    await generate();
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+  });
+
+  it("[D23] demo data: the sentiment analysis is computed and labelled demo past the threshold, and NO task and no alert is made", async () => {
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }, { reasons: ["missing_feature"] }], true);
+    await priorWindow(30, 0);
+    await refresh();
+    const view = await read("sentiment");
+    const d = geoSentimentDetailSchema.parse(view.detail);
+    expect(d.data_source).toBe("demo");
+    expect(d.threshold).toMatchObject({ crossed: true });
+    expect(d.reason_classes).toHaveLength(2);
+    await generate();
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+    expect(view.actions).toEqual([]);
+
+    // mixed (part of the window is live): still labelled, still no task. Fail closed on any demo capture.
+    await db.query("TRUNCATE geo_analyses, tasks CASCADE");
+    await db.query("UPDATE answer_captures SET normalizer_version = 'v1' WHERE id IN (SELECT id FROM answer_captures WHERE normalizer_version = 'demo-seed' ORDER BY id LIMIT 12)");
+    await refresh();
+    expect(geoSentimentDetailSchema.parse((await read("sentiment")).detail).data_source).toBe("mixed");
+    await generate();
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+  });
+
+  // ------------------------------------------------------------------------------------------------ D21 the negative_spike alert
+
+  const context = { pool: undefined, env: {} } as unknown as QueueHandlerContext;
+  let enqueued: { payload: NotifyDispatchPayload }[] = [];
+  async function runJob(): Promise<void> {
+    const handler = createTaskGenerateHandler(context, {
+      realtime: new NoopRealtimePublisher(),
+      enqueueNotify: async (_queue, _ws, payload) => void enqueued.push({ payload }),
+    });
+    const job = { id: randomUUID(), data: { payload: { workspaceId, kid: "test-kid", projectId, metricDate: METRIC_DATE } } } as unknown as Job;
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => handler(db, job));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const spikeAlerts = async () => (await db.query("SELECT * FROM notifications WHERE kind = 'alert.negative_spike' AND project_id = $1", [projectId])).rows;
+
+  it("[D21] a threshold crossing writes ONE negative_spike alert and one task per reason class, linked, and a retried job writes nothing twice", async () => {
+    enqueued = [];
+    const owner = randomUUID();
+    await db.query("INSERT INTO users (id,email,email_verified_at) VALUES ($1,$2,now())", [owner, `o-${owner.slice(0, 8)}@example.com`]);
+    await db.query("INSERT INTO workspace_members (workspace_id,user_id,role) VALUES ($1,$2,'owner')", [workspaceId, owner]);
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }]);
+    await priorWindow(30, 0);
+    await refresh();
+    await runJob();
+    const taskRowsNow = await taskRows("TG-SENTIMENT-REASON");
+    expect(taskRowsNow).toHaveLength(2);
+    const alerts = await spikeAlerts();
+    expect(alerts).toHaveLength(1); // one alert for the crossing, not one per reason class
+    expect(alerts[0]).toMatchObject({ severity: "critical", user_id: null });
+    expect(taskRowsNow.map((t) => t.id)).toContain(alerts[0].payload.task_id);
+    expect(alerts[0].payload.alert_rule).toBe("negative_spike");
+    await runJob();
+    expect(await spikeAlerts()).toHaveLength(1);
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(2);
+  });
+
+  it("[D21/D22] no crossing, no alert: a chronic level raises neither the alert nor a task", async () => {
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }]);
+    await priorWindow(33, 3);
+    await refresh();
+    await runJob();
+    expect(await spikeAlerts()).toHaveLength(0);
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+  });
+
+  it("[D21/D23] demo data raises no negative_spike alert", async () => {
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }, { reasons: ["missing_feature"] }], true);
+    await priorWindow(30, 0);
+    await refresh();
+    await runJob();
+    expect(await spikeAlerts()).toHaveLength(0);
   });
 
   it("[A6c] the prior window trends a theme: present before, absent before, and nothing measured before", async () => {

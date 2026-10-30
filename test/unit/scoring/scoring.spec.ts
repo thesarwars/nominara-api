@@ -349,8 +349,17 @@ describe("STORY-041 · §6 sentiment", () => {
 
   it("alerts on the negative-cell rate only at n >= 30", () => {
     expect(shouldAlertOnNegativeSentiment(100, 6)).toBe(true);
-    expect(shouldAlertOnNegativeSentiment(100, 5)).toBe(false);
+    expect(shouldAlertOnNegativeSentiment(100, 4)).toBe(false);
     expect(shouldAlertOnNegativeSentiment(20, 20)).toBe(false);
+    expect(shouldAlertOnNegativeSentiment(29, 29)).toBe(false);
+    expect(shouldAlertOnNegativeSentiment(30, 30)).toBe(true);
+  });
+
+  // scoring-models.md section 6 / 15 state ">= 0.05" ("crossing 0.05 with n >= 30"); the helper had a strict ">" (owner decision 22).
+  it("the level is >= 0.05: exactly 0.05 meets it", () => {
+    expect(shouldAlertOnNegativeSentiment(100, 5)).toBe(true);
+    expect(shouldAlertOnNegativeSentiment(60, 3)).toBe(true);
+    expect(shouldAlertOnNegativeSentiment(1000, 49)).toBe(false);
   });
 });
 

@@ -55,6 +55,20 @@ describe("STORY-061 / A4 divergence (pure)", () => {
     expect(detail!.excluded.demo_results).toBe(1);
   });
 
+  it("[review-3] demo results counted by the loader (never placed in a prompt's results) are reported in excluded.demo_results", () => {
+    const { detail } = buildDivergence(input(divergent(10), { demoResults: 4 }));
+    expect(detail!.excluded.demo_results).toBe(4);
+    expect(detail!.project_divergence).toBe(1);
+  });
+
+  it("[review-3] a finding's FIRST evidence URL (the task's affected URL, STORY-060's contract) is the brand's page, never the third-party domain", () => {
+    const { write } = buildDivergence(input(divergent(10)));
+    const finding = write.findings.find((f) => f.task_rule_code === "TG-DIVERGENCE")!;
+    expect(finding.evidence[0]!.url).toBe("https://acme.com/");
+    // the third-party domain is still evidence, after the brand's page.
+    expect(finding.evidence.map((e) => e.url)).toContain("https://docs.acme.com/");
+  });
+
   it("[AC2] a demo result never enters the mean: ten demo-only prompts are insufficient, not measured", () => {
     const demoOnly = Array.from({ length: 12 }, (_, i) => prompt(`d${String(i)}`, [demo("gemini", "recommendation"), demo("perplexity", null)]));
     const { write, detail } = buildDivergence(input(demoOnly));

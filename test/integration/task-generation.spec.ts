@@ -280,7 +280,9 @@ describe("STORY-063 · task generation engine", () => {
     expect(codes.filter((c) => c.startsWith("TG-AUX-")).length).toBeGreaterThan(0);
     for (const row of rows) expect(taskGenerationConditionSchema.safeParse(row.condition).success, row.code).toBe(true);
     // The rules whose facts need an analysis that has not shipped are seeded disabled.
-    for (const code of ["TG-RENDER-SCHEMA", "TG-ENTITY-NODE", "TG-DIVERGENCE", "TG-TOPIC-CONTENT", "TG-SENTIMENT-NEGATIVE"]) expect((await rule(code)).enabled, code).toBe(false);
+    for (const code of ["TG-RENDER-SCHEMA", "TG-ENTITY-NODE", "TG-SENTIMENT-NEGATIVE"]) expect((await rule(code)).enabled, code).toBe(false);
+    // STORY-061 / owner decision 20: the A4 and A5 rules are retargeted at their analyses and ENABLED by migration 0152.
+    for (const code of ["TG-DIVERGENCE", "TG-TOPIC-CONTENT", "TG-SENTIMENT-REASON"]) expect((await rule(code)).enabled, code).toBe(true);
     // negative_cell_rate is not computable from metric_daily, so the alert is pending, never approximated by another formula.
     expect((await rule("TG-SENTIMENT-NEGATIVE")).condition).toEqual({ kind: "pending_analysis", analysis: "negative_cell_rate" });
     // Hysteresis is in every windowed rule: a sample floor of 30 and a day-level sustain.

@@ -12,7 +12,7 @@ const SPEC: ReadonlyArray<[code: string, severity: string, cooldownDays: number 
   ["sov_drop_engine", "warning", 7, "TG-SOV-DROP-ENGINE"],
   ["sov_drop_global", "critical", 7, "TG-SOV-DROP-GLOBAL"],
   ["presence_loss", "warning", 7, "TG-PRESENCE-LOSS"],
-  ["negative_spike", "critical", 3, "TG-SENTIMENT-NEGATIVE"],
+  ["negative_spike", "critical", 3, "TG-SENTIMENT-REASON"],
   ["citation_loss", "warning", 7, "TG-CITATION-LOSS"],
   ["competitor_overtake", "warning", 14, "TG-COMPETITOR-GAIN"],
   ["source_gap_critical", "warning", 30, "TG-SOURCE-ABSENCE"],
@@ -47,6 +47,9 @@ describe("STORY-068 · the §15 alert rule catalog", () => {
     expect(alertRuleForTask("TG-AUX-R-001")?.code).toBe("aux_critical");
     expect(alertRuleForTask("TG-AUX-R-007")?.code).toBe("aux_critical");
     expect(alertRuleForTask("TG-UNKNOWN")).toBeUndefined();
+    // Owner decision 21: the negative_spike alert is raised by the reason-class task rule, not the pending cell-rate rule.
+    expect(alertRuleForTask("TG-SENTIMENT-REASON")?.code).toBe("negative_spike");
+    expect(alertRuleForTask("TG-SENTIMENT-NEGATIVE")).toBeUndefined();
   });
 
   it("[STORY-068 AC4 / #5] the high-impact displacement rule has NO cooldown, and neither does a new critical AUX finding", () => {

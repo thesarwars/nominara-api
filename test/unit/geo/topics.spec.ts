@@ -181,4 +181,25 @@ describe("STORY-061 / A5 topical authority (pure)", () => {
   it("exactly 30 answers across 2 topics is sufficient", () => {
     expect(buildTopics(input([topic("a"), topic("b")])).write.sufficient).toBe(true);
   });
+
+  it("[review-3] a topic finding's FIRST evidence URL (the task's affected URL) is the brand's page; the competitors' cited documents follow", () => {
+    const { write } = buildTopics(input([topic("a"), topic("b", { currentAlignment: null, targetAlignment: null })]));
+    const finding = write.findings.find((f) => f.task_rule_code === "TG-TOPIC-CONTENT")!;
+    expect(finding.evidence[0]!.url).toBe("https://acme.com/");
+    expect(finding.evidence.slice(1).map((e) => e.url)).toEqual(["https://rival.com/pricing", "https://rival.com/trust"]);
+  });
+
+  // ---- Owner decision 23: demo data is analysed and labelled, and never raises a task.
+  it("[D23] a recommended topic gap on demo or mixed data is shown (labelled) but asks for no task; on live data it does", () => {
+    const topics = [topic("a"), topic("b", { currentAlignment: null, targetAlignment: null })];
+    for (const dataSource of ["demo", "mixed"] as const) {
+      const { write, detail } = buildTopics(input(topics, { dataSource }));
+      expect(detail!.data_source).toBe(dataSource);
+      expect(detail!.gaps).toHaveLength(1);
+      expect(detail!.topics.find((t) => t.cluster_id === "a")!.recommended).toBe(true);
+      expect(write.findings.some((f) => f.task_rule_code !== undefined), dataSource).toBe(false);
+      expect(write.findings.every((f) => f.no_action === true), dataSource).toBe(true);
+    }
+    expect(buildTopics(input(topics)).write.findings.filter((f) => f.task_rule_code === "TG-TOPIC-CONTENT")).toHaveLength(1);
+  });
 });
