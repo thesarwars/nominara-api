@@ -34,6 +34,14 @@ export const ACHIEVABILITY_SPAN = 0.3;
 export const TOPIC_TOP_DECILE = 0.1;
 export const TOPIC_TASK_RULE = "TG-TOPIC-CONTENT";
 const CONCEPTS_PER_GAP = 5;
+/** Customer copy never carries the raw `answer_form` enum. */
+const ANSWER_FORM_LABEL: Record<string, string> = {
+  ranked_list: "a ranked list",
+  comparison_table: "a comparison table",
+  single_recommendation: "a single recommendation",
+  neutral_enumeration: "a neutral list",
+  narrative: "a narrative",
+};
 
 export interface TopicEntity {
   /** Stable key a cell's entities refer to. */
@@ -223,7 +231,7 @@ export function buildTopics(input: TopicsGeoInput): { write: GeoAnalysisWrite; d
         headline:
           `Create content for "${x.raw.t.label}", where ${x.row.owner.entity_label} leads (authority ${x.row.owner.authority.toFixed(2)} against the brand's ${x.row.brand_authority.toFixed(2)}).` +
           (concepts.length > 0 ? ` Cover: ${concepts.join(", ")}.` : "") +
-          (gap.structure === null ? "" : ` Structure it as ${gap.structure}.`),
+          (gap.structure === null ? "" : ` Structure it as ${ANSWER_FORM_LABEL[gap.structure] ?? gap.structure.replaceAll("_", " ")}.`),
         evidence: evidence.length > 0 ? evidence : rootEvidence,
         metric: { name: "gap_priority", value: x.row.gap_priority ?? 0 },
         task_rule_code: TOPIC_TASK_RULE,
@@ -283,9 +291,8 @@ export async function loadTopicsInput(tx: ClientBase, projectId: string, windowS
   const competitors = await tx.query<{ id: string; name: string }>("SELECT id, name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL ORDER BY lower(name), id", [projectId]);
   const entities = new Map<string, TopicEntity>([["brand", { key: "brand", type: "brand", label: project.rows[0].name }]]);
   for (const c of competitors.rows) entities.set(c.id, { key: c.id, type: "competitor", label: c.name });
-  for (const r of cells.rows) {
-    for (const e of r.entities ?? []) if (e.type === "competitor" && !entities.has(e.key)) entities.set(e.key, { key: e.key, type: "competitor", label: e.label });
-  }
+  // Tracked = the brand and the LIVE competitors (section 10: "over all tracked entities"). A soft-deleted competitor's mentions still
+  // sit in the window; they are in the SoV denominator (section 2) and never a candidate for ownership or a listed row.
 
   // The brand's best-aligned analysed page per cluster; the empirical band floor is the target.
   const alignments = await tx.query<{ prompt_cluster_id: string; current: number | null; target: number | null }>(

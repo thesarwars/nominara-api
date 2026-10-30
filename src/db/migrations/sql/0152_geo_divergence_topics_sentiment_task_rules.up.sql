@@ -19,13 +19,15 @@
 UPDATE task_generation_rules
    SET condition = '{"kind":"geo_finding","analysis":"divergence","finding_id_prefix":"divergence-"}',
        description_template = '{finding_headline}',
-       rule_version = '2026.10.3'
+       rule_version = '2026.10.3',
+       enabled = false
  WHERE code = 'TG-DIVERGENCE';
 
 UPDATE task_generation_rules
    SET condition = '{"kind":"geo_finding","analysis":"topics","finding_id_prefix":"topic-gap-"}',
        description_template = '{finding_headline}',
-       rule_version = '2026.10.3'
+       rule_version = '2026.10.3',
+       enabled = false
  WHERE code = 'TG-TOPIC-CONTENT';
 
 INSERT INTO task_generation_rules

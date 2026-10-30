@@ -361,6 +361,7 @@ export async function loadSentimentInput(
   const priorReasons = await tx.query<PriorReasonRow>(
     `SELECT mf.negative_reasons[1] AS reason, count(*)::int AS mentions
        FROM mention_facts mf
+       JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")}
       WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $5
         AND mf.sentiment_label <> 'positive' AND mf.evidence_start IS NOT NULL AND mf.evidence_end IS NOT NULL
         AND cardinality(mf.negative_reasons) > 0

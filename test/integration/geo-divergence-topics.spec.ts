@@ -217,6 +217,8 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     expect(rows[0]).toMatchObject({ source_geo_analysis: "divergence", affected_engines: ["perplexity"] });
     expect(rows[0].description).toContain("perplexity");
     expect(rows[0].description).toContain("docs.acme.com");
+    // review-1: the action surface carries the losing engine too, not a generic empty list.
+    expect((await read("divergence")).actions[0]!.engines).toEqual(["perplexity"]);
   });
 
   it("[AC4] the engine-source affinity map is learned from the project's own live capture history", async () => {
@@ -334,7 +336,7 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     const rows = await taskRows("TG-TOPIC-CONTENT");
     expect(rows).toHaveLength(1);
     expect(rows[0].description).toContain("usage based pricing");
-    expect(rows[0].description).toContain("comparison_table");
+    expect(rows[0].description).toContain("a comparison table");
     expect(rows[0]).toMatchObject({ source_geo_analysis: "topics" });
   });
 
@@ -348,6 +350,23 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     const d = geoTopicsDetailSchema.parse((await read("topics")).detail);
     expect(d.topics.every((t) => t.achievability === null && t.gap_priority === null && !t.recommended)).toBe(true);
     expect(d.topics[0]!.not_recommended_reason).toMatch(/alignment/i);
+    expect(d.gaps).toEqual([]);
+  });
+
+  it("[#7/review-1] a soft-deleted competitor is never a candidate for ownership or listed: its mentions only fill the SoV denominator", async () => {
+    const rival = await competitor();
+    await db.query("UPDATE competitors SET deleted_at = now() WHERE id = $1", [rival]);
+    const a = await cluster("A");
+    const b = await cluster("B");
+    await alignment(a, 0.62, 0.7);
+    await rivalAnswers(a, rival);
+    await rivalAnswers(b, rival);
+    await refresh();
+    const d = geoTopicsDetailSchema.parse((await read("topics")).detail);
+    const t = d.topics.find((x) => x.cluster_id === a)!;
+    expect(t.owner.entity_type).toBe("brand");
+    expect(t.authorities.map((x) => x.entity_label)).toEqual(["Acme"]);
+    expect(t.recommended).toBe(false);
     expect(d.gaps).toEqual([]);
   });
 

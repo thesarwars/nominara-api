@@ -87,7 +87,7 @@ export class GeoService {
           : row !== null && row.sufficient
           ? validFindings(row)
               .filter((f) => f.task_rule_code !== undefined)
-              .map((f) => ({ label: f.headline, task_title: null, task_id: null, href: null, engines: [] as string[] }))
+              .map((f) => ({ label: f.headline, task_title: null, task_id: null, href: null, engines: f.engine === undefined ? ([] as string[]) : [f.engine] }))
           : [];
       return { summary: summarize(slug, row, days), detail, actions };
     }, { analysis: slug });

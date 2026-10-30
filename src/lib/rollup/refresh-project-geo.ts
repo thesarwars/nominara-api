@@ -37,7 +37,9 @@ export async function refreshProjectGeo(
 ): Promise<GeoAnalysisWrite> {
   const windowDays = options.windowDays ?? GEO_WINDOW_DAYS;
   const started = performance.now();
-  const input = await loadStructureInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays);
+  // One clock read: every analysis of this refresh, and the lever ranking, share the same window even across UTC midnight.
+  const windowStart = windowStartFor(options.asOf ?? new Date(), windowDays);
+  const input = await loadStructureInput(tx, projectId, windowStart, windowDays);
   const { write } = buildStructure(input);
   const persisted = await writeGeoAnalysis(tx, projectId, write);
   incrementCounter("nominara_geo_structure_recompute_total", { sufficient: String(persisted.sufficient) });
@@ -58,7 +60,7 @@ export async function refreshProjectGeo(
   const sentiment = await writeGeoAnalysis(
     tx,
     projectId,
-    buildSentiment(await loadSentimentInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays)).write,
+    buildSentiment(await loadSentimentInput(tx, projectId, windowStart, windowDays)).write,
   );
   incrementCounter("nominara_geo_sentiment_recompute_total", { sufficient: String(sentiment.sufficient) });
   logger.log({
@@ -76,7 +78,7 @@ export async function refreshProjectGeo(
   const entity = await writeGeoAnalysis(
     tx,
     projectId,
-    buildEntity(await loadEntityInput(tx, projectId, windowStartFor(options.asOf ?? new Date(), windowDays), windowDays)).write,
+    buildEntity(await loadEntityInput(tx, projectId, windowStart, windowDays)).write,
   );
   incrementCounter("nominara_geo_entity_recompute_total", { sufficient: String(entity.sufficient) });
   logger.log({
@@ -90,7 +92,6 @@ export async function refreshProjectGeo(
   });
 
   // STORY-061 — A4 divergence and A5 topical authority, same window, same transaction. Reads rows only: no engine, no embedding call.
-  const windowStart = windowStartFor(options.asOf ?? new Date(), windowDays);
   const divergenceStarted = performance.now();
   const divergence = await writeGeoAnalysis(tx, projectId, buildDivergence(await loadDivergenceInput(tx, projectId, windowStart, windowDays)).write);
   incrementCounter("nominara_geo_divergence_recompute_total", { sufficient: String(divergence.sufficient) });

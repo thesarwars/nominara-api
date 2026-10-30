@@ -141,7 +141,8 @@ describe("STORY-061 / A5 topical authority (pure)", () => {
     expect(f.task_rule_code).toBe("TG-TOPIC-CONTENT");
     expect(f.headline).toContain("usage based pricing");
     expect(f.headline).toContain("soc 2");
-    expect(f.headline).toContain("comparison_table");
+    expect(f.headline).toContain("Structure it as a comparison table.");
+    expect(f.headline).not.toContain("comparison_table");
     expect(f.evidence[0]!.url).toBe("https://rival.com/pricing");
     expect(detail!.gaps).toEqual([
       expect.objectContaining({ cluster_id: "a", structure: "comparison_table", required_concepts: [expect.objectContaining({ phrase: "usage based pricing" }), expect.objectContaining({ phrase: "soc 2" })] }),
