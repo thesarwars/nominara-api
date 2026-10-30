@@ -121,3 +121,28 @@ describe("SCANFIX-D3 · the gemini pace is configuration", () => {
     for (const bad of ["0", "-3", "abc", ""]) expect(shape.safeParse(bad).success).toBe(false);
   });
 });
+
+describe("STORY-029 · the Google surfaces are paced by SERP_REQUESTS_PER_MINUTE", () => {
+  it("both surfaces get a one-token bucket at rpm/60, overriding ENGINE_TOKEN_BUCKETS; gemini and the rest are unchanged", () => {
+    const buckets = { google_aio: { capacity: 10, refillPerSecond: 1 }, google_ai_mode: { capacity: 10, refillPerSecond: 1 }, gemini: { capacity: 10, refillPerSecond: 1 }, chatgpt: { capacity: 5, refillPerSecond: 2 } };
+    const configFor = configForFromEnv(buckets, 10, 3);
+    expect(configFor("google_aio")).toEqual({ capacity: 1, refillPerSecond: 3 / 60 });
+    expect(configFor("google_ai_mode")).toEqual({ capacity: 1, refillPerSecond: 3 / 60 });
+    expect(configFor("gemini")).toEqual({ capacity: 1, refillPerSecond: 10 / 60 });
+    expect(configFor("chatgpt")).toEqual({ capacity: 5, refillPerSecond: 2 });
+  });
+
+  it("without a serp rate the surfaces still come from the JSON, and a missing entry still fails loud", () => {
+    expect(configForFromEnv({ google_aio: { capacity: 10, refillPerSecond: 1 } }, 10)("google_aio")).toEqual({ capacity: 10, refillPerSecond: 1 });
+    expect(() => configForFromEnv({}, 10)("google_aio")).toThrow();
+  });
+
+  it("SERP_REQUESTS_PER_MINUTE defaults to 1 and rejects zero, negatives and junk; SERP_API_KEY is optional", () => {
+    const shape = (envSchema.shape as Record<string, z.ZodType | undefined>)["SERP_REQUESTS_PER_MINUTE"]!;
+    expect(shape.parse(undefined)).toBe(1);
+    expect(shape.parse("4")).toBe(4);
+    for (const bad of ["0", "-3", "abc", ""]) expect(shape.safeParse(bad).success).toBe(false);
+    const key = (envSchema.shape as Record<string, z.ZodType | undefined>)["SERP_API_KEY"]!;
+    expect(key.safeParse(undefined).success).toBe(true);
+  });
+});

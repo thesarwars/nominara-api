@@ -34,12 +34,14 @@ describe("NEW-A-4 · gemini is the only capture-ready engine, and only with a ke
 
   it("no key: nothing is capture-ready and gemini resolves to the fixture adapter", () => {
     vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("SERP_API_KEY", "");
     expect(captureReadyEngineKeys()).toEqual([]);
     expect(resolveEngine("gemini")).toBe(FIXTURE_ADAPTERS.gemini);
   });
 
   it("with a key: exactly gemini is capture-ready, bound to the real adapter; the other five stay fixtures", () => {
     vi.stubEnv("GEMINI_API_KEY", "test-key-not-a-secret");
+    vi.stubEnv("SERP_API_KEY", "");
     expect(captureReadyEngineKeys()).toEqual(["gemini"]);
     expect(resolveEngine("gemini")).not.toBe(FIXTURE_ADAPTERS.gemini);
     expect(resolveEngine("gemini").constructor.name).toBe("GeminiApiAdapter");
@@ -51,6 +53,38 @@ describe("NEW-A-4 · gemini is the only capture-ready engine, and only with a ke
   it("the real adapter does not override capture()", () => {
     vi.stubEnv("GEMINI_API_KEY", "test-key-not-a-secret");
     expect(Object.getPrototypeOf(resolveEngine("gemini")).capture).toBe(BaseCaptureAdapter.prototype.capture);
+  });
+});
+
+describe("STORY-029 · the Google surfaces are capture-ready only with SERP_API_KEY, each bound to its own endpoint", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("no key: both stay fixtures and are not capture-ready", () => {
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("SERP_API_KEY", "");
+    expect(captureReadyEngineKeys()).toEqual([]);
+    expect(resolveEngine("google_aio")).toBe(FIXTURE_ADAPTERS.google_aio);
+    expect(resolveEngine("google_ai_mode")).toBe(FIXTURE_ADAPTERS.google_ai_mode);
+  });
+
+  it("with a key: exactly the two surfaces, two distinct adapters stamped licensed_serp, engine key from their own binding", () => {
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("SERP_API_KEY", "test-key-not-a-secret");
+    expect([...captureReadyEngineKeys()].sort()).toEqual(["google_ai_mode", "google_aio"]);
+    const aio = resolveEngine("google_aio");
+    const mode = resolveEngine("google_ai_mode");
+    expect(aio).not.toBe(mode);
+    expect([aio.engineKey, mode.engineKey]).toEqual(["google_aio", "google_ai_mode"]);
+    expect([aio.captureMode, mode.captureMode]).toEqual(["licensed_serp", "licensed_serp"]);
+    expect(Object.getPrototypeOf(aio).capture).toBe(BaseCaptureAdapter.prototype.capture);
+  });
+
+  it("a rotated key builds a new adapter; the same key reuses it", () => {
+    vi.stubEnv("SERP_API_KEY", "key-one-not-a-secret");
+    const first = resolveEngine("google_aio");
+    expect(resolveEngine("google_aio")).toBe(first);
+    vi.stubEnv("SERP_API_KEY", "key-two-not-a-secret");
+    expect(resolveEngine("google_aio")).not.toBe(first);
   });
 });
 

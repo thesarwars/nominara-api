@@ -39,6 +39,10 @@ export const captureInputSchema = z
     // `null` is a validation failure, not treated as equivalent to absent.
     personaHint: z.string().optional(),
     requireCitations: z.boolean(),
+    // STORY-029 - the speed of a licensed-SERP request, chosen by the CALLER (tracking-engine.md section 3, "Two capture speeds"):
+    // `queued` for scheduled work, `live` for a person watching. Absent means queued: scheduled runs are the default path, and
+    // an adapter with no such mode (every API engine) ignores it. The adapter never picks one for itself.
+    requestMode: z.enum(["queued", "live"]).optional(),
   })
   .strict();
 export type CaptureInput = z.infer<typeof captureInputSchema>;
@@ -93,7 +97,11 @@ export type AnswerElement = z.infer<typeof answerElementSchema>;
 // (tracking-engine.md §2, NFR-SIM-07) — closed set, matching
 // answer_captures.flags' `text[]` shape. The base adapter passes these
 // through untouched; it never invents them.
-export const captureFlagSchema = z.enum(["engine_refused_to_answer", "empty_answer"]);
+//
+// STORY-029 / NFR-SIM-12 - `no_ai_overview_for_query`: a licensed-SERP request that WAS sent with the async-load parameter set and
+// still came back with no AI Overview. A genuine absence, stored with brand_present=false. Without the parameter the same payload is
+// an adapter defect and never reaches this flag - it fails the capture.
+export const captureFlagSchema = z.enum(["engine_refused_to_answer", "empty_answer", "no_ai_overview_for_query"]);
 export type CaptureFlag = z.infer<typeof captureFlagSchema>;
 
 export const rawCaptureSchema = z
@@ -109,6 +117,10 @@ export const rawCaptureSchema = z
     vendorRequestId: z.string().optional(),
     costUsd: z.number().min(0),
     flags: z.array(captureFlagSchema).optional(),
+    // STORY-029 / NFR-SIM-12 - answer_captures.async_generated. `true`: the vendor generated the overview on demand and the adapter
+    // loaded it asynchronously. `false`: it came back in the first response (or there was none). `null` is a DIFFERENT fact: the
+    // surface reports no such flag at all. Absent (undefined) is every engine that has no async notion; the column stays NULL.
+    asyncGenerated: z.boolean().nullable().optional(),
   })
   .strict();
 export type RawCapture = z.infer<typeof rawCaptureSchema>;
