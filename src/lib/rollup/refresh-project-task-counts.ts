@@ -73,6 +73,9 @@ export interface TaskSeverityCounts {
  * KEY SHARE` locker (a referencing INSERT) could be racing to protect — so
  * the weaker lock loses no correctness.
  */
+// OPEN = `todo`, `in_progress` or `in_review` (owner decision 30, STORY-055): a seeding task whose contribution URL awaits
+// verification is unfinished work and the gap it targets is still open, so submitting a URL must not drop the count (and a failed
+// check must not raise it again). `done` and `dismissed` leave the count.
 export async function refreshProjectTaskCounts(tx: ClientBase, projectId: string): Promise<void> {
   await tx.query(`SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE`, [projectId]);
   const result = await tx.query<{ critical: string; high: string; medium: string; low: string; total: string }>(
@@ -92,7 +95,7 @@ export async function refreshProjectTaskCounts(tx: ClientBase, projectId: string
             LIMIT 1
          ) psi ON t.source_domain_id IS NOT NULL
         WHERE t.project_id = $1
-          AND t.status IN ('todo', 'in_progress')
+          AND t.status IN ('todo', 'in_progress', 'in_review')
           AND t.deleted_at IS NULL
      )
      SELECT count(*) FILTER (WHERE severity = 'critical')::text AS critical,

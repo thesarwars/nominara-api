@@ -169,6 +169,8 @@ export class GoalsService {
   }
 }
 
+// STORY-055 / owner decision 30: `tasks_done` counts `done` only. A task `in_review` (contribution submitted, not yet verified) is
+// NOT done - it counts in `tasks_total` and not in `tasks_done` - so a goal never advances on an unverified claim.
 const SELECT_GOALS = `
   SELECT g.id, g.project_id, g.title, g.kind, g.target, g.baseline, g.current, g.progress_pct,
          to_char(g.target_date, 'YYYY-MM-DD') AS target_date, g.status, g.achieved_at, g.created_at,

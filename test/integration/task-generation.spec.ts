@@ -738,6 +738,21 @@ describe("STORY-063 · task generation engine", () => {
     expect(refreshed[0].payload).toMatchObject({ metric_date: NEXT, recurrence_count: 1 });
   });
 
+  it("[STORY-055 owner decision 30] a task IN REVIEW is open: a later recurrence refreshes it, and no duplicate is made", async () => {
+    await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
+    await metric("gemini", NEXT, { sov: 0.3 });
+    await generate();
+    const [created] = await taskRows("TG-SOV-DROP-ENGINE");
+    await db.query("UPDATE tasks SET status = 'in_review' WHERE id = $1", [created.id]);
+    await generate(NEXT);
+    const rows = await taskRows("TG-SOV-DROP-ENGINE");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(created.id);
+    expect(rows[0].status).toBe("in_review");
+    expect(rows[0].recurrence_count).toBe(1);
+    expect((await events(created.id)).filter((e) => e.event === "evidence_refreshed")).toHaveLength(1);
+  });
+
   it("[STORY-063 #8] a recurrence on an out-of-order (older) date does not move the evidence backwards or count again", async () => {
     await twoWindows("gemini", { sov: 0.4 }, { sov: 0.3 });
     await metric("gemini", NEXT, { sov: 0.3 });

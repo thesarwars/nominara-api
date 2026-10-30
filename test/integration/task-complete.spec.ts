@@ -99,10 +99,10 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     expect(row.completed_by).toBe(actor);
     const ms = (await client.query(`SELECT * FROM milestones WHERE project_id = $1`, [p])).rows;
     expect(ms).toHaveLength(1);
-    expect(ms[0]).toMatchObject({ id: out.milestone.id, kind: "task_completed", source_type: "task", source_id: t.id, workspace_id: ws, created_by: actor, severity: "positive" });
+    expect(ms[0]).toMatchObject({ id: out.milestone!.id, kind: "task_completed", source_type: "task", source_id: t.id, workspace_id: ws, created_by: actor, severity: "positive" });
     expect(row.milestone_id).toBe(ms[0].id);
     expect(ms[0].occurred_at.getTime()).toBe(row.completed_at.getTime());
-    expect(out.milestone.occurred_at).toBe(row.completed_at.toISOString());
+    expect(out.milestone!.occurred_at).toBe(row.completed_at.toISOString());
     const ev = (await client.query(`SELECT event, actor_id, from_value, to_value FROM task_events WHERE task_id = $1 AND event = 'completed'`, [t.id])).rows;
     expect(ev).toEqual([{ event: "completed", actor_id: actor, from_value: "todo", to_value: "done" }]);
     expect((await client.query(`SELECT open_task_count FROM projects WHERE id = $1`, [p])).rows[0].open_task_count).toBe(0);

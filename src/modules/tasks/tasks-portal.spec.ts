@@ -48,7 +48,8 @@ describe("NEW-E-099b · TasksService.portalTasks", () => {
     await serviceReading([], []).portalTasks(PROJECT, { hideCompetitors: false, completedSince: null });
     const open = calls.find((c) => !/completed_at DESC/.test(c.sql))!;
     expect(open.sql).toMatch(/ORDER BY[\s\S]*impact_score\s+DESC/);
-    expect(open.sql).toMatch(/status\s+IN\s+\('todo',\s*'in_progress'\)/);
+    // Owner decision 30: a task in review (URL submitted, not yet verified) is still open work.
+    expect(open.sql).toMatch(/status\s+IN\s+\('todo',\s*'in_progress',\s*'in_review'\)/);
     expect(open.sql).not.toMatch(/'dismissed'/);
     expect(open.sql).toMatch(/deleted_at IS NULL/);
   });

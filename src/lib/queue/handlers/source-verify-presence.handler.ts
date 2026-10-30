@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
@@ -16,6 +17,13 @@ import {
   type PresenceRunPlan,
   type SeededVerificationPlan,
 } from "../../sources/verify-presence.js";
+import {
+  commitSubmissionVerification,
+  fetchSubmission,
+  prepareSubmissionVerification,
+  type SubmissionOutcome,
+  type SubmissionPlan,
+} from "../../sources/verify-submission.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
 
@@ -29,7 +37,12 @@ import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-facto
 // its commit, the job fetches the task's target URL past the 30-day cache, and
 // a verified mention pins `source_seeded` at the completion.
 //
-// ADR-0003 — A PHASED JOB, in both modes: `prepare` reads in one short tenant
+// STORY-055 (owner decision 30) — and a third mode: the payload names a task AND a `submissionId`, the customer's contribution URL
+// that `TasksService.completeTask` queued after sending a seeding task to `in_review`. The job fetches THAT URL (the guarded
+// fetcher), then either completes the task (milestones, presence flag, gap closed) or leaves it in review with a specific reason.
+// The logic is in `verify-submission.ts`. Idempotent: an answered, superseded or no-longer-in-review submission fetches nothing.
+//
+// ADR-0003 — A PHASED JOB, in all three modes: `prepare` reads in one short tenant
 // transaction, `run` fetches with no transaction and no client, `commit`
 // writes in a second short one. (Before STORY-066 this handler held its job
 // transaction across up to MAX_DOMAINS_PER_RUN fetches — one of the ADR's
@@ -48,6 +61,8 @@ const payloadSchema = z
     projectId: z.string().uuid(),
     /** STORY-066 AC8 — present when the job verifies one completed authority task (enqueued by `completeTask`). */
     taskId: z.string().uuid().optional(),
+    /** STORY-055 — with `taskId`: the `verification_submitted` event this job answers. */
+    submissionId: z.string().uuid().optional(),
   })
   .strict();
 
@@ -58,9 +73,31 @@ export interface SourceVerifyPresenceDeps {
 
 type Prepared =
   | { readonly mode: "project"; readonly projectId: string; readonly plan: PresenceRunPlan; readonly now: Date; readonly today: string }
-  | { readonly mode: "seeded"; readonly plan: SeededVerificationPlan };
+  | { readonly mode: "seeded"; readonly plan: SeededVerificationPlan }
+  | { readonly mode: "submission"; readonly plan: SubmissionPlan };
 
-type Fetched = { readonly mode: "project"; readonly results: PresenceResult[] } | { readonly mode: "seeded"; readonly outcome: PresenceOutcome };
+type Fetched =
+  | { readonly mode: "project"; readonly results: PresenceResult[] }
+  | { readonly mode: "seeded"; readonly outcome: PresenceOutcome }
+  | { readonly mode: "submission"; readonly outcome: SubmissionOutcome };
+
+const tracer = trace.getTracer("nominara-api");
+
+/** The submission's guarded fetch, in a span: the one outbound call of this job mode. IDs only - never the URL. */
+function fetchSubmissionTraced(plan: SubmissionPlan, fetch: PresenceFetcher): Promise<SubmissionOutcome> {
+  return tracer.startActiveSpan("tasks.verify_submission", async (span) => {
+    try {
+      const outcome = await fetchSubmission(plan, fetch);
+      span.setAttribute("nominara.tasks.verification_outcome", outcome.status === "verified" ? "verified" : outcome.reason);
+      return outcome;
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
 
 export function createSourceVerifyPresenceHandler(_context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {
   const logger = new Logger("source.verify_presence");
@@ -70,6 +107,14 @@ export function createSourceVerifyPresenceHandler(_context: QueueHandlerContext,
   return phasedProcessor<Prepared, Fetched>({
     async prepare(tx: ClientBase, job: Job) {
       const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
+      if (payload.taskId !== undefined && payload.submissionId !== undefined) {
+        const plan = await prepareSubmissionVerification(tx, payload.projectId, payload.taskId, payload.submissionId);
+        if (plan === null) {
+          logger.log({ event: "task_verification_nothing_to_verify", workspaceId: payload.workspaceId, projectId: payload.projectId, taskId: payload.taskId });
+          return PHASES_DONE;
+        }
+        return { mode: "submission", plan };
+      }
       if (payload.taskId !== undefined) {
         const plan = await prepareSeededVerification(tx, payload.projectId, payload.taskId);
         if (plan === null) {
@@ -98,11 +143,16 @@ export function createSourceVerifyPresenceHandler(_context: QueueHandlerContext,
     },
 
     async run(prepared: Prepared): Promise<Fetched> {
+      if (prepared.mode === "submission") return { mode: "submission", outcome: await fetchSubmissionTraced(prepared.plan, fetch) };
       if (prepared.mode === "seeded") return { mode: "seeded", outcome: await fetchSeededTarget(prepared.plan, fetch) };
       return { mode: "project", results: await fetchPresence(prepared.plan, fetch) };
     },
 
     async commit(tx: ClientBase, prepared: Prepared, fetched: Fetched) {
+      if (prepared.mode === "submission" && fetched.mode === "submission") {
+        await commitSubmissionVerification(tx, prepared.plan, fetched.outcome, clock());
+        return;
+      }
       if (prepared.mode === "seeded" && fetched.mode === "seeded") {
         await commitSeededVerification(tx, prepared.plan, fetched.outcome, clock());
         return;

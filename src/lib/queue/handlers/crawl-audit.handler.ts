@@ -333,7 +333,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       );
       const tasked = await tx.query<{ url: string }>(
         `SELECT DISTINCT affected_url AS url FROM tasks
-          WHERE project_id = $1 AND affected_url IS NOT NULL AND status IN ('todo','in_progress') AND deleted_at IS NULL LIMIT $2`,
+          WHERE project_id = $1 AND affected_url IS NOT NULL AND status IN ('todo','in_progress','in_review') AND deleted_at IS NULL LIMIT $2`,
         [payload.projectId, EVIDENCE_URL_LIMIT],
       );
       evidence = { citations: cited.rows.map((r) => r.url), tasks: tasked.rows.map((r) => r.url) };

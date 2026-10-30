@@ -332,6 +332,9 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
   // STORY-066 AC8 adds a second producer: `TasksService.completeTask` enqueues
   // one job per completed authority task (payload `taskId`), after its commit,
   // keyed `srcver:seeded:{task}:{completed_at_ms}` — the pattern below is the rollup's key.
+  // STORY-055 (owner decision 30) adds the producer that matters now: `TasksService.completeTask` enqueues one job per SUBMITTED
+  // contribution URL of a seeding task (payload `taskId` + `submissionId`), after its commit, keyed `taskverify:{submission_event_id}`.
+  // The `taskId`-only mode above has no producer any more and is kept for jobs already queued at deploy time.
   // Phased (ADR-0003): no transaction is held across either kind of fetch.
   {
     name: "source.verify_presence",

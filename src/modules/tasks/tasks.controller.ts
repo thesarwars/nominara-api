@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from 
 import {
   bulkTaskRequestSchema,
   bulkTaskResponseSchema,
+  completeTaskRequestSchema,
   completeTaskResponseSchema,
   createCommentRequestSchema,
   createTaskRequestSchema,
@@ -14,6 +15,7 @@ import {
   updateTaskRequestSchema,
   type BulkTaskRequest,
   type BulkTaskResponse,
+  type CompleteTaskRequest,
   type CompleteTaskResponse,
   type CreateCommentRequest,
   type CreateTaskRequest,
@@ -113,7 +115,8 @@ export class TasksController {
     return this.service.createComment(id, body);
   }
 
-  // STORY-064 (step D) — `POST /tasks/{id}/complete`, `task:move`. No body.
+  // STORY-064 (step D) — `POST /tasks/{id}/complete`, `task:move`. The body is optional: owner decision 30 (STORY-055) takes
+  // the contribution `url` of a seeding task, which goes in_review until a job verifies it.
   // Idempotent: a replayed key returns the first response, not a second 409.
   @Post("tasks/:id/complete")
   @HttpCode(200)
@@ -121,9 +124,12 @@ export class TasksController {
   @RequirePermission("task:move")
   @ScopedByQuery()
   @Audit({ action: "task.completed", resourceType: "task" })
-  @ApiContract({ operationId: "completeTask", responseSchema: completeTaskResponseSchema })
-  complete(@Param("id") id: string): Promise<CompleteTaskResponse> {
-    return this.service.completeTask(id);
+  @ApiContract({ operationId: "completeTask", requestSchema: completeTaskRequestSchema, responseSchema: completeTaskResponseSchema })
+  complete(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(completeTaskRequestSchema.default({}))) body: CompleteTaskRequest,
+  ): Promise<CompleteTaskResponse> {
+    return this.service.completeTask(id, body);
   }
 
   // `GET /tasks/{id}/events`, `task:read` — the timeline, newest first.
