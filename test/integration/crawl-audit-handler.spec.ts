@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { crawlManifestSchema, type AuxFinding, type AuxPatch } from "../../contracts/aux/index.js";
 import { AuxService } from "../../src/modules/aux/aux.service.js";
 import { handlerFor } from "../../src/lib/queue/handlers.js";
+import { phasesOf } from "../../src/lib/queue/worker-factory.js";
 import type { GuardedFetchInit, GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 
 // NEW-C-9 — the crawl.audit handler, site-file stage, against a real Postgres.
@@ -216,19 +217,20 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(excluded).not.toContain("page_crawl"); // a page WAS crawled: naming it as not run would be false
   });
 
-  it("NEW-C-9 AC5.1 · publishes the crawler_access subscore, no aux_score (entity_clarity has no evaluated rule); a critical finding sets the capped flag", async () => {
+  it("NEW-C-9 AC5.1 · publishes the crawler_access subscore and, with the pages judged, a PARTIAL headline score (owner decision 38); a critical finding sets the capped flag and caps it at 72", async () => {
     await run(job(), depsServing(healthy(BLOCKED)));
     const [a] = await audits();
-    expect(a.aux_score).toBeNull();
+    // five categories at 1.0 except crawler_access at 0.7: (0.28*0.7 + 0.22 + 0.20 + 0.15 + 0.06) / 0.91 * 100 = 90.8, capped to 72
+    expect(Number(a.aux_score)).toBe(72);
     expect(a.score_capped).toBe(true);
     expect(a.findings_critical).toBe(1);
     expect(Number(a.score_breakdown.crawler_access)).toBeCloseTo(0.7, 5);
   });
 
-  it("NEW-C-9 AC5.2 · a clean site: subscore 1, not capped, aux_score still null", async () => {
+  it("NEW-C-9 AC5.2 · a clean site: subscore 1, not capped, a partial headline of 100 (renormalised over the five measured categories)", async () => {
     await run(job(), depsServing(healthy(OPEN)));
     const [a] = await audits();
-    expect(a.aux_score).toBeNull();
+    expect(Number(a.aux_score)).toBe(100);
     expect(a.score_capped).toBe(false);
     expect(Number(a.score_breakdown.crawler_access)).toBe(1);
     expect(await findings()).toHaveLength(0);
@@ -1249,12 +1251,12 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(a.aux_score).toBeNull();
     });
 
-    it("STORY-052 AC1 · a clean site publishes a subscore of 1 for each category that ran - five; entity_clarity, with no evaluated rule, is absent rather than a made-up 1 - and no headline score", async () => {
+    it("STORY-052 AC1 · a clean site publishes a subscore of 1 for each category that ran - five; entity_clarity, with no evaluated rule, is absent rather than a made-up 1 - and a partial headline", async () => {
       await run(job(), depsServing(healthy(OPEN)));
       const [a] = await audits();
       expect(Object.keys(a.score_breakdown).sort()).toEqual(["context_fitness", "crawler_access", "freshness", "render_mode", "structured_data"]);
       for (const v of Object.values(a.score_breakdown)) expect(Number(v)).toBe(1);
-      expect(a.aux_score).toBeNull(); // null is "not every category ran", never 0 and never 100
+      expect(Number(a.aux_score)).toBe(100); // decision 38: over the five measured categories, renormalised; the API labels it partial
       expect(a.score_capped).toBe(false);
     });
 
@@ -1485,6 +1487,260 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const auditId = await chargedManualAudit();
       await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
       expect(counters).toContainEqual({ name: "nominara_aux_audits_total", labels: { status: "completed", trigger: "manual" } });
+    });
+  });
+
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // AUXLIVE review round 1 - staleness per page, the partial headline (decision 38), a manual audit that must not be refunded twice
+  // ------------------------------------------------------------------------------------------------------------------
+  describe("AUXLIVE review round 1", () => {
+    const withPages = (pages: Record<string, string>): Served => ({
+      ...healthy(OPEN),
+      "/sitemap.xml": { status: 200, body: `<urlset>${Object.keys(pages).map((p) => `<url><loc>https://acme.com${p}</loc></url>`).join("")}</urlset>` },
+      ...Object.fromEntries(Object.entries(pages).map(([path, body]) => [path, { status: 200, body }])),
+    });
+    const weightOf = async (code: string): Promise<number> => Number((await db.query("SELECT weight FROM aux_rule_catalog WHERE code = $1", [code])).rows[0].weight);
+    const r008 = async () => (await findings()).filter((f) => f.rule_code === "AUX-R-008");
+    const milestoneCount = async (): Promise<number> => (await db.query("SELECT count(*)::int AS n FROM milestones")).rows[0].n;
+    const PAGES = { "/": HEALTHY_PAGE, "/pricing": BROKEN_PAGE };
+
+    it("STORY-052 AC8 · a page finding whose page FAILS to fetch is still open after one audit, and STALE after two - not resolved, not open for ever - and it keeps scoring", async () => {
+      await verifyDomain();
+      await run(job(), depsServing(withPages(PAGES)));
+      expect((await r008()).map((f) => f.status)).toEqual(["open"]);
+      const scored = Number((await audits()).at(-1).score_breakdown.structured_data);
+      const down = { ...withPages(PAGES), "/pricing": { status: 500, body: "" } } satisfies Served;
+      await run(job(), depsServing(down));
+      expect((await r008()).map((f) => f.status)).toEqual(["open"]);
+      await run(job(), depsServing(down));
+      const [f] = await r008();
+      expect(f.status).toBe("stale");
+      expect(f.resolved_at).toBeNull();
+      expect(await milestoneCount()).toBe(0);
+      // stale is not fixed: the subscore still carries the penalty (at the floor scope, since the page was not looked at in this audit)
+      expect(Number((await audits()).at(-1).score_breakdown.structured_data)).toBeLessThan(1);
+      expect(scored).toBeLessThan(1);
+    });
+
+    it("STORY-052 AC8 · a page finding whose page is no longer SELECTED (gone from the sitemap) goes stale after two audits, not resolved", async () => {
+      await verifyDomain();
+      await run(job(), depsServing(withPages(PAGES)));
+      const without = withPages({ "/": HEALTHY_PAGE });
+      await run(job(), depsServing(without));
+      await run(job(), depsServing(without));
+      expect((await r008()).map((f) => f.status)).toEqual(["stale"]);
+    });
+
+    it("STORY-052 AC8 · one audit that did not see the page between two that did does NOT make it stale (two CONSECUTIVE audits are required)", async () => {
+      await verifyDomain();
+      const down = { ...withPages(PAGES), "/pricing": { status: 500, body: "" } } satisfies Served;
+      await run(job(), depsServing(withPages(PAGES)));
+      await run(job(), depsServing(down));
+      await run(job(), depsServing(withPages(PAGES)));
+      const [f] = await r008();
+      expect(f.status).toBe("open");
+      expect(f.occurrence_count).toBe(2);
+    });
+
+    it("STORY-052 AC8 · a stale page finding that its page then shows fixed is RESOLVED; one that it shows broken again is reopened on the same row", async () => {
+      await verifyDomain();
+      const down = { ...withPages(PAGES), "/pricing": { status: 500, body: "" } } satisfies Served;
+      await run(job(), depsServing(withPages(PAGES)));
+      await run(job(), depsServing(down));
+      await run(job(), depsServing(down));
+      await run(job(), depsServing(withPages(PAGES)));
+      expect((await r008()).map((f) => f.status)).toEqual(["open"]);
+      expect(await r008()).toHaveLength(1);
+      await run(job(), depsServing(down));
+      await run(job(), depsServing(down));
+      await run(job(), depsServing(withPages({ "/": HEALTHY_PAGE, "/pricing": HEALTHY_PAGE })));
+      expect((await r008()).map((f) => f.status)).toEqual(["resolved"]);
+    });
+
+    it("STORY-052 AC8 · the pages an audit modelled are recorded (error_summary.pages_modelled), and a site-files-only audit records none", async () => {
+      await verifyDomain();
+      await run(job(), depsServing(withPages(PAGES)));
+      expect([...(await audits()).at(-1).error_summary.pages_modelled].sort()).toEqual(["https://acme.com/", "https://acme.com/pricing"]);
+      await run(job(), depsServing({ ...healthy(OPEN), "/": "throw" }));
+      expect((await audits()).at(-1).error_summary?.pages_modelled).toBeUndefined();
+    });
+
+    it("STORY-052 AC9 · affected_pages is written on each page-finding row: the distinct pages the rule is open on", async () => {
+      await verifyDomain();
+      await run(job(), depsServing(withPages({ "/": BROKEN_PAGE, "/pricing": BROKEN_PAGE, "/about": HEALTHY_PAGE })));
+      const rows = await r008();
+      expect(rows).toHaveLength(2);
+      expect(rows.map((r) => r.affected_pages)).toEqual([2, 2]);
+    });
+
+    it("STORY-052 AC9 · the scope counts only pages THIS audit modelled: an open finding on a page not crawled now weighs the 0.25 floor, not a full page", async () => {
+      await verifyDomain();
+      const w = await weightOf("AUX-R-008");
+      await run(job(), depsServing(withPages({ "/": HEALTHY_PAGE, "/pricing": BROKEN_PAGE })));
+      await run(job(), depsServing(withPages({ "/": HEALTHY_PAGE })));
+      expect(Number((await audits()).at(-1).score_breakdown.structured_data)).toBeCloseTo(1 - w * 0.25, 5);
+    });
+
+    it("AUXLIVE-5 · decision 38: the headline is renormalised over the measured categories - one broken page of one: (0.28 + 0.22*(1-w) + 0.20 + 0.15 + 0.06) / 0.91 * 100", async () => {
+      const w = await weightOf("AUX-R-008");
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
+      const [a] = await audits();
+      const expected = Number((((0.28 + 0.22 * (1 - w) + 0.2 + 0.15 + 0.06) / 0.91) * 100).toFixed(1));
+      expect(Number(a.aux_score)).toBe(expected);
+      expect(Object.keys(a.score_breakdown).sort()).toEqual(["context_fitness", "crawler_access", "freshness", "render_mode", "structured_data"]);
+    });
+
+    it("AUXLIVE-5 · the API payload labels it partial and names the unmeasured category; each published category lists the rules that did not run in it", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      const audit = await asTenantAudit();
+      expect(audit).toMatchObject({ aux_score: 100, score_partial: true, unmeasured_categories: ["entity_clarity"] });
+      const cats = Object.fromEntries(audit.categories.map((c) => [c.category, c.rules_not_evaluated]));
+      expect(Object.keys(cats).sort()).toEqual(["context_fitness", "crawler_access", "freshness", "render_mode", "structured_data"]);
+      expect(cats.crawler_access).toEqual(["AUX-R-005"]);
+      // render_mode has AUX-R-028 held and (no timing) AUX-R-029 undecided: its 1.0 is NOT a full measurement, and the payload says so
+      expect(cats.render_mode).toEqual(expect.arrayContaining(["AUX-R-028", "AUX-R-029"]));
+      expect(cats.freshness).toEqual(["AUX-R-031"]);
+      expect(cats.structured_data).toEqual(["AUX-R-013"]);
+    });
+
+    it("AUXLIVE-5 · an audit with no score (nothing measured: a failed one) is not partial and lists every category as unmeasured", async () => {
+      await run(job(), depsServing({}));
+      const audit = await asTenantAudit();
+      expect(audit).toMatchObject({ aux_score: null, score_partial: false, status: "failed" });
+      expect(audit.unmeasured_categories).toHaveLength(6);
+    });
+
+    it("AUXLIVE-5 · a stored audit in which all six categories ran has a full score: partial false, nothing unmeasured", async () => {
+      const id = randomUUID();
+      await db.query(
+        `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, rule_version, tokenizer, status, aux_score, score_breakdown, finished_at)
+         VALUES ($1,$2,$3,'scheduled','key_pages','{}','2026.10.1','cl100k','completed',88.5,$4::jsonb,now())`,
+        [id, workspaceId, projectId, JSON.stringify({ crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 0.5, freshness: 1 })],
+      );
+      const audit = await asTenantAudit(id);
+      expect(audit).toMatchObject({ aux_score: 88.5, score_partial: false, unmeasured_categories: [] });
+    });
+
+    async function asTenantAudit(id?: string) {
+      const c = new Client({ connectionString: container.getConnectionUri() });
+      await c.connect();
+      try {
+        const target = id ?? (await audits()).at(-1).id;
+        return await withTenantContext(c as never, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => new AuxService().getAudit(target));
+      } finally {
+        await c.end();
+      }
+    }
+  });
+
+  describe("AUXLIVE review round 1 · a manual audit's charge and its job's fate", () => {
+    const wallet = async () => {
+      const r = (await db.query("SELECT included_balance FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0];
+      return Number(r.included_balance);
+    };
+    const refunds = async () => (await db.query("SELECT credits::int AS credits FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'refund'", [workspaceId])).rows;
+    async function charged(): Promise<string> {
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+         VALUES ($1,100,(now() AT TIME ZONE 'UTC')::date,(now() AT TIME ZONE 'UTC')::date + 30)`,
+        [workspaceId],
+      );
+      const auditId = randomUUID();
+      const { debitInTransaction } = await import("../../src/lib/credits/debit.js");
+      await db.query("BEGIN");
+      await debitInTransaction(db as never, {
+        workspaceId, actorId: null, actorType: "system", actionCode: "aux_manual", credits: 10, idempotencyKey: ["aux_audit", auditId].join(":"),
+        projectId, referenceType: "aux_audit", referenceId: auditId, includedGrant: 0,
+      });
+      await db.query("COMMIT");
+      await db.query(
+        `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, rule_version, tokenizer, status)
+         VALUES ($1,$2,$3,'manual','key_pages','{}','2026.10.1','cl100k','queued')`,
+        [auditId, workspaceId, projectId],
+      );
+      return auditId;
+    }
+    const manualJob = (auditId: string): Job => job({ trigger: "manual", auditId, scope: "key_pages" });
+    const runTx = async (j: Job, deps: CrawlAuditDeps): Promise<void> => {
+      await db.query("BEGIN");
+      try {
+        await run(j, deps);
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK");
+        throw error;
+      }
+    };
+    const recoverTx = async (auditId: string, attemptsMade: number, trigger = "manual"): Promise<boolean> => {
+      const processor = createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(healthy(OPEN)));
+      const phases = phasesOf(processor)!;
+      const j = { data: { payload: { projectId, auditId, trigger, workspaceId, kid: "k1", scope: "key_pages" } }, attemptsMade, opts: { attempts: 5 } } as unknown as Job;
+      await db.query("BEGIN");
+      try {
+        const settled = await phases.recover!(db as never, j, { phase: "run", error: new Error("boom") });
+        await db.query("COMMIT");
+        return settled;
+      } catch (error) {
+        await db.query("ROLLBACK");
+        throw error;
+      }
+    };
+
+    it("AUXLIVE-3 review · a COMPLETED, charged manual audit redelivered after its project is deleted is NOT refunded: the work was delivered", async () => {
+      const auditId = await charged();
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
+      expect((await audits())[0].status).toBe("completed");
+      await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projectId]);
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
+      expect((await audits())[0].status).toBe("completed");
+      expect(await refunds()).toEqual([]);
+      expect(await wallet()).toBe(90);
+    });
+
+    it("AUXLIVE-3 review · a queued manual audit whose project was deleted is still failed and refunded (the row did move)", async () => {
+      const auditId = await charged();
+      await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projectId]);
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
+      expect((await audits())[0].status).toBe("failed");
+      expect(await refunds()).toHaveLength(1);
+    });
+
+    it("AUXLIVE-3 review · the job's LAST attempt failing settles a manual audit still queued: failed (job_failed), refunded in full, and the job ends instead of dead-lettering", async () => {
+      const auditId = await charged();
+      expect(await recoverTx(auditId, 4)).toBe(true);
+      const [a] = await audits();
+      expect(a).toMatchObject({ id: auditId, status: "failed" });
+      expect(a.error_summary).toEqual({ reason: "job_failed" });
+      expect(a.finished_at).not.toBeNull();
+      expect(await refunds()).toEqual([{ credits: 10 }]);
+      expect(await wallet()).toBe(100);
+    });
+
+    it("AUXLIVE-3 review · an earlier attempt failing settles nothing: the retry ladder still has a chance, and the credits stay taken", async () => {
+      const auditId = await charged();
+      expect(await recoverTx(auditId, 1)).toBe(false);
+      expect((await audits())[0].status).toBe("queued");
+      expect(await refunds()).toEqual([]);
+    });
+
+    it("AUXLIVE-3 review · a last-attempt failure after the audit was already delivered refunds nothing and leaves the job to the queue", async () => {
+      const auditId = await charged();
+      await runTx(manualJob(auditId), depsServing(healthy(OPEN)));
+      expect(await recoverTx(auditId, 4)).toBe(false);
+      expect((await audits())[0].status).toBe("completed");
+      expect(await refunds()).toEqual([]);
+    });
+
+    it("AUXLIVE-3 review · an ONBOARDING job failing on its last attempt has no charge and no row to settle: the failure goes to the queue", async () => {
+      expect(await recoverTx(randomUUID(), 4, "onboarding")).toBe(false);
+    });
+
+    it("AUXLIVE-3 review · recovering twice refunds once", async () => {
+      const auditId = await charged();
+      await recoverTx(auditId, 4);
+      await recoverTx(auditId, 4);
+      expect(await refunds()).toHaveLength(1);
     });
   });
 

@@ -449,6 +449,32 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
   });
 
+  // review round 1 (major): Free has no AUX audits (plans-and-entitlements.md: aux.scheduled_audits is false), so its first scan crawls nothing. "Free
+  // of credits" is not "free to the Free tier".
+  it("AUXLIVE-1 AC10 · a Free workspace's first scan enqueues NO onboarding audit (aux.scheduled_audits is off): the plan, and the scan, still go ahead", async () => {
+    await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [wsA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toEqual([]);
+    // nothing about the audit is left behind either: no row, no ledger entry
+    expect((await db.query("SELECT 1 FROM aux_audits WHERE project_id = $1", [projA])).rowCount).toBe(0);
+    expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
+    // and the project WAS claimed and planned (the skip is the entitlement's, not the claim's)
+    expect((await db.query("SELECT next_run_at > now() AS moved FROM projects WHERE id = $1", [projA])).rows[0].moved).toBe(true);
+  });
+
+  it("AUXLIVE-1 AC10 · every plan that includes AUX audits gets the onboarding audit: starter, growth and business", async () => {
+    for (const plan of ["starter", "growth", "business"]) {
+      audits.length = 0;
+      await db.query("UPDATE workspaces SET plan_key = $2 WHERE id = $1", [wsA, plan]);
+      await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' WHERE id = $1", [projA]);
+      await db.query("DELETE FROM aux_audits WHERE project_id = $1", [projA]);
+      await processor()(signedJob(wsA, projA));
+      await settle();
+      expect(audits, plan).toHaveLength(1);
+    }
+  });
+
   it("AUXLIVE-1 AC2 · the audit id is deterministic per project and differs between projects, and parses as a UUID the job contract accepts", async () => {
     const { crawlAuditJobPayloadSchema } = await import("../../contracts/aux/index.js");
     expect(onboardingAuditId(projA)).toBe(onboardingAuditId(projA));

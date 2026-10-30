@@ -5,7 +5,9 @@ import type { CrawlManifest } from "../../../contracts/aux/index.js";
 import { CATALOG } from "../../../test/support/aux-rules.js";
 import { makeDoc } from "../../../test/support/aux-document.js";
 import { evaluablePageRules, pageFindingFingerprint, runPageRules } from "./page-rules.js";
+import { AuxRuleConfigError } from "./rules/engine.js";
 import { AUX_RULES } from "./rules/index.js";
+import type { AuxRule } from "./rules/types.js";
 
 // STORY-051 AC13 / STORY-052 AC1, AC9 - the page rule engine over a crawl's stored pages: which rules could be decided on which
 // page, which findings came out, and which pages could not be modelled.
@@ -178,3 +180,43 @@ describe("STORY-052 AC4 · pageFindingFingerprint: identity over rule, URL and w
   });
 });
 
+describe("AUXLIVE-2 review round 1 · a rule that crashes on one page does not fail the audit", () => {
+  const explodes = (onTitle: string): AuxRule => ({
+    ...AUX_RULES.find((r) => r.code === "AUX-R-008")!,
+    run: (doc) => {
+      if (doc.meta.title === onTitle) throw new Error("markup the rule cannot handle");
+      return [];
+    },
+  });
+  const rulesWith = (bad: AuxRule): readonly AuxRule[] => AUX_RULES.map((r) => (r.code === bad.code ? bad : r));
+
+  it("AUXLIVE-2 · a rule that throws on ONE of two pages: that page is reported unmodelled (rule_error, with the rule code), the other is evaluated and keeps its findings", async () => {
+    const f = fixture([
+      { url: "https://acme.com/bad", raw: GOOD.replace("<title>Acme</title>", "<title>Bad</title>") },
+      { url: "https://acme.com/", raw: BROKEN_JSONLD },
+    ]);
+    const bad = explodes("Bad");
+    // The good page's own AUX-R-008 finding must survive: use the real rule there, the crashing one only where the title says so.
+    const real = AUX_RULES.find((r) => r.code === "AUX-R-008")!;
+    const mixed: AuxRule = { ...real, run: (doc, thresholds) => (doc.meta.title === "Bad" ? bad.run(doc, thresholds) : real.run(doc, thresholds)) };
+    const out = await runPageRules(f.pages, f.read, CATALOG, { projectId: PROJECT_ID }, rulesWith(mixed));
+    expect(out.unmodelled).toEqual([{ url: "https://acme.com/bad", reason: "rule_error:AUX-R-008" }]);
+    expect(out.evaluated.has("https://acme.com/bad")).toBe(false);
+    expect(out.evaluated.has("https://acme.com/")).toBe(true);
+    expect(out.findings.some((x) => x.rule_code === "AUX-R-008" && x.url === "https://acme.com/")).toBe(true);
+    expect(out.findings.some((x) => x.url === "https://acme.com/bad")).toBe(false);
+  });
+
+  it("AUXLIVE-2 · the reason carries the rule code only: never the error's text or the page's content", async () => {
+    const f = fixture([{ url: "https://acme.com/bad", raw: GOOD.replace("<title>Acme</title>", "<title>Bad</title>") }]);
+    const out = await runPageRules(f.pages, f.read, CATALOG, { projectId: PROJECT_ID }, rulesWith(explodes("Bad")));
+    expect(JSON.stringify(out.unmodelled)).not.toContain("markup the rule cannot handle");
+    expect(JSON.stringify(out.unmodelled)).not.toContain("Bad</");
+  });
+
+  it("AUXLIVE-2 · a rule CONFIGURATION fault stays fail-closed: it fails the whole evaluation, it is not turned into an unmodelled page", async () => {
+    const f = fixture([{ url: "https://acme.com/", raw: GOOD }]);
+    const noCatalogRow: AuxRule = { ...AUX_RULES.find((r) => r.code === "AUX-R-008")!, code: "AUX-R-999" };
+    await expect(runPageRules(f.pages, f.read, CATALOG, { projectId: PROJECT_ID }, [...AUX_RULES, noCatalogRow])).rejects.toBeInstanceOf(AuxRuleConfigError);
+  });
+});

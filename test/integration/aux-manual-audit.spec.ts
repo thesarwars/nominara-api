@@ -8,6 +8,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { auxAuditPrice } from "../../src/lib/aux/audit-price.js";
 import type { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { AuxService } from "../../src/modules/aux/aux.service.js";
+import { reapStaleManualAudits, MANUAL_AUDIT_STALE_AFTER_MINUTES } from "../../src/lib/aux/stale-audit-reaper.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { refundAuxAuditCharge } from "../../src/lib/credits/aux-audit-refund.js";
 
@@ -97,8 +98,18 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
       c.release();
     }
   }
-  const trigger = (body: Parameters<AuxService["triggerAudit"]>[1] = {}, project = projectId) =>
-    asTenant(() => service().triggerAudit(project, body, { id: actorId, type: "user" }));
+  // Owner decision 39: a priced action takes the caller's Idempotency-Key (the audit's identity) and the figure it was shown (X-Nominara-Confirmed-Credits).
+  const trigger = (
+    body: Parameters<AuxService["triggerAudit"]>[1] = {},
+    project = projectId,
+    options: { idempotencyKey?: string; confirmedCredits?: string | undefined } = {},
+  ) =>
+    asTenant(() =>
+      service().triggerAudit(project, body, { id: actorId, type: "user" }, {
+        idempotencyKey: options.idempotencyKey ?? randomUUID(),
+        confirmedCredits: "confirmedCredits" in options ? options.confirmedCredits : "10",
+      }),
+    );
   const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 60));
   const codeOf = (e: unknown): string | undefined => (e as { code?: string }).code;
 
@@ -158,11 +169,138 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
     expect(res.pricing.pages_priced).toBe(1);
   });
 
-  it("AUXLIVE-3 AC5 · the same request twice is two audits and two charges here (replay protection is the Idempotency-Key interceptor's, proven over HTTP)", async () => {
+  it("AUXLIVE-3 AC5 · the same Idempotency-Key twice is ONE audit and ONE charge, from the database alone - no interceptor, no cache in this test - and the second answer is the first", async () => {
+    const key = randomUUID();
+    const first = await trigger({}, projectId, { idempotencyKey: key });
+    const second = await trigger({}, projectId, { idempotencyKey: key });
+    expect(second).toEqual(first);
+    expect(await wallet()).toMatchObject({ included: 90, spent: 10 });
+    expect(await audits()).toHaveLength(1);
+    expect((await ledger()).filter((r) => r.entry_type === "commit")).toHaveLength(1);
+    await settle();
+    // the replay does not queue a second job either
+    expect(enqueued).toHaveLength(1);
+  });
+
+  it("AUXLIVE-3 AC5 · the replayed answer needs no fresh price check: a retry of a SUCCEEDED request is not turned into price_changed by a price that moved since", async () => {
+    const key = randomUUID();
+    const first = await trigger({}, projectId, { idempotencyKey: key });
+    const replay = await trigger({}, projectId, { idempotencyKey: key, confirmedCredits: "999" });
+    expect(replay).toEqual(first);
+  });
+
+  it("AUXLIVE-3 AC5 · the same key with a DIFFERENT body is 409 idempotency_conflict and charges nothing more", async () => {
+    const key = randomUUID();
+    await trigger({}, projectId, { idempotencyKey: key });
+    const err = await trigger({ scope: "sitemap_sample" }, projectId, { idempotencyKey: key }).then(() => null, (e: unknown) => e);
+    expect(codeOf(err)).toBe("idempotency_conflict");
+    expect(await audits()).toHaveLength(1);
+    expect(await wallet()).toMatchObject({ included: 90 });
+  });
+
+  it("AUXLIVE-3 AC5 · two DIFFERENT keys are two audits and two charges; another workspace's identical key is a different audit", async () => {
     await trigger();
     await trigger();
     expect(await wallet()).toMatchObject({ included: 80 });
     expect(new Set((await audits()).map((a) => a.id)).size).toBe(2);
+  });
+
+  it("AUXLIVE-3 AC5 · the audit id and the ledger key are the derived ones, so the DATABASE refuses a replay: the audit id is manualAuditIdentity(workspace, key)", async () => {
+    const key = randomUUID();
+    const res = await trigger({}, projectId, { idempotencyKey: key });
+    const { manualAuditIdentity } = await import("../../src/lib/aux/manual-audit-id.js");
+    const derived = manualAuditIdentity(workspaceId, key);
+    expect(res.audit_id).toBe(derived.auditId);
+    expect((await ledger()).filter((r) => r.entry_type === "commit")[0]!.idempotency_key).toBe(derived.ledgerKey);
+  });
+
+  it("AUXLIVE-3 AC5 · twenty CONCURRENT attempts with ONE key (a client retrying while the first is still in flight) charge once and all get the same answer", async () => {
+    const key = randomUUID();
+    const settled = await Promise.allSettled(Array.from({ length: 20 }, () => trigger({}, projectId, { idempotencyKey: key })));
+    const answers = settled.map((r) => (r.status === "fulfilled" ? r.value : r.reason));
+    for (const a of answers) expect(a).toMatchObject({ status: "queued", credits_charged: 10 });
+    expect(new Set(answers.map((a) => (a as { audit_id: string }).audit_id)).size).toBe(1);
+    expect(await audits()).toHaveLength(1);
+    expect(await wallet()).toMatchObject({ included: 90, spent: 10 });
+    expect((await ledger()).filter((r) => r.entry_type === "commit")).toHaveLength(1);
+  });
+
+  it("AUXLIVE-3 AC13 · twenty concurrent attempts against a wallet of 50: exactly 5 succeed, 15 are 402, the balance is 0, and there are 5 audits and 5 commits", async () => {
+    await seed("starter", 50);
+    const settled = await Promise.allSettled(Array.from({ length: 20 }, () => trigger()));
+    expect(settled.filter((r) => r.status === "fulfilled")).toHaveLength(5);
+    const refused = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(refused).toHaveLength(15);
+    for (const r of refused) expect(codeOf(r.reason)).toBe("insufficient_credits");
+    expect(await wallet()).toMatchObject({ included: 0, reserved: 0, spent: 50 });
+    expect(await audits()).toHaveLength(5);
+    expect((await ledger()).filter((r) => r.entry_type === "commit")).toHaveLength(5);
+  });
+
+  // ---- owner decision 39: the priced-action flow (api-specification.md sections 1 and 7) ----
+
+  it("AUXLIVE-3 AC14 · no X-Nominara-Confirmed-Credits is 400 validation_failed NAMING the header: nothing charged, written or queued", async () => {
+    const err = await trigger({}, projectId, { confirmedCredits: undefined }).then(() => null, (e: unknown) => e);
+    expect(codeOf(err)).toBe("validation_failed");
+    expect(JSON.stringify(err)).toContain("x-nominara-confirmed-credits");
+    expect(await audits()).toEqual([]);
+    expect(await ledger()).toEqual([]);
+    await settle();
+    expect(enqueued).toEqual([]);
+  });
+
+  it("AUXLIVE-3 AC14 · a malformed header (not a whole number) is 400, and a blank one is the same as absent", async () => {
+    for (const bad of ["ten", "1e1", "10abc", "-10", "10.0", ""]) {
+      const err = await trigger({}, projectId, { confirmedCredits: bad }).then(() => null, (e: unknown) => e);
+      expect(codeOf(err), bad).toBe("validation_failed");
+    }
+    expect(await ledger()).toEqual([]);
+  });
+
+  it("AUXLIVE-3 AC14 · a figure that does not match the price recomputed now is 409 price_changed with shown, recomputed and a reason - BEFORE any money moves", async () => {
+    for (const shown of ["9", "11", "0"]) {
+      const err = await trigger({}, projectId, { confirmedCredits: shown }).then(() => null, (e: unknown) => e);
+      expect(codeOf(err), shown).toBe("price_changed");
+      expect((err as { details?: Record<string, unknown> }).details).toMatchObject({ shown: Number(shown), recomputed: 10 });
+      expect(typeof (err as { details?: { reason?: unknown } }).details?.reason).toBe("string");
+    }
+    expect(await audits()).toEqual([]);
+    expect(await ledger()).toEqual([]);
+    expect(await wallet()).toMatchObject({ included: 100, reserved: 0, spent: 0 });
+  });
+
+  it("AUXLIVE-3 AC14 · the price is checked BEFORE the wallet: a mismatch on an empty wallet is price_changed, not insufficient_credits", async () => {
+    await seed("starter", 0);
+    const err = await trigger({}, projectId, { confirmedCredits: "7" }).then(() => null, (e: unknown) => e);
+    expect(codeOf(err)).toBe("price_changed");
+  });
+
+  it("AUXLIVE-3 AC14 · a matching figure is charged; a single-URL audit is also 10, so 10 is the figure it must echo", async () => {
+    await expect(trigger({ scope: "single_url", target_urls: ["https://acme.com/pricing"] }, projectId, { confirmedCredits: "10" })).resolves.toMatchObject({ credits_charged: 10 });
+  });
+
+  it("AUXLIVE-3 AC15 · the PREVIEW quotes the price and its breakdown and changes nothing: no ledger entry, no audit row, no job, no reservation", async () => {
+    const quote = await asTenant(() => service().previewAudit(projectId, {}));
+    expect(quote).toEqual({ credits: 10, requested_scope: "key_pages", pricing: { pages_priced: 25, base_credits: 10, base_page_band: 25, extra_page_credits: 1 }, credits_charged: 0 });
+    const single = await asTenant(() => service().previewAudit(projectId, { scope: "single_url", target_urls: ["https://acme.com/a"] }));
+    expect(single).toMatchObject({ credits: 10, pricing: { pages_priced: 1 } });
+    expect(await ledger()).toEqual([]);
+    expect(await audits()).toEqual([]);
+    expect(await wallet()).toMatchObject({ included: 100, reserved: 0, spent: 0 });
+    await settle();
+    expect(enqueued).toEqual([]);
+  });
+
+  it("AUXLIVE-3 AC15 · the preview quotes the same figure the trigger demands: echoing it is accepted", async () => {
+    const quote = await asTenant(() => service().previewAudit(projectId, {}));
+    await expect(trigger({}, projectId, { confirmedCredits: String(quote.credits) })).resolves.toMatchObject({ credits_charged: quote.credits });
+  });
+
+  it("AUXLIVE-3 AC15 · the preview is refused for a plan with no AUX audits (403 feature_not_in_plan) and for a project that is not the caller's (404), like the trigger", async () => {
+    await seed("free", 60);
+    expect(codeOf(await asTenant(() => service().previewAudit(projectId, {})).then(() => null, (e: unknown) => e))).toBe("feature_not_in_plan");
+    await seed("starter", 60);
+    expect(codeOf(await asTenant(() => service().previewAudit(randomUUID(), {})).then(() => null, (e: unknown) => e))).toBe("not_found");
   });
 
   it("AUXLIVE-3 AC6 · a wallet that cannot cover it is 402 insufficient_credits: no audit row, no ledger entry, nothing enqueued", async () => {
@@ -281,5 +419,92 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
     expect(await wallet()).toMatchObject({ included: 0, purchased: 14 });
     await withTx((tx) => refundAuxAuditCharge(tx, { workspaceId, auditId: res.audit_id, reason: "audit_failed" }));
     expect(await wallet()).toMatchObject({ included: 4, purchased: 20 });
+  });
+
+  // ---- owner decision 40: the 60-minute reaper for a manual audit whose job never finished ----
+
+  describe("AUXLIVE-3 AC16 · the stale manual-audit reaper", () => {
+    const age = (id: string, minutes: number, status = "queued"): Promise<unknown> =>
+      db.query("UPDATE aux_audits SET created_at = now() - make_interval(mins => $2), status = $3 WHERE id = $1", [id, minutes, status]);
+    const refunds = async () => (await ledger()).filter((r) => r.entry_type === "refund");
+
+    it("AUXLIVE-3 AC16 · the bound is 60 minutes (owner decision 40)", () => {
+      expect(MANUAL_AUDIT_STALE_AFTER_MINUTES).toBe(60);
+    });
+
+    it("AUXLIVE-3 AC16 · a manual audit still queued after 61 minutes is failed (stale) and refunded in full to the buckets it came from", async () => {
+      const res = await trigger();
+      await age(res.audit_id, 61);
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 1 });
+      const [a] = await audits();
+      expect(a).toMatchObject({ id: res.audit_id, status: "failed" });
+      expect(a.error_summary).toEqual({ reason: "stale" });
+      expect(a.finished_at).not.toBeNull();
+      expect(await wallet()).toMatchObject({ included: 100, reserved: 0 });
+      expect(await refunds()).toHaveLength(1);
+    });
+
+    it("AUXLIVE-3 AC16 · a manual audit still RUNNING after 61 minutes is reaped too", async () => {
+      const res = await trigger();
+      await age(res.audit_id, 61, "running");
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 1 });
+      expect((await audits())[0].status).toBe("failed");
+      expect(await wallet()).toMatchObject({ included: 100 });
+    });
+
+    it("AUXLIVE-3 AC16 · boundary: 59 minutes is left alone", async () => {
+      const res = await trigger();
+      await age(res.audit_id, 59);
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 0 });
+      expect((await audits())[0].status).toBe("queued");
+      expect(await wallet()).toMatchObject({ included: 90 });
+    });
+
+    it("AUXLIVE-3 AC16 · only QUEUED/RUNNING manual audits: a finished one keeps its charge, and an onboarding audit (no charge) is not this reaper's", async () => {
+      const done = await trigger();
+      await age(done.audit_id, 500, "completed");
+      const partial = await trigger();
+      await age(partial.audit_id, 500, "partial");
+      await db.query(
+        `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, rule_version, tokenizer, status, created_at)
+         VALUES ($1,$2,$3,'onboarding','public_surface','{}','2026.10.1','cl100k','queued', now() - interval '5 hours')`,
+        [randomUUID(), workspaceId, projectId],
+      );
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 0 });
+      expect(await refunds()).toEqual([]);
+      expect(await wallet()).toMatchObject({ included: 80 });
+    });
+
+    it("AUXLIVE-3 AC16 · idempotent: a second pass refunds nothing more, and a refund already made (the job failed it first) is not repeated", async () => {
+      const res = await trigger();
+      await age(res.audit_id, 120);
+      await reapStaleManualAudits(db, new Date());
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 0 });
+      expect(await refunds()).toHaveLength(1);
+      expect(await wallet()).toMatchObject({ included: 100 });
+    });
+
+    it("AUXLIVE-3 AC16 · one tenant's stale audits are settled in THEIR OWN context: two workspaces, each refunded to its own wallet", async () => {
+      const first = await trigger();
+      await age(first.audit_id, 90);
+      const firstWorkspace = workspaceId;
+      const firstProject = projectId;
+      // a second workspace with its own funded wallet and a stale charged audit
+      const otherWs = randomUUID();
+      await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'O',$2,'starter','UTC')", [otherWs, `w-${randomUUID().slice(0, 8)}`]);
+      const otherProject = randomUUID();
+      await db.query("INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status, cadence) VALUES ($1,$2,'O',$3,'https://o.test','o.test','active','weekly')", [otherProject, otherWs, `p-${randomUUID().slice(0, 8)}`]);
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end) VALUES ($1,100,(now() AT TIME ZONE 'UTC')::date,(now() AT TIME ZONE 'UTC')::date + 30)`,
+        [otherWs],
+      );
+      const second = await asTenant(() => service().triggerAudit(otherProject, {}, { id: actorId, type: "user" }, { idempotencyKey: randomUUID(), confirmedCredits: "10" }), otherWs);
+      await age(second.audit_id, 90);
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 2 });
+      const balances = (await db.query("SELECT workspace_id, included_balance::int AS b FROM credit_wallets ORDER BY b")).rows;
+      expect(balances.map((r) => r.b)).toEqual([100, 100]);
+      expect(new Set(balances.map((r) => r.workspace_id))).toEqual(new Set([firstWorkspace, otherWs]));
+      expect(firstProject).toBeDefined();
+    });
   });
 });

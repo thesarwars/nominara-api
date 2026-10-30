@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Redis } from "ioredis";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -81,11 +82,13 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
     return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
 
-  const headers = (a: Actor, key: string | null = randomUUID()): Record<string, string> => ({
+  const headers = (a: Actor, key: string | null = randomUUID(), confirmed: string | null = "10"): Record<string, string> => ({
     cookie: a.cookie,
     [CSRF_HEADER_NAME]: a.csrf,
     "content-type": "application/json",
     ...(key === null ? {} : { "idempotency-key": key }),
+    // Owner decision 39: the figure the operator was shown. Every priced POST carries it; a test of the header itself passes null or another figure.
+    ...(confirmed === null ? {} : { "x-nominara-confirmed-credits": confirmed }),
   });
   const errorOf = (res: { json(): unknown }) => (res.json() as { error: { code: string; details?: Record<string, unknown> } }).error;
   async function project(a: Actor): Promise<string> {
@@ -104,8 +107,10 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
       [a.workspaceId, credits],
     );
   }
-  const post = (a: Actor, projectId: string, payload: unknown = {}, key: string | null = randomUUID()) =>
-    harness.app().inject({ method: "POST", url: apiUrl(`/projects/${projectId}/aux-audits`), headers: headers(a, key), payload: payload as object });
+  const post = (a: Actor, projectId: string, payload: unknown = {}, key: string | null = randomUUID(), confirmed: string | null = "10") =>
+    harness.app().inject({ method: "POST", url: apiUrl(`/projects/${projectId}/aux-audits`), headers: headers(a, key, confirmed), payload: payload as object });
+  const preview = (a: Actor, projectId: string, payload: unknown = {}) =>
+    harness.app().inject({ method: "POST", url: apiUrl(`/projects/${projectId}/aux-audits/preview`), headers: headers(a, null, null), payload: payload as object });
   const debits = async (a: Actor): Promise<number> =>
     (await harness.db().query("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit'", [a.workspaceId])).rows[0].n;
   const auditRows = async (a: Actor): Promise<number> =>
@@ -223,5 +228,82 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
     const res = await post(a, theirs);
     expect([403, 404], res.body).toContain(res.statusCode);
     expect(await debits(a)).toBe(0);
+  }, 90_000);
+
+  it("AUXLIVE-3 H9 · no X-Nominara-Confirmed-Credits is 400 validation_failed naming the header; nothing is charged, written or queued", async () => {
+    const a = await owner("starter");
+    await fund(a);
+    const projectId = await project(a);
+    const enqueue = vi.spyOn(harness.app().get(QueueProducer), "enqueueTenantJob");
+    const res = await post(a, projectId, {}, randomUUID(), null);
+    expect(res.statusCode, res.body).toBe(400);
+    expect(errorOf(res).code).toBe("validation_failed");
+    expect(res.body).toContain("x-nominara-confirmed-credits");
+    expect(await debits(a)).toBe(0);
+    expect(await auditRows(a)).toBe(0);
+    expect(enqueue.mock.calls.filter((c) => c[0] === "crawl.audit")).toHaveLength(0);
+  }, 90_000);
+
+  it("AUXLIVE-3 H10 · a figure that does not match the price is 409 price_changed with shown and recomputed; the same request with the matching figure is 202", async () => {
+    const a = await owner("starter");
+    await fund(a);
+    const projectId = await project(a);
+    const wrong = await post(a, projectId, {}, randomUUID(), "35");
+    expect(wrong.statusCode, wrong.body).toBe(409);
+    expect(errorOf(wrong).code).toBe("price_changed");
+    expect(errorOf(wrong).details).toMatchObject({ shown: 35, recomputed: 10 });
+    expect(await debits(a)).toBe(0);
+    expect(await auditRows(a)).toBe(0);
+    const right = await post(a, projectId, {}, randomUUID(), "10");
+    expect(right.statusCode, right.body).toBe(202);
+    expect(await debits(a)).toBe(1);
+  }, 90_000);
+
+  it("AUXLIVE-3 H11 · POST .../aux-audits/preview quotes the credits and the pricing breakdown, needs no Idempotency-Key or confirmation, and changes nothing", async () => {
+    const a = await owner("starter");
+    await fund(a);
+    const projectId = await project(a);
+    const enqueue = vi.spyOn(harness.app().get(QueueProducer), "enqueueTenantJob");
+    const res = await preview(a, projectId);
+    expect(res.statusCode, res.body).toBe(200);
+    expect((res.json() as { data: unknown }).data).toEqual({ credits: 10, requested_scope: "key_pages", pricing: { pages_priced: 25, base_credits: 10, base_page_band: 25, extra_page_credits: 1 }, credits_charged: 0 });
+    expect(await debits(a)).toBe(0);
+    expect(await auditRows(a)).toBe(0);
+    expect((await harness.db().query("SELECT included_balance::int AS b FROM credit_wallets WHERE workspace_id = $1", [a.workspaceId])).rows[0].b).toBe(100);
+    expect(enqueue.mock.calls.filter((c) => c[0] === "crawl.audit")).toHaveLength(0);
+  }, 90_000);
+
+  it("AUXLIVE-3 H12 · the preview is the figure the POST accepts, and it needs aux:trigger: a plan with no AUX audits is 403 for both", async () => {
+    const a = await owner("starter");
+    await fund(a);
+    const projectId = await project(a);
+    const quoted = ((await preview(a, projectId)).json() as { data: { credits: number } }).data.credits;
+    expect((await post(a, projectId, {}, randomUUID(), String(quoted))).statusCode).toBe(202);
+    const f = await owner("free");
+    const freeProject = await project(f);
+    const res = await preview(f, freeProject);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(errorOf(res).code).toBe("feature_not_in_plan");
+  }, 90_000);
+
+  it("AUXLIVE-3 H13 · a replay after the cache LOST the idempotency record (eviction under memory pressure) still charges once and queues one audit: the database refuses it", async () => {
+    const a = await owner("starter");
+    await fund(a);
+    const projectId = await project(a);
+    const key = randomUUID();
+    const first = await post(a, projectId, {}, key);
+    expect(first.statusCode, first.body).toBe(202);
+    const cache = new Redis(cacheValkey.url);
+    try {
+      await cache.flushall();
+    } finally {
+      cache.disconnect();
+    }
+    const second = await post(a, projectId, {}, key);
+    expect(second.statusCode, second.body).toBe(202);
+    expect((second.json() as { data: { audit_id: string } }).data.audit_id).toBe((first.json() as { data: { audit_id: string } }).data.audit_id);
+    expect(await debits(a)).toBe(1);
+    expect(await auditRows(a)).toBe(1);
+    expect((await harness.db().query("SELECT included_balance::int AS b FROM credit_wallets WHERE workspace_id = $1", [a.workspaceId])).rows[0].b).toBe(90);
   }, 90_000);
 });
