@@ -8,6 +8,10 @@ import { ConflictError, NotFoundError, type DomainError, PreconditionUnmetError 
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
 import { AUDIT_METADATA_KEY } from "../../api/decorators/audit.decorator.js";
+import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
+import { RATE_LIMIT_CLASS_KEY } from "../../api/rate-limit/route-class.js";
+import { PROJECT_PARAM_KEY } from "../../api/decorators/project-param.decorator.js";
+import { CREDITS_KEY } from "../../api/decorators/credits.decorator.js";
 import { updateAuxFindingRequestSchema } from "../../../contracts/aux/index.js";
 
 // STORY-022 — one compiles-test per scaffolded module.
@@ -166,7 +170,25 @@ describe("NEW-C-10 · controller", () => {
 
   it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the reads and the one finding action (a patch is read, never written, by a client)", () => {
     const routes = Object.getOwnPropertyNames(AuxController.prototype).filter((n) => n !== "constructor").sort();
-    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "updateFinding"]);
+    // + triggerAudit (AUXLIVE-3): it creates an audit, it cannot touch a finding.
+    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "triggerAudit", "updateFinding"]);
+  });
+
+  it("AUXLIVE-3 · POST /projects/{id}/aux-audits requires aux:trigger, is project-scoped, audited, idempotent and in the project_aux_audits rate class (10/hour per user, burst 3)", () => {
+    expect(meta(REQUIRE_PERMISSION_KEY, "triggerAudit")).toBe("aux:trigger");
+    expect(meta(PROJECT_PARAM_KEY, "triggerAudit")).toBe("id");
+    expect(meta(AUDIT_METADATA_KEY, "triggerAudit")).toMatchObject({ action: "aux_audit.triggered", resourceType: "project" });
+    expect(meta(IDEMPOTENT_KEY, "triggerAudit")).toBe(true);
+    expect(meta(RATE_LIMIT_CLASS_KEY, "triggerAudit")).toBe("project_aux_audits");
+    // The price is variable, so the flat-price guard is deliberately not on it: the service debits inline.
+    expect(meta(CREDITS_KEY, "triggerAudit")).toBeUndefined();
+  });
+
+  it("AUXLIVE-3 · the service refuses to charge when it was built without the queue or the pool (fail closed, before any debit)", async () => {
+    const query = vi.fn();
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: "w", actorId: "a" } } as never);
+    await expect(new AuxService().triggerAudit(PROJECT_ID, {}, { id: "a", type: "user" })).rejects.toThrow(/queue producer/);
+    expect(query).not.toHaveBeenCalled();
   });
 });
 

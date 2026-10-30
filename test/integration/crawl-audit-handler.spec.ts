@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { Logger } from "@nestjs/common";
 import { Client, Pool } from "pg";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
@@ -46,8 +47,19 @@ const BLOCKED = "User-agent: GPTBot\nDisallow: /\n";
 const OPEN = "User-agent: *\nAllow: /\nSitemap: https://acme.com/sitemap.xml\n";
 const LLMS = "# Acme\n- [Docs](https://acme.com/docs)\n";
 const SITEMAP = `<urlset><url><loc>https://acme.com/</loc><lastmod>2026-10-01</lastmod></url></urlset>`;
+// STORY-051 AC13: pages are now judged by the page rules, so a "healthy" site needs a page no rule fires on. (The old fixture,
+// `<html><body>home</body></html>`, has no title, no structured data and no heading, and rightly draws findings.)
+const LD = JSON.stringify([
+  { "@context": "https://schema.org", "@type": "Organization", name: "Acme", url: "https://acme.com", logo: "https://acme.com/logo.png", sameAs: ["https://www.linkedin.com/company/acme"], description: "Acme makes widgets." },
+  { "@context": "https://schema.org", "@type": "SoftwareApplication", name: "Acme Widgets", featureList: ["Pipeline analytics", "Workflow automation"], offers: { "@type": "Offer", price: "47.00", priceCurrency: "USD" }, aggregateRating: { "@type": "AggregateRating", ratingValue: "4.6", reviewCount: "120" }, dateModified: "2026-10-01" },
+]);
+const pageWith = (extraHead: string): string =>
+  `<!doctype html><html lang="en"><head><title>Acme Widgets</title><meta name="description" content="Acme Widgets pipeline analytics."><link rel="canonical" href="https://acme.com/"><meta property="article:modified_time" content="2026-10-01"><script type="application/ld+json">${LD}</script>${extraHead}</head><body><main><h1>Acme Widgets</h1><p>Acme Widgets starts at $47 per month. Rated 4.6/5 from 120 reviews.</p><h2>Pipeline analytics</h2><p>See every deal.</p><h2>Workflow automation</h2><p>Automate follow-ups.</p><p>Last updated: 2026-10-01</p></main></body></html>`;
+const HEALTHY_PAGE = pageWith("");
+// A second JSON-LD block that is not JSON: AUX-R-008, critical, in structured_data - and nothing else fires, because the first block is sound.
+const BROKEN_PAGE = pageWith('<script type="application/ld+json">{ "@context": "https://schema.org", "@type": }</script>');
 const healthy = (robots: string): Served => ({
-  "/": { status: 200, body: "<html><body>home</body></html>" },
+  "/": { status: 200, body: HEALTHY_PAGE },
   "/robots.txt": { status: 200, body: robots },
   "/llms.txt": { status: 200, body: LLMS },
   "/.well-known/llms.txt": { status: 404, body: "" },
@@ -68,7 +80,9 @@ function depsServing(served: Served, requested: string[] = [], timeoutMs = 10_00
     nowMs: () => clockMs,
     sleep: async (ms: number) => { sleeps.push(ms); clockMs += ms; },
     timeoutMs,
-    renderer: { render: async (url) => { rendered.push(url); return { html: `<html>rendered ${url}</html>`, finalUrl: url, status: 200 }; } },
+    // The renderer returns what the site serves for that path (a page that renders to itself): STORY-051 AC13 judges the rendered copy against the
+    // plain one, and a stub that renders to something else would make every "healthy" site look like a client-side-rendered one.
+    renderer: { render: async (url) => { rendered.push(url); const hit = served[new URL(url).pathname]; const html = hit === undefined || hit === "throw" || hit === "hang" ? `<html>rendered ${url}</html>` : (hit.body ?? ""); return { html, finalUrl: url, status: 200 }; } },
     store: async (relative, body) => { stored.set(relative, body); return `crawl/test/ws/${relative}`; },
     ...extra,
     // Behaves like guardedFetch for redirects: a 3xx is followed (and the next request recorded) unless the caller's
@@ -188,21 +202,21 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(a.finished_at).not.toBeNull();
   });
 
-  it("NEW-C-9 AC2.2 · excluded_rules names every rule that did not run: 27 outside crawler_access, AUX-R-005 and AUX-R-006 (the page-level rules wait for STORY-051)", async () => {
+  it("NEW-C-9 AC2.2 · excluded_rules names every rule that did not run: AUX-R-005, 013, 028, 031-034 and, with no measured timing, AUX-R-029 (the page rules that ran are no longer named: STORY-051 AC13)", async () => {
     await run(job(), depsServing(healthy(OPEN)));
     const [a] = await audits();
     const excluded: string[] = a.excluded_rules;
     const codes = excluded.filter((e) => e.startsWith("AUX-R-"));
-    expect(codes).toHaveLength(29);
-    for (const ran of ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"]) expect(excluded).not.toContain(ran);
+    expect(codes).toHaveLength(8);
+    for (const ran of ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007", "AUX-R-006", "AUX-R-008"]) expect(excluded).not.toContain(ran);
     expect(excluded).toContain("AUX-R-005");
-    expect(excluded).toContain("AUX-R-006");
-    expect(excluded).toContain("AUX-R-008");
+    expect(excluded).toContain("AUX-R-013");
+    expect(excluded).toContain("AUX-R-029");
     expect(excluded).toContain("AUX-R-034");
     expect(excluded).not.toContain("page_crawl"); // a page WAS crawled: naming it as not run would be false
   });
 
-  it("NEW-C-9 AC5.1 · publishes the crawler_access subscore, no aux_score; a critical finding sets the capped flag", async () => {
+  it("NEW-C-9 AC5.1 · publishes the crawler_access subscore, no aux_score (entity_clarity has no evaluated rule); a critical finding sets the capped flag", async () => {
     await run(job(), depsServing(healthy(BLOCKED)));
     const [a] = await audits();
     expect(a.aux_score).toBeNull();
@@ -291,8 +305,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(await audits()).toHaveLength(0);
   });
 
-  it("NEW-C-9 AC1.7 · a trigger outside onboarding/scheduled is refused at the boundary", async () => {
-    await expect(run(job({ trigger: "manual" }), depsServing(healthy(OPEN)))).rejects.toThrow();
+  it("NEW-C-9 AC1.7 · a trigger outside onboarding/scheduled/manual (post_fix is not produced yet) is refused at the boundary", async () => {
+    await expect(run(job({ trigger: "post_fix" }), depsServing(healthy(OPEN)))).rejects.toThrow();
     await expect(run(job({ extra: 1 }), depsServing(healthy(OPEN)))).rejects.toThrow();
   });
 
@@ -312,8 +326,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   const withSitemap = (xml: string, robots = OPEN): Served => ({
     ...healthy(robots),
     "/sitemap.xml": { status: 200, body: xml },
-    "/pricing": { status: 200, body: "<html>pricing</html>" },
-    "/about": { status: 200, body: "<html>about</html>" },
+    "/pricing": { status: 200, body: HEALTHY_PAGE },
+    "/about": { status: 200, body: HEALTHY_PAGE },
   });
   const manifestOf = async (): Promise<ReturnType<typeof crawlManifestSchema.parse>> => {
     const [a] = await audits();
@@ -331,7 +345,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(requested).not.toContain("https://acme.com/pricing");
     expect(requested).not.toContain("https://acme.com/about");
     expect(a.target_urls).toContain("https://acme.com/");
-    expect(a.excluded_rules).toContain("AUX-R-008");
+    expect(a.excluded_rules).toContain("AUX-R-005");
   });
 
   it("STORY-049 AC8 (owner decision 2026-10-22) · an unverified domain's audit sends every request as NominaraBot and under no other crawler's name", async () => {
@@ -381,7 +395,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     const page = m.pages.find((p) => p.url === "https://acme.com/pricing")!;
     expect(page.outcome).toBe("ok");
     const rawKey = page.raw!.object_key.replace("crawl/test/ws/", "");
-    expect(gunzipSync(stored.get(rawKey)!).toString()).toBe("<html>pricing</html>");
+    expect(gunzipSync(stored.get(rawKey)!).toString()).toBe(HEALTHY_PAGE);
     expect(m.sitemap).toMatchObject({ files_fetched: 1, total_seen: 3 });
   });
 
@@ -914,6 +928,19 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(calls[0]!.key).toBe(`taskgen:${projectId}:${f.rule_code}:${Buffer.from(f.fingerprint).toString("hex")}`);
     });
 
+    it("STORY-052 AC10 (AUXLIVE-2) · a NEW page finding at or above its rule's task threshold enqueues task.generate after commit, keyed by rule and fingerprint; a re-detection enqueues nothing", async () => {
+      const enqueued: { key: string; payload: unknown }[] = [];
+      const enqueueTaskGenerate: Enqueue = async (_workspace, payload, key) => { enqueued.push({ key, payload }); };
+      const broken: Served = { ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } };
+      await runAsTenant(broken, { enqueueTaskGenerate });
+      await new Promise((r) => setTimeout(r, 20));
+      const [f] = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(enqueued).toEqual([{ key: `taskgen:${projectId}:AUX-R-008:${(f.fingerprint as Buffer).toString("hex")}`, payload: { projectId, triggerKinds: ["aux_finding"] } }]);
+      await runAsTenant(broken, { enqueueTaskGenerate });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(enqueued).toHaveLength(1);
+    });
+
     it("STORY-052 scenario 11 · a finding BELOW its rule's task threshold enqueues nothing (AUX-R-004 absent is low, its threshold is medium)", async () => {
       const enqueueTaskGenerate = vi.fn<Enqueue>(async () => undefined);
       await runAsTenant(noLlms, { enqueueTaskGenerate });
@@ -1143,6 +1170,307 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
         const src = readFileSync(new URL(file, dir), "utf8");
         expect(src, file).not.toMatch(/guarded-fetch|node:http|node:https|node:net|node:dns|\bfetch\(|storage|\bpg\b/);
       }
+    });
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // STORY-051 AC13 / STORY-052 AC1, AC9 (owner decision 34, item 2) - the page rules run inside crawl.audit
+  // ------------------------------------------------------------------------------------------------------------------
+  describe("AUXLIVE-2 · the page rule engine is wired into crawl.audit", () => {
+    const NOT_EVALUATED = ["AUX-R-005", "AUX-R-013", "AUX-R-028", "AUX-R-031", "AUX-R-032", "AUX-R-033", "AUX-R-034"];
+    const SITE_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"];
+    const weightOf = async (code: string): Promise<number> => Number((await db.query("SELECT weight FROM aux_rule_catalog WHERE code = $1", [code])).rows[0].weight);
+    const withPages = (pages: Record<string, string>): Served => ({
+      ...healthy(OPEN),
+      "/sitemap.xml": { status: 200, body: `<urlset>${Object.keys(pages).map((p) => `<url><loc>https://acme.com${p}</loc></url>`).join("")}</urlset>` },
+      ...Object.fromEntries(Object.entries(pages).map(([path, body]) => [path, { status: 200, body }])),
+    });
+
+    it("STORY-051 AC13 · a crawled page produces a page-rule finding: AUX-R-008 on a broken JSON-LD block, with the URL, the evidence shape and the catalog rule version", async () => {
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
+      const f = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(f).toHaveLength(1);
+      expect(f[0]).toMatchObject({ url: "https://acme.com/", severity: "critical", status: "open", occurrence_count: 1 });
+      expect(Object.keys(f[0].evidence).sort()).toEqual(["locator", "reason", "snippet"]);
+      const version = (await db.query("SELECT rule_version, title FROM aux_rule_catalog WHERE code = 'AUX-R-008'")).rows[0];
+      expect(f[0].rule_version).toBe(version.rule_version);
+      expect(f[0].title).toBe(version.title);
+      expect(f[0].fingerprint).toHaveLength(32);
+      const [a] = await audits();
+      expect(a).toMatchObject({ status: "completed", findings_critical: 1 });
+    });
+
+    it("STORY-051 AC13 · a healthy page produces no finding from any rule, and the audit completes", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      expect(await findings()).toEqual([]);
+      expect((await audits())[0]).toMatchObject({ status: "completed", pages_crawled: 1 });
+    });
+
+    it("STORY-051 AC13 · excluded_rules drops the page rules that ran, and keeps AUX-R-029 (no measured timing) and every not-evaluated code, AUX-R-013 included", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      const excluded: string[] = (await audits())[0].excluded_rules;
+      expect([...excluded].sort()).toEqual([...NOT_EVALUATED, "AUX-R-029"].sort());
+      for (const ran of [...SITE_RULES, "AUX-R-006", "AUX-R-008", "AUX-R-026", "AUX-R-027"]) expect(excluded, ran).not.toContain(ran);
+      expect(excluded).not.toContain("page_crawl");
+    });
+
+    it("STORY-051 AC13 · with no renderer installed (no rendered copy) AUX-R-026 and AUX-R-027 stay excluded as well", async () => {
+      await run(job(), depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer }));
+      const excluded: string[] = (await audits())[0].excluded_rules;
+      expect([...excluded].sort()).toEqual([...NOT_EVALUATED, "AUX-R-026", "AUX-R-027", "AUX-R-029"].sort());
+    });
+
+    it("STORY-051 AC13 · a measured response time brings AUX-R-029 back into the evaluated rules", async () => {
+      const timed = depsServing(healthy(OPEN));
+      const inner = timed.fetch!;
+      await run(job(), { ...timed, fetch: async (url, init) => ({ ...(await inner(url, init)), ttfbMs: 40, loadMs: 90 }) });
+      const excluded: string[] = (await audits())[0].excluded_rules;
+      expect(excluded).not.toContain("AUX-R-029");
+      expect([...excluded].sort()).toEqual([...NOT_EVALUATED].sort());
+    });
+
+    it("STORY-051 AC13 · AUX_RULES_PARTIAL is surfaced as its own annotation: error_summary.rules_partial names the partly-checked rules that ran, not the ones that were excluded or held", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      const partial: string[] = (await audits())[0].error_summary.rules_partial;
+      expect(partial).toEqual(expect.arrayContaining(["AUX-R-006", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027"]));
+      expect(partial).not.toContain("AUX-R-029"); // no timing: it did not run, so it is excluded, not partial
+      expect(partial).not.toContain("AUX-R-013"); // held: not evaluated at all
+      expect(partial).toEqual([...partial].sort());
+      expect(new Set(partial).size).toBe(partial.length);
+    });
+
+    it("STORY-051 AC13 · a site-files-only audit (the page was never fetched) names every page rule as excluded and carries no rules_partial", async () => {
+      await run(job(), depsServing({ ...healthy(OPEN), "/": "throw" }));
+      const [a] = await audits();
+      expect(a.pages_crawled).toBe(0);
+      expect(a.excluded_rules).toEqual(expect.arrayContaining(["AUX-R-008", "AUX-R-006", "AUX-R-026", "AUX-R-029", "page_crawl", ...NOT_EVALUATED]));
+      expect(a.excluded_rules).not.toContain("AUX-R-001");
+      expect(a.error_summary?.rules_partial).toBeUndefined();
+      expect(a.aux_score).toBeNull();
+    });
+
+    it("STORY-052 AC1 · a clean site publishes a subscore of 1 for each category that ran - five; entity_clarity, with no evaluated rule, is absent rather than a made-up 1 - and no headline score", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      const [a] = await audits();
+      expect(Object.keys(a.score_breakdown).sort()).toEqual(["context_fitness", "crawler_access", "freshness", "render_mode", "structured_data"]);
+      for (const v of Object.values(a.score_breakdown)) expect(Number(v)).toBe(1);
+      expect(a.aux_score).toBeNull(); // null is "not every category ran", never 0 and never 100
+      expect(a.score_capped).toBe(false);
+    });
+
+    it("STORY-052 AC1 · render_mode is published only when a render-mode rule could be decided: with no renderer and no timing, none could, so it is absent", async () => {
+      await run(job(), depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer }));
+      const [a] = await audits();
+      expect(Object.keys(a.score_breakdown).sort()).toEqual(["context_fitness", "crawler_access", "freshness", "structured_data"]);
+    });
+
+    it("STORY-052 AC1 · the subscore is scoring-models.md section 7: the AUX-R-008 critical finding takes its catalog weight off structured_data; no other category moves", async () => {
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
+      const [a] = await audits();
+      const w = await weightOf("AUX-R-008");
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - w, 5);
+      for (const c of ["crawler_access", "context_fitness", "freshness", "render_mode"]) expect(Number(a.score_breakdown[c]), c).toBe(1);
+      expect(a.score_capped).toBe(false); // the cap is for a critical crawler_access finding only
+    });
+
+    it("STORY-052 AC9 · affected page counts feed the scope factor: one broken page of three weighs 1/3, two of three weigh 2/3", async () => {
+      await verifyDomain();
+      const w = await weightOf("AUX-R-008");
+      await run(job(), depsServing(withPages({ "/": BROKEN_PAGE, "/pricing": HEALTHY_PAGE, "/about": HEALTHY_PAGE })));
+      let [a] = await audits();
+      expect(a.pages_crawled).toBe(3);
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - w * (1 / 3), 5);
+
+      await db.query("TRUNCATE aux_audits CASCADE");
+      stored.clear();
+      await run(job(), depsServing(withPages({ "/": BROKEN_PAGE, "/pricing": BROKEN_PAGE, "/about": HEALTHY_PAGE })));
+      [a] = await audits();
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - w * (2 / 3), 5);
+    });
+
+    it("STORY-052 AC9 · the scope factor is floored at 0.25: one broken page of ten is not diluted below it", async () => {
+      await verifyDomain();
+      const w = await weightOf("AUX-R-008");
+      const pages: Record<string, string> = { "/": BROKEN_PAGE };
+      for (let i = 1; i < 10; i += 1) pages[`/p${i}`] = HEALTHY_PAGE;
+      await run(job(), depsServing(withPages(pages), [], 10_000, { pageCap: 25 }));
+      const [a] = await audits();
+      expect(a.pages_crawled).toBe(10);
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - w * 0.25, 5);
+    });
+
+    it("STORY-052 AC4 · the same page defect in two audits is ONE finding with occurrence_count 2; fixing the page resolves it (with a milestone), and it regresses if it returns", async () => {
+      const broken: Served = { ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } };
+      await run(job(), depsServing(broken));
+      await run(job(), depsServing(broken));
+      let f = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(f).toHaveLength(1);
+      expect(f[0].occurrence_count).toBe(2);
+
+      await run(job(), depsServing(healthy(OPEN)));
+      f = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(f[0]).toMatchObject({ status: "resolved" });
+      expect(f[0].resolved_at).not.toBeNull();
+      const pinned = await db.query("SELECT kind FROM milestones WHERE source_type = 'aux_finding' AND source_id = $1", [f[0].id]);
+      expect(pinned.rows).toEqual([{ kind: "schema_fixed" }]);
+
+      await run(job(), depsServing(broken));
+      f = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(f).toHaveLength(1);
+      expect(f[0]).toMatchObject({ status: "regressed", severity: "critical" });
+      expect(f[0].regressed_at).not.toBeNull();
+    });
+
+    it("STORY-052 AC5 · a page the audit could not fetch resolves nothing: its earlier finding stays open", async () => {
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 500, body: "" } }));
+      const f = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(f).toHaveLength(1);
+      expect(f[0].status).toBe("open");
+      expect(f[0].resolved_at).toBeNull();
+    });
+
+    it("STORY-052 AC5 · a finding on a rule the page could not decide (AUX-R-026/027 with no rendered copy) is neither resolved nor opened by an audit that could not look", async () => {
+      // Seed an open AUX-R-026 finding on the page, then audit with no renderer: the rule was undecidable, so the finding must survive.
+      await run(job(), depsServing(healthy(OPEN)));
+      await db.query(
+        `INSERT INTO aux_findings (workspace_id, project_id, audit_id, rule_code, url, severity, fingerprint, title, evidence, rule_version, first_detected_at, last_detected_at)
+         SELECT workspace_id, project_id, id, 'AUX-R-026', 'https://acme.com/', 'high', sha256('seed'::bytea), 't', '{"reason":"seed","snippet":null,"locator":"x"}'::jsonb, '2026.10.2', now(), now() FROM aux_audits LIMIT 1`,
+      );
+      await run(job(), depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer }));
+      const seeded = (await findings()).find((x) => x.rule_code === "AUX-R-026")!;
+      expect(seeded.status).toBe("open");
+    });
+
+    it("STORY-049 scenario 10 / STORY-048 · an unverified domain is audited at public-surface scope: only the supplied URL is judged, the sitemap's other pages are not, and the excluded rules are named", async () => {
+      const served = withPages({ "/": HEALTHY_PAGE, "/pricing": BROKEN_PAGE });
+      await run(job(), depsServing(served));
+      const [a] = await audits();
+      expect(a.scope).toBe("public_surface");
+      expect(a.pages_crawled).toBe(1);
+      expect((await findings()).filter((x) => x.rule_code === "AUX-R-008")).toEqual([]);
+      expect(a.excluded_rules).toEqual(expect.arrayContaining(NOT_EVALUATED));
+    });
+
+    it("STORY-049 scenario 10 / STORY-048 · a verified domain is judged page by page: the broken sibling page is found at its own URL", async () => {
+      await verifyDomain();
+      await run(job(), depsServing(withPages({ "/": HEALTHY_PAGE, "/pricing": BROKEN_PAGE })));
+      const f = (await findings()).filter((x) => x.rule_code === "AUX-R-008");
+      expect(f.map((x) => x.url)).toEqual(["https://acme.com/pricing"]);
+    });
+
+    it("STORY-051 AC13 · observability: the audit log line counts the page findings and the pages evaluated, carries the workspace id, and no page text", async () => {
+      const lines: unknown[] = [];
+      const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => { lines.push(m); });
+      try {
+        await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
+      } finally {
+        spy.mockRestore();
+      }
+      const line = lines.find((l) => (l as { span?: string }).span === "crawl.audit") as Record<string, unknown>;
+      expect(line).toMatchObject({ workspace_id: workspaceId, pages_evaluated: 1, page_findings: expect.any(Number) });
+      expect(line.page_findings as number).toBeGreaterThanOrEqual(1);
+      expect(JSON.stringify(lines)).not.toContain("Pipeline analytics");
+      expect(counters.some((c) => c.name === "nominara_aux_page_rules_evaluated_total")).toBe(true);
+    });
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // AUXLIVE-3 (STORY-194) - a manual audit was charged by its producer: a failed audit gives the charge back, a partial one keeps it
+  // ------------------------------------------------------------------------------------------------------------------
+  describe("AUXLIVE-3 · crawl.audit and the manual audit's charge", () => {
+    const wallet = async () => {
+      const r = (await db.query("SELECT included_balance, purchased_balance, reserved FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0];
+      return { included: Number(r.included_balance), purchased: Number(r.purchased_balance), reserved: Number(r.reserved) };
+    };
+    const refunds = async () => (await db.query("SELECT credits::int AS credits, reference_type, reference_id FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'refund'", [workspaceId])).rows;
+
+    /** What POST /projects/{id}/aux-audits leaves behind: a charged 10 credits and a queued row. */
+    async function chargedManualAudit(): Promise<string> {
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+         VALUES ($1,100,(now() AT TIME ZONE 'UTC')::date,(now() AT TIME ZONE 'UTC')::date + 30)`,
+        [workspaceId],
+      );
+      const auditId = randomUUID();
+      const { debitInTransaction } = await import("../../src/lib/credits/debit.js");
+      await debitInTransaction(db as never, {
+        workspaceId, actorId: null, actorType: "system", actionCode: "aux_manual", credits: 10, idempotencyKey: ["aux_audit", auditId].join(":"),
+        projectId, referenceType: "aux_audit", referenceId: auditId, includedGrant: 0,
+      });
+      await db.query(
+        `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, rule_version, tokenizer, status)
+         VALUES ($1,$2,$3,'manual','key_pages','{}','2026.10.1','cl100k','queued')`,
+        [auditId, workspaceId, projectId],
+      );
+      return auditId;
+    }
+    const manualJob = (auditId: string): Job => job({ trigger: "manual", auditId, scope: "key_pages" });
+
+    it("AUXLIVE-3 · a manual audit takes over the queued row its producer made: same id, now completed, and the charge STANDS", async () => {
+      const auditId = await chargedManualAudit();
+      await run(manualJob(auditId), depsServing(healthy(OPEN)));
+      const all = await audits();
+      expect(all).toHaveLength(1);
+      expect(all[0]).toMatchObject({ id: auditId, trigger: "manual", status: "completed" });
+      expect(await refunds()).toEqual([]);
+      expect(await wallet()).toMatchObject({ included: 90 });
+    });
+
+    it("AUXLIVE-3 · a manual audit where NO site file can be reached ends failed and the charge is refunded in full, naming the audit", async () => {
+      const auditId = await chargedManualAudit();
+      await run(manualJob(auditId), depsServing({}));
+      const [a] = await audits();
+      expect(a).toMatchObject({ id: auditId, status: "failed" });
+      expect(await refunds()).toEqual([{ credits: 10, reference_type: "aux_audit", reference_id: auditId }]);
+      expect(await wallet()).toMatchObject({ included: 100, reserved: 0 });
+    });
+
+    it("AUXLIVE-3 · redelivering the failed job refunds nothing more", async () => {
+      const auditId = await chargedManualAudit();
+      await run(manualJob(auditId), depsServing({}));
+      await run(manualJob(auditId), depsServing({}));
+      expect(await refunds()).toHaveLength(1);
+      expect(await wallet()).toMatchObject({ included: 100 });
+    });
+
+    it("AUXLIVE-3 · a PARTIAL manual audit (a page failed, the site files answered) is charged in full: no refund", async () => {
+      const auditId = await chargedManualAudit();
+      await verifyDomain();
+      await run(manualJob(auditId), depsServing({ ...withSitemap(SITEMAP_PAGES), "/pricing": { status: 500, body: "" } }));
+      const [a] = await audits();
+      expect(a.status).toBe("partial");
+      expect(await refunds()).toEqual([]);
+      expect(await wallet()).toMatchObject({ included: 90 });
+    });
+
+    it("AUXLIVE-3 · an ONBOARDING audit that fails touches no ledger at all: it was never charged", async () => {
+      await db.query(
+        `INSERT INTO credit_wallets (workspace_id, included_balance, cycle_start, cycle_end)
+         VALUES ($1,100,(now() AT TIME ZONE 'UTC')::date,(now() AT TIME ZONE 'UTC')::date + 30)`,
+        [workspaceId],
+      );
+      await run(job({ trigger: "onboarding" }), depsServing({}));
+      expect((await audits())[0].status).toBe("failed");
+      expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
+    });
+
+    it("AUXLIVE-3 · a manual audit whose project was deleted before it ran is failed and refunded, and nothing is fetched", async () => {
+      const auditId = await chargedManualAudit();
+      await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projectId]);
+      const requested: string[] = [];
+      await run(manualJob(auditId), depsServing(healthy(OPEN), requested));
+      expect(requested).toEqual([]);
+      expect((await audits())[0]).toMatchObject({ id: auditId, status: "failed" });
+      expect((await audits())[0].error_summary).toEqual({ reason: "project_deleted" });
+      expect(await refunds()).toHaveLength(1);
+      expect(await wallet()).toMatchObject({ included: 100 });
+    });
+
+    it("AUXLIVE-3 · the audit counter carries the manual trigger", async () => {
+      const auditId = await chargedManualAudit();
+      await run(manualJob(auditId), depsServing(healthy(OPEN)));
+      expect(counters).toContainEqual({ name: "nominara_aux_audits_total", labels: { status: "completed", trigger: "manual" } });
     });
   });
 

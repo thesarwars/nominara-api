@@ -57,3 +57,18 @@ describe("STORY-078 · the server's tool-run ledger keys are reserved", () => {
     expect(isReservedLedgerKey("my-tool_run:x")).toBe(false);
   });
 });
+
+describe("AUXLIVE-3 · the inline debit's reference and the reserved ledger-key namespace", () => {
+  it("refuses a reference with only one half named, before touching the database", async () => {
+    const query = vi.fn();
+    await expect(debitInTransaction({ query } as unknown as ClientBase, { ...base, credits: 10, referenceType: "aux_audit" })).rejects.toThrow(/both/);
+    await expect(debitInTransaction({ query } as unknown as ClientBase, { ...base, credits: 10, referenceId: "a" })).rejects.toThrow(/both/);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("a client Idempotency-Key starting aux_audit: (any case) is reserved: it is the namespace the manual audit's own ledger key lives in", () => {
+    for (const key of ["aux_audit:abc", "AUX_AUDIT:abc", "aux_audit:"]) expect(isReservedLedgerKey(key), key).toBe(true);
+    for (const key of ["my-aux_audit:x", "aux_audited", "k-1"]) expect(isReservedLedgerKey(key), key).toBe(false);
+    expect(isReservedLedgerKey("prompt_activate:p:abc")).toBe(true);
+  });
+});

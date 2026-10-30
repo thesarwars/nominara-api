@@ -37,6 +37,20 @@ vi.mock("../../src/lib/telemetry/metrics.js", async () => {
   };
 });
 
+// STORY-051 AC13: the page rules run in the fetch phase, so they too must see no transaction and no checked-out client. The engine is
+// wrapped, not replaced: the real evaluation still runs.
+const engineHook = vi.hoisted(() => ({ onEvaluate: null as null | (() => Promise<void>) }));
+vi.mock("../../src/lib/aux/rules/engine.js", async () => {
+  const actual = await vi.importActual<typeof import("../../src/lib/aux/rules/engine.js")>("../../src/lib/aux/rules/engine.js");
+  return {
+    ...actual,
+    evaluateDocuments: async (...args: Parameters<typeof actual.evaluateDocuments>) => {
+      if (engineHook.onEvaluate !== null) await engineHook.onEvaluate();
+      return actual.evaluateDocuments(...args);
+    },
+  };
+});
+
 const ENTRY = QUEUE_TOPOLOGY.find((e) => e.name === "crawl.audit")!;
 const ROBOTS = "User-agent: *\nAllow: /\nSitemap: https://acme.com/sitemap.xml\n";
 const SITEMAP = "<urlset><url><loc>https://acme.com/</loc></url><url><loc>https://acme.com/pricing</loc></url><url><loc>https://acme.com/about</loc></url></urlset>";
@@ -137,6 +151,8 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
         if (body === undefined) return { status: 404, headers: {}, body: Buffer.from(""), finalUrl: url };
         return { status: 200, headers: {}, body: Buffer.from(body), finalUrl: url };
       },
+      // The queue is never touched: these pages are bare stubs, so the page rules open findings and ask for task generation.
+      enqueueTaskGenerate: async () => undefined,
       ...extra,
     };
   }
@@ -172,6 +188,24 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
       expect(o.checkedOut, `pooled client checked out during ${o.what}`).toBe(0);
     }
     expect(pool.totalCount - pool.idleCount).toBe(0); // and nothing leaked afterwards
+  });
+
+  it("KAD-06 / STORY-051 AC13 · the page rules are evaluated with no transaction open and no pooled connection checked out, and the findings are written by the short write transaction", async () => {
+    engineHook.onEvaluate = () => observe("evaluate");
+    try {
+      await processor(deps())(signedJob(wsA, projA));
+    } finally {
+      engineHook.onEvaluate = null;
+    }
+    const evaluations = observed.filter((o) => o.what === "evaluate");
+    expect(evaluations).toHaveLength(1); // once per audit, over every crawled page together
+    for (const o of evaluations) {
+      expect(o.idleInTx).toBe(0);
+      expect(o.checkedOut).toBe(0);
+    }
+    // The pages are bare "<html>x</html>" stubs, so the rules find plenty: those findings exist, in the job's workspace only.
+    const rows = (await db.query("SELECT DISTINCT workspace_id FROM aux_findings WHERE rule_code NOT IN ('AUX-R-001','AUX-R-002','AUX-R-003','AUX-R-004','AUX-R-007')")).rows;
+    expect(rows).toEqual([{ workspace_id: wsA }]);
   });
 
   it("observability · the fetch phase is a span carrying counts only, the write is counted, and no log line names a workspace or a domain", async () => {
