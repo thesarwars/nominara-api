@@ -7,6 +7,7 @@ import {
   toolRunDetailSchema,
   toolRunIdSchema,
   toolRunListQuerySchema,
+  toolRunListResponseSchema,
   toolRunSchema,
   updateToolRunRequestSchema,
   type ConvertToolRunRequest,
@@ -42,7 +43,7 @@ export class ToolsController {
   @Get("runs")
   @RequirePermission("lookup:read_history")
   @ScopedByQuery()
-  @ApiContract({ operationId: "listToolRuns", querySchema: toolRunListQuerySchema, responseSchema: toolRunSchema, listOf: true })
+  @ApiContract({ operationId: "listToolRuns", querySchema: toolRunListQuerySchema, responseSchema: toolRunListResponseSchema, listOf: true })
   list(@Query(new ZodValidationPipe(toolRunListQuerySchema)) query: ToolRunListQuery): Promise<Page<ToolRun>> {
     return this.service.list(query);
   }

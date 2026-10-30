@@ -122,6 +122,9 @@ export const toolRunSchema = z
   })
   .strict();
 
+/** The `data` of GET /tools/runs: a listOf operation's responseSchema is the array of items (the cursor envelope adds `pagination`). */
+export const toolRunListResponseSchema = z.array(toolRunSchema);
+
 /**
  * `tool_runs.result_json` (jsonb, <= 24 KB by trigger). Its inner shape belongs to each tool's own story; the shared core only
  * guarantees it is an object, so a tool cannot park a bare scalar or array in the timeline's payload column.
