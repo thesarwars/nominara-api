@@ -834,6 +834,23 @@ describe("STORY-063 · task generation engine", () => {
     }
   });
 
+  it("[STORY-055 AC1/AC4] a generated authority task carries the playbook of its domain's class when the domain has no stored slug, and a non-seedable domain makes none", async () => {
+    const sd = await actionable("forum.example.org");
+    await db.query("UPDATE source_domains SET source_class = 'community_forum' WHERE id = $1", [sd]);
+    const other = await actionable("rev.example.org");
+    await db.query("UPDATE source_domains SET source_class = 'review_marketplace' WHERE id = $1", [other]);
+    const vendor = await actionable("vendor.example.org");
+    await db.query("UPDATE source_domains SET source_class = 'vendor_owned', is_seedable = false WHERE id = $1", [vendor]);
+    await displacement({ citationGap: [gapEntry("forum.example.org"), gapEntry("rev.example.org"), gapEntry("vendor.example.org")], impact: 80 });
+    await generate();
+    const tasks = [...(await taskRows("TG-DISPLACEMENT-RECOVER")), ...(await taskRows("TG-SOURCE-ABSENCE"))];
+    const slugOf = (id: string): (string | null)[] => tasks.filter((t) => t.source_domain_id === id).map((t) => t.playbook_slug);
+    expect(slugOf(sd).length).toBeGreaterThan(0);
+    expect(new Set(slugOf(sd))).toEqual(new Set(["playbook-community_forum"]));
+    expect(new Set(slugOf(other))).toEqual(new Set(["playbook-review_marketplace"]));
+    expect(slugOf(vendor)).toEqual([]);
+  });
+
   // ---- enable / disable / tuning --------------------------------------------------------------------------------
 
   it("[STORY-063 #12 / AC13] a disabled rule generates nothing, and re-enabling does not retroactively generate for the disabled period", async () => {
