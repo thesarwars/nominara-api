@@ -470,6 +470,8 @@ export const geoFindingSchema = z
     evidence: z.array(geoEvidenceSchema).min(1),
     metric: z.object({ name: z.string().min(1), value: z.number(), target: z.number().optional() }).strict().optional(),
     task_rule_code: z.string().min(1).optional(),
+    /** The engine the finding targets (STORY-061 A4: the engine that is missing the domain); the task it generates is scoped to it. */
+    engine: z.string().min(1).optional(),
     no_action: z.literal(true).optional(),
     lever_rank: z.number().int().min(1).max(3).optional(),
     /** The A6 detail, carried by the one finding that speaks for the analysis (STORY-061). */

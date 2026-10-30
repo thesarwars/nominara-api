@@ -7,7 +7,8 @@ import {
   type SentimentMention,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
-import { SCORING_VERSION } from "../scoring/index.js";
+import { NEGATIVE_ALERT_MIN_CELLS, NEGATIVE_CELL_RATE_ALERT, SCORING_VERSION, shouldAlertOnNegativeSentiment } from "../scoring/index.js";
+import { hasFactsStatusSql } from "../rollup/aggregate-day.js";
 import { DEMO_NORMALIZER_VERSION } from "./structure.js";
 
 // STORY-061 — A6 sentiment drivers: which non-positive brand mentions exist,
@@ -20,8 +21,9 @@ import { DEMO_NORMALIZER_VERSION } from "./structure.js";
 //  - A contradiction against the brand's own verified structured data. None
 //    exists to compare with, so `factual_error` is false WITH A REASON on
 //    every mention. A claim is never guessed to be wrong.
-//  - A task. One task per distinct reason class is the task engine's job
-//    (deferred): each class carries a rule code and a title, no task id.
+//  - A task. The task engine makes it (the `geo_finding` condition reads the finding): each reason class is one finding, and
+//    a finding asks for a task ONLY while the negative cell rate has crossed the alert threshold with the sample floor met
+//    (scoring-models.md section 6: 0.05 with n >= 30), so a quiet window raises none. Themes are trended against the prior window.
 //  - `negative_source_url_hash`: the parser does not write it. The citation a
 //    framing traces to is the slot nearest the evidence span, located in the
 //    stored answer text; where it cannot be located it is null, never guessed.
@@ -30,7 +32,7 @@ import { DEMO_NORMALIZER_VERSION } from "./structure.js";
 export const SENTIMENT_MIN_MENTIONS = 30;
 /** The mentions the detail lists (most recent first). Counts and clusters always cover all of them. */
 export const SENTIMENT_LISTED_MENTIONS = 50;
-export const SENTIMENT_TASK_RULE = "TG-SENTIMENT-NEGATIVE";
+export const SENTIMENT_TASK_RULE = "TG-SENTIMENT-REASON";
 
 export const NO_VERIFIED_DATA_REASON =
   "No verified structured data exists for this brand to compare the claim against, so no factual error is asserted.";
@@ -61,6 +63,14 @@ export interface SentimentInput {
   dataSource: DataSource | null;
   /** Non-positive brand mentions that carry an evidence span. */
   mentions: SentimentMentionInput[];
+  /** `C(T)`: parsed answers in the window, and those with any negative brand mention (section 6's `negative_cell_rate`). */
+  cells: number;
+  negativeCells: number;
+  /** The same two for the prior window of equal length. */
+  priorCells: number;
+  priorNegativeCells: number;
+  /** Prior-window non-positive brand mentions by primary reason class. */
+  priorReasonCounts: Record<string, number>;
 }
 
 const REASON_LABEL: Readonly<Record<string, string>> = {
@@ -162,7 +172,13 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
   const byReason = new Map<string, number>();
   for (const x of all) if (x.reason !== null) byReason.set(x.reason, (byReason.get(x.reason) ?? 0) + 1);
   const reasonClasses = [...byReason.entries()]
-    .map(([reason, mention_count]) => ({ reason, mention_count, task_title: `Address ${reasonLabel(reason)} in how engines describe the brand` }))
+    .map(([reason, mention_count]) => ({
+      reason,
+      mention_count,
+      task_title: `Address ${reasonLabel(reason)} in how engines describe the brand`,
+      // null: the prior window held no parsed answer, so nothing was measured. 0: it was measured and the theme was absent.
+      prior_mention_count: input.priorCells === 0 ? null : (input.priorReasonCounts[reason] ?? 0),
+    }))
     .sort((a, b) => b.mention_count - a.mention_count || a.reason.localeCompare(b.reason));
 
   const recentFirst = [...all].sort((a, b) => (a.captured_at < b.captured_at ? 1 : a.captured_at > b.captured_at ? -1 : a.result_id < b.result_id ? 1 : -1));
@@ -177,7 +193,17 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
     clusters,
     reason_classes: reasonClasses,
     factual_error_reason: NO_VERIFIED_DATA_REASON,
+    threshold: {
+      cells: input.cells,
+      negative_cells: input.negativeCells,
+      negative_cell_rate: input.cells === 0 ? null : input.negativeCells / input.cells,
+      prior_negative_cell_rate: input.priorCells === 0 ? null : input.priorNegativeCells / input.priorCells,
+      rate_threshold: NEGATIVE_CELL_RATE_ALERT,
+      min_cells: NEGATIVE_ALERT_MIN_CELLS,
+      crossed: shouldAlertOnNegativeSentiment(input.cells, input.negativeCells),
+    },
   };
+  const crossed = detail.threshold!.crossed;
 
   const rootEvidence = (snippet: string) => [{ url: `https://${input.rootDomain}/`, snippet }];
   const evidenceFor = (mention: SentimentMention | undefined, fallback: string): GeoFinding["evidence"] =>
@@ -216,11 +242,12 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
   } else {
     findings = reasonClasses.map((rc, i) => ({
       id: `sentiment-reason-${rc.reason}`,
-      severity: "medium" as const,
+      severity: crossed ? ("medium" as const) : ("low" as const),
       headline: `${String(rc.mention_count)} ${rc.mention_count === 1 ? "mention frames" : "mentions frame"} the brand through ${reasonLabel(rc.reason)}.` + (i === 0 ? topNote : ""),
       evidence: evidenceFor(recentFirst.find((x) => x.reason === rc.reason), "No evidence span."),
       metric: { name: "reason_class_mentions", value: rc.mention_count },
-      task_rule_code: SENTIMENT_TASK_RULE,
+      // One task per reason class, and only past the alert threshold: a theme under it is reported, not assigned.
+      ...(crossed ? { task_rule_code: SENTIMENT_TASK_RULE } : { no_action: true as const }),
       // The detail rides on the finding that speaks for the analysis, once.
       ...(i === 0 ? { sentiment: detail } : {}),
     }));
@@ -240,6 +267,14 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
   };
 }
 
+interface CellCountRow {
+  cells: number;
+  negative_cells: number;
+}
+interface PriorReasonRow {
+  reason: string;
+  mentions: number;
+}
 interface BrandCountRow {
   brand_mentions: number;
   demo: number;
@@ -305,6 +340,36 @@ export async function loadSentimentInput(
     [projectId, windowStart, windowDays, SCORING_VERSION],
   );
 
+  // C(T): parsed answers, and those with any negative brand mention. Offset 0 is the window, offset `windowDays` the prior window.
+  const cellCounts = async (offsetDays: number): Promise<CellCountRow> =>
+    (
+      await tx.query<CellCountRow>(
+        `SELECT count(*)::int AS cells,
+                (count(*) FILTER (WHERE EXISTS (
+                   SELECT 1 FROM mention_facts mf
+                    WHERE mf.result_id = ac.id AND mf.captured_at = ac.captured_at AND mf.project_id = $1
+                      AND mf.entity_type = 'brand' AND mf.sentiment_label = 'negative' AND mf.scoring_version = $5)))::int AS negative_cells
+           FROM answer_captures ac
+          WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")}
+            AND ac.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC') - make_interval(days => $4)
+            AND ac.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') - make_interval(days => $4) + make_interval(days => $3)`,
+        [projectId, windowStart, windowDays, offsetDays, SCORING_VERSION],
+      )
+    ).rows[0]!;
+  const now = await cellCounts(0);
+  const prior = await cellCounts(windowDays);
+  const priorReasons = await tx.query<PriorReasonRow>(
+    `SELECT mf.negative_reasons[1] AS reason, count(*)::int AS mentions
+       FROM mention_facts mf
+      WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $5
+        AND mf.sentiment_label <> 'positive' AND mf.evidence_start IS NOT NULL AND mf.evidence_end IS NOT NULL
+        AND cardinality(mf.negative_reasons) > 0
+        AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC') - make_interval(days => $4)
+        AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') - make_interval(days => $4) + make_interval(days => $3)
+      GROUP BY 1`,
+    [projectId, windowStart, windowDays, windowDays, SCORING_VERSION],
+  );
+
   const resultIds = [...new Set(mentions.rows.map((r) => r.result_id))];
   const citations =
     resultIds.length === 0
@@ -329,6 +394,11 @@ export async function loadSentimentInput(
     windowDays,
     rootDomain: project.rows[0].root_domain,
     brandMentions: c.brand_mentions,
+    cells: now.cells,
+    negativeCells: now.negative_cells,
+    priorCells: prior.cells,
+    priorNegativeCells: prior.negative_cells,
+    priorReasonCounts: Object.fromEntries(priorReasons.rows.map((r) => [r.reason, r.mentions])),
     // Nothing measured is null, never "demo".
     dataSource: c.brand_mentions === 0 ? null : c.demo > 0 && c.live > 0 ? "mixed" : c.demo > 0 ? "demo" : "live",
     mentions: mentions.rows.map((r) => ({

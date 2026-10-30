@@ -82,7 +82,8 @@ export class GeoService {
       const actions =
         sentiment?.success === true
           ? // One action per distinct reason class: a title, and no task id yet. The digest levers resolve an open task (`openTaskLookup`); reuse it here once GEO-rule tasks are produced (STORY-063 follow-up), or the two surfaces will disagree.
-            sentiment.data.reason_classes.map((rc) => ({ label: rc.task_title, task_title: rc.task_title, task_id: null, href: null, engines: [] as string[] }))
+            // Under the alert threshold a theme is reported, not assigned (FR-GEO-A6c); a detail persisted before the threshold existed has none and keeps its actions.
+            (sentiment.data.threshold?.crossed === false ? [] : sentiment.data.reason_classes).map((rc) => ({ label: rc.task_title, task_title: rc.task_title, task_id: null, href: null, engines: [] as string[] }))
           : row !== null && row.sufficient
           ? validFindings(row)
               .filter((f) => f.task_rule_code !== undefined)
@@ -135,6 +136,14 @@ export class GeoService {
     if (slug === "sentiment") {
       if (row === null || !row.sufficient) return null;
       return validFindings(row).find((f) => f.sentiment !== undefined)?.sentiment ?? null;
+    }
+    if (slug === "divergence") {
+      if (row === null || !row.sufficient) return null;
+      return validFindings(row).find((f) => f.divergence !== undefined)?.divergence ?? null;
+    }
+    if (slug === "topics") {
+      if (row === null || !row.sufficient) return null;
+      return validFindings(row).find((f) => f.topics !== undefined)?.topics ?? null;
     }
     if (slug === "entity") {
       if (row === null || !row.sufficient) return null;

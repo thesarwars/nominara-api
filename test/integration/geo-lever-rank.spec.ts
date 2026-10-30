@@ -4,6 +4,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { rankGeoLevers } from "../../src/lib/geo/lever-rank.js";
+import { SENTIMENT_TASK_RULE } from "../../src/lib/geo/sentiment.js";
 import { refreshProjectGeoWindows } from "../../src/lib/rollup/refresh-project-geo.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { GeoService } from "../../src/modules/geo/geo.service.js";
@@ -109,7 +110,8 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     expect(s7).toMatchObject({ sufficient: false, lever_rank: null });
   });
 
-  const RULE = "TG-SENTIMENT-NEGATIVE";
+  // The rule the sentiment finding names (STORY-061 moved it from TG-SENTIMENT-NEGATIVE, the cell-rate alert rule, to its own).
+  const RULE = SENTIMENT_TASK_RULE;
   interface TaskSeed {
     status?: string;
     rule?: string | null;
@@ -223,7 +225,7 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     await refresh();
     await refresh();
     const again = await rows();
-    expect(again).toHaveLength(9); // structure + entity + sentiment, three windows
+    expect(again).toHaveLength(15); // structure + entity + sentiment + divergence + topics (STORY-061), three windows
     expect(again.map((x) => [x.analysis, x.window_days, x.lever_rank])).toEqual(first.map((x) => [x.analysis, x.window_days, x.lever_rank]));
   });
 
