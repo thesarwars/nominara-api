@@ -140,6 +140,9 @@ export const toolRunListQuerySchema = paginationRequestSchema
   })
   .strict();
 
+/** The `{id}` path parameter: a uuid, so a malformed one is a 400 rather than a database cast error. */
+export const toolRunIdSchema = lowercaseUuidSchema;
+
 export const updateToolRunRequestSchema = z.object({ pinned: z.boolean() }).strict();
 
 export type ToolRunHeadline = z.infer<typeof toolRunHeadlineSchema>;
