@@ -256,7 +256,13 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     expect(await stored("divergence")).toMatchObject({ sufficient: true, evidence_cells: 10 });
     const d = geoDivergenceDetailSchema.parse((await read("divergence")).detail);
     expect(d.project_divergence).toBe(1);
-    expect(d.excluded.demo_results).toBe(10);
+    // r4: a demo result is counted only where NO live capture was used; here every pair used its live capture.
+    expect(d.excluded.demo_results).toBe(0);
+    // a pair that has only a demo capture is the one that is counted.
+    const only = await addPrompt();
+    await capture({ prompt: only, engine: "gemini", brand: null, cites: [], demo: true });
+    await refresh();
+    expect(geoDivergenceDetailSchema.parse((await read("divergence")).detail).excluded.demo_results).toBe(1);
   });
 
   it("[AC4] the engine-source affinity map is learned from the project's own live capture history", async () => {
@@ -468,11 +474,11 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     for (const n of negative) await capture({ prompt, engine: "gemini", demo, brand: "ranked", sentiment: { label: "negative", reasons: n.reasons }, cites: ["reddit.com"] });
   }
   /** The prior window (2026-08-03 .. 2026-09-01): `answers` parsed answers of which `negative` carry a negative brand mention. */
-  async function priorWindow(answers: number, negative: number): Promise<void> {
+  async function priorWindow(answers: number, negative: number, demo = false): Promise<void> {
     const prompt = await addPrompt();
     for (let i = 0; i < answers; i++) {
       const bad = i < negative;
-      await capture({ prompt, engine: "gemini", at: "2026-08-15T10:00:00Z", brand: "ranked", sentiment: bad ? { label: "negative", reasons: ["pricing_objection"] } : { label: "positive" } });
+      await capture({ prompt, engine: "gemini", demo, at: "2026-08-15T10:00:00Z", brand: "ranked", sentiment: bad ? { label: "negative", reasons: ["pricing_objection"] } : { label: "positive" } });
     }
   }
 
@@ -557,6 +563,52 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     await new Promise((resolve) => setImmediate(resolve));
   }
   const spikeAlerts = async () => (await db.query("SELECT * FROM notifications WHERE kind = 'alert.negative_spike' AND project_id = $1", [projectId])).rows;
+
+  it("[r4-2a] a DEMO prior window is unmeasured: a live 3/33 against a seeded clean 0/30 demo prior does not cross, and raises no alert and no task", async () => {
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }]);
+    await priorWindow(30, 0, true);
+    await refresh();
+    const d = geoSentimentDetailSchema.parse((await read("sentiment")).detail);
+    expect(d.threshold).toMatchObject({ prior_cells: 0, prior_negative_cell_rate: null, rose: false, crossed: false });
+    await runJob();
+    expect(await spikeAlerts()).toHaveLength(0);
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+  });
+
+  it("[r4-2b] a prior window whose facts exist only at ANOTHER scoring_version is unmeasured: a chronic current level does not cross against it", async () => {
+    await sentimentFixture(30, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }, { reasons: ["missing_feature"] }]);
+    await priorWindow(30, 3);
+    await db.query("UPDATE mention_facts SET scoring_version = 'v0' WHERE captured_at < '2026-09-01'");
+    await refresh();
+    const d = geoSentimentDetailSchema.parse((await read("sentiment")).detail);
+    expect(d.threshold).toMatchObject({ prior_cells: 0, rose: false, crossed: false });
+    await runJob();
+    expect(await spikeAlerts()).toHaveLength(0);
+    expect(await taskRows("TG-SENTIMENT-REASON")).toHaveLength(0);
+  });
+
+  it("[r4-3] the alert links the first draft whose task was CREATED; when none was created it links the first draft", async () => {
+    const owner = randomUUID();
+    await db.query("INSERT INTO users (id,email,email_verified_at) VALUES ($1,$2,now())", [owner, `o-${owner.slice(0, 8)}@example.com`]);
+    await db.query("INSERT INTO workspace_members (workspace_id,user_id,role) VALUES ($1,$2,'owner')", [workspaceId, owner]);
+    await sentimentFixture(30, [{ reasons: ["missing_feature"] }, { reasons: ["missing_feature"] }, { reasons: ["missing_feature"] }]);
+    await priorWindow(30, 0);
+    await refresh();
+    await runJob();
+    const feature = (await taskRows("TG-SENTIMENT-REASON"))[0];
+    expect((await spikeAlerts())[0].payload.task_id).toBe(feature.id);
+    // A second theme appears; the alert's cooldown is cleared so the next evaluation may alert. missing_feature sorts FIRST but is not new.
+    await db.query("DELETE FROM notifications WHERE kind = 'alert.negative_spike'");
+    await sentimentFixture(0, [{ reasons: ["pricing_objection"] }, { reasons: ["pricing_objection"] }]);
+    await refresh();
+    await runJob();
+    const pricing = (await taskRows("TG-SENTIMENT-REASON")).find((t) => t.id !== feature.id)!;
+    expect((await spikeAlerts())[0].payload.task_id).toBe(pricing.id);
+    // Nothing created this time: the fallback is the first draft.
+    await db.query("DELETE FROM notifications WHERE kind = 'alert.negative_spike'");
+    await runJob();
+    expect((await spikeAlerts())[0].payload.task_id).toBe(feature.id);
+  });
 
   it("[D21] a threshold crossing writes ONE negative_spike alert and one task per reason class, linked, and a retried job writes nothing twice", async () => {
     enqueued = [];
