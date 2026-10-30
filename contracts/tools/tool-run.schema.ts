@@ -61,19 +61,28 @@ export const toolRunExpiredSchema = z
   })
   .strict();
 
-/** The slot cost of converting a run, stated BEFORE the click. */
+/**
+ * What converting a run would do, from the run alone (the same fields on every read, so the entity tag of a re-opened run does not
+ * move when an unrelated project is created). The plan-dependent cost is `toolRunConversionPreviewSchema`.
+ */
 export const toolRunConversionSchema = z
   .object({
     state: z.enum(["available", "converted", "unavailable"]),
     /** Why it is `unavailable`; `null` otherwise. */
     reason: z.enum(["run_not_finished", "run_failed", "no_url"]).nullable(),
-    project_slot: z.object({ used: z.number().int().nonnegative(), max: z.number().int().nonnegative().nullable(), free: z.boolean() }).strict(),
-    prompt_slots: z.object({ carried: z.number().int().nonnegative(), cap: z.number().int().nonnegative().nullable() }).strict(),
     /** Converting costs nothing, and neither does tracking thereafter (FR-TL-09). */
     credits: z.literal(0),
     prefill: z
       .object({ project_name: z.string().nullable(), root_url: z.string().nullable(), prompts: z.array(z.string()) })
       .strict(),
+  })
+  .strict();
+
+/** The slot cost of converting a run, stated BEFORE the click: which project slot, how many prompt slots. */
+export const toolRunConversionPreviewSchema = toolRunConversionSchema
+  .extend({
+    project_slot: z.object({ used: z.number().int().nonnegative(), max: z.number().int().nonnegative().nullable(), free: z.boolean() }).strict(),
+    prompt_slots: z.object({ carried: z.number().int().nonnegative(), cap: z.number().int().nonnegative().nullable() }).strict(),
   })
   .strict();
 
@@ -138,6 +147,7 @@ export type ToolRunInputs = z.infer<typeof toolRunInputsSchema>;
 export type ToolRunPresentation = z.infer<typeof toolRunPresentationSchema>;
 export type ToolRunExpired = z.infer<typeof toolRunExpiredSchema>;
 export type ToolRunConversion = z.infer<typeof toolRunConversionSchema>;
+export type ToolRunConversionPreview = z.infer<typeof toolRunConversionPreviewSchema>;
 export type ToolRun = z.infer<typeof toolRunSchema>;
 export type ToolRunResult = z.infer<typeof toolRunResultSchema>;
 export type ToolRunDetail = z.infer<typeof toolRunDetailSchema>;

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { toolRunConversionSchema } from "./tool-run.schema.js";
+import { toolRunConversionPreviewSchema } from "./tool-run.schema.js";
 
 // STORY-078 - POST /v1/tools/runs/{id}/convert: ONE conversion contract for all six entry points (FR-TL-09).
 // Idempotent by run: converting twice returns the first project (`already_converted: true`) and creates nothing.
@@ -18,8 +18,8 @@ export const convertToolRunResponseSchema = z
     project_id: z.uuid(),
     converted_at: z.iso.datetime(),
     already_converted: z.boolean(),
-    /** The slot cost this conversion took (or, on a repeat, the cost it took the first time is not re-charged: nothing is). */
-    slot_cost: toolRunConversionSchema.pick({ project_slot: true, prompt_slots: true, credits: true }),
+    /** The slot cost of the conversion that created the project; a repeat creates nothing and charges nothing. */
+    slot_cost: toolRunConversionPreviewSchema.pick({ project_slot: true, prompt_slots: true, credits: true }),
     poll: z.object({ discovery: z.string() }).strict(),
   })
   .strict();
