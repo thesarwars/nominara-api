@@ -19,7 +19,12 @@ function recorder(): { tx: ClientBase; statements: string[] } {
   const tx = {
     query: (sql: string) => {
       statements.push(sql);
-      return Promise.resolve({ rows: /FROM projects/.test(sql) ? [{ root_domain: "acme.com", name: "Acme" }] : [], rowCount: 0 });
+      // Every statement gets a row that lets the loader go on: the project, a zeroed count row, one result id. Nothing else is returned empty
+      // on purpose: with no rows the loaders skip the statements that depend on them.
+      const row = /FROM projects/.test(sql)
+        ? [{ root_domain: "acme.com", name: "Acme" }]
+        : [{ cells: 0, negative_cells: 0, demo_cells: 0, stale_cells: 0, answers: 0, brand_mentions: 0, demo: 0, live: 0, demo_results: 0, result_id: "00000000-0000-0000-0000-000000000001", prompt_id: "p", engine_key: "gemini", id: "c", label: "x", commercial_intent: 0.5, is_demo: false, stability_score: 1, position_class: null, captured_at: new Date(), sentiment_label: "negative", evidence_start: 0, evidence_end: 4, negative_reasons: ["x"], text: "text", slot_index: 1, raw_url: "u", domain: "d.com", reason: "x", mentions: 1 }];
+      return Promise.resolve({ rows: row, rowCount: row.length });
     },
   } as unknown as ClientBase;
   return { tx, statements };
@@ -40,16 +45,17 @@ function unguarded(sql: string): string[] {
 }
 
 describe("STORY-061 r4 - loaders carry the workspace predicate on every tenant table", () => {
-  const loaders: [string, (tx: ClientBase) => Promise<unknown>][] = [
-    ["loadDivergenceInput", (tx) => loadDivergenceInput(tx, "p", "2026-09-02", 30)],
-    ["loadSentimentInput", (tx) => loadSentimentInput(tx, "p", "2026-09-02", 30)],
-    ["loadTopicsInput", (tx) => loadTopicsInput(tx, "p", "2026-09-02", 30)],
+  // The exact number of statements each loader issues: a statement added or dropped changes it, and the test must be re-read.
+  const loaders: [string, (tx: ClientBase) => Promise<unknown>, number][] = [
+    ["loadDivergenceInput", (tx) => loadDivergenceInput(tx, "p", "2026-09-02", 30), 7],
+    ["loadSentimentInput", (tx) => loadSentimentInput(tx, "p", "2026-09-02", 30), 7],
+    ["loadTopicsInput", (tx) => loadTopicsInput(tx, "p", "2026-09-02", 30), 7],
   ];
-  for (const [name, run] of loaders) {
+  for (const [name, run, count] of loaders) {
     it(`[r4-1] ${name}: no statement reads a tenant table without workspace_id = app.current_workspace()`, async () => {
       const { tx, statements } = recorder();
-      await run(tx).catch(() => undefined); // an empty project may stop a loader early; what it issued is what is checked
-      expect(statements.length).toBeGreaterThan(1);
+      await run(tx);
+      expect(statements).toHaveLength(count);
       const bad = statements.flatMap((s) => unguarded(s));
       expect(bad).toEqual([]);
     });

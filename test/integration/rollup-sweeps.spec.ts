@@ -10,6 +10,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
+import { asTenantJob } from "../support/tenant-job.js";
 import type { EnqueueRollup } from "../../src/lib/queue/handlers/run-rollup-request.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { type DirtyEntry, RollupDirtySet } from "../../src/lib/rollup/dirty-dates.js";
@@ -490,7 +491,7 @@ describe("STORY-042 · closed-day sweep, dirty-date sweep, freshness", () => {
       await runDirtyDateSweep(dirty, collector, new Date());
       expect(enqueued).toHaveLength(1);
       const rollup = createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext);
-      await rollup(db, { id: "j1", timestamp: Date.now(), data: { payload: { ...enqueued[0]!.payload, workspaceId: ids.workspaceId, kid: "k" } } } as unknown as Job);
+      await asTenantJob(db, ids.workspaceId, () => rollup(db, { id: "j1", timestamp: Date.now(), data: { payload: { ...enqueued[0]!.payload, workspaceId: ids.workspaceId, kid: "k" } } } as unknown as Job));
 
       const after = await db.query("SELECT cells_total FROM metric_daily WHERE project_id = $1 AND entity_type = 'brand'", [ids.projectId]);
       expect(after.rows[0].cells_total).toBe(2);

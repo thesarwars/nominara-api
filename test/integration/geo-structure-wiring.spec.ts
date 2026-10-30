@@ -7,6 +7,7 @@ import { geoStructureDetailSchema } from "../../contracts/analytics/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import { asTenantJob } from "../support/tenant-job.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
@@ -94,22 +95,13 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
       } as unknown as Job),
     );
 
-  // Inside a tenant transaction, as `withTenantJob` runs it, so `app.current_workspace()` is set: the loaders' workspace predicate
-  // (STORY-061 r4) reads nothing without it, which is the production behaviour. The context is set transaction-locally on the same
-  // connection; `withTenantContext` is not used because its after-commit hooks would reach for a queue this test does not have.
-  const rollup = async () => {
-    await db.query("BEGIN");
-    try {
-      await db.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
-      await createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
+  // Inside a tenant transaction, as `withTenantJob` runs it (the shared helper; see test/support/tenant-job.ts).
+  const rollup = () =>
+    asTenantJob(db, workspaceId, () =>
+      createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
         data: { payload: { workspaceId, kid: "k", projectId } },
-      } as unknown as Job);
-      await db.query("COMMIT");
-    } catch (error) {
-      await db.query("ROLLBACK");
-      throw error;
-    }
-  };
+      } as unknown as Job),
+    );
 
   const structureRows = async () =>
     (await db.query("SELECT * FROM geo_analyses WHERE project_id = $1 AND analysis = 'structure' ORDER BY window_days", [projectId])).rows;
