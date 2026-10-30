@@ -89,7 +89,7 @@ export class SerpApiProvider implements LicensedSerpProvider {
   }
 
   /** One GET. The key travels as `api_key` (the vendor's only mechanism) and is never put in an error, a log line or a span. */
-  private async getJson(url: URL, signal: AbortSignal, engineKey: EngineKey): Promise<unknown> {
+  private async getJson(url: URL, signal: AbortSignal, engineKey: EngineKey, softClientError = false): Promise<unknown> {
     url.searchParams.set("api_key", this.config.apiKey);
     const response = await this.fetchFn(url, { method: "GET", signal });
     const text = await response.text();
@@ -98,6 +98,11 @@ export class SerpApiProvider implements LicensedSerpProvider {
       body = JSON.parse(text);
     } catch {
       body = undefined;
+    }
+    // A follow-up whose token the vendor refuses with a plain 4xx (expired, gone) is reported as an error body so the caller can re-search;
+    // auth, throttle and server faults still throw.
+    if (!response.ok && softClientError && response.status >= 400 && response.status < 500 && ![401, 403, 429].includes(response.status)) {
+      return { error: `HTTP ${response.status}` };
     }
     if (!response.ok) throw failure(codeForStatus(response.status, body), engineKey);
     if (body === undefined) throw failure("malformed_response", engineKey);
@@ -135,17 +140,27 @@ export class SerpApiProvider implements LicensedSerpProvider {
       return live;
     }
     let body = await this.getJson(this.searchUrl({ ...params, async: "true" }), signal, engineKey);
-    billIfAccepted(body); // billed at submit: a timeout while polling still spent it
-    for (;;) {
-      signal.throwIfAborted();
-      const envelope = serpEnvelopeSchema.safeParse(body);
-      if (!envelope.success) throw failure("malformed_response", engineKey);
-      const status = envelope.data.search_metadata?.status;
-      if (status === "Success" || status === "Error") return body;
-      const id = envelope.data.search_metadata?.id;
-      if (id === undefined) throw failure("malformed_response", engineKey);
-      await sleep(this.config.pollIntervalMs ?? 2000, signal);
-      body = await this.getJson(new URL(`/searches/${encodeURIComponent(id)}.json`, BASE_URL), signal, engineKey);
+    // Billed from the FINAL body (an errored search is not billed). If the read-back dies first (timeout, abort, HTTP fault) the
+    // accepted submit is billed instead: it may well have run.
+    const submitAccepted = typeof (body as { error?: unknown } | null)?.error !== "string";
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const envelope = serpEnvelopeSchema.safeParse(body);
+        if (!envelope.success) throw failure("malformed_response", engineKey);
+        const status = envelope.data.search_metadata?.status;
+        if (status === "Success" || status === "Error") {
+          if (status === "Success") billIfAccepted(body);
+          return body;
+        }
+        const id = envelope.data.search_metadata?.id;
+        if (id === undefined) throw failure("malformed_response", engineKey);
+        await sleep(this.config.pollIntervalMs ?? 2000, signal);
+        body = await this.getJson(new URL(`/searches/${encodeURIComponent(id)}.json`, BASE_URL), signal, engineKey);
+      }
+    } catch (error) {
+      if (submitAccepted) onSearchBilled();
+      throw error;
     }
   }
 
@@ -153,8 +168,8 @@ export class SerpApiProvider implements LicensedSerpProvider {
     return request.surface === "google_ai_mode" ? this.fetchAiMode(request, signal, onSearchBilled) : this.fetchOverview(request, signal, onSearchBilled);
   }
 
-  private malformed(engineKey: EngineKey): CaptureFailureError {
-    incrementCounter("nominara_capture_malformed_response_total", { engine_key: engineKey, adapter_version: `${this.id}.${this.version}` });
+  private malformed(engineKey: EngineKey, reason?: string): CaptureFailureError {
+    incrementCounter("nominara_capture_malformed_response_total", { engine_key: engineKey, adapter_version: `${this.id}.${this.version}`, ...(reason !== undefined ? { reason } : {}) });
     return failure("malformed_response", engineKey);
   }
 
@@ -163,11 +178,12 @@ export class SerpApiProvider implements LicensedSerpProvider {
     const body = await this.search({ engine: "google_ai_mode", q: request.query, ...this.localeParams(request.locale) }, request.mode, signal, engineKey, onSearchBilled);
     const parsed = serpAiModeResponseSchema.safeParse(body);
     if (!parsed.success) throw this.malformed(engineKey);
-    // "Google hasn't returned any results" is Google's answer about the query, not a vendor fault: a genuine absence (empty_answer),
-    // not billed. Any other error string is not an answer and not an absence: it fails (retryably) so no data point is stored for it.
+    // AI Mode always returns an answer (tracking-engine.md section 3), so "no results" here points at a capture defect (Google failed to
+    // render or blocked the scrape), never at the brand: terminal failure, no row stored, counted under its own reason label. Any other
+    // error string is a retryable vendor fault. Neither is ever an absence.
     if (parsed.data.error !== undefined) {
-      if (!isNoResultsMessage(parsed.data.error)) throw failure("upstream_5xx", engineKey);
-      return { answer: null, asyncGenerated: null, searchesBilled: 0 };
+      if (isNoResultsMessage(parsed.data.error)) throw this.malformed(engineKey, "no_results");
+      throw failure("upstream_5xx", engineKey);
     }
     const requestId = parsed.data.search_metadata?.id;
     // AI Mode reports no on-demand flag, so the persisted value is null, not false.
@@ -218,7 +234,7 @@ export class SerpApiProvider implements LicensedSerpProvider {
       // Only a page_token. Without the async-load parameter this is the false absence NFR-SIM-11 exists to prevent.
       if (overview.page_token === undefined || !request.asyncLoad) throw this.malformed(engineKey);
 
-      const followUp = await this.getJson(this.searchUrl({ engine: "google_ai_overview", page_token: overview.page_token }), signal, engineKey);
+      const followUp = await this.getJson(this.searchUrl({ engine: "google_ai_overview", page_token: overview.page_token }), signal, engineKey, true);
       const second = serpAiOverviewResponseSchema.safeParse(followUp);
       if (!second.success) throw this.malformed(engineKey);
       if (second.data.error === undefined) bill();

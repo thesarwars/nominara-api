@@ -531,6 +531,20 @@ describe("STORY-029 review 1 · a vendor-cached response can never stand in for 
     expect(raw.asyncGenerated).toBe(true);
   });
 
+  it.each([400, 404, 410])("a queued stale token refused with HTTP %i is re-searched live, not failed terminally", async (status) => {
+    const { fetchImpl, urls } = fetchSequence(aioDeferred, { status, body: { error: "expired" } }, aioDeferred, aioFollowUp);
+    const raw = await adapterFor("google_aio", fetchImpl).capture({ ...input, requestMode: "queued" }, makeCtx().ctx);
+    expect(urls[2]?.searchParams.get("no_cache")).toBe("true");
+    expect(raw.asyncGenerated).toBe(true);
+  });
+
+  it("a follow-up refused with HTTP 401 stays auth_failed, never re-searched", async () => {
+    const { fetchImpl, urls } = fetchSequence(aioDeferred, { status: 401, body: { error: "bad key" } });
+    const outcome = await settle(adapterFor("google_aio", fetchImpl).capture({ ...input, requestMode: "queued" }, makeCtx().ctx));
+    expect((outcome as CaptureFailureError).code).toBe("auth_failed");
+    expect(urls).toHaveLength(2);
+  });
+
   it("the fresh re-fetch happens once: a second failed follow-up is a retryable timeout", async () => {
     const { fetchImpl, urls } = fetchSequence(aioDeferred, { status: 200, body: vendorFault }, aioDeferred, { status: 200, body: vendorFault });
     const outcome = await settle(adapterFor("google_aio", fetchImpl).capture({ ...input, requestMode: "queued" }, makeCtx().ctx));
@@ -599,11 +613,35 @@ describe("STORY-029 review 1 · the vendor's no-results message is a genuine abs
     expect(recordCost).toHaveBeenCalledWith(0);
   });
 
-  it("google_ai_mode: no results is empty_answer, async null", async () => {
-    const raw = await adapterFor("google_ai_mode", fetchSequence(errorBody).fetchImpl).capture({ ...input, requestMode: "live" }, makeCtx().ctx);
-    expect(raw.text).toBe("");
-    expect(raw.flags).toEqual(["empty_answer"]);
-    expect(raw.asyncGenerated).toBeNull();
+  it("google_ai_mode: no results is a terminal malformed_response under its own counter label, and no row is stored", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const outcome = await settle(adapterFor("google_ai_mode", fetchSequence(errorBody).fetchImpl).capture({ ...input, requestMode: "live" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("malformed_response");
+    expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_capture_malformed_response_total", expect.objectContaining({ engine_key: "google_ai_mode", reason: "no_results" }));
+    expect(recordCost).not.toHaveBeenCalled();
+  });
+
+  it("queued google_aio: a search that finishes with no results is not billed, same as live", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const raw = await adapterFor("google_aio", fetchSequence(aiModeSubmitProcessing, errorBody).fetchImpl).capture({ ...input, requestMode: "queued" }, ctx);
+    expect(raw.flags).toEqual(["no_ai_overview_for_query"]);
+    expect(raw.costUsd).toBe(0);
+    expect(recordCost).toHaveBeenCalledWith(0);
+  });
+
+  it("queued google_ai_mode: no results fails terminally and nothing is metered", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const outcome = await settle(adapterFor("google_ai_mode", fetchSequence(aiModeSubmitProcessing, errorBody).fetchImpl).capture({ ...input, requestMode: "queued" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("malformed_response");
+    expect(recordCost).not.toHaveBeenCalled();
+  });
+
+  it("queued: a search that finishes with any other vendor error is not billed on the failure path", async () => {
+    const { ctx, recordCost } = makeCtx();
+    const body = { search_metadata: { status: "Error" }, error: "Results could not be returned, try again." };
+    const outcome = await settle(adapterFor("google_ai_mode", fetchSequence(aiModeSubmitProcessing, body).fetchImpl).capture({ ...input, requestMode: "queued" }, ctx));
+    expect((outcome as CaptureFailureError).code).toBe("upstream_5xx");
+    expect(recordCost).not.toHaveBeenCalled();
   });
 
   it("the match is narrow: a different error that merely mentions results stays upstream_5xx", async () => {

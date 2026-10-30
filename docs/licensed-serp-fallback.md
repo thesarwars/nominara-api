@@ -7,7 +7,7 @@ vendor is **not** in that class. It sits behind `LicensedSerpProvider`:
 ```ts
 interface LicensedSerpProvider {
   id: string; version: string;                  // recorded in adapterVersion, e.g. 0.1.0+serpapi.1
-  fetchAnswer(request: LicensedSerpRequest, signal: AbortSignal): Promise<LicensedFetchResult>;
+  fetchAnswer(request: LicensedSerpRequest, signal: AbortSignal, onSearchBilled?: () => void): Promise<LicensedFetchResult>;
   healthProbe(): Promise<{ ok: boolean; latencyMs: number; detail?: string }>;
 }
 ```
@@ -41,7 +41,7 @@ documented message, not a recording.
 
 ## Switching to a fallback
 
-A switch is configuration plus a mapper. It is never a change to the adapter, the
+A switch is one line in `registry.ts` (`serpAdapterFor`, where the provider is chosen) plus a provider and a mapper; it is a code change, not an environment value. It is never a change to the adapter, the
 registry's callers, the parser, or storage.
 
 1. Write `src/lib/engines/serp/<vendor>-provider.ts` implementing
