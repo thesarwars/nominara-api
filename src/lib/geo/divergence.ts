@@ -278,7 +278,7 @@ export async function loadDivergenceInput(
   windowStart: string,
   windowDays: 7 | 30 | 90,
 ): Promise<DivergenceGeoInput> {
-  const project = await tx.query<{ root_domain: string }>("SELECT root_domain FROM projects WHERE id = $1 AND deleted_at IS NULL", [projectId]);
+  const project = await tx.query<{ root_domain: string }>("SELECT root_domain FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL", [projectId]);
   if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
 
   // The latest LIVE capture per (prompt, engine): the demo filter runs INSIDE the DISTINCT ON, so a later demo capture cannot shadow a live one.
@@ -287,25 +287,29 @@ export async function loadDivergenceInput(
             tp.stability_score, first_mention.position_class
        FROM (SELECT DISTINCT ON (ac.prompt_id, ac.engine_key) ac.id, ac.captured_at, ac.prompt_id, ac.engine_key, ac.normalizer_version
                FROM answer_captures ac
-              WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("ac")}
+              WHERE ac.project_id = $1 AND ac.workspace_id = app.current_workspace() AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("ac")}
               ORDER BY ac.prompt_id, ac.engine_key, ac.captured_at DESC, ac.id) latest
-       JOIN tracked_prompts tp ON tp.id = latest.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL
+       JOIN tracked_prompts tp ON tp.id = latest.prompt_id AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL
        LEFT JOIN LATERAL (SELECT mf.position_class
                             FROM mention_facts mf
                            WHERE mf.result_id = latest.id AND mf.captured_at = latest.captured_at
-                             AND mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $5
+                             AND mf.project_id = $1 AND mf.workspace_id = app.current_workspace() AND mf.entity_type = 'brand' AND mf.scoring_version = $5
                            ORDER BY mf.occurrence_index, mf.char_start LIMIT 1) first_mention ON true
       ORDER BY latest.prompt_id, latest.engine_key`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION, SCORING_VERSION],
   );
 
-  // Demo results are counted apart: (prompt, engine) pairs the demo seed captured in the window, for live prompts only.
+  // Demo results are counted apart: (prompt, engine) pairs the demo seed captured in the window, for live prompts only, where NO live
+  // capture of the pair was used (a pair with a live capture is scored on it; its demo capture is not a result that was set aside).
   const demo = await tx.query<{ demo_results: number }>(
     `SELECT count(*)::int AS demo_results
        FROM (SELECT DISTINCT ac.prompt_id, ac.engine_key
                FROM answer_captures ac
-               JOIN tracked_prompts tp ON tp.id = ac.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL
-              WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version = $4 AND ${windowClause("ac")}) d`,
+               JOIN tracked_prompts tp ON tp.id = ac.prompt_id AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL
+              WHERE ac.project_id = $1 AND ac.workspace_id = app.current_workspace() AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version = $4 AND ${windowClause("ac")}
+                AND NOT EXISTS (SELECT 1 FROM answer_captures lv
+                                 WHERE lv.project_id = $1 AND lv.workspace_id = app.current_workspace() AND lv.prompt_id = ac.prompt_id AND lv.engine_key = ac.engine_key
+                                   AND ${hasFactsStatusSql("lv.status")} AND lv.normalizer_version <> $4 AND ${windowClause("lv")})) d`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION],
   );
 
@@ -315,7 +319,7 @@ export async function loadDivergenceInput(
     const rows = await tx.query<{ result_id: string; domain: string }>(
       `SELECT DISTINCT cf.result_id, lower(cf.domain) AS domain
          FROM citation_facts cf
-        WHERE cf.project_id = $1 AND cf.result_id = ANY($4::uuid[]) AND ${windowClause("cf")}`,
+        WHERE cf.project_id = $1 AND cf.workspace_id = app.current_workspace() AND cf.result_id = ANY($4::uuid[]) AND ${windowClause("cf")}`,
       [projectId, windowStart, windowDays, resultIds],
     );
     for (const r of rows.rows) (cited.get(r.result_id) ?? cited.set(r.result_id, new Set()).get(r.result_id)!).add(r.domain);
@@ -333,9 +337,9 @@ export async function loadDivergenceInput(
     `SELECT lower(sd.domain) AS domain, psi.context_weight::float8 AS context_weight
        FROM (SELECT DISTINCT ON (source_domain_id) source_domain_id, context_weight
                FROM project_source_index
-              WHERE project_id = $1 AND engine_key = 'all' AND window_days = $2 AND scoring_version = $3
+              WHERE project_id = $1 AND workspace_id = app.current_workspace() AND engine_key = 'all' AND window_days = $2 AND scoring_version = $3
               ORDER BY source_domain_id, window_start DESC) psi
-       JOIN source_domains sd ON sd.id = psi.source_domain_id`,
+       JOIN source_domains sd ON sd.id = psi.source_domain_id AND sd.workspace_id = app.current_workspace()`,
     [projectId, windowDays, SCORING_VERSION],
   );
 
@@ -343,7 +347,7 @@ export async function loadDivergenceInput(
   const answers = await tx.query<{ engine_key: string; answers: number }>(
     `SELECT ac.engine_key, count(*)::int AS answers
        FROM answer_captures ac
-      WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("ac")}
+      WHERE ac.project_id = $1 AND ac.workspace_id = app.current_workspace() AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("ac")}
       GROUP BY ac.engine_key`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION],
   );
@@ -351,8 +355,8 @@ export async function loadDivergenceInput(
     `SELECT cf.engine_key, lower(cf.domain) AS domain, count(DISTINCT cf.result_id)::int AS answers_citing,
             mode() WITHIN GROUP (ORDER BY cf.source_class) AS source_class, count(*)::int AS citations
        FROM citation_facts cf
-       JOIN answer_captures ac ON ac.id = cf.result_id AND ac.captured_at = cf.captured_at
-      WHERE cf.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("cf")}
+       JOIN answer_captures ac ON ac.id = cf.result_id AND ac.captured_at = cf.captured_at AND ac.workspace_id = app.current_workspace()
+      WHERE cf.project_id = $1 AND cf.workspace_id = app.current_workspace() AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("cf")}
       GROUP BY cf.engine_key, lower(cf.domain)`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION],
   );

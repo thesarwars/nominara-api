@@ -265,11 +265,11 @@ interface CellRow {
  * planner. A cell is a parsed answer to a prompt that belongs to a cluster; a prompt in no cluster is in no topic.
  */
 export async function loadTopicsInput(tx: ClientBase, projectId: string, windowStart: string, windowDays: 7 | 30 | 90): Promise<TopicsGeoInput> {
-  const project = await tx.query<{ root_domain: string; name: string }>("SELECT root_domain, name FROM projects WHERE id = $1 AND deleted_at IS NULL", [projectId]);
+  const project = await tx.query<{ root_domain: string; name: string }>("SELECT root_domain, name FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL", [projectId]);
   if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
 
   const clusters = await tx.query<ClusterRow>(
-    "SELECT id, label, commercial_intent::float8 AS commercial_intent FROM topic_clusters WHERE project_id = $1 ORDER BY id",
+    "SELECT id, label, commercial_intent::float8 AS commercial_intent FROM topic_clusters WHERE project_id = $1 AND workspace_id = app.current_workspace() ORDER BY id",
     [projectId],
   );
 
@@ -281,18 +281,18 @@ export async function loadTopicsInput(tx: ClientBase, projectId: string, windowS
                FROM (SELECT CASE mf.entity_type WHEN 'brand' THEN 'brand' ELSE COALESCE(mf.entity_id::text, 'label:' || lower(mf.entity_label)) END AS key,
                             mf.entity_type, max(mf.entity_label) AS label, max(mf.prominence)::float8 AS prominence
                        FROM mention_facts mf
-                      WHERE mf.result_id = ac.id AND mf.captured_at = ac.captured_at AND mf.project_id = $1 AND mf.scoring_version = $5
+                      WHERE mf.result_id = ac.id AND mf.captured_at = ac.captured_at AND mf.project_id = $1 AND mf.workspace_id = app.current_workspace() AND mf.scoring_version = $5
                       GROUP BY 1, mf.entity_type) e) AS entities
        FROM answer_captures ac
-       JOIN tracked_prompts tp ON tp.id = ac.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL AND tp.cluster_id IS NOT NULL
-       LEFT JOIN project_engines pe ON pe.project_id = $1 AND pe.engine_key = ac.engine_key
-      WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")}
+       JOIN tracked_prompts tp ON tp.id = ac.prompt_id AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL AND tp.cluster_id IS NOT NULL
+       LEFT JOIN project_engines pe ON pe.project_id = $1 AND pe.workspace_id = app.current_workspace() AND pe.engine_key = ac.engine_key
+      WHERE ac.project_id = $1 AND ac.workspace_id = app.current_workspace() AND ${hasFactsStatusSql("ac.status")}
         AND ac.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND ac.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION, SCORING_VERSION],
   );
 
-  const competitors = await tx.query<{ id: string; name: string }>("SELECT id, name FROM competitors WHERE project_id = $1 AND deleted_at IS NULL ORDER BY lower(name), id", [projectId]);
+  const competitors = await tx.query<{ id: string; name: string }>("SELECT id, name FROM competitors WHERE project_id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL ORDER BY lower(name), id", [projectId]);
   const entities = new Map<string, TopicEntity>([["brand", { key: "brand", type: "brand", label: project.rows[0].name }]]);
   for (const c of competitors.rows) entities.set(c.id, { key: c.id, type: "competitor", label: c.name });
   // Tracked = the brand and the LIVE competitors (section 10: "over all tracked entities"). A soft-deleted competitor's mentions still
@@ -303,7 +303,7 @@ export async function loadTopicsInput(tx: ClientBase, projectId: string, windowS
     `SELECT DISTINCT ON (prompt_cluster_id) prompt_cluster_id,
             COALESCE(current_alignment, baseline_alignment)::float8 AS current, target_band_low::float8 AS target
        FROM geo_alignments
-      WHERE project_id = $1 AND prompt_cluster_id IS NOT NULL AND target_band_low IS NOT NULL
+      WHERE project_id = $1 AND workspace_id = app.current_workspace() AND prompt_cluster_id IS NOT NULL AND target_band_low IS NOT NULL
         AND COALESCE(current_alignment, baseline_alignment) IS NOT NULL
       ORDER BY prompt_cluster_id, COALESCE(current_alignment, baseline_alignment) DESC, id`,
     [projectId],
@@ -313,7 +313,7 @@ export async function loadTopicsInput(tx: ClientBase, projectId: string, windowS
   const nodes = await tx.query<{ prompt_cluster_id: string; phrase: string; node_type: string; corpus_doc_ratio: number; evidence_url: string; evidence_snippet: string }>(
     `SELECT prompt_cluster_id, phrase, node_type, corpus_doc_ratio::float8 AS corpus_doc_ratio, evidence_url, evidence_snippet
        FROM semantic_nodes
-      WHERE project_id = $1 AND prompt_cluster_id IS NOT NULL AND collapsed_into_id IS NULL AND corpus_doc_ratio >= $2
+      WHERE project_id = $1 AND workspace_id = app.current_workspace() AND prompt_cluster_id IS NOT NULL AND collapsed_into_id IS NULL AND corpus_doc_ratio >= $2
       ORDER BY prompt_cluster_id, corpus_doc_ratio DESC, phrase`,
     [projectId, ALIGNMENT.minDocRatio],
   );
@@ -321,9 +321,9 @@ export async function loadTopicsInput(tx: ClientBase, projectId: string, windowS
   const forms = await tx.query<{ cluster_id: string; answer_form: string }>(
     `SELECT DISTINCT ON (tp.cluster_id) tp.cluster_id, mf.answer_form
        FROM mention_facts mf
-       JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")}
-       JOIN tracked_prompts tp ON tp.id = mf.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL AND tp.cluster_id IS NOT NULL
-      WHERE mf.project_id = $1 AND mf.answer_form IS NOT NULL AND mf.scoring_version = $4
+       JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.project_id = $1 AND ac.workspace_id = app.current_workspace() AND ${hasFactsStatusSql("ac.status")}
+       JOIN tracked_prompts tp ON tp.id = mf.prompt_id AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL AND tp.cluster_id IS NOT NULL
+      WHERE mf.project_id = $1 AND mf.workspace_id = app.current_workspace() AND mf.answer_form IS NOT NULL AND mf.scoring_version = $4
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)
       GROUP BY tp.cluster_id, mf.answer_form

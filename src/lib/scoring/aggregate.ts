@@ -181,9 +181,6 @@ export const NEGATIVE_CELL_RATE_ALERT = 0.05;
 export const NEGATIVE_ALERT_MIN_CELLS = 30;
 export const NEGATIVE_CELL_RATE_RISE_ALERT = 0.03;
 
-/** A rate difference is a difference of two quotients: compare it with a tolerance far under any real count ratio (1e-9). */
-const RATE_EPSILON = 1e-9;
-
 /** The §6 level alone: `negative_cell_rate ≥ 0.05` with `n ≥ 30`. */
 export function shouldAlertOnNegativeSentiment(cells: number, negativeCells: number): boolean {
   if (cells < NEGATIVE_ALERT_MIN_CELLS) return false;
@@ -196,5 +193,6 @@ export function shouldAlertOnNegativeSentiment(cells: number, negativeCells: num
  */
 export function negativeSentimentRose(cells: number, negativeCells: number, priorCells: number, priorNegativeCells: number): boolean {
   if (cells <= 0 || priorCells < NEGATIVE_ALERT_MIN_CELLS) return false;
-  return negativeCells / cells - priorNegativeCells / priorCells >= NEGATIVE_CELL_RATE_RISE_ALERT - RATE_EPSILON;
+  // rate - priorRate >= 0.03, cross-multiplied into integers: 100 * (n * P - p * C) >= 3 * C * P. No float subtraction, no tolerance.
+  return 100 * (negativeCells * priorCells - priorNegativeCells * cells) >= 3 * cells * priorCells;
 }

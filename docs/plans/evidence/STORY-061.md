@@ -67,3 +67,12 @@ Branch `story/061-divergence-topics-sentiment`. Source of the decisions: `plans-
 ## A5 needs a real-model run
 
 A5 (topical authority) is proven here on stand-in data: crafted alignments, concepts and prominences, and no embedding model. The achievability inputs (`geo_alignments`, `semantic_nodes`) come from STORY-059/060's real-model path; an end-to-end run with a real embedding model, against a project with measured alignments, is still owed before the recommendation quality can be judged.
+
+## Round 4 (audit of 9ff78c1..6a9d957)
+
+- **Docs repo:** scoring-models.md sections 6 and 15 (the `negative_spike` mapping to TG-SENTIMENT-REASON, and the level-AND-rise reconciliation) are updated in the wave docs PR, carried by the orchestrator. This change does not edit the docs repo.
+- **Workspace predicate.** Every tenant-table reference in `loadDivergenceInput`, `loadSentimentInput` and `loadTopicsInput` now carries `<alias>.workspace_id = app.current_workspace()`. `test/unit/geo/loader-workspace-predicate.spec.ts` records every statement each loader issues and fails on any tenant table without it.
+- **The prior window fails closed.** Any demo cell in it, or any parsed capture whose facts exist only at another `scoring_version` (EXISTS at another version, NOT EXISTS at the current one), makes it unmeasured: no cells, no rate, no theme counts, so `rose` is false. Chosen over bounding the prior to a version cut-over because it needs no cut-over date.
+- **The rise is exact integer arithmetic:** `100 * (neg * priorCells - priorNeg * cells) >= 3 * cells * priorCells`. The 1e-9 tolerance is gone; 472/3003 against 431/3389 is not a rise.
+- **The alert links the first draft whose task was `created`** (`FiredDraft.outcome`), else the first draft.
+- **`excluded.demo_results`** counts only (prompt, engine) pairs where no live capture was used.
