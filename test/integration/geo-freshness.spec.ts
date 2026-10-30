@@ -94,7 +94,7 @@ describe("STORY-062 AC12 · GEO recompute freshness", () => {
       await refreshProjectGeoWindows(tx, projectId, { asOf: AS_OF });
     });
     const rows = (await db.query<{ analysis: string; window_days: number; computed_at: Date }>("SELECT analysis, window_days, computed_at FROM geo_analyses")).rows;
-    expect(rows).toHaveLength(9); // structure + entity + sentiment, three windows
+    expect(rows).toHaveLength(15); // structure + entity + sentiment + divergence + topics (STORY-061), three windows
     expect(new Set(rows.map((r) => r.window_days))).toEqual(new Set([7, 30, 90]));
     for (const r of rows) {
       const lagSeconds = (r.computed_at.getTime() - trigger.getTime()) / 1000;
@@ -130,7 +130,7 @@ describe("STORY-062 AC12 · GEO recompute freshness", () => {
     await refresh();
     const second = (await db.query<{ computed_at: Date }>("SELECT min(computed_at) AS computed_at FROM geo_analyses")).rows[0]!.computed_at;
     expect(second.getTime()).toBeGreaterThan(first.getTime());
-    expect(Number((await db.query("SELECT count(*) FROM geo_analyses")).rows[0].count)).toBe(9); // structure + entity + sentiment, three windows
+    expect(Number((await db.query("SELECT count(*) FROM geo_analyses")).rows[0].count)).toBe(15); // structure + entity + sentiment + divergence + topics (STORY-061), three windows
   });
 
   it("[F4] observability · a geo.refresh span, the compute-duration measure and a log line with the project ID, never the workspace's name or answer text", async () => {

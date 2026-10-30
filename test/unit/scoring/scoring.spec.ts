@@ -18,6 +18,7 @@ import {
   measuredCellCount,
   presenceRate,
   responseShareOfVoice,
+  negativeSentimentRose,
   sentimentBand,
   sentimentScore,
   shareOfVoice,
@@ -349,8 +350,27 @@ describe("STORY-041 · §6 sentiment", () => {
 
   it("alerts on the negative-cell rate only at n >= 30", () => {
     expect(shouldAlertOnNegativeSentiment(100, 6)).toBe(true);
-    expect(shouldAlertOnNegativeSentiment(100, 5)).toBe(false);
+    expect(shouldAlertOnNegativeSentiment(100, 4)).toBe(false);
     expect(shouldAlertOnNegativeSentiment(20, 20)).toBe(false);
+    expect(shouldAlertOnNegativeSentiment(29, 29)).toBe(false);
+    expect(shouldAlertOnNegativeSentiment(30, 30)).toBe(true);
+  });
+
+  // scoring-models.md section 6 / 15 state ">= 0.05" ("crossing 0.05 with n >= 30"); the helper had a strict ">" (owner decision 22).
+  it("[r4] the rise is exact integer arithmetic: exactly 0.03 rises, 472/3003 against 431/3389 (0.0299999997) does not", () => {
+    expect(negativeSentimentRose(100, 8, 100, 5)).toBe(true);
+    expect(negativeSentimentRose(100, 7, 100, 5)).toBe(false);
+    expect(negativeSentimentRose(1000, 79, 1000, 50)).toBe(false);
+    expect(negativeSentimentRose(3003, 472, 3389, 431)).toBe(false);
+    expect(negativeSentimentRose(100, 10, 29, 0)).toBe(false); // prior under its floor
+    expect(negativeSentimentRose(100, 10, 30, 0)).toBe(true);
+    expect(negativeSentimentRose(0, 0, 30, 0)).toBe(false);
+  });
+
+  it("the level is >= 0.05: exactly 0.05 meets it", () => {
+    expect(shouldAlertOnNegativeSentiment(100, 5)).toBe(true);
+    expect(shouldAlertOnNegativeSentiment(60, 3)).toBe(true);
+    expect(shouldAlertOnNegativeSentiment(1000, 49)).toBe(false);
   });
 });
 

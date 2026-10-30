@@ -68,11 +68,21 @@ async function inCooldown(tx: ClientBase, ctx: AlertContext, rule: AlertRule, sc
 /** AC1-AC3 — one alert per fired draft of a catalogued rule, unless the same rule and scope alerted inside its cooldown. */
 export async function raiseAlertsForDrafts(tx: ClientBase, ctx: AlertContext, fired: readonly FiredDraft[], options: WriterOptions = {}): Promise<AlertSummary> {
   const summary = emptySummary();
-  for (const item of fired) {
-    const rule = alertRuleForTask(item.ruleCode);
+  const crossings = new Set<string>();
+  // One negative_spike alert per crossing links the first draft whose task was CREATED by this evaluation; with none created, the first draft.
+  const spikeDrafts = fired.filter((f) => alertRuleForTask(f.ruleCode)?.code === "negative_spike");
+  const spikeLink = spikeDrafts.find((f) => f.outcome === "created") ?? spikeDrafts[0];
+  for (const drafted of fired) {
+    const rule = alertRuleForTask(drafted.ruleCode);
     // The displacement rule is raised from its events (raiseDisplacementAlerts), never from the authority drafts.
     if (rule === undefined || rule.code === "displacement_detected") continue;
-    const scope = item.draft.fingerprint.toString("hex");
+    // A negative-sentiment CROSSING is one alert however many reason-class tasks it makes (owner decision 21): its scope is the project, not the task.
+    const scope = rule.code === "negative_spike" ? `project:${ctx.projectId}` : drafted.draft.fingerprint.toString("hex");
+    if (rule.code === "negative_spike") {
+      if (crossings.has(scope)) continue;
+      crossings.add(scope);
+    }
+    const item = rule.code === "negative_spike" ? (spikeLink ?? drafted) : drafted;
     if (await inCooldown(tx, ctx, rule, scope)) {
       summary.cooledDown += 1;
       incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: "cooldown" });

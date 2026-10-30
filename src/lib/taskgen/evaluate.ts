@@ -291,9 +291,9 @@ async function evaluateAuxFinding(rule: RuleRow, condition: Extract<TaskGenerati
  * enabled are not read (the non-retroactive watermark every event rule uses).
  */
 async function evaluateGeoFinding(rule: RuleRow, condition: Extract<TaskGenerationCondition, { kind: "geo_finding" }>, ctx: EvalContext): Promise<TaskDraft[]> {
-  const found = await ctx.tx.query<{ finding_id: string; headline: string; severity: string; url: string | null }>(
+  const found = await ctx.tx.query<{ finding_id: string; headline: string; severity: string; url: string | null; engine: string | null }>(
     `SELECT DISTINCT ON (f ->> 'id') f ->> 'id' AS finding_id, f ->> 'headline' AS headline, f ->> 'severity' AS severity,
-            f #>> '{evidence,0,url}' AS url
+            f #>> '{evidence,0,url}' AS url, f ->> 'engine' AS engine
        FROM (
          SELECT DISTINCT ON (window_days) findings, computed_at, window_start, sufficient
            FROM geo_analyses
@@ -312,7 +312,8 @@ async function evaluateGeoFinding(rule: RuleRow, condition: Extract<TaskGenerati
     vars: { finding_headline: row.headline },
     strength: SEVERITY_STRENGTH[row.severity] ?? 0.5,
     baselineEngine: "all",
-    affectedEngines: [],
+    // STORY-061: an engine-targeted finding (A4) scopes its task to that engine; the others name none.
+    affectedEngines: row.engine === null ? [] : [row.engine],
     affectedPromptIds: [],
     affectedUrl: row.url,
     sourceGeoAnalysis: condition.analysis,

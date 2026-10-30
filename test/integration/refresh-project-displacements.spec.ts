@@ -11,6 +11,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
+import { asTenantJob } from "../support/tenant-job.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { backfillProjectDisplacements, refreshProjectDisplacements } from "../../src/lib/rollup/refresh-project-displacements.js";
 
@@ -549,13 +550,13 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
 
     it("STORY-056 #12 · a single-date rollup job (the live path) observes the lag", async () => {
       const date = await lossTwoMinutesAgo();
-      await rollupHandler()(db, rollupJob({ metricDate: date }));
+      await asTenantJob(db, workspaceId, () => rollupHandler()(db, rollupJob({ metricDate: date })));
       expect(lagLines()).toHaveLength(1);
     });
 
     it("STORY-056 #12 · a fromDate/toDate rebuild job observes no lag, so a rebuild cannot put days-old lags into the p95 series", async () => {
       const date = await lossTwoMinutesAgo();
-      await rollupHandler()(db, rollupJob({ fromDate: date, toDate: date }));
+      await asTenantJob(db, workspaceId, () => rollupHandler()(db, rollupJob({ fromDate: date, toDate: date })));
       expect(await events()).toHaveLength(1);
       expect(lagLines()).toHaveLength(0);
     });
@@ -680,8 +681,8 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
     const handler = createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext);
     const job = { data: { payload: { workspaceId, kid: "k", projectId, metricDate: D2 } } } as unknown as Job;
-    await handler(db, job);
-    await handler(db, job);
+    await asTenantJob(db, workspaceId, () => handler(db, job));
+    await asTenantJob(db, workspaceId, () => handler(db, job));
     expect(await events()).toHaveLength(1);
   });
 

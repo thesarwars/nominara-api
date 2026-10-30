@@ -7,6 +7,7 @@ import { geoStructureDetailSchema } from "../../contracts/analytics/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import { asTenantJob } from "../support/tenant-job.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
@@ -94,10 +95,13 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
       } as unknown as Job),
     );
 
+  // Inside a tenant transaction, as `withTenantJob` runs it (the shared helper; see test/support/tenant-job.ts).
   const rollup = () =>
-    createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
-      data: { payload: { workspaceId, kid: "k", projectId } },
-    } as unknown as Job);
+    asTenantJob(db, workspaceId, () =>
+      createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
+        data: { payload: { workspaceId, kid: "k", projectId } },
+      } as unknown as Job),
+    );
 
   const structureRows = async () =>
     (await db.query("SELECT * FROM geo_analyses WHERE project_id = $1 AND analysis = 'structure' ORDER BY window_days", [projectId])).rows;
