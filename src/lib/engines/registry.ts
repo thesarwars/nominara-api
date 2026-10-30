@@ -2,7 +2,7 @@ import type { CaptureAdapter, EngineKey } from "./contract.js";
 import { engineKeySchema } from "./contract.js";
 import { FIXTURE_ADAPTERS } from "./fixtures/index.js";
 import { GeminiApiAdapter } from "./gemini/gemini-api-adapter.js";
-import { LicensedSerpAdapter, type LicensedSurface } from "./serp/licensed-serp.js";
+import { LicensedSerpAdapter, SERP_CAPTURE_TIMEOUT_MS, type LicensedSurface } from "./serp/licensed-serp.js";
 import { SerpApiProvider } from "./serp/serpapi-provider.js";
 
 // STORY-027 — mirrors src/lib/auth/oauth-providers.ts's static-map shape and
@@ -88,9 +88,7 @@ const REGISTRY: Record<EngineKey, EngineRegistration> = {
 const GEMINI_CAPTURE_TIMEOUT_MS = 30_000;
 let geminiAdapterCache: { readonly key: string; readonly adapter: GeminiApiAdapter } | undefined;
 
-// STORY-029 - hard per-capture timeout for the licensed-SERP adapters. A queued capture waits on the vendor's queue and an overview
-// is two requests, so this is well above the documented p95 (15 s queued). tracking-engine.md section 3 allows queued turnaround up to 5 minutes; 60 s is a recorded departure (story decision 13).
-const SERP_CAPTURE_TIMEOUT_MS = 60_000;
+// STORY-029 - the licensed-SERP capture timeout is SERP_CAPTURE_TIMEOUT_MS (licensed-serp.ts): the 5-minute queued wait of tracking-engine.md section 3 plus follow-up headroom (owner decision 29, 2026-10-30).
 const serpAdapterCache = new Map<LicensedSurface, { readonly key: string; readonly adapter: LicensedSerpAdapter }>();
 
 /** The licensed-SERP adapter for a surface when SERP_API_KEY is configured. THE PROVIDER IS CHOSEN HERE: a fallback vendor is a different provider on this line (docs/licensed-serp-fallback.md). */

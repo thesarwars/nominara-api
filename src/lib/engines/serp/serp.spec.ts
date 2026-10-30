@@ -19,12 +19,16 @@ import {
   AsyncLoadMissingError,
   buildLicensedRequest,
   LicensedSerpAdapter,
+  SERP_CAPTURE_TIMEOUT_MS,
+  SERP_FOLLOW_UP_HEADROOM_MS,
+  SERP_QUEUED_WAIT_MS,
   type LicensedFetchResult,
   type LicensedSerpProvider,
   type LicensedSerpRequest,
 } from "./licensed-serp.js";
 import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { SerpApiProvider } from "./serpapi-provider.js";
+import { STUCK_RUN_GRACE_MS } from "../../capture/stuck-run-reaper.js";
 
 // STORY-029 - the scenarios table, one test per row, named with the row. Every body below is a RECORDED SerpApi response
 // (fixtures/serp-recorded.ts) or says it is hand-built. No test touches the network: fetch is always injected.
@@ -677,5 +681,36 @@ describe("STORY-029 review 1 · a product shown only as a top-level priced card 
     const mapped = mapSerpAnswer({ text_blocks: [{ type: "paragraph", snippet: "Some intro." }], shopping_results: [{ title: "Zephyr Buds Pro", price: "$59.00" }] });
     expect(mapped.elements.some((element) => element.kind === "product")).toBe(true);
     expect(mapped.markdown).toContain("Zephyr Buds Pro - $59.00");
+  });
+});
+
+describe("STORY-029 · decision 29 · a queued search may wait the 5 minutes tracking-engine.md section 3 allows", () => {
+  it("the queued wait is 5 minutes, and the capture timeout is the wait plus follow-up headroom, so the wait cannot be cut off", () => {
+    expect(SERP_QUEUED_WAIT_MS).toBe(5 * 60_000);
+    expect(SERP_FOLLOW_UP_HEADROOM_MS).toBeGreaterThan(0);
+    expect(SERP_CAPTURE_TIMEOUT_MS).toBe(SERP_QUEUED_WAIT_MS + SERP_FOLLOW_UP_HEADROOM_MS);
+  });
+
+  it("the stuck-run reaper's grace outlasts the capture timeout, so a slow queued capture is never reaped under its own job", () => {
+    expect(STUCK_RUN_GRACE_MS).toBeGreaterThan(SERP_CAPTURE_TIMEOUT_MS);
+  });
+
+  it("a queued search that finishes at 4 min 50 s succeeds under the production timeout: one submit, no timeout, no retry to pay again", async () => {
+    vi.useFakeTimers();
+    try {
+      const processing = Array.from({ length: 29 }, () => aiModeSubmitProcessing);
+      const { fetchImpl, urls } = fetchSequence(...processing, aiModeQueuedResult);
+      const adapter = new LicensedSerpAdapter("google_ai_mode", {
+        provider: new SerpApiProvider({ apiKey: FAKE_KEY, fetchImpl, pollIntervalMs: 10_000, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }),
+        timeoutMs: SERP_CAPTURE_TIMEOUT_MS,
+      });
+      const pending = adapter.capture({ ...input, requestMode: "queued" }, makeCtx().ctx);
+      const settled = pending.then(() => "ok", (error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(290_000);
+      expect(await settled).toBe("ok");
+      expect(urls.filter((url) => url.searchParams.get("async") === "true")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

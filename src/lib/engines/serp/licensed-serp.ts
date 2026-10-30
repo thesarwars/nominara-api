@@ -144,6 +144,18 @@ function toElement(element: LicensedElement): AnswerElement {
   };
 }
 
+/**
+ * Owner decision 29 (2026-10-30): a queued SerpApi search may wait the 5 minutes tracking-engine.md section 3 allows.
+ * The capture timeout is the ONLY bound on that wait (there is no separate job timeout: BullMQ renews the job lock while the worker
+ * lives, the engine lease is a token bucket with no duration, and the stuck-run reaper's grace is 6 hours). It must cover the wait AND the
+ * synchronous follow-up (and a stale-token live re-search) that come after it, or a search accepted and billed at minute 4:59 times out, the
+ * retry submits again and pays twice. serp.spec.ts pins these relationships.
+ */
+export const SERP_QUEUED_WAIT_MS = 5 * 60_000;
+/** Room after a full queued wait for the live follow-up and one stale-token re-search (live ~6 s each). */
+export const SERP_FOLLOW_UP_HEADROOM_MS = 60_000;
+export const SERP_CAPTURE_TIMEOUT_MS = SERP_QUEUED_WAIT_MS + SERP_FOLLOW_UP_HEADROOM_MS;
+
 export class LicensedSerpAdapter extends BaseCaptureAdapter {
   readonly captureMode: CaptureMode = "licensed_serp";
   readonly supportsCitations = true;
