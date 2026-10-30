@@ -2,12 +2,14 @@
 UPDATE task_generation_rules
    SET condition = '{"kind":"pending_analysis","analysis":"divergence"}',
        description_template = 'Cross-engine divergence is high; one engine is missing a domain the others cite.',
-       rule_version = '2026.10.1'
+       rule_version = '2026.10.1',
+       enabled = false
  WHERE code = 'TG-DIVERGENCE';
 UPDATE task_generation_rules
    SET condition = '{"kind":"pending_analysis","analysis":"topic_gap"}',
        description_template = 'A topic with a high gap priority and good achievability has no covering content.',
-       rule_version = '2026.10.1'
+       rule_version = '2026.10.1',
+       enabled = false
  WHERE code = 'TG-TOPIC-CONTENT';
 DELETE FROM task_generation_rules r
  WHERE r.code = 'TG-SENTIMENT-REASON'

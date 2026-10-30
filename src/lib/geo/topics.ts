@@ -201,6 +201,8 @@ export function buildTopics(input: TopicsGeoInput): { write: GeoAnalysisWrite; d
   };
 
   const rootEvidence = [{ url: `https://${input.rootDomain}/`, snippet: "Topical authority over the project's topic clusters." }];
+  // Owner decision 23: demo data (or nothing measured) is analysed and labelled, and never asks for a task.
+  const asksForTasks = input.dataSource === "live";
   let findings: GeoFinding[];
   const recommended = topicRows.filter((x) => x.recommended);
   if (recommended.length === 0) {
@@ -221,10 +223,12 @@ export function buildTopics(input: TopicsGeoInput): { write: GeoAnalysisWrite; d
     findings = recommended.map((x, i) => {
       const gap = gaps.find((g) => g.cluster_id === x.raw.t.clusterId)!;
       const concepts = gap.required_concepts.map((c) => c.phrase);
-      const evidence = x.raw.t.requiredConcepts
+      const cited = x.raw.t.requiredConcepts
         .filter((c) => gap.required_concepts.some((g) => g.phrase === c.phrase))
         .slice(0, 3)
         .map((c) => ({ url: c.evidenceUrl, snippet: c.evidenceSnippet, corpus_doc_ratio: c.corpusDocRatio }));
+      // The task's affected URL is the FIRST evidence URL (STORY-060's contract): the brand's page, with the competitors' cited documents after it.
+      const evidence = [{ url: rootEvidence[0]!.url, snippet: `The brand's own site, where the content for "${x.raw.t.label}" belongs; the documents below are what the engines cite instead.` }, ...cited];
       return {
         id: `topic-gap-${x.raw.t.clusterId}`,
         severity: "medium" as const,
@@ -232,9 +236,9 @@ export function buildTopics(input: TopicsGeoInput): { write: GeoAnalysisWrite; d
           `Create content for "${x.raw.t.label}", where ${x.row.owner.entity_label} leads (authority ${x.row.owner.authority.toFixed(2)} against the brand's ${x.row.brand_authority.toFixed(2)}).` +
           (concepts.length > 0 ? ` Cover: ${concepts.join(", ")}.` : "") +
           (gap.structure === null ? "" : ` Structure it as ${ANSWER_FORM_LABEL[gap.structure] ?? gap.structure.replaceAll("_", " ")}.`),
-        evidence: evidence.length > 0 ? evidence : rootEvidence,
+        evidence,
         metric: { name: "gap_priority", value: x.row.gap_priority ?? 0 },
-        task_rule_code: TOPIC_TASK_RULE,
+        ...(asksForTasks ? { task_rule_code: TOPIC_TASK_RULE } : { no_action: true as const }),
         ...(i === 0 ? { topics: detail } : {}),
       };
     });
@@ -317,7 +321,8 @@ export async function loadTopicsInput(tx: ClientBase, projectId: string, windowS
   const forms = await tx.query<{ cluster_id: string; answer_form: string }>(
     `SELECT DISTINCT ON (tp.cluster_id) tp.cluster_id, mf.answer_form
        FROM mention_facts mf
-       JOIN tracked_prompts tp ON tp.id = mf.prompt_id AND tp.project_id = $1 AND tp.cluster_id IS NOT NULL
+       JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")}
+       JOIN tracked_prompts tp ON tp.id = mf.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL AND tp.cluster_id IS NOT NULL
       WHERE mf.project_id = $1 AND mf.answer_form IS NOT NULL AND mf.scoring_version = $4
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)

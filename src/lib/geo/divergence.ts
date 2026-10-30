@@ -57,6 +57,11 @@ export interface DivergenceGeoInput {
   windowDays: 7 | 30 | 90;
   rootDomain: string;
   prompts: DivergenceGeoPrompt[];
+  /**
+   * Demo results the loader counted apart ((prompt, engine) pairs captured by the demo seed in the window). They are never placed in a
+   * prompt's `results`: a live capture must not be shadowed by a later demo one. Added to `excluded.demo_results`.
+   */
+  demoResults?: number;
   /** `context_weight` by domain; a domain absent from the map weighs 0. */
   contextWeights: Record<string, number>;
   affinity: DivergenceAffinityInput[];
@@ -97,7 +102,7 @@ const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 export function buildDivergence(input: DivergenceGeoInput): { write: GeoAnalysisWrite; detail: GeoDivergenceDetail | null } {
   const base = { analysis: "divergence" as const, window_start: input.windowStart, window_days: input.windowDays };
 
-  const demoResults = input.prompts.reduce((n, p) => n + p.results.filter((r) => r.dataSource === "demo").length, 0);
+  const demoResults = (input.demoResults ?? 0) + input.prompts.reduce((n, p) => n + p.results.filter((r) => r.dataSource === "demo").length, 0);
   const scored = crossEngineDivergence({
     contextWeights: input.contextWeights,
     prompts: input.prompts.map((p) => ({
@@ -208,7 +213,11 @@ export function buildDivergence(input: DivergenceGeoInput): { write: GeoAnalysis
       id: `divergence-${t.losing_engine}-${t.domain}`,
       severity: "medium" as const,
       headline: `The ${t.losing_engine} answers do not cite ${t.domain}, which ${t.winning_engines.join(" and ")} cite${t.winning_engines.length === 1 ? "s" : ""} for ${String(t.prompts)} prompt${t.prompts === 1 ? "" : "s"} where the brand is recommended there and not here.`,
-      evidence: [{ url: `https://${t.domain}/`, snippet: `Cited by ${t.winning_engines.join(", ")} and absent from ${t.losing_engine} on ${String(t.prompts)} divergent prompt${t.prompts === 1 ? "" : "s"}.` }],
+      // The FIRST evidence URL is the task's affected URL (STORY-060's contract): the brand's page, never the third-party domain, which follows as evidence.
+      evidence: [
+        ...rootEvidence(`The brand's own site: the ${t.losing_engine} answers do not cite ${t.domain}, which other engines do.`),
+        { url: `https://${t.domain}/`, snippet: `Cited by ${t.winning_engines.join(", ")} and absent from ${t.losing_engine} on ${String(t.prompts)} divergent prompt${t.prompts === 1 ? "" : "s"}.` },
+      ],
       metric: { name: "project_divergence", value: projectDivergence, target: DIVERGENCE_ALERT_THRESHOLD },
       task_rule_code: DIVERGENCE_TASK_RULE,
       engine: t.losing_engine,
@@ -272,12 +281,13 @@ export async function loadDivergenceInput(
   const project = await tx.query<{ root_domain: string }>("SELECT root_domain FROM projects WHERE id = $1 AND deleted_at IS NULL", [projectId]);
   if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
 
+  // The latest LIVE capture per (prompt, engine): the demo filter runs INSIDE the DISTINCT ON, so a later demo capture cannot shadow a live one.
   const captures = await tx.query<CaptureRow>(
-    `SELECT latest.prompt_id, latest.engine_key, latest.id AS result_id, (latest.normalizer_version = $4) AS is_demo,
+    `SELECT latest.prompt_id, latest.engine_key, latest.id AS result_id, false AS is_demo,
             tp.stability_score, first_mention.position_class
        FROM (SELECT DISTINCT ON (ac.prompt_id, ac.engine_key) ac.id, ac.captured_at, ac.prompt_id, ac.engine_key, ac.normalizer_version
                FROM answer_captures ac
-              WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ${windowClause("ac")}
+              WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version <> $4 AND ${windowClause("ac")}
               ORDER BY ac.prompt_id, ac.engine_key, ac.captured_at DESC, ac.id) latest
        JOIN tracked_prompts tp ON tp.id = latest.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL
        LEFT JOIN LATERAL (SELECT mf.position_class
@@ -287,6 +297,16 @@ export async function loadDivergenceInput(
                            ORDER BY mf.occurrence_index, mf.char_start LIMIT 1) first_mention ON true
       ORDER BY latest.prompt_id, latest.engine_key`,
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION, SCORING_VERSION],
+  );
+
+  // Demo results are counted apart: (prompt, engine) pairs the demo seed captured in the window, for live prompts only.
+  const demo = await tx.query<{ demo_results: number }>(
+    `SELECT count(*)::int AS demo_results
+       FROM (SELECT DISTINCT ac.prompt_id, ac.engine_key
+               FROM answer_captures ac
+               JOIN tracked_prompts tp ON tp.id = ac.prompt_id AND tp.project_id = $1 AND tp.deleted_at IS NULL
+              WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")} AND ac.normalizer_version = $4 AND ${windowClause("ac")}) d`,
+    [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION],
   );
 
   const resultIds = captures.rows.map((r) => r.result_id);
@@ -352,6 +372,7 @@ export async function loadDivergenceInput(
     windowStart,
     windowDays,
     rootDomain: project.rows[0].root_domain,
+    demoResults: demo.rows[0]?.demo_results ?? 0,
     prompts: [...byPrompt.values()],
     contextWeights: Object.fromEntries(weights.rows.map((w) => [w.domain, w.context_weight])),
     affinity,

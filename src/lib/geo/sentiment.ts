@@ -7,7 +7,14 @@ import {
   type SentimentMention,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
-import { NEGATIVE_ALERT_MIN_CELLS, NEGATIVE_CELL_RATE_ALERT, SCORING_VERSION, shouldAlertOnNegativeSentiment } from "../scoring/index.js";
+import {
+  NEGATIVE_ALERT_MIN_CELLS,
+  NEGATIVE_CELL_RATE_ALERT,
+  NEGATIVE_CELL_RATE_RISE_ALERT,
+  negativeSentimentRose,
+  SCORING_VERSION,
+  shouldAlertOnNegativeSentiment,
+} from "../scoring/index.js";
 import { hasFactsStatusSql } from "../rollup/aggregate-day.js";
 import { DEMO_NORMALIZER_VERSION } from "./structure.js";
 
@@ -22,8 +29,9 @@ import { DEMO_NORMALIZER_VERSION } from "./structure.js";
 //    exists to compare with, so `factual_error` is false WITH A REASON on
 //    every mention. A claim is never guessed to be wrong.
 //  - A task. The task engine makes it (the `geo_finding` condition reads the finding): each reason class is one finding, and
-//    a finding asks for a task ONLY while the negative cell rate has crossed the alert threshold with the sample floor met
-//    (scoring-models.md section 6: 0.05 with n >= 30), so a quiet window raises none. Themes are trended against the prior window.
+//    a finding asks for a task ONLY on a CROSSING (owner decision 22): the section 6 level (negative cell rate >= 0.05 with n >= 30)
+//    AND the section 15 rise (up >= 0.03 on the prior window, which meets its own n >= 30), so a quiet or chronic window raises none.
+//    Themes are trended against the prior window. Never on demo data (owner decision 23): the analysis is shown, labelled, and asks for nothing.
 //  - `negative_source_url_hash`: the parser does not write it. The citation a
 //    framing traces to is the slot nearest the evidence span, located in the
 //    stored answer text; where it cannot be located it is null, never guessed.
@@ -183,6 +191,10 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
 
   const recentFirst = [...all].sort((a, b) => (a.captured_at < b.captured_at ? 1 : a.captured_at > b.captured_at ? -1 : a.result_id < b.result_id ? 1 : -1));
 
+  const level = shouldAlertOnNegativeSentiment(input.cells, input.negativeCells);
+  const rose = negativeSentimentRose(input.cells, input.negativeCells, input.priorCells, input.priorNegativeCells);
+  const crossed = level && rose;
+
   const detail: GeoSentimentDetail = {
     slug: "sentiment",
     data_source: input.dataSource,
@@ -199,11 +211,15 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
       negative_cell_rate: input.cells === 0 ? null : input.negativeCells / input.cells,
       prior_negative_cell_rate: input.priorCells === 0 ? null : input.priorNegativeCells / input.priorCells,
       rate_threshold: NEGATIVE_CELL_RATE_ALERT,
+      prior_cells: input.priorCells,
+      rise_threshold: NEGATIVE_CELL_RATE_RISE_ALERT,
       min_cells: NEGATIVE_ALERT_MIN_CELLS,
-      crossed: shouldAlertOnNegativeSentiment(input.cells, input.negativeCells),
+      rose,
+      crossed,
     },
   };
-  const crossed = detail.threshold!.crossed;
+  // Owner decision 23: any demo data in the window (or nothing measured) is analysed and labelled, and never asks for a task.
+  const asksForTasks = crossed && input.dataSource === "live";
 
   const rootEvidence = (snippet: string) => [{ url: `https://${input.rootDomain}/`, snippet }];
   const evidenceFor = (mention: SentimentMention | undefined, fallback: string): GeoFinding["evidence"] =>
@@ -246,8 +262,8 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
       headline: `${String(rc.mention_count)} ${rc.mention_count === 1 ? "mention frames" : "mentions frame"} the brand through ${reasonLabel(rc.reason)}.` + (i === 0 ? topNote : ""),
       evidence: evidenceFor(recentFirst.find((x) => x.reason === rc.reason), "No evidence span."),
       metric: { name: "reason_class_mentions", value: rc.mention_count },
-      // One task per reason class, and only past the alert threshold: a theme under it is reported, not assigned.
-      ...(crossed ? { task_rule_code: SENTIMENT_TASK_RULE } : { no_action: true as const }),
+      // One task per reason class, and only on a live crossing: a theme under it (or on demo data) is reported, not assigned.
+      ...(asksForTasks ? { task_rule_code: SENTIMENT_TASK_RULE } : { no_action: true as const }),
       // The detail rides on the finding that speaks for the analysis, once.
       ...(i === 0 ? { sentiment: detail } : {}),
     }));
@@ -270,6 +286,7 @@ export function buildSentiment(input: SentimentInput): { write: GeoAnalysisWrite
 interface CellCountRow {
   cells: number;
   negative_cells: number;
+  demo_cells: number;
 }
 interface PriorReasonRow {
   reason: string;
@@ -295,6 +312,11 @@ interface CitationRow {
   slot_index: number;
   raw_url: string;
   domain: string;
+}
+
+function dataSourceOf(brandMentions: number, demo: number, live: number): DataSource | null {
+  if (brandMentions === 0) return null;
+  return demo > 0 && live > 0 ? "mixed" : demo > 0 ? "demo" : "live";
 }
 
 /**
@@ -345,6 +367,7 @@ export async function loadSentimentInput(
     (
       await tx.query<CellCountRow>(
         `SELECT count(*)::int AS cells,
+                (count(*) FILTER (WHERE ac.normalizer_version = $6))::int AS demo_cells,
                 (count(*) FILTER (WHERE EXISTS (
                    SELECT 1 FROM mention_facts mf
                     WHERE mf.result_id = ac.id AND mf.captured_at = ac.captured_at AND mf.project_id = $1
@@ -353,7 +376,7 @@ export async function loadSentimentInput(
           WHERE ac.project_id = $1 AND ${hasFactsStatusSql("ac.status")}
             AND ac.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC') - make_interval(days => $4)
             AND ac.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') - make_interval(days => $4) + make_interval(days => $3)`,
-        [projectId, windowStart, windowDays, offsetDays, SCORING_VERSION],
+        [projectId, windowStart, windowDays, offsetDays, SCORING_VERSION, DEMO_NORMALIZER_VERSION],
       )
     ).rows[0]!;
   const now = await cellCounts(0);
@@ -401,7 +424,8 @@ export async function loadSentimentInput(
     priorNegativeCells: prior.negative_cells,
     priorReasonCounts: Object.fromEntries(priorReasons.rows.map((r) => [r.reason, r.mentions])),
     // Nothing measured is null, never "demo".
-    dataSource: c.brand_mentions === 0 ? null : c.demo > 0 && c.live > 0 ? "mixed" : c.demo > 0 ? "demo" : "live",
+    // Demo is judged on the window's mentions AND its parsed answers (a demo answer that never named the brand is still demo data).
+    dataSource: dataSourceOf(c.brand_mentions, c.demo + now.demo_cells, c.live + (now.cells - now.demo_cells)),
     mentions: mentions.rows.map((r) => ({
       resultId: r.result_id,
       engine: r.engine_key,

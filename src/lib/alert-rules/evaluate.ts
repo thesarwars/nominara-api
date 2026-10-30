@@ -68,11 +68,17 @@ async function inCooldown(tx: ClientBase, ctx: AlertContext, rule: AlertRule, sc
 /** AC1-AC3 — one alert per fired draft of a catalogued rule, unless the same rule and scope alerted inside its cooldown. */
 export async function raiseAlertsForDrafts(tx: ClientBase, ctx: AlertContext, fired: readonly FiredDraft[], options: WriterOptions = {}): Promise<AlertSummary> {
   const summary = emptySummary();
+  const crossings = new Set<string>();
   for (const item of fired) {
     const rule = alertRuleForTask(item.ruleCode);
     // The displacement rule is raised from its events (raiseDisplacementAlerts), never from the authority drafts.
     if (rule === undefined || rule.code === "displacement_detected") continue;
-    const scope = item.draft.fingerprint.toString("hex");
+    // A negative-sentiment CROSSING is one alert however many reason-class tasks it makes (owner decision 21): its scope is the project, not the task.
+    const scope = rule.code === "negative_spike" ? `project:${ctx.projectId}` : item.draft.fingerprint.toString("hex");
+    if (rule.code === "negative_spike") {
+      if (crossings.has(scope)) continue;
+      crossings.add(scope);
+    }
     if (await inCooldown(tx, ctx, rule, scope)) {
       summary.cooledDown += 1;
       incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: "cooldown" });

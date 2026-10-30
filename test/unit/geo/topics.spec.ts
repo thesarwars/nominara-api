@@ -143,7 +143,9 @@ describe("STORY-061 / A5 topical authority (pure)", () => {
     expect(f.headline).toContain("soc 2");
     expect(f.headline).toContain("Structure it as a comparison table.");
     expect(f.headline).not.toContain("comparison_table");
-    expect(f.evidence[0]!.url).toBe("https://rival.com/pricing");
+    // review-3: the first evidence URL is the task's target (the brand's page); the cited document is still evidence, after it.
+    expect(f.evidence[0]!.url).toBe("https://acme.com/");
+    expect(f.evidence[1]!.url).toBe("https://rival.com/pricing");
     expect(detail!.gaps).toEqual([
       expect.objectContaining({ cluster_id: "a", structure: "comparison_table", required_concepts: [expect.objectContaining({ phrase: "usage based pricing" }), expect.objectContaining({ phrase: "soc 2" })] }),
     ]);

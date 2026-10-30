@@ -43,7 +43,9 @@ export const ALERT_CATALOG: readonly AlertRule[] = Object.freeze([
   rule("sov_drop_engine", "warning", 7, "TG-SOV-DROP-ENGINE"),
   rule("sov_drop_global", "critical", 7, "TG-SOV-DROP-GLOBAL"),
   rule("presence_loss", "warning", 7, "TG-PRESENCE-LOSS"),
-  rule("negative_spike", "critical", 3, "TG-SENTIMENT-NEGATIVE"),
+  // Owner decision 21: raised through the reason-class rule (one task per distinct negative reason). TG-SENTIMENT-NEGATIVE stays a pending
+  // cell-rate rule and no alert maps to it. A crossing is the section 6 level AND the section 15 rise (decision 22), judged by the A6 analysis.
+  rule("negative_spike", "critical", 3, "TG-SENTIMENT-REASON"),
   rule("citation_loss", "warning", 7, "TG-CITATION-LOSS"),
   rule("competitor_overtake", "warning", 14, "TG-COMPETITOR-GAIN"),
   // "30 d per domain": the cooldown scope is the domain (the task fingerprint is per project and domain).
