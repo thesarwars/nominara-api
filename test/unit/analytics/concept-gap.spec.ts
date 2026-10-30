@@ -12,27 +12,30 @@ const candidate = (over: Partial<ConceptCandidate> = {}): ConceptCandidate => ({
   ...over,
 });
 
+const CITED = ["https://doc.example/guide"];
+const derive = (candidates: readonly ConceptCandidate[], cited: readonly string[] = CITED) => deriveConceptGap(candidates, cited);
+
 describe("STORY-057 · deriveConceptGap", () => {
   it("STORY-057 #6 · a concept above the threshold carries its prevalence and an evidence URL", () => {
-    const { entries } = deriveConceptGap([candidate()]);
+    const { entries } = derive([candidate()]);
     expect(entries).toEqual([{ concept: "role based access", prevalence: 0.5, evidence_url: "https://doc.example/guide" }]);
     expect(conceptGapEntrySchema.safeParse(entries[0]).success).toBe(true);
   });
 
   it("the threshold is the documented 0.30 (>= 30% of cited passages), inclusive, and a real-typed 0.3 passes", () => {
     expect(CONCEPT_PREVALENCE_THRESHOLD).toBe(0.3);
-    expect(deriveConceptGap([candidate({ prevalence: 0.3 })]).entries).toHaveLength(1);
-    expect(deriveConceptGap([candidate({ prevalence: Math.fround(0.3) })]).entries).toHaveLength(1);
+    expect(derive([candidate({ prevalence: 0.3 })]).entries).toHaveLength(1);
+    expect(derive([candidate({ prevalence: Math.fround(0.3) })]).entries).toHaveLength(1);
   });
 
   it("STORY-057 #7 · a concept below the threshold is NOT included", () => {
-    const result = deriveConceptGap([candidate({ prevalence: 0.2999 }), candidate({ phrase: "zero", prevalence: 0 })]);
+    const result = derive([candidate({ prevalence: 0.2999 }), candidate({ phrase: "zero", prevalence: 0 })]);
     expect(result.entries).toEqual([]);
     expect(result.droppedBelowThreshold).toBe(2);
   });
 
   it("STORY-057 #8 · a concept with no evidence URL is DROPPED, not caveated", () => {
-    const result = deriveConceptGap([
+    const result = derive([
       candidate({ phrase: "a b", evidenceUrl: "" }),
       candidate({ phrase: "c d", evidenceUrl: "   " }),
       candidate({ phrase: "e f", evidenceUrl: "not a url" }),
@@ -45,22 +48,33 @@ describe("STORY-057 · deriveConceptGap", () => {
   });
 
   it("a non-finite or out-of-range prevalence is dropped, never clamped into a claim", () => {
-    const result = deriveConceptGap([candidate({ prevalence: Number.NaN }), candidate({ phrase: "x y", prevalence: 1.4 }), candidate({ phrase: "z w", prevalence: 1 })]);
+    const result = derive([candidate({ prevalence: Number.NaN }), candidate({ phrase: "x y", prevalence: 1.4 }), candidate({ phrase: "z w", prevalence: 1 })]);
     expect(result.entries.map((e) => [e.concept, e.prevalence])).toEqual([["z w", 1]]);
   });
 
   it("the same concept written two ways is one entry (the first, i.e. the best ranked)", () => {
-    const result = deriveConceptGap([candidate({ phrase: "SOC 2 report" }), candidate({ phrase: "soc  2 report", prevalence: 0.9 })]);
+    const result = derive([candidate({ phrase: "SOC 2 report" }), candidate({ phrase: "soc  2 report", prevalence: 0.9 })]);
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0]!.concept).toBe("SOC 2 report");
   });
 
   it("an empty candidate list is an empty gap, not an error", () => {
-    expect(deriveConceptGap([])).toEqual({ entries: [], droppedBelowThreshold: 0, droppedNoEvidence: 0 });
+    expect(derive([])).toEqual({ entries: [], droppedBelowThreshold: 0, droppedNoEvidence: 0, droppedNotCited: 0 });
+  });
+
+  it("STORY-057 FR-CO-03(d) · a concept whose evidence is not a source the displacers cited is dropped; no cited sources, no concepts", () => {
+    const result = derive([candidate({ phrase: "cited one" }), candidate({ phrase: "other source", evidenceUrl: "https://elsewhere.example/x" })]);
+    expect(result.entries.map((e) => e.concept)).toEqual(["cited one"]);
+    expect(result.droppedNotCited).toBe(1);
+    expect(derive([candidate()], []).entries).toEqual([]);
+  });
+
+  it("STORY-057 FR-CO-03(d) · the evidence URL matches a cited source after normalisation (tracking parameter, trailing slash)", () => {
+    expect(derive([candidate({ evidenceUrl: "https://doc.example/guide/?utm_source=x" })]).entries).toHaveLength(1);
   });
 
   it("prevalence is rounded for display only after the threshold test", () => {
-    const { entries } = deriveConceptGap([candidate({ prevalence: Math.fround(0.55) })]);
+    const { entries } = derive([candidate({ prevalence: Math.fround(0.55) })]);
     expect(entries[0]!.prevalence).toBe(0.55);
   });
 });

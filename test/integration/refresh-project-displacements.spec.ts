@@ -683,7 +683,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
           present_in_content, evidence_url, evidence_snippet, priority_rank)
        VALUES ($1,$2,$3,$4,$5,$6,'capability',$7,$8,$9,'snippet',$10)`,
       [id, workspaceId, over.project ?? projectId, over.cluster === undefined ? clusterId : over.cluster, phrase, phrase.toLowerCase(), over.ratio ?? 0.6,
-        over.present ?? false, over.evidence ?? "https://doc.example/p", over.rank === undefined ? null : over.rank],
+        over.present ?? false, over.evidence ?? "https://rival.com/p", over.rank === undefined ? null : over.rank],
     );
     if (over.collapsed === true) {
       const keeper = await node(`${phrase} keeper`, { ratio: 0.9 });
@@ -692,28 +692,30 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     return id;
   }
 
-  /** The analysis that judged the nodes: stamped after them, as `analyseNodes` does (coverage_ratio set, updated_at = its transaction). */
-  async function analysed(cluster: string | null = clusterId): Promise<void> {
+  /** The analysis that judged the nodes: `analyseNodes` sets coverage_ratio; `extractSemanticNodes` clears it. Nine sources = not a thin corpus. */
+  async function analysed(cluster: string | null = clusterId, sources = 9): Promise<void> {
     await db.query(
-      `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, coverage_ratio)
-       VALUES ($1,$2,'https://acme.com/p',$3,'{gemini}','m',0.5)`,
-      [workspaceId, projectId, cluster],
+      `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, coverage_ratio, centroid_source_count)
+       VALUES ($1,$2,'https://acme.com/p',$3,'{gemini}','m',0.5,$4)`,
+      [workspaceId, projectId, cluster, sources],
     );
   }
 
-  async function lossWithConcepts(): Promise<void> {
+  /** The displacement: the rival takes the slot citing `cited` (default: the nodes' default evidence page). */
+  async function lossWithConcepts(cited: string[] = ["https://rival.com/p"]): Promise<void> {
     await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
-    await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    const after = await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    for (const [i, url] of cited.entries()) await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url, slot: i + 1 });
     await run(D2);
   }
   const conceptGap = async () => conceptGapSchema.parse((await events())[0]!.concept_gap);
 
   it("STORY-057 #6 · a concept above the prevalence threshold and absent from the page is stored with its prevalence and evidence URL", async () => {
     await inCluster(clusterId);
-    await node("role based access", { ratio: 0.6, evidence: "https://doc.example/rbac", rank: 1 });
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
     await analysed();
-    await lossWithConcepts();
-    expect(await conceptGap()).toEqual([{ concept: "role based access", prevalence: 0.6, evidence_url: "https://doc.example/rbac" }]);
+    await lossWithConcepts(["https://rival.com/rbac"]);
+    expect(await conceptGap()).toEqual([{ concept: "role based access", prevalence: 0.6, evidence_url: "https://rival.com/rbac" }]);
   });
 
   it("STORY-057 #7 · a concept below the threshold is not included, and 0.30 exactly is", async () => {
@@ -729,9 +731,9 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await inCluster(clusterId);
     await node("no evidence at all", { evidence: "" });
     await node("evidence is not a url", { evidence: "see the docs" });
-    await node("evidenced", { evidence: "https://doc.example/ok" });
+    await node("evidenced", { evidence: "https://rival.com/ok" });
     await analysed();
-    await lossWithConcepts();
+    await lossWithConcepts(["https://rival.com/ok"]);
     expect((await conceptGap()).map((c) => c.concept)).toEqual(["evidenced"]);
   });
 
@@ -740,7 +742,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await node("already there", { present: true });
     await node("collapsed copy", { collapsed: true });
     await analysed();
-    await lossWithConcepts();
+    await lossWithConcepts(["https://rival.com/p"]);
     expect((await conceptGap()).map((c) => c.concept)).toEqual(["collapsed copy keeper"]);
   });
 
@@ -751,13 +753,40 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(await conceptGap()).toEqual([]);
   });
 
-  it("STORY-057 · a node written after the last analysis is unjudged, and stays out until the next analysis", async () => {
+  it("STORY-057 review 1 · a re-extraction un-judges the nodes, and a later touch of an alignment's updated_at does not make them judged again", async () => {
     await inCluster(clusterId);
-    await node("judged", {});
+    await node("page already has this", {});
     await analysed();
-    await node("extracted later", {});
+    // Re-extraction: nodes reset to absent with a fresh computed_at, and every alignment's coverage_ratio cleared.
+    await db.query(`UPDATE semantic_nodes SET present_in_content = false, computed_at = now() WHERE project_id = $1`, [projectId]);
+    await db.query(`UPDATE geo_alignments SET coverage_ratio = NULL WHERE project_id = $1`, [projectId]);
+    // A centroid / alignment recompute touches the row without re-judging presence.
+    await db.query(`UPDATE geo_alignments SET centroid_source_count = centroid_source_count WHERE project_id = $1`, [projectId]);
     await lossWithConcepts();
-    expect((await conceptGap()).map((c) => c.concept)).toEqual(["judged"]);
+    expect(await conceptGap()).toEqual([]);
+  });
+
+  it("STORY-057 review 1 · FR-CO-03(d): a node whose evidence URL the displacer did not cite on the after-capture is not in the gap", async () => {
+    await inCluster(clusterId);
+    await node("covered by the cited source", { evidence: "https://rival.com/cited" });
+    await node("covered only by an earlier source", { evidence: "https://rival.com/earlier" });
+    await analysed();
+    await lossWithConcepts(["https://rival.com/cited"]);
+    expect((await conceptGap()).map((c) => c.concept)).toEqual(["covered by the cited source"]);
+  });
+
+  it("STORY-057 review 1 · a thin corpus (< 8 sources) keeps only priority ranks 1-3, a null rank dropped; a full corpus keeps all", async () => {
+    await inCluster(clusterId);
+    await node("rank two", { rank: 2 });
+    await node("rank four", { rank: 4 });
+    await node("no rank", { rank: null });
+    await analysed(clusterId, 2);
+    await lossWithConcepts();
+    expect((await conceptGap()).map((c) => c.concept)).toEqual(["rank two"]);
+    await db.query(`TRUNCATE displacement_events`);
+    await db.query(`UPDATE geo_alignments SET centroid_source_count = 8 WHERE project_id = $1`, [projectId]);
+    await run(D2);
+    expect((await conceptGap()).map((c) => c.concept)).toEqual(["rank two", "rank four", "no rank"]);
   });
 
   it("STORY-057 · only the prompt's own cluster counts: another cluster's nodes, and a prompt with no corpus, give an empty gap", async () => {
@@ -799,7 +828,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     const lines: string[] = [];
     const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(JSON.stringify(m)));
     await inCluster(clusterId);
-    await node("secret phrase", { ratio: 0.5, evidence: "https://doc.example/secret-path" });
+    await node("secret phrase", { ratio: 0.5, evidence: "https://rival.com/secret-path" });
     await node("weak phrase", { ratio: 0.1 });
     await node("unevidenced phrase", { evidence: "" });
     await analysed();

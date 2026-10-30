@@ -266,7 +266,8 @@ export class DisplacementService {
         description: `${Math.round(entry.prevalence * 100)}% of the sources engines cite for this topic cover "${entry.concept}" (see ${entry.evidence_url}); your page does not. Add it only if it is true of your product.`,
         sourceDisplacementId: displacementId,
         sourceDomainId: null,
-        affectedUrl: entry.evidence_url,
+        // The evidence is a THIRD-PARTY page: it stays in the description. The brand page to change is not settled (open with the owner).
+        affectedUrl: null,
       });
       tasks.push(result.task);
       if (result.created) created += 1;

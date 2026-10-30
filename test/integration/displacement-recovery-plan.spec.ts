@@ -269,7 +269,8 @@ describe("NEW-C-6 · displacement recovery plan", () => {
       expect(row.status).toBe("todo");
     }
     const content = rows.filter((r) => r.kind === "content");
-    expect(content.map((r) => r.affected_url).sort()).toEqual(["https://e.com/pricing-tiers", "https://e.com/soc-2-report"]);
+    expect(content.map((r) => r.affected_url), "a third-party evidence page is not the page to change").toEqual([null, null]);
+    expect(content.map((r) => r.description).join("\n")).toContain("https://e.com/pricing-tiers");
     const pricing = content.find((r) => r.title.includes("pricing tiers"))!;
     expect(Buffer.from(pricing.dedupe_fingerprint).equals(createHash("sha256").update(`content:${projectId}:pricing tiers`).digest())).toBe(true);
     expect(pricing.description).toContain("60%");
