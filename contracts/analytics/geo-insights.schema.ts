@@ -121,6 +121,10 @@ export const geoSentimentDetailSchema = z
     /**
      * FR-GEO-A6c: `negative_cell_rate` (answers with any negative brand mention / parsed answers) against the alert threshold with
      * its sample floor. Tasks (one per reason class) exist only while `crossed` is true. Optional only for a pre-trend detail.
+     *
+     * Owner decision 22: a crossing needs BOTH the section 6 level (`negative_cell_rate >= rate_threshold` with `cells >= min_cells`) AND
+     * the section 15 rise (`negative_cell_rate - prior_negative_cell_rate >= rise_threshold`, the prior window meeting its own
+     * `min_cells` floor: `prior_cells`). `rose` is the second condition alone; `crossed` is `level && rose`.
      */
     threshold: z
       .object({
@@ -129,8 +133,11 @@ export const geoSentimentDetailSchema = z
         /** `null` with no parsed answers: nothing measured, not a rate of zero. */
         negative_cell_rate: z.number().min(0).max(1).nullable(),
         prior_negative_cell_rate: z.number().min(0).max(1).nullable(),
+        prior_cells: z.number().int().nonnegative(),
         rate_threshold: z.number(),
+        rise_threshold: z.number(),
         min_cells: z.number().int().positive(),
+        rose: z.boolean(),
         crossed: z.boolean(),
       })
       .strict()
