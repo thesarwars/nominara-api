@@ -22,6 +22,11 @@ export interface ToolRunOutcomeInput {
 export interface ToolRunOutcome {
   readonly status: Extract<ToolRunStatus, "completed" | "partial" | "failed">;
   readonly refund: boolean;
+  /**
+   * What `engines_failed` is stored as: the engines the caller reported failed PLUS every engine in the set that was reported by neither
+   * list (a timed-out engine never reports). An engine that did not answer is a failure, whoever forgot to say so; in the run's engine order.
+   */
+  readonly enginesFailed: readonly string[];
 }
 
 export function deriveToolRunOutcome(input: ToolRunOutcomeInput): ToolRunOutcome {
@@ -29,8 +34,14 @@ export function deriveToolRunOutcome(input: ToolRunOutcomeInput): ToolRunOutcome
   for (const engine of [...input.enginesSucceeded, ...input.enginesFailed]) {
     if (!allowed.has(engine)) throw new Error(`engine '${engine}' is not in the run's engine set`);
   }
-  if (input.engineKeys.length === 0) return input.failed === true ? { status: "failed", refund: true } : { status: "completed", refund: false };
-  if (input.enginesSucceeded.length === 0) return { status: "failed", refund: true };
-  if (input.enginesFailed.length > 0) return { status: "partial", refund: false };
-  return { status: "completed", refund: false };
+  const succeeded = new Set(input.enginesSucceeded);
+  const reportedFailed = new Set(input.enginesFailed);
+  for (const engine of succeeded) {
+    if (reportedFailed.has(engine)) throw new Error(`engine '${engine}' is listed as both succeeded and failed`);
+  }
+  if (input.engineKeys.length === 0) return { status: input.failed === true ? "failed" : "completed", refund: input.failed === true, enginesFailed: [] };
+  const enginesFailed = [...new Set(input.engineKeys)].filter((engine) => !succeeded.has(engine));
+  if (succeeded.size === 0) return { status: "failed", refund: true, enginesFailed };
+  if (enginesFailed.length > 0) return { status: "partial", refund: false, enginesFailed };
+  return { status: "completed", refund: false, enginesFailed: [] };
 }

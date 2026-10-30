@@ -67,24 +67,37 @@ describe("STORY-078 · scenarios 9 and 10 - what a finished run is called and ch
   const captureBacked = ["perplexity", "chatgpt"];
 
   it("scenario 10 - every engine answered: completed, charged in full", () => {
-    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: captureBacked, enginesFailed: [] })).toEqual({ status: "completed", refund: false });
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: captureBacked, enginesFailed: [] })).toEqual({ status: "completed", refund: false, enginesFailed: [] });
   });
 
   it("scenario 10 - some engines failed: partial, charged in full (no refund), the arrays say which", () => {
-    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: ["perplexity"], enginesFailed: ["chatgpt"] })).toEqual({ status: "partial", refund: false });
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: ["perplexity"], enginesFailed: ["chatgpt"] })).toEqual({ status: "partial", refund: false, enginesFailed: ["chatgpt"] });
   });
 
   it("scenario 9 - nothing captured: failed and refunded in full", () => {
-    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: [], enginesFailed: captureBacked })).toEqual({ status: "failed", refund: true });
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: [], enginesFailed: captureBacked })).toEqual({ status: "failed", refund: true, enginesFailed: captureBacked });
   });
 
   it("scenario 9 - nothing captured and nothing recorded as failed is still a full refund, never a charge", () => {
-    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: [], enginesFailed: [] })).toEqual({ status: "failed", refund: true });
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: [], enginesFailed: [] })).toEqual({ status: "failed", refund: true, enginesFailed: captureBacked });
   });
 
   it("scenario 7 - a tool with no engines is completed unless its own run failed; a failed one is refunded", () => {
-    expect(deriveToolRunOutcome({ engineKeys: [], enginesSucceeded: [], enginesFailed: [] })).toEqual({ status: "completed", refund: false });
-    expect(deriveToolRunOutcome({ engineKeys: [], enginesSucceeded: [], enginesFailed: [], failed: true })).toEqual({ status: "failed", refund: true });
+    expect(deriveToolRunOutcome({ engineKeys: [], enginesSucceeded: [], enginesFailed: [] })).toEqual({ status: "completed", refund: false, enginesFailed: [] });
+    expect(deriveToolRunOutcome({ engineKeys: [], enginesSucceeded: [], enginesFailed: [], failed: true })).toEqual({ status: "failed", refund: true, enginesFailed: [] });
+  });
+
+  it("scenario 10 - an engine in the set that was reported by neither list did not answer: partial, charged in full, and named in engines_failed (review: a timeout must not read as completed)", () => {
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: ["perplexity"], enginesFailed: [] })).toEqual({ status: "partial", refund: false, enginesFailed: ["chatgpt"] });
+  });
+
+  it("scenario 10 - an unreported engine is merged with the ones the caller did report, once each, in the run's engine order", () => {
+    const three = ["perplexity", "chatgpt", "gemini"];
+    expect(deriveToolRunOutcome({ engineKeys: three, enginesSucceeded: ["perplexity"], enginesFailed: ["gemini"] }).enginesFailed).toEqual(["chatgpt", "gemini"]);
+  });
+
+  it("scenario 10 - an engine listed as both succeeded and failed is contradictory evidence and is refused", () => {
+    expect(() => deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: ["perplexity"], enginesFailed: ["perplexity"] })).toThrow(/both succeeded and failed/);
   });
 
   it("scenario 10 - an engine reported that was never part of the run is refused, not counted", () => {
@@ -180,6 +193,18 @@ describe("STORY-078 · scenarios 18 and 21 - one conversion contract", () => {
     expect(toolConversionPlan(run({ status: "failed" }))).toMatchObject({ state: "unavailable", reason: "run_failed" });
     expect(toolConversionPlan(run({ status: "expired" })).state).toBe("available");
     expect(toolConversionPlan(run({ status: "partial" })).state).toBe("available");
+  });
+
+  it("scenario 18 - the competitors the source run found are carried: trimmed, de-duplicated case-insensitively, blanks dropped (FR-VS-06)", () => {
+    const plan = toolConversionPlan(run({ tool_key: "competitor_finder", result_json: { competitors: [" Rival ", "rival", "", "  ", "Other"] } }));
+    expect(plan.prefill.competitors).toEqual(["Rival", "Other"]);
+  });
+
+  it("scenario 18 - no result, an expired one, or a malformed competitors key carries none (an empty list, never a throw)", () => {
+    expect(toolConversionPlan(run({ result_json: null })).prefill.competitors).toEqual([]);
+    expect(toolConversionPlan(run({ result_json: { competitors: "Rival" } })).prefill.competitors).toEqual([]);
+    expect(toolConversionPlan(run({ result_json: { competitors: [1, null, "Ok"] } })).prefill.competitors).toEqual(["Ok"]);
+    expect(toolConversionPlan(run()).prefill.competitors).toEqual([]);
   });
 
   it("scenario 21 - converting is free: the contract's credit figure is the literal 0", () => {

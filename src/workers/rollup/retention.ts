@@ -7,6 +7,7 @@ import { connect, requireDatabaseUrl } from "../../db/client.js";
 import { WorkspaceLockBusyError } from "../../lib/billing/errors.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
+import { settleFinishedRunCredits } from "../../lib/credits/run-settlement.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
 import { incrementCounter, observeValue } from "../../lib/telemetry/metrics.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
@@ -628,7 +629,8 @@ export interface ToolSnapshotSweepOptions {
  * IDEMPOTENT (an expired run is not selected again), BATCHED (each batch is its own short transaction, so no lock outlives a batch) and
  * BOUNDED (a workspace gets at most `maxBatches` batches a pass; the rest wait for the next night). `FOR UPDATE SKIP LOCKED`: a run being
  * finished, pinned or converted at this moment is skipped and expires on the next pass, never blocks the sweep, and is never raced.
- * Pinning is not read: a pinned run still expires.
+ * Pinning is not read: a pinned run still expires. ONLY A FINISHED RUN EXPIRES (the database trigger agrees): a run still `running` has an
+ * unsettled charge, and expiring it would strand the debit; `reapStaleToolRuns` settles it first.
  */
 export async function expireToolSnapshotsForWorkspace(
   client: ClientBase,
@@ -644,7 +646,7 @@ export async function expireToolSnapshotsForWorkspace(
       const result = await tx.query(
         `WITH due AS (
            SELECT id FROM tool_runs
-            WHERE workspace_id = $1 AND status <> 'expired' AND expires_at <= $2
+            WHERE workspace_id = $1 AND status IN ('completed', 'partial', 'failed') AND expires_at <= $2
             ORDER BY expires_at, id
             LIMIT $3
               FOR UPDATE SKIP LOCKED
@@ -663,6 +665,48 @@ export async function expireToolSnapshotsForWorkspace(
     logger.log({ message: "tool snapshots expired", workspace_id: workspaceId, rows: total });
   }
   return total;
+}
+
+/** A run still `running` after this long has lost its worker: the engine fan-out is bounded at about a minute (api-specification section 9). */
+export const TOOL_RUN_STALE_AFTER_MINUTES = 60;
+export const TOOL_RUN_REAP_BATCH_SIZE = 200;
+
+/**
+ * KAD-12 - every reserve ends in a commit or a release, including when the job that held the run is lost (worker crash, enqueue failure
+ * after commit, poison message). A stale `running` run is settled as `failed` with `run_abandoned` and its charge returned in full
+ * through the same refund path `finishRun` uses; the debit's own idempotency key makes a repeat (or a late `finishRun` from the lost
+ * worker, which then finds the run not running) refund nothing more. Bounded to one batch a pass per workspace; a locked row is skipped.
+ */
+export async function reapStaleToolRuns(
+  client: ClientBase,
+  workspaceId: string,
+  referenceDate: Date = new Date(),
+  options: { readonly staleAfterMinutes?: number; readonly batchSize?: number } = {},
+): Promise<number> {
+  const cutoff = new Date(referenceDate.getTime() - (options.staleAfterMinutes ?? TOOL_RUN_STALE_AFTER_MINUTES) * 60_000);
+  const reaped = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+    const due = await tx.query<{ id: string; credits_charged: number }>(
+      `SELECT id, credits_charged FROM tool_runs
+        WHERE workspace_id = $1 AND status = 'running' AND created_at <= $2
+        ORDER BY created_at, id
+        LIMIT $3
+          FOR UPDATE SKIP LOCKED`,
+      [workspaceId, cutoff.toISOString(), options.batchSize ?? TOOL_RUN_REAP_BATCH_SIZE],
+    );
+    for (const run of due.rows) {
+      const refunded = run.credits_charged > 0 ? (await settleFinishedRunCredits(tx, { workspaceId, runId: run.id, deliveredCells: 0, referenceType: "tool_run" })).refunded : 0;
+      await tx.query(
+        "UPDATE tool_runs SET status = 'failed', error_code = 'run_abandoned', credits_charged = credits_charged - $3 WHERE workspace_id = $1 AND id = $2 AND status = 'running'",
+        [workspaceId, run.id, refunded],
+      );
+    }
+    return due.rows.length;
+  });
+  if (reaped > 0) {
+    observeValue("nominara_tools_runs_reaped_rows", reaped);
+    logger.warn({ message: "stale tool runs settled as failed and refunded", workspace_id: workspaceId, rows: reaped });
+  }
+  return reaped;
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +867,10 @@ export interface NightlySweepResult {
   readonly derivedAnalysesExpired: DerivedAnalysesExpired;
   readonly attributionDailyExpired: number;
   readonly toolSnapshotsExpired: number;
+  /** Stale `running` tool runs settled as failed and refunded this pass. */
+  readonly toolRunsReaped: number;
+  /** Workspaces whose tool-run reap or expiry threw: counted, logged and skipped so one tenant's bad row cannot stop retention for the rest. */
+  readonly toolSweepFailedWorkspaces: readonly string[];
   /** Workspaces swept under the replaced plan's longer windows because their first purge is deferred (STORY-077 slice B). */
   readonly deferredWorkspaces: number;
   readonly orphans: readonly OrphanReport[];
@@ -837,6 +885,8 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
   let rollupsExpired = 0;
   let attributionDailyExpired = 0;
   let toolSnapshotsExpired = 0;
+  let toolRunsReaped = 0;
+  const toolSweepFailedWorkspaces: string[] = [];
   const derivedAnalysesExpired: { geoAnalyses: number; attributionUrlRollup: number; topicClusters: number } = {
     geoAnalyses: 0,
     attributionUrlRollup: 0,
@@ -862,7 +912,16 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
     derivedAnalysesExpired.attributionUrlRollup += derived.attributionUrlRollup;
     derivedAnalysesExpired.topicClusters += derived.topicClusters;
     attributionDailyExpired += await expireAttributionDaily(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
-    toolSnapshotsExpired += await expireToolSnapshotsForWorkspace(privilegedClient, workspaceId, referenceDate);
+    try {
+      toolRunsReaped += await reapStaleToolRuns(privilegedClient, workspaceId, referenceDate);
+      toolSnapshotsExpired += await expireToolSnapshotsForWorkspace(privilegedClient, workspaceId, referenceDate);
+    } catch (error) {
+      // Not swallowed: reported in the result and the metric, and the pass continues for every other tenant. The error text can carry row
+      // values, so only its class is logged.
+      toolSweepFailedWorkspaces.push(workspaceId);
+      incrementCounter("nominara_tools_sweep_failures_total");
+      logger.error({ message: "tool-run retention failed for a workspace; continuing with the rest", workspace_id: workspaceId, error: error instanceof Error ? error.name : "unknown" });
+    }
   }
 
   const orphans = await scanForOrphans(privilegedClient);
@@ -873,6 +932,8 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
     derivedAnalysesExpired,
     attributionDailyExpired,
     toolSnapshotsExpired,
+    toolRunsReaped,
+    toolSweepFailedWorkspaces,
     deferredWorkspaces: workspacesDeferred,
     orphans,
   };

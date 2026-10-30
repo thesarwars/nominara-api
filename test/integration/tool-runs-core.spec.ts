@@ -10,7 +10,7 @@ import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
 import { ToolsService, type StartToolRunInput } from "../../src/modules/tools/tools.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
-import { expireToolSnapshotsForWorkspace } from "../../src/workers/rollup/retention.js";
+import { expireToolSnapshotsForWorkspace, reapStaleToolRuns, runNightlySweep } from "../../src/workers/rollup/retention.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
@@ -117,10 +117,21 @@ describe("STORY-078 · shared tool core", () => {
   const patch = (a: Actor, id: string, payload: unknown) =>
     harness.app().inject({ method: "PATCH", url: apiUrl(`/tools/runs/${id}`), headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" }, payload: payload as object });
   const preview = (a: Actor, id: string) => harness.app().inject({ method: "GET", url: apiUrl(`/tools/runs/${id}/convert`), headers: { cookie: a.cookie } });
-  const convert = (a: Actor, id: string, payload: unknown = {}) =>
-    harness.app().inject({ method: "POST", url: apiUrl(`/tools/runs/${id}/convert`), headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" }, payload: payload as object });
+  // Each call is a distinct click, so each carries its own Idempotency-Key (the route is declared `@Idempotent()`); `key: null` sends none.
+  const convert = (a: Actor, id: string, payload: unknown = {}, key: string | null = uuidV7()) =>
+    harness.app().inject({
+      method: "POST",
+      url: apiUrl(`/tools/runs/${id}/convert`),
+      headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json", ...(key === null ? {} : { "idempotency-key": key }) },
+      payload: payload as object,
+    });
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
   const age = (id: string) => harness.db().query("UPDATE tool_runs SET expires_at = now() - interval '1 day' WHERE id = $1", [id]);
+  const finished = async (a: Actor, over: Partial<StartToolRunInput> = {}) => {
+    const run = await start(a, scan({ credits: 0, ...over }));
+    await inTenant(a, () => tools().finishRun(run.id, { enginesSucceeded: over.engineKeys ?? ["perplexity", "chatgpt"], enginesFailed: [] }));
+    return run;
+  };
   const sweep = (workspaceId: string, options?: { batchSize?: number; maxBatches?: number }) =>
     expireToolSnapshotsForWorkspace(harness.db(), workspaceId, new Date(), options);
 
@@ -386,7 +397,7 @@ describe("STORY-078 · shared tool core", () => {
   it("scenario 16 - the sweep is idempotent and bounded per pass: it cannot lock the table, and a second pass finishes the rest", async () => {
     const a = await owner("starter");
     const ids: string[] = [];
-    for (let i = 0; i < 5; i += 1) ids.push((await start(a, scan({ credits: 0, brandName: `B${String(i)}` }))).id);
+    for (let i = 0; i < 5; i += 1) ids.push((await finished(a, { brandName: `B${String(i)}` })).id);
     for (const id of ids) await age(id);
     expect(await sweep(a.workspaceId, { batchSize: 2, maxBatches: 2 })).toBe(4);
     expect((await harness.db().query("SELECT 1 FROM tool_runs WHERE status = 'expired'")).rowCount).toBe(4);
@@ -398,17 +409,17 @@ describe("STORY-078 · shared tool core", () => {
   it("scenario 16 - a sweep for one workspace never touches another's due runs", async () => {
     const a = await owner("starter");
     const b = await owner("starter");
-    const mine = await start(a, scan({ credits: 0 }));
-    const theirs = await start(b, scan({ credits: 0 }));
+    const mine = await finished(a);
+    const theirs = await finished(b);
     await age(mine.id);
     await age(theirs.id);
     expect(await sweep(a.workspaceId)).toBe(1);
-    expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [theirs.id])).rows[0]).toEqual({ status: "running" });
+    expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [theirs.id])).rows[0]).toEqual({ status: "completed" });
   });
 
   it("scenario 17 - pinning a run does not extend its retention: aged past expiry, a pinned run still expires", async () => {
     const a = await owner("starter");
-    const run = await start(a, scan({ credits: 0 }));
+    const run = await finished(a);
     const pinned = await patch(a, run.id, { pinned: true });
     expect(pinned.statusCode, pinned.body).toBe(200);
     expect(data<{ pinned: boolean }>(pinned).pinned).toBe(true);
@@ -422,7 +433,68 @@ describe("STORY-078 · shared tool core", () => {
     expect((await patch(a, run.id, { pinned: true, status: "completed" })).statusCode).toBe(400);
   });
 
-  it("scenario 18 - converting from each of the six tools is one contract: the slot cost is stated before the click, and one funnel event carries the tool", async () => {
+  it("scenario 14 - an aged Schema Builder run expires too: payload null, status expired, and the sweep does not throw (ck_tr_shape review finding)", async () => {
+    const a = await owner("starter");
+    const run = await start(a, { toolKey: "schema_builder", resultJson: { jsonld: { "@type": "Organization" } }, engineKeys: [], credits: 0 });
+    await inTenant(a, () => tools().finishRun(run.id, {}));
+    await age(run.id);
+    await expect(sweep(a.workspaceId)).resolves.toBe(1);
+    expect((await harness.db().query("SELECT status, result_json FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ status: "expired", result_json: null });
+  });
+
+  it("scenario 14 - the sweep expires only finished runs: an aged run still `running` is left for the reaper, never expired with its charge unsettled", async () => {
+    const a = await owner("starter");
+    const run = await start(a, scan({ credits: 10 }));
+    await age(run.id);
+    expect(await sweep(a.workspaceId)).toBe(0);
+    expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ status: "running" });
+  });
+
+  it("scenario 9 - a paid run whose worker died is reaped as failed and refunded in full: wallet restored, ledger shows commit plus refund (KAD-12)", async () => {
+    const a = await owner("starter");
+    const before = await wallet(a.workspaceId);
+    const lost = await start(a, scan({ credits: 10 }));
+    const fresh = await start(a, scan({ credits: 10, brandName: "Fresh" }));
+    await harness.db().query("UPDATE tool_runs SET created_at = now() - interval '2 hours' WHERE id = $1", [lost.id]);
+    expect(await reapStaleToolRuns(harness.db(), a.workspaceId, new Date())).toBe(1);
+    const row = (await harness.db().query("SELECT status, credits_charged, error_code FROM tool_runs WHERE id = $1", [lost.id])).rows[0];
+    expect(row).toEqual({ status: "failed", credits_charged: 0, error_code: "run_abandoned" });
+    expect((await harness.db().query("SELECT status, credits_charged FROM tool_runs WHERE id = $1", [fresh.id])).rows[0]).toEqual({ status: "running", credits_charged: 10 });
+    const after = await wallet(a.workspaceId);
+    expect((after?.included_balance ?? 0) + (after?.purchased_balance ?? 0)).toBe((before?.included_balance ?? 450) + (before?.purchased_balance ?? 0) - 10);
+    const entries = await harness.db().query<{ entry_type: string; credits: number }>("SELECT entry_type, credits FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 ORDER BY seq", [a.workspaceId, lost.id]);
+    expect(entries.rows.map((r) => [r.entry_type, r.credits])).toEqual(expect.arrayContaining([["commit", 10], ["refund", 10]]));
+    // idempotent: a second pass finds nothing and refunds nothing more
+    expect(await reapStaleToolRuns(harness.db(), a.workspaceId, new Date())).toBe(0);
+    expect(await wallet(a.workspaceId)).toEqual(after);
+    // a late finish from the lost worker changes nothing
+    await inTenant(a, () => tools().finishRun(lost.id, { enginesSucceeded: ["perplexity", "chatgpt"], enginesFailed: [] }));
+    expect(await wallet(a.workspaceId)).toEqual(after);
+    expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [lost.id])).rows[0]).toEqual({ status: "failed" });
+  });
+
+  it("scenario 16 - one workspace whose sweep fails is counted and named, and retention for every other workspace still runs", async () => {
+    const a = await owner("starter");
+    const b = await owner("starter");
+    const bad = await finished(a);
+    const good = await finished(b);
+    await age(bad.id);
+    await age(good.id);
+    await harness.db().query(`CREATE OR REPLACE FUNCTION public.zz_injected_sweep_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.workspace_id = '${a.workspaceId}' THEN RAISE EXCEPTION 'injected sweep failure'; END IF; RETURN NEW; END $$`);
+    await harness.db().query("CREATE TRIGGER zz_injected BEFORE UPDATE OF status ON tool_runs FOR EACH ROW EXECUTE FUNCTION public.zz_injected_sweep_failure()");
+    try {
+      const result = await runNightlySweep(harness.db(), new Date());
+      expect(result.toolSweepFailedWorkspaces).toContain(a.workspaceId);
+      expect(result.toolSweepFailedWorkspaces).not.toContain(b.workspaceId);
+      expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [good.id])).rows[0]).toEqual({ status: "expired" });
+      expect((await harness.db().query("SELECT status FROM tool_runs WHERE id = $1", [bad.id])).rows[0]).toEqual({ status: "completed" });
+    } finally {
+      await harness.db().query("DROP TRIGGER zz_injected ON tool_runs");
+      await harness.db().query("DROP FUNCTION public.zz_injected_sweep_failure()");
+    }
+  });
+
+  it("scenario 18 - converting from each of the six tools is one contract: the slot cost is stated before the click, and the conversion counter carries the tool", async () => {
     const tools6: Array<[string, StartToolRunInput]> = [
       ["visibility_scan", scan({ credits: 0 })],
       ["prompt_research", { toolKey: "prompt_research", brandName: "Acme", brandUrl: "https://acme.test", promptTexts: ["a?", "b?"], engineKeys: ["perplexity"], credits: 0 }],
@@ -440,20 +512,26 @@ describe("STORY-078 · shared tool core", () => {
         runInput = { ...input, diffBaseRunId: x.id, diffCompareRunId: y.id };
       }
       const run = await start(a, runInput);
-      await inTenant(a, () => tools().finishRun(run.id, { enginesSucceeded: runInput.engineKeys ?? [], enginesFailed: [] }));
+      await inTenant(a, () => tools().finishRun(run.id, { enginesSucceeded: runInput.engineKeys ?? [], enginesFailed: [], ...(toolKey === "competitor_finder" ? { result: { competitors: ["Rival", "Other"] } } : {}) }));
       const log = vi.spyOn(Logger.prototype, "log");
       const hasUrl = toolKey !== "schema_builder" && toolKey !== "compare_runs";
-      const quote = data<{ state: string; reason: string | null; project_slot: { used: number; max: number | null; free: boolean }; prompt_slots: { carried: number; cap: number | null }; credits: number }>(await preview(a, run.id));
+      const quote = data<{ state: string; reason: string | null; project_slot: { used: number; max: number | null; free: boolean }; prompt_slots: { carried: number; cap: number | null }; competitor_slots: { carried: number; cap: number | null }; credits: number; prefill: { competitors: string[] } }>(await preview(a, run.id));
       expect(quote.state, toolKey).toBe(hasUrl ? "available" : "unavailable");
       expect(quote.reason).toBe(hasUrl ? null : "no_url");
       expect(quote.project_slot).toEqual({ used: 0, max: 1, free: true });
       expect(quote.prompt_slots.cap).toBe(30);
       expect(quote.credits).toBe(0);
+      // FR-VS-06 / review - the competitors the run found are pre-filled and counted against competitors.max_per_project before the click.
+      const found = toolKey === "competitor_finder" ? ["Rival", "Other"] : [];
+      expect(quote.prefill.competitors, toolKey).toEqual(found);
+      expect(quote.competitor_slots.carried, toolKey).toBe(quote.competitor_slots.cap === null ? found.length : Math.min(found.length, quote.competitor_slots.cap));
       const res = await convert(a, run.id, hasUrl ? {} : { root_url: "https://supplied.test" });
       expect(res.statusCode, `${toolKey}: ${res.body}`).toBe(200);
       const body = data<{ project_id: string; already_converted: boolean; slot_cost: { project_slot: { free: boolean }; credits: number } }>(res);
       expect(body.already_converted).toBe(false);
       expect(body.slot_cost.credits).toBe(0);
+      const tracked = await harness.db().query<{ name: string }>("SELECT name FROM competitors WHERE project_id = $1 ORDER BY name", [body.project_id]);
+      expect(tracked.rows.map((r) => r.name), toolKey).toEqual(found.slice(0, quote.competitor_slots.carried).sort());
       const events = log.mock.calls.filter(([m]) => typeof m === "object" && m !== null && (m as { metric?: string }).metric === "nominara_tools_conversions_total");
       expect(events, toolKey).toHaveLength(1);
       expect(events[0]![0]).toMatchObject({ tool_key: toolKey });
@@ -463,6 +541,15 @@ describe("STORY-078 · shared tool core", () => {
       log.mockRestore();
     }
   }, 120_000);
+
+  it("scenario 20 - the convert route requires an Idempotency-Key (api-specification section 3): none is refused, and nothing is created", async () => {
+    const a = await owner("starter");
+    const run = await finished(a);
+    const res = await convert(a, run.id, {}, null);
+    expect(res.statusCode, res.body).toBeGreaterThanOrEqual(400);
+    expect(res.statusCode).toBeLessThan(500);
+    expect((await harness.db().query("SELECT converted_project_id FROM tool_runs WHERE id = $1", [run.id])).rows[0]).toEqual({ converted_project_id: null });
+  });
 
   it("scenario 19 - converting with no project slot free is refused with the entitlement error naming the limit, and the run stays unconverted", async () => {
     const free = await owner("free");
@@ -477,7 +564,7 @@ describe("STORY-078 · shared tool core", () => {
     expect((await harness.db().query("SELECT 1 FROM projects WHERE workspace_id = $1", [free.workspaceId])).rowCount).toBe(0);
   });
 
-  it("scenario 20 - converting twice returns the first project: no second project, no second charge, one funnel event, even when raced", async () => {
+  it("scenario 20 - converting twice returns the first project: no second project, no second charge, one counted conversion, even when raced", async () => {
     const a = await owner("growth");
     const run = await start(a, scan({ credits: 0 }));
     await inTenant(a, () => tools().finishRun(run.id, { enginesSucceeded: ["perplexity", "chatgpt"], enginesFailed: [] }));

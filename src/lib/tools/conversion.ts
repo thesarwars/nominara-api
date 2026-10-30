@@ -13,9 +13,30 @@ export interface ConvertibleRun {
   readonly query_text: string | null;
   readonly prompt_texts: readonly string[] | null;
   readonly converted_project_id: string | null;
+  /** Read for one documented key only: `competitors` (see below). An expired run has none. */
+  readonly result_json?: Readonly<Record<string, unknown>> | null;
 }
 
 export type ToolConversionPlan = Pick<ToolRunConversion, "state" | "reason" | "credits" | "prefill">;
+
+// COMPETITORS (FR-VS-06, api-specification section 9 `convert_cta.prefill`). There is no competitors column, so a tool that finds competitors
+// (Competitor Finder, Visibility Scan) writes them to `result_json.competitors` as an array of names - that key is the contract, and each
+// such tool's own story must write it. They live and die with the payload: an expired run has none to carry.
+function competitorsOf(resultJson: ConvertibleRun["result_json"]): string[] {
+  const raw = resultJson?.["competitors"];
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const item of raw as unknown[]) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    const key = trimmed.toLowerCase();
+    if (trimmed === "" || seen.has(key)) continue;
+    seen.add(key);
+    names.push(trimmed);
+  }
+  return names;
+}
 
 export function toolConversionPlan(run: ConvertibleRun): ToolConversionPlan {
   const seen = new Set<string>();
@@ -28,7 +49,7 @@ export function toolConversionPlan(run: ConvertibleRun): ToolConversionPlan {
     prompts.push(trimmed);
   }
   const rootUrl = run.brand_url ?? run.target_url;
-  const prefill = { project_name: run.brand_name, root_url: rootUrl, prompts };
+  const prefill = { project_name: run.brand_name, root_url: rootUrl, prompts, competitors: competitorsOf(run.result_json) };
 
   // `converted` wins over everything: converting a second time returns the first project (AC20) whatever the run looks like now.
   if (run.converted_project_id !== null) return { state: "converted", reason: null, credits: 0, prefill };

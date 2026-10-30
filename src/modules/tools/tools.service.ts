@@ -30,6 +30,7 @@ import { toolPresentation } from "../../lib/tools/presentation.js";
 import { toolSnapshotExpiresAt } from "../../lib/tools/retention-window.js";
 import { deriveToolRunOutcome } from "../../lib/tools/run-outcome.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { ProjectsService } from "../projects/projects.service.js";
 
@@ -268,7 +269,7 @@ export class ToolsService {
           await debitInTransaction(client, {
             workspaceId,
             actorId,
-            actorType: "user",
+            actorType: actorId === SYSTEM_ACTOR_ID ? "system" : "user",
             actionCode: "lookup",
             credits: input.credits,
             // Built with join: a three-segment colon template reads as an un-namespaced cache key to the ISO-13 scanner, and this is a ledger key.
@@ -306,8 +307,8 @@ export class ToolsService {
         if (row.status !== "running") return toRun(row);
 
         const succeeded = [...(finish.enginesSucceeded ?? [])];
-        const failed = [...(finish.enginesFailed ?? [])];
-        const outcome = deriveToolRunOutcome({ engineKeys: row.engine_keys, enginesSucceeded: succeeded, enginesFailed: failed, ...(finish.failed === undefined ? {} : { failed: finish.failed }) });
+        const outcome = deriveToolRunOutcome({ engineKeys: row.engine_keys, enginesSucceeded: succeeded, enginesFailed: [...(finish.enginesFailed ?? [])], ...(finish.failed === undefined ? {} : { failed: finish.failed }) });
+        const failed = [...outcome.enginesFailed];
         let creditsCharged = row.credits_charged;
         if (outcome.refund && creditsCharged > 0) {
           const { refunded } = await settleFinishedRunCredits(client, { workspaceId, runId, deliveredCells: 0, referenceType: "tool_run" });
@@ -386,7 +387,7 @@ export class ToolsService {
     return toDetail(row);
   }
 
-  /** AC10 - pinning is an ordering and filtering affordance. It touches no retention column: `expires_at` is not in this statement. */
+  /** AC10 - pinning is a flag that the `?pinned=` filter selects on (the timeline is not re-sorted by it; owner to confirm that reading). It touches no retention column: `expires_at` is not in this statement. */
   async setPinned(id: string, pinned: boolean): Promise<ToolRun> {
     const { client } = this.store();
     const updated = await client.query<RunRow>(`UPDATE tool_runs SET pinned = $2 WHERE workspace_id = app.current_workspace() AND id = $1 RETURNING ${COLUMNS}`, [id, pinned]);
@@ -406,7 +407,8 @@ export class ToolsService {
     const found = await client.query<RunRow>(`SELECT ${COLUMNS} FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1`, [id]);
     const row = found.rows[0];
     if (row === undefined) throw new NotFoundError({ message: "no such tool run" });
-    return { ...toolConversionPlan(row), ...(await this.slotCost(client, workspaceId, toolConversionPlan(row).prefill.prompts.length)) };
+    const plan = toolConversionPlan(row);
+    return { ...plan, ...(await this.slotCost(client, workspaceId, plan.prefill.prompts.length, plan.prefill.competitors.length)) };
   }
 
   /**
@@ -423,7 +425,7 @@ export class ToolsService {
         const row = found.rows[0];
         if (row === undefined) throw new NotFoundError({ message: "no such tool run" });
         const plan = toolConversionPlan(row);
-        const slot = await this.slotCost(client, workspaceId, plan.prefill.prompts.length);
+        const slot = await this.slotCost(client, workspaceId, plan.prefill.prompts.length, plan.prefill.competitors.length);
         span.setAttribute("nominara.tool_key", row.tool_key);
 
         if (row.converted_project_id !== null && row.converted_at !== null) {
@@ -432,7 +434,7 @@ export class ToolsService {
             project_id: row.converted_project_id,
             converted_at: iso(row.converted_at),
             already_converted: true,
-            slot_cost: { project_slot: slot.project_slot, prompt_slots: slot.prompt_slots, credits: 0 as const },
+            slot_cost: { project_slot: slot.project_slot, prompt_slots: slot.prompt_slots, competitor_slots: slot.competitor_slots, credits: 0 as const },
             poll: { discovery: `/v1/projects/${row.converted_project_id}/discovery` },
           };
         }
@@ -450,7 +452,9 @@ export class ToolsService {
         const created = await this.projects.create(
           workspaceId,
           actorId,
-          { root_url: rootUrl, ...(name === undefined ? {} : { name }), ...(row.locale === "en-US" ? {} : { locale: row.locale }), ...(plan.prefill.prompts.length === 0 ? {} : { prompts: plan.prefill.prompts.map((text) => ({ text })) }) },
+          { root_url: rootUrl, ...(name === undefined ? {} : { name }), ...(row.locale === "en-US" ? {} : { locale: row.locale }), ...(plan.prefill.prompts.length === 0 ? {} : { prompts: plan.prefill.prompts.map((text) => ({ text })) }),
+            // Only as many as the plan allows (the preview states the same figure): a run that found more than the cap still converts.
+            ...(slot.competitor_slots.carried === 0 ? {} : { competitors: plan.prefill.competitors.slice(0, slot.competitor_slots.carried).map((name) => ({ name })) }) },
           undefined,
         );
         const stamped = await client.query<{ converted_at: Date }>(
@@ -459,7 +463,8 @@ export class ToolsService {
         );
         const convertedAt = stamped.rows[0]?.converted_at;
         if (convertedAt === undefined) throw new ConflictError({ message: "the run was converted while this request was creating its project", details: { current_state: "converted" } });
-        // AC19 - the one funnel event, with the tool as a property. Counted once, after the stamp, in the transaction that created the project.
+        // AC19 (open) - this is the conversion COUNTER, with the tool as a label, not a product-analytics funnel event: that sink is not decided.
+        // Counted once, after the stamp, in the transaction that created the project.
         incrementCounter("nominara_tools_conversions_total", { tool_key: row.tool_key });
         logger.log({ event: "tools.run.converted", workspace_id: workspaceId, run_id: id, tool_key: row.tool_key, project_id: created.project_id });
         return {
@@ -467,7 +472,7 @@ export class ToolsService {
           project_id: created.project_id,
           converted_at: iso(convertedAt),
           already_converted: false,
-          slot_cost: { project_slot: { used: slot.project_slot.used + 1, max: slot.project_slot.max, free: slot.project_slot.max === null || slot.project_slot.used + 1 < slot.project_slot.max }, prompt_slots: slot.prompt_slots, credits: 0 as const },
+          slot_cost: { project_slot: { used: slot.project_slot.used + 1, max: slot.project_slot.max, free: slot.project_slot.max === null || slot.project_slot.used + 1 < slot.project_slot.max }, prompt_slots: slot.prompt_slots, competitor_slots: slot.competitor_slots, credits: 0 as const },
           poll: { discovery: created.poll.discovery },
         };
       } catch (error) {
@@ -483,13 +488,16 @@ export class ToolsService {
     client: ClientBase,
     workspaceId: string,
     promptsCarried: number,
-  ): Promise<Pick<ToolRunConversionPreview, "project_slot" | "prompt_slots" | "credits">> {
+    competitorsFound: number,
+  ): Promise<Pick<ToolRunConversionPreview, "project_slot" | "prompt_slots" | "competitor_slots" | "credits">> {
     const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
     const used = await countStructural(client, "projects.max", workspaceId);
     const max = limitOf(resolved.entitlements["projects.max"]?.value);
+    const competitorCap = limitOf(resolved.entitlements["competitors.max_per_project"]?.value);
     return {
       project_slot: { used, max, free: max === null || used < max },
       prompt_slots: { carried: promptsCarried, cap: limitOf(resolved.entitlements["prompts.max_per_project"]?.value) },
+      competitor_slots: { carried: competitorCap === null ? competitorsFound : Math.min(competitorsFound, competitorCap), cap: competitorCap },
       credits: 0 as const,
     };
   }

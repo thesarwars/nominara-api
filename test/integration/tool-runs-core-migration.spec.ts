@@ -140,6 +140,22 @@ describe("migration 0153 - tool_runs core guards", () => {
     await expect(client.query("UPDATE tool_runs SET status = 'completed' WHERE id = $1", [id])).rejects.toThrow(/tool_runs status/);
   });
 
+  it("scenario 14 - a Schema Builder run (which stores its result at the start) may expire with its payload nulled; ck_tr_shape no longer blocks the sweep", async () => {
+    const id = await insert({ tool_key: "schema_builder", engine_keys: [], result_json: JSON.stringify({ jsonld: {} }), input_hash: Buffer.alloc(32, 11) });
+    await client.query("UPDATE tool_runs SET status = 'completed' WHERE id = $1", [id]);
+    await expect(client.query("UPDATE tool_runs SET status = 'expired', result_json = NULL WHERE id = $1", [id])).resolves.toBeDefined();
+    // ...but a LIVE schema_builder run must still carry its result
+    await expect(insert({ tool_key: "schema_builder", engine_keys: [], input_hash: Buffer.alloc(32, 12) })).rejects.toThrow(/ck_tr_shape/);
+    const live = await insert({ tool_key: "schema_builder", engine_keys: [], result_json: JSON.stringify({ jsonld: {} }), input_hash: Buffer.alloc(32, 13) });
+    await expect(client.query("UPDATE tool_runs SET result_json = NULL WHERE id = $1", [live])).rejects.toThrow(/ck_tr_shape/);
+  });
+
+  it("scenario 9 - a run still `running` cannot jump to expired: it must be settled (failed and refunded) first, so no charge is stranded", async () => {
+    const id = await insert({ input_hash: Buffer.alloc(32, 14) });
+    await expect(client.query("UPDATE tool_runs SET status = 'expired', result_json = NULL WHERE id = $1", [id])).rejects.toThrow(/tool_runs status/);
+    expect((await client.query("SELECT status FROM tool_runs WHERE id = $1", [id])).rows[0]).toEqual({ status: "running" });
+  });
+
   it("scenario 7 - a run with a nonexistent status is still refused by the status CHECK (the trigger does not replace it)", async () => {
     const id = await insert({ input_hash: Buffer.alloc(32, 10) });
     await expect(client.query("UPDATE tool_runs SET status = 'bogus' WHERE id = $1", [id])).rejects.toThrow();
@@ -147,6 +163,9 @@ describe("migration 0153 - tool_runs core guards", () => {
 
   it("down restores the original constraints (gemini barred again) and removes the trigger; up again restores them", async () => {
     await client.query("DELETE FROM tool_runs WHERE engine_keys && ARRAY['gemini']");
+    // The rollback restores the strict schema_builder shape, so an expired (payload-removed) Schema Builder run must be cleared first, loudly by design.
+    await expect(client.query(await readFile(path.join(MIGRATIONS_DIR, `${NAME}.down.sql`), "utf8"))).rejects.toThrow(/ck_tr_shape/);
+    await client.query("DELETE FROM tool_runs WHERE tool_key = 'schema_builder' AND result_json IS NULL");
     await client.query(await readFile(path.join(MIGRATIONS_DIR, `${NAME}.down.sql`), "utf8"));
     await expect(insert({ engine_keys: ["gemini"] })).rejects.toThrow(/ck_tr_engine_set/);
     expect((await client.query("SELECT 1 FROM pg_trigger WHERE tgname = 'tr_tool_runs_status_write_once'")).rowCount).toBe(0);

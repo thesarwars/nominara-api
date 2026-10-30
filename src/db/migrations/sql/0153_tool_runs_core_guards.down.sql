@@ -11,7 +11,7 @@ ALTER TABLE tool_runs ADD CONSTRAINT ck_tr_shape CHECK (
     WHEN 'prompt_research'   THEN array_length(prompt_texts, 1) BETWEEN 1 AND 10
     WHEN 'competitor_finder' THEN brand_url IS NOT NULL
     WHEN 'aux_audit'         THEN target_url IS NOT NULL
-    WHEN 'schema_builder'    THEN result_json IS NOT NULL
+    WHEN 'schema_builder'    THEN result_json IS NOT NULL   -- NOTE: an expired schema_builder run (result_json NULL) fails this ADD; delete or restore such rows first
     WHEN 'compare_runs'      THEN diff_base_run_id IS NOT NULL AND diff_compare_run_id IS NOT NULL
   END);
 

@@ -19,6 +19,7 @@ import {
 } from "../../../contracts/tools/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
+import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
 import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
@@ -66,6 +67,8 @@ export class ToolsController {
     return run;
   }
 
+  // api-specification section 3 gives PATCH /tools/runs/{id} the permission `lookup:read_history` - pinning is a per-run flag on a row the
+  // caller can already read, with no credit or retention effect - so that is deliberately NOT a write permission.
   @Patch("runs/:id")
   @RequirePermission("lookup:read_history")
   @ScopedByQuery()
@@ -91,6 +94,7 @@ export class ToolsController {
   // project, so there is nothing for the project-scope check to bind to; the new project is created by this caller's `project:create`.
   @Post("runs/:id/convert")
   @HttpCode(200)
+  @Idempotent()
   @RequirePermission("project:create")
   @ScopedByQuery()
   @Audit({
