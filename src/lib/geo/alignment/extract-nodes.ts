@@ -93,7 +93,7 @@ async function run(deps: ExtractNodesDeps, sessionId: string): Promise<ExtractNo
     // scope may keep a coverage_ratio that says they were judged. `coverage_ratio IS NOT NULL` is what STORY-057's concept gap reads as
     // "judged", and only `analyseNodes` sets it again.
     await tx.query(
-      `UPDATE geo_alignments SET coverage_ratio = NULL, recommendations = '[]'::jsonb
+      `UPDATE geo_alignments SET coverage_ratio = NULL, recommendations = '[]'::jsonb, updated_at = now()
         WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2`,
       [read.projectId, read.clusterId],
     );

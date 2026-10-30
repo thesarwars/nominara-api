@@ -10,3 +10,10 @@ import type { ClientBase } from "pg";
 export async function lockNodeScope(tx: ClientBase, projectId: string, clusterId: string | null): Promise<void> {
   await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || COALESCE($2::text, ''), 0))", [projectId, clusterId]);
 }
+
+// A READER that needs the judged check and the nodes to agree (STORY-057's concept gap reads two statements, each with its own READ COMMITTED
+// snapshot) takes the SHARED form of the same key: it waits out an in-flight extraction or analysis (their exclusive lock conflicts) and then
+// blocks a new one until its transaction ends. Several readers do not block each other.
+export async function lockNodeScopeShared(tx: ClientBase, projectId: string, clusterId: string | null): Promise<void> {
+  await tx.query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text || ':' || COALESCE($2::text, ''), 0))", [projectId, clusterId]);
+}

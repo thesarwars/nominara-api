@@ -20,6 +20,7 @@ import { deriveConceptGap, type ConceptCandidate } from "../analytics/concept-ga
 import { isLowConfidence, suppressRecommendations } from "../geo/corpus/weights.js";
 import { classifyDomain } from "../parser/citation-url.js";
 import { displacementImpactForEvent, type FunnelStage } from "../scoring/displacement-impact.js";
+import { lockNodeScopeShared } from "../geo/alignment/scope-lock.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 import { datesWithFacts, measurementStatusSql } from "./aggregate-day.js";
@@ -461,7 +462,11 @@ async function citationGap(
  *   3. threshold and evidence (`deriveConceptGap`).
  *
  * BUILDER READING (open with the owner): "the brand's page" is whatever page the latest analysis of the cluster read; the reference
- * names none for a displacement. ACCEPTED LIMITATION: the gap is written when the event is first stored (or filled while empty), so a
+ * names none for a displacement. OPEN: `analyseNodes(draft: true)` also sets `present_in_content` and `coverage_ratio` from an UNSAVED
+ * draft, which would count as "judged" here; no caller passes draft today. Before draft analysis ships, exclude draft-judged
+ * alignments (needs a marker of the analysis source) or keep draft presence off the shared nodes.
+ * WIRING: nothing in src calls `openAlignmentSession` / `extractSemanticNodes` / `analyseNodes` yet (no `geo.analyze` handler, no
+ * session route), so in production no scope is ever judged and the gap is always [] until STORY-059's pipeline is wired. ACCEPTED LIMITATION: the gap is written when the event is first stored (or filled while empty), so a
  * backfill over an old date describes today's corpus; the cited-source filter bounds that to sources that capture actually cited.
  */
 interface ConceptNode extends ConceptCandidate {
@@ -476,6 +481,9 @@ async function loadConceptNodes(tx: ClientBase, workspaceId: string, projectId: 
   const clusterId =
     (await tx.query<{ cluster_id: string | null }>(`SELECT cluster_id FROM tracked_prompts WHERE id = $1 AND workspace_id = $2 AND project_id = $3`, [promptId, workspaceId, projectId]))
       .rows[0]?.cluster_id ?? null;
+  // The judged check and the node read are two statements with two snapshots (READ COMMITTED): wait out any extraction/analysis of the
+  // scope first, so a commit between them cannot pair "judged" with freshly reset (all-absent) nodes.
+  await lockNodeScopeShared(tx, projectId, clusterId);
   const judging = (
     await tx.query<{ min_sources: number | null }>(
       `SELECT min(centroid_source_count)::int AS min_sources

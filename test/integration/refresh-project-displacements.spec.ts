@@ -5,6 +5,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
+import { lockNodeScope } from "../../src/lib/geo/alignment/scope-lock.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { citationGapSchema, conceptGapSchema, displacedBySchema } from "../../contracts/analytics/displacement-event.schema.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
@@ -763,6 +764,37 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     // A centroid / alignment recompute touches the row without re-judging presence.
     await db.query(`UPDATE geo_alignments SET centroid_source_count = centroid_source_count WHERE project_id = $1`, [projectId]);
     await lossWithConcepts();
+    expect(await conceptGap()).toEqual([]);
+  });
+
+  it("STORY-057 review 2 · the concept read waits out an in-flight extraction of the scope: a commit between the judged check and the node read cannot leave a stale diagnosis", async () => {
+    await inCluster(clusterId);
+    await node("page already has this", {});
+    await analysed();
+    // An extraction is in flight: it holds the scope lock and has cleared the judgement, but has not committed.
+    const extractor = new Client({ connectionString: container.getConnectionUri() });
+    await extractor.connect();
+    try {
+      await extractor.query("BEGIN");
+      await lockNodeScope(extractor, projectId, clusterId);
+      await extractor.query(`UPDATE geo_alignments SET coverage_ratio = NULL, recommendations = '[]'::jsonb, updated_at = now() WHERE project_id = $1`, [projectId]);
+      await extractor.query(`UPDATE semantic_nodes SET present_in_content = false, priority_rank = NULL, computed_at = now() WHERE project_id = $1`, [projectId]);
+      const refreshing = (async () => {
+        await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+        const after = await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+        await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/p", slot: 1 });
+        await run(D2);
+        return true;
+      })();
+      const settledEarly = await Promise.race([refreshing, new Promise<boolean>((r) => setTimeout(() => r(false), 1500))]);
+      // The refresh must be waiting on the scope, not reading around the writer's uncommitted state.
+      expect(settledEarly).toBe(false);
+      await extractor.query("COMMIT");
+      await refreshing;
+    } finally {
+      await extractor.query("ROLLBACK").catch(() => undefined);
+      await extractor.end();
+    }
     expect(await conceptGap()).toEqual([]);
   });
 
