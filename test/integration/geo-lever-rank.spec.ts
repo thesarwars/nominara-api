@@ -223,7 +223,7 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     await refresh();
     await refresh();
     const again = await rows();
-    expect(again).toHaveLength(6); // structure + sentiment, three windows
+    expect(again).toHaveLength(9); // structure + entity + sentiment, three windows
     expect(again.map((x) => [x.analysis, x.window_days, x.lever_rank])).toEqual(first.map((x) => [x.analysis, x.window_days, x.lever_rank]));
   });
 

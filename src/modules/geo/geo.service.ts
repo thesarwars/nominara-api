@@ -136,6 +136,10 @@ export class GeoService {
       if (row === null || !row.sufficient) return null;
       return validFindings(row).find((f) => f.sentiment !== undefined)?.sentiment ?? null;
     }
+    if (slug === "entity") {
+      if (row === null || !row.sufficient) return null;
+      return validFindings(row).find((f) => f.entity !== undefined)?.entity ?? null;
+    }
     if (slug !== "structure" || row === null || !row.sufficient) return null;
     // Read back, never re-aggregated: a row persisted before the detail rode on the finding has none until the next rollup.
     return validFindings(row).find((f) => f.structure !== undefined)?.structure ?? null;

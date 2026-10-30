@@ -1,0 +1,617 @@
+import type { ClientBase } from "pg";
+import {
+  type EntityScoredNode,
+  type GeoAnalysisWrite,
+  type GeoEntityDetail,
+  type GeoFinding,
+} from "../../../contracts/analytics/index.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { fold } from "../parser/fold.js";
+import { normalize } from "../parser/normalize.js";
+import { SCORING_VERSION } from "../scoring/index.js";
+import { incrementCounter } from "../telemetry/metrics.js";
+
+// STORY-060 — A2 entity readiness (scoring-models.md §10 "Entity Authority (A2)"). Free and unmetered: it reads
+// `entity_nodes`, `mention_facts` and `corpus_passages`, and touches no engine, embedding provider or crawl target.
+//
+// THE DEFAULT IS TO WITHHOLD. The authority figure is published only when every scored node has been checked, and is
+// withheld outright when the brand's name collides with common words (`high` disambiguation risk): a figure computed
+// over false positives is worse than none. The risk itself is reported next to the score and never folded into it.
+//
+// TWO GATES, NOT ONE. Only the SCORE (and sameAs coverage and the node-based findings) waits for all seven nodes to be
+// checked. Disambiguation risk and category co-occurrence read `mention_facts` and `corpus_passages`, need no profile
+// data, and are computed and persisted whether or not any node was ever checked: a brand whose name collides with a
+// common word gets its alias-tuning task today, not after a profile probe exists.
+//
+// WHAT THIS FILE DOES NOT DO: probe Wikidata, Wikipedia, Crunchbase, LinkedIn, GitHub, G2/Capterra or a category
+// directory. That is network I/O and belongs to a job behind a port, outside any transaction (ADR-0003); the sources
+// and their access terms are an owner decision. `writeEntityNodes` is the one place a check result becomes an
+// `entity_nodes` row, so that job has a single, tested write path to call.
+
+/** The stored `entity_nodes.node` vocabulary. */
+export type StoredEntityNode = "wikidata" | "wikipedia" | "g2" | "capterra" | "crunchbase" | "linkedin" | "github" | "category_directory";
+
+/** scoring-models.md §10 `NODES`, in display order. They sum to 1. */
+export const ENTITY_NODE_WEIGHTS: Readonly<Record<EntityScoredNode, number>> = {
+  wikidata: 0.22,
+  wikipedia: 0.14,
+  g2_or_capterra: 0.18,
+  crunchbase: 0.1,
+  linkedin: 0.08,
+  github: 0.08,
+  category_directory: 0.2,
+};
+const SCORED_ORDER = Object.keys(ENTITY_NODE_WEIGHTS) as EntityScoredNode[];
+
+/** scoring-models.md §15 `entity_node_missing`: "a NODES entry with weight >= 0.18 absent". */
+export const ENTITY_ALERT_MIN_WEIGHT = 0.18;
+/** §10: present but incomplete (missing >= 2 core fields) = 0.6. */
+export const ENTITY_THIN_MISSING_FIELDS = 2;
+export const ENTITY_THIN_PRESENCE = 0.6;
+/** §10 disambiguation bands: low < 0.05, medium 0.05..0.20, high > 0.20. */
+export const DISAMBIGUATION_MEDIUM_FROM = 0.05;
+export const DISAMBIGUATION_HIGH_ABOVE = 0.2;
+/**
+ * Owner decision 16 (2026-10-29): the fewest brand-name matches a risk ratio is computed over (the same 30 the
+ * other analyses and the §15 alert floor use). Below it the risk is "unmeasured", never low.
+ */
+export const ENTITY_MIN_NAME_MATCHES = 30;
+/** Owner decision 16 (2026-10-29): A1's "8 cited passages" is the only passage minimum the reference states; co-occurrence reuses it. */
+export const ENTITY_MIN_CATEGORY_PASSAGES = 8;
+
+export const ENTITY_NODE_TASK_RULE = "TG-ENTITY-NODE";
+/** The alias-tuning task rule: owner decision 15, seeded by migration 0150 (a `geo_finding` rule over this analysis's `entity-alias-tuning`). */
+export const ENTITY_ALIAS_TASK_RULE = "TG-ENTITY-ALIAS";
+
+const NODE_LABEL: Readonly<Record<EntityScoredNode, string>> = {
+  wikidata: "Wikidata",
+  wikipedia: "Wikipedia",
+  g2_or_capterra: "G2 or Capterra",
+  crunchbase: "Crunchbase",
+  linkedin: "LinkedIn",
+  github: "GitHub",
+  category_directory: "category directory",
+};
+
+export interface EntityNodeRecord {
+  node: StoredEntityNode;
+  present: boolean;
+  complete: boolean;
+  url: string | null;
+  missingFields: string[];
+  inBrandSameas: boolean;
+}
+
+export interface EntityInput {
+  windowStart: string;
+  windowDays: 7 | 30 | 90;
+  rootDomain: string;
+  nodes: EntityNodeRecord[];
+  /** Brand-name matches in the window (mention rows). */
+  nameMatches: number;
+  /** Of those, the matches that could not be judged (answer text unreadable, or no case signal for the brand): reported, never judged, and outside the risk denominator. */
+  unjudged: number;
+  /** Of the judged matches (`nameMatches - unjudged`), those judged not to be about this brand. */
+  notAboutBrand: number;
+  cooccurrence: { terms: string[]; categoryPassages: number; entities: { name: string; isBrand: boolean; passages: number }[] };
+}
+
+const round3 = (x: number): number => Math.round(x * 1_000) / 1_000;
+const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
+const pct = (x: number): string => `${String(Math.round(x * 100))}%`;
+
+export function disambiguationLevel(risk: number): "low" | "medium" | "high" {
+  if (risk < DISAMBIGUATION_MEDIUM_FROM) return "low";
+  return risk <= DISAMBIGUATION_HIGH_ABOVE ? "medium" : "high";
+}
+
+interface ScoredNode {
+  node: EntityScoredNode;
+  checked: boolean;
+  present: boolean;
+  complete: boolean;
+  url: string | null;
+  missingFields: string[];
+  inBrandSameas: boolean;
+}
+
+/** `g2` and `capterra` are one scored node: the better-presented profile speaks for it, and a link to either covers it. */
+function scoredNodes(records: readonly EntityNodeRecord[]): ScoredNode[] {
+  return SCORED_ORDER.map((node) => {
+    const rows = records.filter((r) => (node === "g2_or_capterra" ? r.node === "g2" || r.node === "capterra" : r.node === node));
+    if (rows.length === 0) return { node, checked: false, present: false, complete: false, url: null, missingFields: [], inBrandSameas: false };
+    const present = rows.filter((r) => r.present);
+    // Complete beats thin; then the stored order (g2 before capterra) keeps the pick independent of input order.
+    const best = present.find((r) => r.complete) ?? present[0] ?? rows[0]!;
+    return {
+      node,
+      checked: true,
+      present: present.length > 0,
+      complete: best.present && best.complete,
+      url: best.present ? best.url : null,
+      missingFields: best.present ? best.missingFields : [],
+      inBrandSameas: present.some((r) => r.inBrandSameas),
+    };
+  });
+}
+
+const presenceOf = (n: ScoredNode): number => (!n.present ? 0 : n.complete ? 1 : ENTITY_THIN_PRESENCE);
+
+function fixPath(n: ScoredNode, linkGap: boolean): string | null {
+  const label = NODE_LABEL[n.node];
+  if (!n.present) return `Create the ${label} profile, then link it from the brand's sameAs.`;
+  const parts: string[] = [];
+  if (!n.complete) parts.push(`Complete the ${label} profile${n.missingFields.length > 0 ? `: add ${n.missingFields.join(", ")}` : ""}.`);
+  if (linkGap) parts.push(`Add ${n.url ?? "its URL"} to the brand's Organization sameAs.`);
+  return parts.length === 0 ? null : parts.join(" ");
+}
+
+/** Pure: the persisted row and the read detail from one aggregate, so they cannot disagree. */
+export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; detail: GeoEntityDetail | null } {
+  const base = { analysis: "entity" as const, window_start: input.windowStart, window_days: input.windowDays, score_label: "Entity Authority" };
+  const nodes = scoredNodes(input.nodes);
+  const unchecked = nodes.filter((n) => !n.checked);
+  const allChecked = unchecked.length === 0;
+
+  // ---- disambiguation: separate, never folded in, and independent of the node checks ----
+  const judged = input.nameMatches - input.unjudged;
+  const measured = judged >= ENTITY_MIN_NAME_MATCHES;
+  const riskRaw = measured ? input.notAboutBrand / judged : null;
+  const level = riskRaw === null ? ("unmeasured" as const) : disambiguationLevel(riskRaw);
+  const highRisk = level === "high";
+
+  const coSufficient = input.cooccurrence.terms.length > 0 && input.cooccurrence.categoryPassages >= ENTITY_MIN_CATEGORY_PASSAGES;
+  const notCheckedReason =
+    unchecked.length === nodes.length
+      ? "Authoritative profiles have not been checked for this project yet; the Entity Authority score needs all seven nodes checked."
+      : `These authoritative nodes have not been checked yet: ${unchecked.map((n) => n.node).join(", ")}. The score needs all seven.`;
+
+  // Nothing at all is measurable: say so, publish nothing else.
+  if (!allChecked && level === "unmeasured" && !coSufficient) {
+    return {
+      write: {
+        ...base,
+        score: null,
+        evidence_cells: input.nameMatches,
+        evidence_passages: input.cooccurrence.categoryPassages,
+        sufficient: false,
+        suppression_reason: notCheckedReason,
+        findings: [],
+        lever_rank: null,
+      },
+      detail: null,
+    };
+  }
+
+  // ---- authority: exactly §10, only over a fully checked set ----
+  const presentNodes = nodes.filter((n) => n.present);
+  const weighted = nodes.reduce((sum, n) => sum + ENTITY_NODE_WEIGHTS[n.node] * presenceOf(n), 0);
+  // null, not 0, when nothing is present (or nothing was checked): coverage is not "zero percent".
+  const sameasCoverage = !allChecked || presentNodes.length === 0 ? null : presentNodes.filter((n) => n.inBrandSameas).length / presentNodes.length;
+  const authority = allChecked ? round3(100 * (0.75 * weighted + 0.25 * (sameasCoverage ?? 0))) : null;
+
+  // Unmeasured risk withholds too: a score we cannot show is free of false positives is not a score we can trust.
+  const unmeasuredRisk = level === "unmeasured";
+  const suppressed = highRisk || unmeasuredRisk;
+  const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(judged)} judged brand-name matches of the ${String(ENTITY_MIN_NAME_MATCHES)} it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
+  const reason = highRisk
+    ? `Disambiguation risk is high (${pct(riskRaw!)} of ${String(judged)} judged name matches are not about this brand), so the Entity Authority score would be computed over false positives and is withheld. Tune the brand's aliases first.${allChecked ? "" : ` ${notCheckedReason}`}`
+    : unmeasuredRisk
+      ? `${unmeasuredReason}${allChecked ? "" : ` ${notCheckedReason}`}`
+      : allChecked
+        ? null
+        : notCheckedReason;
+  const score = suppressed ? null : authority;
+
+  const detailNodes = nodes.map((n) => {
+    const linkGap = n.checked && n.present && !n.inBrandSameas;
+    return {
+      node: n.node,
+      weight: ENTITY_NODE_WEIGHTS[n.node],
+      status: !n.checked ? ("unchecked" as const) : !n.present ? ("absent" as const) : n.complete ? ("complete" as const) : ("thin" as const),
+      presence: presenceOf(n),
+      url: n.url,
+      missing_fields: n.missingFields,
+      in_brand_sameas: n.present && n.inBrandSameas,
+      link_gap: linkGap,
+      fix_path: n.checked ? fixPath(n, linkGap) : null,
+    };
+  });
+
+  const entities = input.cooccurrence.entities.map((e) => ({
+    name: e.name,
+    is_brand: e.isBrand,
+    passages: e.passages,
+    rate: input.cooccurrence.categoryPassages >= ENTITY_MIN_CATEGORY_PASSAGES ? round4(e.passages / input.cooccurrence.categoryPassages) : null,
+  }));
+  const detail: GeoEntityDetail = {
+    slug: "entity",
+    nodes: detailNodes,
+    sameas_coverage: sameasCoverage === null ? null : round4(sameasCoverage),
+    authority: { score, suppressed, reason },
+    disambiguation: {
+      risk: riskRaw === null ? null : round4(riskRaw),
+      level,
+      name_matches: input.nameMatches,
+      not_about_brand: input.notAboutBrand,
+      unjudged: input.unjudged,
+      minimum_matches: ENTITY_MIN_NAME_MATCHES,
+    },
+    cooccurrence: {
+      sufficient: coSufficient,
+      reason: coSufficient
+        ? null
+        : input.cooccurrence.terms.length === 0
+          ? "No category terms are known for this project (no category or verticals set), so co-occurrence cannot be measured."
+          : `Needs ${String(ENTITY_MIN_CATEGORY_PASSAGES)} cited passages that contain a category term; the corpus has ${String(input.cooccurrence.categoryPassages)}.`,
+      terms: input.cooccurrence.terms,
+      category_passages: input.cooccurrence.categoryPassages,
+      entities,
+    },
+  };
+
+  // ---- findings: each evidenced, each ending in a task rule or a no-action verdict ----
+  const home = `https://${input.rootDomain}/`;
+  const findings: GeoFinding[] = [];
+
+  if (highRisk) {
+    findings.push({
+      id: "entity-alias-tuning",
+      severity: "high",
+      headline: `${pct(riskRaw!)} of the mentions matching the brand's name are not about it. Tune the brand's aliases and negative aliases before trusting any mention-based figure.`,
+      detail: reason!,
+      evidence: [{ url: home, snippet: `${String(input.notAboutBrand)} of ${String(judged)} readable name matches were judged not to be about this brand.` }],
+      metric: { name: "disambiguation_risk", value: round4(riskRaw!), target: DISAMBIGUATION_HIGH_ABOVE },
+      task_rule_code: ENTITY_ALIAS_TASK_RULE,
+    });
+  }
+
+  // Node-based findings need every node checked: an unchecked node is not an absent one.
+  for (const n of allChecked ? nodes : []) {
+    if (n.present || ENTITY_NODE_WEIGHTS[n.node] < ENTITY_ALERT_MIN_WEIGHT) continue;
+    findings.push({
+      id: `entity-node-missing-${n.node}`,
+      severity: "medium",
+      headline: `No ${NODE_LABEL[n.node]} profile was found (weight ${String(ENTITY_NODE_WEIGHTS[n.node])} of the Entity Authority score).`,
+      detail: fixPath(n, false)!,
+      evidence: [{ url: home, snippet: `${NODE_LABEL[n.node]} was checked for this brand and no profile was found.` }],
+      metric: { name: "node_weight", value: ENTITY_NODE_WEIGHTS[n.node], target: ENTITY_ALERT_MIN_WEIGHT },
+      task_rule_code: ENTITY_NODE_TASK_RULE,
+    });
+  }
+
+  const linkGaps = allChecked ? detailNodes.filter((n) => n.link_gap) : [];
+  if (linkGaps.length > 0) {
+    findings.push({
+      id: "entity-link-gap",
+      severity: "low",
+      headline: `${String(linkGaps.length)} ${linkGaps.length === 1 ? "profile exists" : "profiles exist"} that the brand's own structured data does not link to (${linkGaps.map((n) => NODE_LABEL[n.node]).join(", ")}). Adding the sameAs links is minutes of work.`,
+      evidence: linkGaps.map((n) => ({ url: n.url ?? home, snippet: `${NODE_LABEL[n.node]} profile is not in the brand's sameAs.` })),
+      metric: { name: "link_gap_nodes", value: linkGaps.length },
+      // The fix is a sameAs patch, produced by the AUX audit (AUX-R-034 / the sameAs patch) and not by a task of its own.
+      no_action: true,
+    });
+  }
+
+  const brand = entities.find((e) => e.is_brand);
+  const rivals = entities.filter((e) => !e.is_brand && e.rate !== null);
+  const topRival = rivals.reduce<(typeof rivals)[number] | undefined>((best, e) => (best === undefined || e.rate! > best.rate! ? e : best), undefined);
+  if (coSufficient && brand?.rate != null && topRival !== undefined && topRival.rate! > brand.rate) {
+    findings.push({
+      id: "entity-category-cooccurrence",
+      severity: "info",
+      headline: `The brand appears in ${pct(brand.rate)} of the cited passages about the category; ${topRival.name} appears in ${pct(topRival.rate!)}. Engines may know the brand without associating it with the category.`,
+      detail: "Reported to explain the gap; it generates no task of its own.",
+      evidence: [{ url: home, snippet: `${String(brand.passages)} of ${String(input.cooccurrence.categoryPassages)} category passages name the brand.` }],
+      metric: { name: "brand_cooccurrence_rate", value: brand.rate },
+      no_action: true,
+    });
+  }
+
+  // The detail rides on the first finding, so a row with none would drop it: a brand with nothing to act on gets an explicit no-action verdict.
+  if (findings.length === 0) {
+    findings.push(
+      allChecked && !unmeasuredRisk
+        ? {
+            id: "entity-ready",
+            severity: "info",
+            headline: `Entity Authority is ${String(authority)}: no high-weight profile is missing, no profile is unlinked, and disambiguation risk is not high.`,
+            detail: "Reported so the analysis states its verdict; it generates no task.",
+            evidence: [{ url: home, snippet: `${String(presentNodes.length)} of ${String(nodes.length)} scored nodes are present.` }],
+            metric: { name: "authority_score", value: authority! },
+            no_action: true,
+          }
+        : {
+            id: "entity-nodes-unchecked",
+            severity: "info",
+            headline: unmeasuredRisk
+              ? "Disambiguation risk is not yet measurable; the Entity Authority score waits for enough brand-name matches."
+              : `Disambiguation risk is ${level}; the Entity Authority score waits for the authoritative profiles to be checked.`,
+            detail: unmeasuredRisk ? unmeasuredReason : notCheckedReason,
+            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(judged)} judged brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
+            metric: unmeasuredRisk ? { name: "name_matches", value: judged, target: ENTITY_MIN_NAME_MATCHES } : { name: "unchecked_nodes", value: unchecked.length },
+            no_action: true,
+          },
+    );
+  }
+
+  return {
+    write: {
+      ...base,
+      score,
+      evidence_cells: input.nameMatches,
+      evidence_passages: input.cooccurrence.categoryPassages,
+      sufficient: true,
+      suppression_reason: reason,
+      findings: findings.map((f, i) => (i === 0 ? { ...f, entity: detail } : f)),
+      lever_rank: null,
+    },
+    detail,
+  };
+}
+
+// ------------------------------------------------------------ node records
+
+/** What a profile check found. `url` null means no profile exists. */
+export interface EntityCheck {
+  node: StoredEntityNode;
+  url: string | null;
+  missingFields: string[];
+}
+
+/** Host without `www.`, path without a trailing slash, no fragment or query: the identity of a profile URL. */
+function normaliseProfileUrl(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    return `${u.hostname.toLowerCase().replace(/^www\./u, "")}${u.pathname.replace(/\/+$/u, "").toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pure: a check result as an `entity_nodes` row. Presence and completeness are recorded separately; a profile missing
+ * `ENTITY_THIN_MISSING_FIELDS` or more core fields is incomplete. `in_brand_sameas` is true only for a profile that
+ * exists and whose normalised URL is one of the brand's own `sameAs` links.
+ */
+export function deriveNodeRecord(check: EntityCheck, brandSameAs: readonly string[]): EntityNodeRecord {
+  if (check.url === null) return { node: check.node, present: false, complete: false, url: null, missingFields: [], inBrandSameas: false };
+  const own = normaliseProfileUrl(check.url);
+  return {
+    node: check.node,
+    present: true,
+    complete: check.missingFields.length < ENTITY_THIN_MISSING_FIELDS,
+    url: check.url,
+    missingFields: check.missingFields,
+    inBrandSameas: own !== null && brandSameAs.some((s) => normaliseProfileUrl(s) === own),
+  };
+}
+
+/**
+ * The one write path into `entity_nodes`: upserts each check on the composite key so a re-check REPLACES. Runs in the
+ * caller's tenant transaction; the checks were made BEFORE it opened (no network call is made here).
+ */
+export async function writeEntityNodes(tx: ClientBase, projectId: string, checks: readonly EntityCheck[], brandSameAs: readonly string[]): Promise<EntityNodeRecord[]> {
+  const records = checks.map((c) => deriveNodeRecord(c, brandSameAs));
+  for (const r of records) {
+    const res = await tx.query(
+      `INSERT INTO entity_nodes (workspace_id, project_id, node, present, complete, url, missing_fields, in_brand_sameas, last_checked_at)
+       SELECT p.workspace_id, p.id, $2, $3, $4, $5, $6::text[], $7, clock_timestamp()
+         FROM projects p WHERE p.id = $1 AND p.deleted_at IS NULL
+       ON CONFLICT (project_id, node) DO UPDATE SET
+         present = EXCLUDED.present, complete = EXCLUDED.complete, url = EXCLUDED.url,
+         missing_fields = EXCLUDED.missing_fields, in_brand_sameas = EXCLUDED.in_brand_sameas, last_checked_at = clock_timestamp()`,
+      [projectId, r.node, r.present, r.complete, r.url, r.missingFields, r.inBrandSameas],
+    );
+    if (res.rowCount === 0) throw new NotFoundError({ message: "no such project" });
+    incrementCounter("nominara_geo_entity_node_checked_total", { node: r.node, present: String(r.present) });
+  }
+  return records;
+}
+
+// ------------------------------------------------------ name-match judging
+
+/**
+ * v1 case heuristic, kept by owner decision 17 (2026-10-29). The reference defines the risk as the share of name matches
+ * "NOT about this brand" without saying how a match is judged. The only signal the stored facts carry for free is case: the
+ * parser folds case when it matches, so a lowercase span of a capitalised name ("notion" for "Notion") is the common word,
+ * not the brand. A brand whose cased spelling has no uppercase letter carries no such signal, so its matches are
+ * "unjudged" (counted as matches, outside the risk denominator), never guessed to be about the brand; so is a span that is
+ * not the alias once folded (a misread offset). The heuristic undercounts false positives (sentence-initial and
+ * markup-wrapped capitalised uses pass), so risk is biased low.
+ * FOLLOW-UP, not started: a model-assisted judge behind this same signature, run outside the transaction. No job may
+ * publish Entity Authority in production until it lands.
+ */
+export function judgeNameMatch(match: { alias: string; span: string; before?: string; after?: string }): "about_brand" | "not_about_brand" | "unjudged" {
+  // A span that is not the alias once folded the way the matcher folds is a misread offset: no evidence either way.
+  if (fold(match.span).folded !== fold(match.alias).folded) return "unjudged";
+  // No uppercase letter in the cased spelling: the case heuristic has no signal ("monday" the brand vs the weekday).
+  if (match.alias === match.alias.toLowerCase()) return "unjudged";
+  // A span inside a domain or URL ("notion.so", "https://www.notion.so/x", a markdown link target) is the brand's own address, written lowercase by convention.
+  if (insideUrlOrDomain(match.before ?? "", match.after ?? "")) return "about_brand";
+  const spanIsLower = match.span !== "" && match.span === match.span.toLowerCase() && match.span !== match.span.toUpperCase();
+  return spanIsLower ? "not_about_brand" : "about_brand";
+}
+
+/** True when the span is part of a domain token (a TLD follows it), markdown link text, or a URL (a scheme or `www.` precedes it in the same token). */
+export function insideUrlOrDomain(before: string, after: string): boolean {
+  if (/^\.[a-z]{2,}(?![a-z])/iu.test(after)) return true;
+  // Markdown link text: `[notion](https://notion.so)` is the brand being linked.
+  if (after.startsWith("](")) return true;
+  const token = /\S*$/u.exec(before)?.[0] ?? "";
+  return /:\/\/|^www\.|\]\(/iu.test(token);
+}
+
+/**
+ * The spelling to judge each folded alias by. Keyed by the fold the matcher compares with, and a spelling that holds an uppercase letter
+ * wins over an all-lowercase one of the same fold: a project with name "Notion" and alias "notion" is still a cased brand, so a lowercase
+ * span is still a suspect common word. (A Map keyed by plain lowercase let the later lowercase entry replace the cased one.)
+ */
+export function casedSpellings(names: readonly string[]): Map<string, string> {
+  const spellings = new Map<string, string>();
+  for (const name of names) {
+    const key = fold(name).folded;
+    const held = spellings.get(key);
+    if (held === undefined || (held === held.toLowerCase() && name !== name.toLowerCase())) spellings.set(key, name);
+  }
+  return spellings;
+}
+
+/** The casings a CASED alias is accepted in when matching corpus passages: as spelled, ALL CAPS, and Capitalised. Never the lowercase form. */
+export function casedVariants(alias: string): string[] {
+  const capitalised = alias.charAt(0).toUpperCase() + alias.slice(1).toLowerCase();
+  return [...new Set([alias, alias.toUpperCase(), capitalised])];
+}
+
+/**
+ * The matched span of a stored mention. `mention_facts.char_start/char_end` are UTF-16 offsets into the NORMALISED text
+ * (parser/normalize.ts), while `answer_captures.payload.text` is the raw adapter text: normalise it first, then slice.
+ * Null when no text is held or the offsets fall outside it (unreadable, which the caller never counts as a false positive).
+ */
+export function spanOfMention(rawText: string | null, charStart: number, charEnd: number): string | null {
+  if (rawText === null) return null;
+  const text = normalize(rawText);
+  if (charStart < 0 || charEnd <= charStart || charEnd > text.length) return null;
+  return text.slice(charStart, charEnd);
+}
+
+/** The span with a little text each side, for judging; null under the same conditions as `spanOfMention`. */
+export function mentionContext(rawText: string | null, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
+  return rawText === null ? null : contextOfNormalised(normalize(rawText), charStart, charEnd);
+}
+
+/** `mentionContext` over text that is already normalised. */
+function contextOfNormalised(text: string, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
+  if (charStart < 0 || charEnd <= charStart || charEnd > text.length) return null;
+  return { span: text.slice(charStart, charEnd), before: text.slice(Math.max(0, charStart - 64), charStart), after: text.slice(charEnd, charEnd + 16) };
+}
+
+// ------------------------------------------------------------------ loader
+
+interface NodeRow {
+  node: StoredEntityNode;
+  present: boolean;
+  complete: boolean;
+  url: string | null;
+  missing_fields: string[];
+  in_brand_sameas: boolean;
+}
+
+/**
+ * A word-bounded POSIX ARE for a literal term, matched case-insensitively (`~*`). Bound as a parameter, never concatenated
+ * into SQL. Only regex metacharacters are escaped: a backslash before a LETTER (`\é`) is an ARE escape or an error, and
+ * non-ASCII letters are alphanumeric under the database's UTF-8 locale. The boundary is lookaround rather than `\m`/`\M`,
+ * so a term that starts or ends in a symbol (".NET", "C++") still has one: no word character may touch either end.
+ */
+export const termPattern = (term: string): string => `(?<![[:alnum:]_])${term.replace(/[.^$|?*+()[\]{}\\]/gu, "\\$&")}(?![[:alnum:]_])`;
+
+/** Category terms from the project's own category and verticals; empty when it set neither. */
+export function categoryTerms(categorySlug: string | null, verticals: readonly string[]): string[] {
+  const fromSlug = categorySlug === null ? [] : [categorySlug.replace(/[-_]+/gu, " ").trim()];
+  return [...new Set([...fromSlug, ...verticals].map((t) => t.trim().toLowerCase()).filter((t) => t !== ""))];
+}
+
+/** Reads the window's facts. Must run inside the ambient tenant transaction: RLS is the guarantee, `project_id` is for the planner. */
+export async function loadEntityInput(tx: ClientBase, projectId: string, windowStart: string, windowDays: 7 | 30 | 90): Promise<EntityInput> {
+  const project = await tx.query<{ root_domain: string; name: string; brand_aliases: string[]; category_slug: string | null; verticals: string[] }>(
+    "SELECT root_domain, name, brand_aliases, category_slug, verticals FROM projects WHERE id = $1 AND deleted_at IS NULL",
+    [projectId],
+  );
+  const p = project.rows[0];
+  if (p === undefined) throw new NotFoundError({ message: "no such project" });
+
+  const nodes = await tx.query<NodeRow>(
+    "SELECT node, present, complete, url, missing_fields, in_brand_sameas FROM entity_nodes WHERE project_id = $1 ORDER BY node",
+    [projectId],
+  );
+
+  // One row per capture with its mentions' offsets. The span is cut in application code, from the normalised text: the
+  // offsets are UTF-16 indices into the normalised string, which SQL `substr` over the raw payload cannot honour.
+  // The text is resolved as the parser resolves it (capture-parse `reusedTextOf`): an L2-reused row carries `{}` and a
+  // `source_result_id`, its mentions were matched against the SOURCE row's text, so that is where their offsets point.
+  const captures = await tx.query<{ text: string | null; mentions: [string, number, number][] }>(
+    `SELECT min(COALESCE(NULLIF(ac.payload ->> 'text', ''), NULLIF(src.payload ->> 'text', ''))) AS text,
+            json_agg(json_build_array(mf.matched_alias, mf.char_start, mf.char_end)) AS mentions
+       FROM mention_facts mf
+       LEFT JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.workspace_id = mf.workspace_id AND ac.project_id = mf.project_id
+       LEFT JOIN answer_captures src ON src.id = ac.source_result_id AND src.workspace_id = ac.workspace_id AND src.project_id = ac.project_id
+      WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $4
+        AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
+        AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)
+      GROUP BY mf.result_id, mf.captured_at`,
+    [projectId, windowStart, windowDays, SCORING_VERSION],
+  );
+  // The parser may store the folded alias; judge against the cased spelling the project actually holds.
+  const cased = casedSpellings([p.name, ...p.brand_aliases]);
+  let nameMatches = 0;
+  let unjudged = 0;
+  let notAboutBrand = 0;
+  for (const c of captures.rows) {
+    // Normalised once per capture, not once per mention.
+    const text = c.text === null ? null : normalize(c.text);
+    for (const [alias, start, end] of c.mentions) {
+      nameMatches += 1;
+      // A span that cannot be read (answer text no longer held), or that the case heuristic cannot judge, is counted as a match, reported as unjudged, and never as a false positive.
+      const ctx = text === null ? null : contextOfNormalised(text, start, end);
+      const verdict = ctx === null ? "unjudged" : judgeNameMatch({ alias: cased.get(fold(alias).folded) ?? alias, ...ctx });
+      if (verdict === "unjudged") unjudged += 1;
+      else if (verdict === "not_about_brand") notAboutBrand += 1;
+    }
+  }
+
+  const terms = categoryTerms(p.category_slug, p.verticals);
+  const termPatterns = terms.map(termPattern);
+  const competitors = await tx.query<{ name: string; aliases: string[] }>(
+    "SELECT name, aliases FROM competitors WHERE project_id = $1 AND deleted_at IS NULL ORDER BY lower(name), id",
+    [projectId],
+  );
+  const entities = [{ name: p.name, isBrand: true, aliases: [p.name, ...p.brand_aliases] }, ...competitors.rows.map((c) => ({ name: c.name, isBrand: false, aliases: [c.name, ...c.aliases] }))];
+
+  // ONE scan of the passages that carry a category term, then each entity's patterns joined against that set: cost no longer
+  // multiplies by the competitor count. Row `-1` is the category total; an entity with no hit has no row (zero).
+  const patIdx: number[] = [];
+  const patText: string[] = [];
+  const patCased: boolean[] = [];
+  entities.forEach((e, i) => {
+    // A capitalised alias ("Notion") is matched case-SENSITIVELY: folding it would count the common word ("notion") as the brand and inflate the rate.
+    // Its casing variants (all caps, title case) are accepted too: they are written as headings and brand marks, and are not the common word.
+    for (const a of e.aliases) {
+      if (a.trim() === "") continue;
+      const isCased = a !== a.toLowerCase();
+      for (const variant of isCased ? casedVariants(a) : [a]) { patIdx.push(i); patText.push(termPattern(variant)); patCased.push(isCased); }
+    }
+  });
+  const counts = new Map<number, number>();
+  if (termPatterns.length > 0) {
+    const res = await tx.query<{ idx: number; n: number }>(
+      `WITH cat AS (
+         SELECT row_number() OVER () AS rn, cp.text FROM corpus_passages cp
+          WHERE cp.project_id = $1 AND cp.expires_at > now() AND cp.text ~* ANY($2::text[])
+       )
+       SELECT -1 AS idx, count(*)::int AS n FROM cat
+       UNION ALL
+       SELECT pats.idx, count(DISTINCT cat.rn)::int AS n
+         FROM unnest($3::int[], $4::text[], $5::boolean[]) AS pats(idx, pat, cased) JOIN cat ON CASE WHEN pats.cased THEN cat.text ~ pats.pat ELSE cat.text ~* pats.pat END
+        GROUP BY pats.idx`,
+      [projectId, termPatterns, patIdx, patText, patCased],
+    );
+    for (const r of res.rows) counts.set(r.idx, r.n);
+  }
+  const categoryPassages = counts.get(-1) ?? 0;
+  const counted = entities.map((e, i) => ({ name: e.name, isBrand: e.isBrand, passages: counts.get(i) ?? 0 }));
+
+  return {
+    windowStart,
+    windowDays,
+    rootDomain: p.root_domain,
+    nodes: nodes.rows.map((r) => ({ node: r.node, present: r.present, complete: r.complete, url: r.url, missingFields: r.missing_fields, inBrandSameas: r.in_brand_sameas })),
+    nameMatches,
+    unjudged,
+    notAboutBrand,
+    cooccurrence: {
+      terms,
+      categoryPassages,
+      entities: counted,
+    },
+  };
+}
