@@ -259,6 +259,13 @@ describe("STORY-055 · complete takes an optional strict body", () => {
     return body!.pipes[0]!;
   }
 
+  it("review r3 - the route audits a submission as task.verification_submitted and a completion as task.completed", () => {
+    const options = Reflect.getMetadata("auditOptions", TasksController.prototype.complete) as { action: string; actionFrom: (body: unknown) => string };
+    expect(options.action).toBe("task.completed");
+    expect(options.actionFrom({ task: { status: "in_review" } })).toBe("task.verification_submitted");
+    expect(options.actionFrom({ task: { status: "done" } })).toBe("task.completed");
+  });
+
   it("no body at all is {} (a content task completes exactly as before)", () => {
     expect(bodyPipe().transform(undefined)).toEqual({});
   });

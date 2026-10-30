@@ -227,6 +227,8 @@ export const featureNotInPlanDetailsSchema = z
 //   change_scheduled                    an add-on removal is scheduled on the subscription
 //   plan_change_pending                 a plan change is already pending: cancel it first
 //   plan_change_not_pending             cancelling when nothing is pending
+// STORY-055 (review r3) - completing a seeding task with a contribution URL:
+//   no_source_domain                    the task has a playbook but no source domain to hold the URL to, so it cannot be verified
 export const CONFLICT_REASONS = [
   "member_suspended",
   "already_member",
@@ -247,6 +249,7 @@ export const CONFLICT_REASONS = [
   "change_scheduled",
   "plan_change_pending",
   "plan_change_not_pending",
+  "no_source_domain",
 ] as const;
 
 export const conflictDetailsSchema = z

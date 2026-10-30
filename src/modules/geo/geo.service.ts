@@ -66,7 +66,7 @@ export class GeoService {
       const days = WINDOW_DAYS[query.timeframe];
       const rows = await this.latestRows(projectId, days);
       incrementCounter("nominara_geo_digest_read_total", { sufficient: String(rows.some((r) => r.sufficient)) });
-      // STORY-062 AC10: a lever links the OPEN task (todo / in_progress) behind its finding's rule on that analysis, within the
+      // STORY-062 AC10: a lever links the OPEN task (todo / in_progress / in_review) behind its finding's rule on that analysis, within the
       // caller's scope; none open (or only dismissed / done ones) means null, never a stale task offered as the action.
       return composeDigest(rows, days, await this.openTaskLookup(projectId, rows));
     });

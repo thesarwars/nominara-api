@@ -9,7 +9,9 @@ describe("STORY-055 scenario 8 · checkSubmittedUrl (pure host rules)", () => {
     ["https://www.reddit.com/r/saas/comments/abc/best_tools/", "https://www.reddit.com/r/saas/comments/abc/best_tools/"],
     ["http://g2.com/products/acme/reviews", "http://g2.com/products/acme/reviews"],
     ["  https://news.ycombinator.com/item?id=1  ", "https://news.ycombinator.com/item?id=1"],
-    ["https://example.com:443/x", "https://example.com:443/x"],
+    // review r3: the NORMALISED href is what is stored, fetched and returned (default port dropped, scheme and host lowercased).
+    ["https://example.com:443/x", "https://example.com/x"],
+    ["HTTPS://Example.COM/Path?Q=1#f", "https://example.com/Path?Q=1#f"],
   ])("accepts %s", (raw, url) => {
     expect(checkSubmittedUrl(raw)).toEqual({ ok: true, url });
   });
@@ -46,6 +48,10 @@ describe("STORY-055 scenario 8 · checkSubmittedUrl (pure host rules)", () => {
     ["http://example.com:22/x", "port_not_allowed"],
   ])("refuses %s as %s", (raw, reason) => {
     expect(checkSubmittedUrl(raw)).toEqual({ ok: false, reason });
+  });
+
+  it.each(["https://user:pw@reddit.com/r/x", "https://user@reddit.com/r/x", "http://:pw@g2.com/x"])("review r3 - refuses a URL that carries credentials: %s", (raw) => {
+    expect(checkSubmittedUrl(raw)).toEqual({ ok: false, reason: "credentials" });
   });
 
   it("the refusal never echoes the address", () => {

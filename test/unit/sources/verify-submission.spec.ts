@@ -36,7 +36,16 @@ describe("STORY-055 · fetchSubmission", () => {
     ["a 500", () => Promise.resolve(res("boom", { status: 500 })), "unreachable"],
     ["a PDF", () => Promise.resolve(res("%PDF", { headers: { "content-type": "application/pdf" } })), "not_a_page"],
     ["a refusal by the guard", () => Promise.reject(new GuardedFetchRefusal("address_not_global")), "unsafe_target"],
-    ["a redirect-hop refusal", () => Promise.reject(new GuardedFetchRefusal("redirect_target_refused")), "unsafe_target"],
+    ["a redirect-hop refusal to a private address", () => Promise.reject(new GuardedFetchRefusal("redirect_target_refused")), "unsafe_target"],
+    ["a refused port", () => Promise.reject(new GuardedFetchRefusal("port_not_allowed")), "unsafe_target"],
+    ["a refused scheme", () => Promise.reject(new GuardedFetchRefusal("scheme_not_allowed")), "unsafe_target"],
+    // Review r3 M1: a name that does not resolve, or a resolver that is down, is about the NETWORK, not about the customer's URL.
+    ["a name that does not exist (NXDOMAIN)", () => Promise.reject(new GuardedFetchRefusal("dns_resolution_failed", "ENOTFOUND")), "unreachable"],
+    ["a resolver that is down (EAI_AGAIN)", () => Promise.reject(new GuardedFetchRefusal("dns_resolution_failed", "EAI_AGAIN")), "unreachable"],
+    ["a resolver failure (ESERVFAIL)", () => Promise.reject(new GuardedFetchRefusal("dns_resolution_failed", "ESERVFAIL")), "unreachable"],
+    ["a resolver failure with no errno", () => Promise.reject(new GuardedFetchRefusal("dns_resolution_failed", "UNKNOWN")), "unreachable"],
+    ["a redirect hop whose name does not resolve", () => Promise.reject(new GuardedFetchRefusal("redirect_target_refused", "ENOTFOUND")), "unreachable"],
+    ["too many redirects", () => Promise.reject(new GuardedFetchRefusal("too_many_redirects")), "unreachable"],
   ])("scenario 7 - %s gives %s", async (_name, fetch, reason) => {
     await expect(fetchSubmission(plan(), vi.fn().mockImplementation(fetch))).resolves.toEqual({ status: "unverified", reason });
   });
@@ -67,7 +76,16 @@ describe("STORY-055 · fetchSubmission", () => {
     });
   });
 
-  it("a task with no source domain (a playbook-only task) has no domain constraint", async () => {
-    await expect(fetchSubmission(plan({ domain: null, sourceDomainId: null, url: "https://anywhere.org/p" }), vi.fn().mockResolvedValue(res("Acme Analytics", { finalUrl: "https://anywhere.org/p" })))).resolves.toEqual({ status: "verified" });
+  it("review r3 - a redirect off the domain whose page does NOT name the brand is wrong_domain, not no_mention", async () => {
+    await expect(fetchSubmission(plan(), vi.fn().mockResolvedValue(res("Globex only", { finalUrl: "https://evil.org/landing" })))).resolves.toEqual({
+      status: "unverified",
+      reason: "wrong_domain",
+    });
+  });
+
+  it("review r3 - a task with no source domain FAILS CLOSED in the job too (the request already refuses it): nothing is fetched", async () => {
+    const fetch = vi.fn().mockResolvedValue(res("Acme Analytics", { finalUrl: "https://anywhere.org/p" }));
+    await expect(fetchSubmission(plan({ domain: null, sourceDomainId: null, url: "https://anywhere.org/p" }), fetch)).resolves.toEqual({ status: "unverified", reason: "wrong_domain" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

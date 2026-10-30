@@ -24,6 +24,8 @@ import {
   type SubmissionOutcome,
   type SubmissionPlan,
 } from "../../sources/verify-submission.js";
+import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
+import { afterCommit } from "../../../tenancy/tenant-context.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
 
@@ -68,6 +70,8 @@ const payloadSchema = z
 
 export interface SourceVerifyPresenceDeps {
   readonly fetch?: PresenceFetcher;
+  /** STORY-055 - the realtime publisher a changed task announces itself on (`task.moved`). Built lazily in production; injected in tests. */
+  readonly realtime?: RealtimePublisher;
   readonly now?: () => Date;
 }
 
@@ -99,10 +103,13 @@ function fetchSubmissionTraced(plan: SubmissionPlan, fetch: PresenceFetcher): Pr
   });
 }
 
-export function createSourceVerifyPresenceHandler(_context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {
+export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {
   const logger = new Logger("source.verify_presence");
   const fetch = deps.fetch ?? ((url: string) => guardedFetch(url));
   const clock = deps.now ?? (() => new Date());
+  // Built on the first submission job, not at boot: a worker group without a reachable cache must still boot (as task.generate's).
+  let publisher: RealtimePublisher | undefined;
+  const realtime = (): RealtimePublisher => (publisher ??= deps.realtime ?? new ValkeyRealtimePublisher(context.env.VALKEY_CACHE_URL));
 
   return phasedProcessor<Prepared, Fetched>({
     async prepare(tx: ClientBase, job: Job) {
@@ -150,7 +157,13 @@ export function createSourceVerifyPresenceHandler(_context: QueueHandlerContext,
 
     async commit(tx: ClientBase, prepared: Prepared, fetched: Fetched) {
       if (prepared.mode === "submission" && fetched.mode === "submission") {
-        await commitSubmissionVerification(tx, prepared.plan, fetched.outcome, clock());
+        const changed = await commitSubmissionVerification(tx, prepared.plan, fetched.outcome, clock());
+        if (changed) {
+          // After COMMIT, like TasksService's: a rolled-back verification announces nothing. A failed check changes what the task
+          // shows (its review reason) as much as a completion does.
+          const { workspaceId, projectId, taskId } = prepared.plan;
+          afterCommit(() => realtime().toWorkspace(workspaceId, "task.moved", { task_id: taskId, project_id: projectId }));
+        }
         return;
       }
       if (prepared.mode === "seeded" && fetched.mode === "seeded") {

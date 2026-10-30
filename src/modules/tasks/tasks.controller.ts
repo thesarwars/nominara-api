@@ -123,7 +123,12 @@ export class TasksController {
   @Idempotent()
   @RequirePermission("task:move")
   @ScopedByQuery()
-  @Audit({ action: "task.completed", resourceType: "task" })
+  @Audit({
+    action: "task.completed",
+    // A seeding task is only SUBMITTED for review here; the job audits the completion (`task.verification_completed`).
+    actionFrom: (body) => ((body as { task?: { status?: string } }).task?.status === "in_review" ? "task.verification_submitted" : "task.completed"),
+    resourceType: "task",
+  })
   @ApiContract({ operationId: "completeTask", requestSchema: completeTaskRequestSchema, responseSchema: completeTaskResponseSchema })
   complete(
     @Param("id") id: string,

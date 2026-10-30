@@ -5,7 +5,7 @@ import { taskSchema } from "./task-response.schema.js";
 //
 // Owner decision 30 / STORY-055: a SEEDING task (playbook or source class) is completed WITH a `url` (see
 // complete-task-request.schema.ts). It goes `in_review`, not `done`: no milestone exists yet, so `milestone` is null and
-// `task.verification.state` is `pending`. Every other task completes exactly as before.
+// `task.review.state` is `pending`. Every other task completes exactly as before.
 //
 // Completing a task is a workflow event, not a status flip: it sets the task
 // `done`, pins a `task_completed` milestone at that instant, and writes the

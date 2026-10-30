@@ -180,7 +180,7 @@ export class TasksService {
       `SELECT DISTINCT ON (rule_code, source_geo_analysis) id, title, rule_code, source_geo_analysis
          FROM tasks
         WHERE project_id = $1 AND rule_code = ANY($2::text[]) AND source_geo_analysis IS NOT NULL
-          AND status IN ('todo', 'in_progress') AND deleted_at IS NULL
+          AND status IN ('todo', 'in_progress', 'in_review') AND deleted_at IS NULL
           AND (cardinality(app.current_scope_projects()) = 0 OR project_id = ANY(app.current_scope_projects()))
         ORDER BY rule_code, source_geo_analysis, impact_score DESC, created_at, id`,
       [projectId, [...ruleCodes]],
@@ -228,7 +228,7 @@ export class TasksService {
            t.source_finding_id, t.source_domain_id, t.source_displacement_id,
            t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
            t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
-           ${VERIFICATION_SELECT},
+           ${REVIEW_SELECT},
            ${SORT_KEYS[query.sort]}
          FROM tasks t
          LEFT JOIN goals g ON g.id = t.goal_id
@@ -593,7 +593,7 @@ export class TasksService {
               t.source_finding_id, t.source_domain_id, t.source_displacement_id,
               t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
               t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
-              ${VERIFICATION_SELECT}
+              ${REVIEW_SELECT}
          FROM tasks t
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
          LEFT JOIN LATERAL (
@@ -867,6 +867,21 @@ export class TasksService {
       throw new ConflictError({ message: `a ${current.status} task cannot be completed`, details: { current_state: current.status } });
     }
 
+    if (seeding && current.source_domain_id === null) {
+      // FAIL CLOSED (review r3, the orchestrator's default, open to the owner): a verification needs a domain to hold the page to, and
+      // a playbook-only task has none. Refused with a reason rather than verified against "anywhere on the web".
+      throw new ConflictError({
+        message: "this task has no source domain, so a contribution URL cannot be verified against it",
+        details: { reason: "no_source_domain", current_state: current.status },
+      });
+    }
+    if (!seeding && body.url !== undefined) {
+      throw new ValidationFailedError({
+        message: "url: only a seeding task is completed with a URL",
+        details: { issues: [{ path: ["url"], message: "not accepted: this task has no playbook or source class" }] },
+      });
+    }
+
     if (seeding) return this.submitForVerification(store, taskId, current, body);
 
     const milestone = await client.query<{ id: string; occurred_at: Date }>(
@@ -906,7 +921,7 @@ export class TasksService {
    * `source.verify_presence` for THIS submission AFTER COMMIT (a job enqueued inside the transaction could run before the
    * `in_review` row is visible; a rolled-back submission asks for nothing). The key is the submission's event id, so a replayed
    * request cannot queue two, while a resubmission after a failed check is a new submission and a new job. A failed enqueue is
-   * logged, never thrown - the submission is durable, and the task simply stays in review pending.
+   * logged, never thrown - the submission is durable, and the task stays in review pending until the next submit's 409 re-queues it.
    */
   private async submitForVerification(
     store: NonNullable<ReturnType<typeof currentTenantStore>>,
@@ -922,18 +937,31 @@ export class TasksService {
       });
     }
     const checked = checkSubmittedUrl(body.url);
+    if (!checked.ok && checked.reason === "credentials") {
+      // A malformed submission, not an unsafe target - and the message never echoes what was typed (it may be a password).
+      throw new ValidationFailedError({
+        message: "url: must not contain a user name or password",
+        details: { issues: [{ path: ["url"], message: "must not contain credentials" }] },
+      });
+    }
     if (!checked.ok) throw new UnsafeTargetError({ message: "this URL cannot be fetched", details: { reason: checked.reason } });
 
     if (current.status === "in_review") {
-      const latest = await client.query<{ pending: boolean }>(
-        `SELECT NOT EXISTS (SELECT 1 FROM task_events a
+      const latest = await client.query<{ id: string; pending: boolean }>(
+        `SELECT s.id, NOT EXISTS (SELECT 1 FROM task_events a
                              WHERE a.task_id = s.task_id AND a.event = 'verification_failed' AND a.payload->>'submission_id' = s.id::text) AS pending
            FROM task_events s
           WHERE s.task_id = $1 AND s.event = 'verification_submitted'
           ORDER BY s.occurred_at DESC, s.id DESC LIMIT 1`,
         [taskId],
       );
-      if (latest.rows[0]?.pending === true) {
+      const pending = latest.rows[0];
+      if (pending?.pending === true) {
+        // A submission whose job was never queued (the enqueue failed after the commit) or was lost would otherwise sit pending for
+        // ever, and every resubmit would land here. So the 409 RE-QUEUES THE SAME SUBMISSION: the key is the submission's, so a job
+        // that does exist is not duplicated and one that does not is created. Not deferred to after-commit: this request is about to
+        // roll back, and the submission it names was committed long ago.
+        this.enqueueVerification(store.context.workspaceId, current.project_id, taskId, pending.id);
         throw new ConflictError({ message: "the submitted URL is still being verified", details: { current_state: "in_review" } });
       }
     }
@@ -959,28 +987,31 @@ export class TasksService {
   }
 
   private requestSubmissionVerification(workspaceId: string, projectId: string, taskId: string, submissionId: string): void {
+    afterCommit(() => this.enqueueVerification(workspaceId, projectId, taskId, submissionId));
+  }
+
+  /** Enqueues the submission's job (idempotent by key). Never throws: a failed enqueue is logged and counted, and the next submit re-queues it. */
+  private enqueueVerification(workspaceId: string, projectId: string, taskId: string, submissionId: string): void {
     const queues = this.queues;
     if (queues === undefined) {
       this.logger.warn({ message: "no queue producer: the submitted URL is not verified", workspace_id: workspaceId, task_id: taskId });
       return;
     }
-    afterCommit(() => {
-      void queues
-        .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId, submissionId }, { idempotencyKey: `taskverify:${submissionId}` })
-        .then(() => {
-          incrementCounter("nominara_tasks_verification_requested_total", {});
-        })
-        .catch((error: unknown) => {
-          incrementCounter("nominara_tasks_verification_request_failed_total", {});
-          this.logger.error({
-            message: "submission verification request failed",
-            workspace_id: workspaceId,
-            project_id: projectId,
-            task_id: taskId,
-            error: error instanceof Error ? error.name : "unknown",
-          });
+    void queues
+      .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId, submissionId }, { idempotencyKey: `taskverify:${submissionId}` })
+      .then(() => {
+        incrementCounter("nominara_tasks_verification_requested_total", {});
+      })
+      .catch((error: unknown) => {
+        incrementCounter("nominara_tasks_verification_request_failed_total", {});
+        this.logger.error({
+          message: "submission verification request failed",
+          workspace_id: workspaceId,
+          project_id: projectId,
+          task_id: taskId,
+          error: error instanceof Error ? error.name : "unknown",
         });
-    });
+      });
   }
 
   /**
@@ -1423,7 +1454,7 @@ const SORT_KEYS: Record<TaskSort, string> = {
  * submission's `verification_failed` answer (migration 0155 keeps both in `task_events`, no column). Evaluated only for an
  * `in_review` row, so every other task pays nothing. `reason` is null while the job has not answered.
  */
-const VERIFICATION_SELECT = `CASE WHEN t.status = 'in_review' THEN (
+const REVIEW_SELECT = `CASE WHEN t.status = 'in_review' THEN (
              SELECT jsonb_build_object(
                       'url', s.payload->>'url',
                       'submitted_at', to_char(s.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
@@ -1432,7 +1463,7 @@ const VERIFICATION_SELECT = `CASE WHEN t.status = 'in_review' THEN (
                LEFT JOIN task_events f ON f.task_id = s.task_id AND f.event = 'verification_failed' AND f.payload->>'submission_id' = s.id::text
               WHERE s.task_id = t.id AND s.event = 'verification_submitted'
               ORDER BY s.occurred_at DESC, s.id DESC LIMIT 1)
-           END AS verification`;
+           END AS review`;
 
 interface TaskRow {
   id: string;
@@ -1460,7 +1491,7 @@ interface TaskRow {
   affected_url: string | null;
   created_at: Date;
   updated_at: Date;
-  verification: { url: string; submitted_at: string; reason: TaskVerification["reason"] } | null;
+  review: { url: string; submitted_at: string; reason: TaskVerification["reason"] } | null;
   k1_key: string;
   k2_key: string;
   k3_key: string;
@@ -1490,10 +1521,10 @@ function toTask(row: TaskRow): Task {
     resurface_at: row.resurface_at?.toISOString() ?? null,
     completed_at: row.completed_at?.toISOString() ?? null,
     affected_url: row.affected_url,
-    verification:
-      row.verification === null || row.verification === undefined
+    review:
+      row.review === null || row.review === undefined
         ? null
-        : { state: row.verification.reason === null ? "pending" : "unverified", url: row.verification.url, submitted_at: row.verification.submitted_at, reason: row.verification.reason },
+        : { state: row.review.reason === null ? "pending" : "unverified", url: row.review.url, submitted_at: row.review.submitted_at, reason: row.review.reason },
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
   };

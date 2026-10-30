@@ -42,7 +42,7 @@ function service(task: TaskFixture) {
         }
         if (sql.includes("INSERT INTO milestones")) return { rows: [{ id: "66666666-6666-7666-8666-666666666666", occurred_at: OCCURRED_AT }], rowCount: 1 };
         if (sql.includes("verification_submitted") && sql.includes("INSERT INTO task_events")) return { rows: [{ id: SUBMISSION }], rowCount: 1 };
-        if (sql.includes("verification_submitted")) return { rows: [{ pending: task.pending ?? false }], rowCount: 1 };
+        if (sql.includes("verification_submitted")) return { rows: [{ id: SUBMISSION, pending: task.pending ?? false }], rowCount: 1 };
         return { rows: [{ critical: "0", high: "0", medium: "0", low: "0", total: "0" }], rowCount: 1 };
       }),
     },
@@ -73,15 +73,25 @@ describe("STORY-055 AC5 · a seeding task requires a URL", () => {
     expect(s.enqueueTenantJob).not.toHaveBeenCalled();
   });
 
-  it("a playbook alone, and a source domain alone, each make a task a seeding task", async () => {
-    for (const task of [
-      { kind: "content", source_domain_id: null, playbook_slug: "reddit-contribution" },
-      { kind: "authority", source_domain_id: DOMAIN_ID, playbook_slug: null },
-    ]) {
-      const s = service(task);
-      await expect(s.tasks.completeTask(TASK, {})).rejects.toBeInstanceOf(ValidationFailedError);
-      vi.restoreAllMocks();
-    }
+  it("a source domain alone makes a task a seeding task (a URL is required)", async () => {
+    const s = service({ kind: "authority", source_domain_id: DOMAIN_ID, playbook_slug: null });
+    await expect(s.tasks.completeTask(TASK, {})).rejects.toBeInstanceOf(ValidationFailedError);
+  });
+
+  it("review r3 - a playbook with NO source domain is refused with no_source_domain (fails closed), before any write", async () => {
+    const s = service({ kind: "content", source_domain_id: null, playbook_slug: "reddit-contribution" });
+    const error = await s.tasks.completeTask(TASK, { url: URL_OK }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConflictError);
+    expect((error as { details: unknown }).details).toMatchObject({ reason: "no_source_domain" });
+    expect(s.statements.some((sql) => /^\s*(INSERT|UPDATE)/u.test(sql))).toBe(false);
+  });
+
+  it("review r3 - a URL carrying credentials is a 400 validation_failed, before any write", async () => {
+    const s = service(SEEDING);
+    const error = await s.tasks.completeTask(TASK, { url: "https://me:secret@www.reddit.com/r/x" }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ValidationFailedError);
+    expect(JSON.stringify(error)).not.toContain("secret");
+    expect(s.statements.some((sql) => /^\s*(INSERT|UPDATE)/u.test(sql))).toBe(false);
   });
 
   it("scenario 8 — an internal address is 422 unsafe_target at submit, naming the check and never the address, with no write", async () => {
@@ -114,16 +124,26 @@ describe("STORY-055 AC6 · a submitted URL goes in_review and is verified by a j
     const s = service(SEEDING);
     const out = await s.tasks.completeTask(TASK, { url: URL_OK });
     expect(out.milestone).toBeNull();
-    expect(out.verification).toBeNull();
+    expect(out.verification).toBeNull(); // STORY-067's scheduling, untouched; the review state is task.review
   });
 
-  it("a task already in review with its URL still being checked is a 409, and nothing is enqueued", async () => {
+  it("a task already in review with its URL still being checked is a 409 that re-queues the SAME submission's job (idempotent key), and writes nothing", async () => {
     const s = service({ ...SEEDING, status: "in_review", pending: true });
     const error = await s.tasks.completeTask(TASK, { url: URL_OK }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ConflictError);
     expect((error as { details: unknown }).details).toMatchObject({ current_state: "in_review" });
-    s.commit();
-    expect(s.enqueueTenantJob).not.toHaveBeenCalled();
+    expect(s.statements.some((sql) => /^\s*(INSERT|UPDATE)/u.test(sql))).toBe(false);
+    // Not deferred to after-commit: the 409 rolls the request back, and the submission itself was committed long ago.
+    expect(s.enqueueTenantJob.mock.calls).toEqual([
+      ["source.verify_presence", WS, { projectId: PROJECT, taskId: TASK, submissionId: SUBMISSION }, { idempotencyKey: `taskverify:${SUBMISSION}` }],
+    ]);
+  });
+
+  it("the 409's re-queue failing still answers 409 (never a 500)", async () => {
+    const s = service({ ...SEEDING, status: "in_review", pending: true });
+    s.enqueueTenantJob.mockRejectedValue(new Error("redis down"));
+    await expect(s.tasks.completeTask(TASK, { url: URL_OK })).rejects.toBeInstanceOf(ConflictError);
+    await new Promise((resolve) => setImmediate(resolve));
   });
 
   it("a task in review whose last check failed may be submitted again", async () => {
@@ -153,9 +173,10 @@ describe("STORY-055 · every other task completes exactly as before", () => {
     expect(s.enqueueTenantJob).not.toHaveBeenCalled();
   });
 
-  it("a URL sent for a task that is not a seeding task is ignored, never fetched, never queued", async () => {
+  it("review r3 - a URL sent for a task that is not a seeding task is a 400, never fetched, never queued", async () => {
     const s = service({ kind: "technical", source_domain_id: null, playbook_slug: null });
-    await s.tasks.completeTask(TASK, { url: "http://10.0.0.1/x" });
+    await expect(s.tasks.completeTask(TASK, { url: "https://example.org/x" })).rejects.toBeInstanceOf(ValidationFailedError);
+    expect(s.statements.some((sql) => /^\s*(INSERT|UPDATE)/u.test(sql))).toBe(false);
     s.commit();
     expect(s.enqueueTenantJob).not.toHaveBeenCalled();
   });

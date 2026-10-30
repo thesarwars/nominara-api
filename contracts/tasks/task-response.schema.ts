@@ -59,7 +59,8 @@ export const taskSchema = z
     resurface_at: z.string().nullable(),
     completed_at: z.string().nullable(),
     affected_url: z.string().nullable(),
-    verification: taskVerificationSchema.nullable(),
+    /** Owner decision 30: why a seeding task is `in_review`. Null on every other task. (Not the STORY-067 `verification` of the complete response.) */
+    review: taskVerificationSchema.nullable(),
     created_at: z.string(),
     updated_at: z.string(),
   })

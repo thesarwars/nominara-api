@@ -2,8 +2,10 @@ import { isIP } from "node:net";
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { taskVerificationSubmittedPayloadSchema, type TaskVerificationFailedPayload } from "../../../contracts/tasks/index.js";
-import type { GuardedResponse } from "../net/guarded-fetch.js";
+import { GuardedFetchRefusal, type GuardedResponse } from "../net/guarded-fetch.js";
 import { ALLOWED_PORTS, ALLOWED_SCHEMES, isGloballyReachable, type UnsafeTargetReason } from "../net/address-rules.js";
+import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withProjectQueueLock } from "../queue/locks.js";
 import { refreshProjectSourceIndex } from "../rollup/refresh-project-source-index.js";
 import { refreshProjectTaskCounts } from "../rollup/refresh-project-task-counts.js";
@@ -37,7 +39,8 @@ export function isSeedingTask(task: { readonly playbook_slug: string | null; rea
   return task.playbook_slug !== null || task.source_domain_id !== null;
 }
 
-export type SubmittedUrlCheck = { readonly ok: true; readonly url: string } | { readonly ok: false; readonly reason: UnsafeTargetReason };
+/** `credentials`: the URL embeds a user name or password - not an unsafe TARGET, a malformed submission (a 400, never stored or echoed). */
+export type SubmittedUrlCheck = { readonly ok: true; readonly url: string } | { readonly ok: false; readonly reason: UnsafeTargetReason | "credentials" };
 
 /** Host names that are internal by their label alone (RFC 6761 `localhost`, mDNS `.local`, the conventional `.internal`, RFC 8375 `.home.arpa`). */
 const INTERNAL_SUFFIXES: readonly string[] = [".localhost", ".local", ".internal", ".home.arpa"];
@@ -47,7 +50,8 @@ const INTERNAL_SUFFIXES: readonly string[] = [".localhost", ".local", ".internal
  * reuses the guarded fetcher's own rules (allowed schemes and ports, `isGloballyReachable` for an address literal) and its own
  * reasons, so `422 unsafe_target` reads the same on every surface. A public-looking NAME that resolves to a private address is
  * the one thing it cannot see; the guarded fetch in the job refuses that again (`unsafe_target` in the review reason).
- * `new URL` canonicalises the odd literal forms (`127.1`, `0x7f.0.0.1`, `2130706433`) to dotted quads before the check.
+ * The accepted URL is returned as `url.href` (normalised: default port dropped, scheme and host lowercased) and THAT is what is stored,
+ * fetched and returned. `new URL` canonicalises the odd literal forms (`127.1`, `0x7f.0.0.1`, `2130706433`) to dotted quads before the check.
  */
 export function checkSubmittedUrl(raw: string): SubmittedUrlCheck {
   const trimmed = raw.trim();
@@ -58,15 +62,16 @@ export function checkSubmittedUrl(raw: string): SubmittedUrlCheck {
     return { ok: false, reason: "scheme_not_allowed" };
   }
   if (!ALLOWED_SCHEMES.includes(url.protocol)) return { ok: false, reason: "scheme_not_allowed" };
+  if (url.username !== "" || url.password !== "") return { ok: false, reason: "credentials" };
   if (url.port !== "" && !ALLOWED_PORTS.includes(Number(url.port))) return { ok: false, reason: "port_not_allowed" };
 
   const host = url.hostname.toLowerCase().replace(/\.$/u, "");
   if (host === "") return { ok: false, reason: "hostname_missing" };
   const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-  if (isIP(bare) !== 0) return isGloballyReachable(bare) ? { ok: true, url: trimmed } : { ok: false, reason: "address_not_global" };
+  if (isIP(bare) !== 0) return isGloballyReachable(bare) ? { ok: true, url: url.href } : { ok: false, reason: "address_not_global" };
 
   const internal = host === "localhost" || !host.includes(".") || INTERNAL_SUFFIXES.some((suffix) => host.endsWith(suffix));
-  return internal ? { ok: false, reason: "address_not_global" } : { ok: true, url: trimmed };
+  return internal ? { ok: false, reason: "address_not_global" } : { ok: true, url: url.href };
 }
 
 /** What the job read: everything `fetchSubmission` and `commitSubmissionVerification` need, and nothing else. */
@@ -150,22 +155,50 @@ export async function prepareSubmissionVerification(tx: ClientBase, projectId: s
  * Phase 2 (NO transaction, no client): fetch the submitted URL through the injected guarded fetcher and say why it does not close
  * the gap, if it does not. The URL (and the page it ended on after redirects) must be on the task's own domain: a mention on
  * another site is not a contribution to THIS platform. Never throws - every failure is a reason the customer can act on.
+ *
+ * A TRANSIENT FETCH ERROR IS FINAL HERE, on purpose (unlike the legacy `taskId` mode, which throws so the queue retries): the task
+ * stays `in_review`, the reason is `unreachable`, and the customer resubmits - a retry loop would leave the task showing "pending"
+ * for the length of the backoff, and a 404 and a connection reset are indistinguishable to us. The cost is that a one-off blip needs
+ * a resubmit; the benefit is that no submission can sit pending behind a failing fetch.
  */
 export async function fetchSubmission(plan: SubmissionPlan, fetch: PresenceFetcher): Promise<SubmissionOutcome> {
-  if (plan.domain !== null && seededTargetUrl(plan.url, plan.domain) === null) return { status: "unverified", reason: "wrong_domain" };
+  // FAIL CLOSED: `completeTask` refuses a seeding task with no source domain (`no_source_domain`), so none reaches here; if one
+  // ever did, an unconstrained mention anywhere on the web must not close a gap.
+  if (plan.domain === null || seededTargetUrl(plan.url, plan.domain) === null) return { status: "unverified", reason: "wrong_domain" };
 
-  const seen: { response?: GuardedResponse } = {};
+  // `verifyUrlPresence` folds every GuardedFetchRefusal into "refused" and drops the error. The reason matters here, so the wrapper
+  // keeps the refusal itself: only a refusal about the ADDRESS, PORT or SCHEME is the customer's unsafe target.
+  const seen: { response?: GuardedResponse; refusal?: GuardedFetchRefusal } = {};
   const outcome = await verifyUrlPresence(plan.url, plan.brand, async (url) => {
-    seen.response = await fetch(url);
+    try {
+      seen.response = await fetch(url);
+    } catch (error) {
+      if (error instanceof GuardedFetchRefusal) seen.refusal = error;
+      throw error;
+    }
     return seen.response;
   });
   if (outcome.status === "failed") {
+    if (outcome.reason === "refused" && seen.refusal !== undefined) return { status: "unverified", reason: refusalReason(seen.refusal) };
     const reason = outcome.reason === "refused" ? "unsafe_target" : outcome.reason === "not_text" ? "not_a_page" : outcome.reason === "no_aliases" ? "no_brand_names" : "unreachable";
     return { status: "unverified", reason };
   }
-  if (outcome.status === "absent") return { status: "unverified", reason: "no_mention" };
-  if (plan.domain !== null && seen.response !== undefined && seededTargetUrl(seen.response.finalUrl, plan.domain) === null) return { status: "unverified", reason: "wrong_domain" };
-  return { status: "verified" };
+  // Before present/absent: a page the redirects carried OFF the task's domain says nothing about a contribution THERE, whether or
+  // not it names the brand (a customer told "no mention" would look for a mention on a page that was never theirs).
+  if (seen.response !== undefined && seededTargetUrl(seen.response.finalUrl, plan.domain) === null) return { status: "unverified", reason: "wrong_domain" };
+  return outcome.status === "absent" ? { status: "unverified", reason: "no_mention" } : { status: "verified" };
+}
+
+/**
+ * A guard refusal is either about the TARGET (an address that is not global, a port or scheme that is not allowed - including on a
+ * redirect hop) or about the NETWORK (the name did not resolve, the resolver is down, the redirects never ended). `resolverCode`
+ * is set only for a resolution failure, on the first request or on a hop. Telling a customer their URL is "unsafe" because our
+ * resolver timed out would be a false accusation, so the network cases are `unreachable`.
+ */
+function refusalReason(refusal: GuardedFetchRefusal): "unsafe_target" | "unreachable" {
+  if (refusal.resolverCode !== undefined) return "unreachable";
+  if (refusal.reason === "dns_resolution_failed" || refusal.reason === "too_many_redirects") return "unreachable";
+  return "unsafe_target";
 }
 
 /**
@@ -253,5 +286,25 @@ async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: Submi
   incrementCounter("nominara_tasks_events_written_total", { event: "completed" });
   incrementCounter("nominara_tasks_completed_total", {});
   logger.log({ event: "task_verification_verified", workspaceId: plan.workspaceId, projectId: plan.projectId, taskId: plan.taskId });
+
+  // The audit row for the in_review -> done transition (the submission was audited by the route as `task.verification_submitted`).
+  // LAST, as the rollup does: an audit append takes the workspace's audit-chain lock until COMMIT and nothing after it may wait.
+  // The actor is the system (the job); the submitter is the task's `completed_by`. No ids in the state: the audit redactor
+  // stores a long high-entropy string as "[redacted]".
+  await new AuditChainService().append(tx, {
+    workspaceId: plan.workspaceId,
+    actorType: "system",
+    actorId: SYSTEM_ACTOR_ID,
+    actorIp: null,
+    actorUa: "job:source.verify_presence",
+    action: "task.verification_completed",
+    resourceType: "task",
+    resourceId: plan.taskId,
+    beforeState: { status: "in_review" },
+    afterState: { status: "done" },
+    requestId: "",
+    supportGrantId: null,
+    severity: "info",
+  });
   return true;
 }

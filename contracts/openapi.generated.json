@@ -18273,7 +18273,7 @@
                               }
                             ]
                           },
-                          "verification": {
+                          "review": {
                             "anyOf": [
                               {
                                 "type": "object",
@@ -18352,7 +18352,7 @@
                           "resurface_at",
                           "completed_at",
                           "affected_url",
-                          "verification",
+                          "review",
                           "created_at",
                           "updated_at"
                         ],
@@ -44334,7 +44334,7 @@
                               }
                             ]
                           },
-                          "verification": {
+                          "review": {
                             "anyOf": [
                               {
                                 "type": "object",
@@ -44413,7 +44413,7 @@
                           "resurface_at",
                           "completed_at",
                           "affected_url",
-                          "verification",
+                          "review",
                           "created_at",
                           "updated_at"
                         ],
@@ -44950,7 +44950,7 @@
                             }
                           ]
                         },
-                        "verification": {
+                        "review": {
                           "anyOf": [
                             {
                               "type": "object",
@@ -45029,7 +45029,7 @@
                         "resurface_at",
                         "completed_at",
                         "affected_url",
-                        "verification",
+                        "review",
                         "created_at",
                         "updated_at"
                       ],
@@ -53716,7 +53716,7 @@
                             }
                           ]
                         },
-                        "verification": {
+                        "review": {
                           "anyOf": [
                             {
                               "type": "object",
@@ -53795,7 +53795,7 @@
                         "resurface_at",
                         "completed_at",
                         "affected_url",
-                        "verification",
+                        "review",
                         "created_at",
                         "updated_at"
                       ],
@@ -54738,7 +54738,7 @@
                                 }
                               ]
                             },
-                            "verification": {
+                            "review": {
                               "anyOf": [
                                 {
                                   "type": "object",
@@ -54817,7 +54817,7 @@
                             "resurface_at",
                             "completed_at",
                             "affected_url",
-                            "verification",
+                            "review",
                             "created_at",
                             "updated_at"
                           ],
@@ -67017,7 +67017,7 @@
                                   }
                                 ]
                               },
-                              "verification": {
+                              "review": {
                                 "anyOf": [
                                   {
                                     "type": "object",
@@ -67096,7 +67096,7 @@
                               "resurface_at",
                               "completed_at",
                               "affected_url",
-                              "verification",
+                              "review",
                               "created_at",
                               "updated_at"
                             ],
