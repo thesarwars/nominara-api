@@ -5540,6 +5540,23 @@
                             }
                           ]
                         },
+                        "score_partial": {
+                          "type": "boolean"
+                        },
+                        "unmeasured_categories": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "crawler_access",
+                              "structured_data",
+                              "context_fitness",
+                              "render_mode",
+                              "entity_clarity",
+                              "freshness"
+                            ]
+                          }
+                        },
                         "capped": {
                           "type": "boolean"
                         },
@@ -5579,12 +5596,19 @@
                                 "type": "number",
                                 "minimum": 0,
                                 "maximum": 1
+                              },
+                              "rules_not_evaluated": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
                               }
                             },
                             "required": [
                               "category",
                               "weight",
-                              "subscore"
+                              "subscore",
+                              "rules_not_evaluated"
                             ],
                             "additionalProperties": false
                           }
@@ -5675,6 +5699,8 @@
                         "pages_crawled",
                         "pages_failed",
                         "aux_score",
+                        "score_partial",
+                        "unmeasured_categories",
                         "capped",
                         "delta",
                         "rule_version",
@@ -27563,6 +27589,23 @@
                             }
                           ]
                         },
+                        "score_partial": {
+                          "type": "boolean"
+                        },
+                        "unmeasured_categories": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "crawler_access",
+                              "structured_data",
+                              "context_fitness",
+                              "render_mode",
+                              "entity_clarity",
+                              "freshness"
+                            ]
+                          }
+                        },
                         "capped": {
                           "type": "boolean"
                         },
@@ -27602,12 +27645,19 @@
                                 "type": "number",
                                 "minimum": 0,
                                 "maximum": 1
+                              },
+                              "rules_not_evaluated": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                }
                               }
                             },
                             "required": [
                               "category",
                               "weight",
-                              "subscore"
+                              "subscore",
+                              "rules_not_evaluated"
                             ],
                             "additionalProperties": false
                           }
@@ -27698,6 +27748,8 @@
                         "pages_crawled",
                         "pages_failed",
                         "aux_score",
+                        "score_partial",
+                        "unmeasured_categories",
                         "capped",
                         "delta",
                         "rule_version",

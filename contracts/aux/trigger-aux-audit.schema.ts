@@ -62,3 +62,20 @@ export const triggerAuxAuditResponseSchema = z
   })
   .strict();
 export type TriggerAuxAuditResponse = z.infer<typeof triggerAuxAuditResponseSchema>;
+
+/**
+ * `POST /projects/{id}/aux-audits/preview` (owner decision 39; api-specification.md section 7) - the QUOTE half of the priced-action flow. Same
+ * body as the trigger. Free and read-only: nothing is reserved, debited, written or queued. `credits` is the figure the client echoes in
+ * `X-Nominara-Confirmed-Credits`; the trigger charges only when it matches the price recomputed at that moment.
+ */
+export const triggerAuxAuditPreviewResponseSchema = z
+  .object({
+    /** What the audit would debit now, in whole credits. */
+    credits: z.number().int().min(1),
+    requested_scope: z.enum(CRAWL_AUDIT_REQUESTED_SCOPES),
+    pricing: auxAuditPricingSchema,
+    /** A LITERAL ZERO: a preview debits nothing and reserves nothing. */
+    credits_charged: z.literal(0),
+  })
+  .strict();
+export type TriggerAuxAuditPreviewResponse = z.infer<typeof triggerAuxAuditPreviewResponseSchema>;

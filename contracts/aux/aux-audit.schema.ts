@@ -45,6 +45,11 @@ export const auxAuditCategorySchema = z
     weight: z.number(),
     /** 0..1 */
     subscore: z.number().min(0).max(1),
+    /**
+     * Rules of this category that did NOT run in this audit (a held rule, one with no input, one the document model cannot judge). A rule that
+     * did not run adds no penalty, so a non-empty list means the subscore is not a full measurement of the category: a client labels it.
+     */
+    rules_not_evaluated: z.array(z.string()),
   })
   .strict();
 
@@ -68,8 +73,15 @@ export const auxAuditSchema = z
     created_at: z.string(),
     pages_crawled: z.number().int(),
     pages_failed: z.number().int(),
-    /** 0..100, or null when the audit did not produce a score. */
+    /**
+     * 0..100, or null when the audit did not produce a score. When `score_partial` is true it is computed over the categories that were measured,
+     * renormalised to 100 (owner decision 38) - never present it as a full score.
+     */
     aux_score: z.number().nullable(),
+    /** True when `aux_score` leaves out categories no rule could measure yet. False for a full score and for no score. */
+    score_partial: z.boolean(),
+    /** The categories with no published subscore in this audit (all six when nothing was measured). Never empty on a partial score. */
+    unmeasured_categories: z.array(auxCategorySchema),
     /** True when the critical-access hard cap applied; the interface states it whenever it is. */
     capped: z.boolean(),
     /** aux_score minus the previous scored audit's; null when either is absent. */
