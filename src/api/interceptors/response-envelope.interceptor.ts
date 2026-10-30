@@ -74,6 +74,10 @@ export class ResponseEnvelopeInterceptor implements NestInterceptor {
 
     return next.handle().pipe(
       map((body: unknown) => {
+        // STORY-078 - a 304 Not Modified has no message body by definition (RFC 9110 section 15.4.5). Wrapping `null` in an envelope would
+        // put a body on a response that must not have one and defeat the revalidation it exists for.
+        if (reply.statusCode === 304) return undefined;
+
         const meta: EnvelopeMeta = {
           request_id: requestId,
           scoring_version: SCORING_VERSION,

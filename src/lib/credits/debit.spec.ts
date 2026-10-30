@@ -1,6 +1,6 @@
 import type { ClientBase } from "pg";
 import { describe, expect, it, vi } from "vitest";
-import { debitInTransaction, idempotencyKeyFor, includedGrantOf } from "./debit.js";
+import { debitInTransaction, idempotencyKeyFor, includedGrantOf, isReservedLedgerKey } from "./debit.js";
 
 // STORY-046 AC3 - the pure edges of the in-transaction debit. The reserve/commit
 // pair against a real wallet and ledger is test/integration/prompt-activation-charge.spec.ts.
@@ -47,4 +47,13 @@ describe("STORY-046 AC3 · includedGrantOf", () => {
   it("reads a positive whole number", () => expect(grant(37)).toBe(37));
   it.each([0, -5, 1.5, "custom", null, undefined])("grants nothing for %s", (value) => expect(grant(value)).toBe(0));
   it("grants nothing when the plan publishes no key", () => expect(includedGrantOf({})).toBe(0));
+});
+
+describe("STORY-078 · the server's tool-run ledger keys are reserved", () => {
+  it("a client Idempotency-Key in the tool_run namespace is refused as a ledger key, in any case", () => {
+    expect(isReservedLedgerKey("tool_run:0197c1e0")).toBe(true);
+    expect(isReservedLedgerKey("TOOL_RUN:0197c1e0")).toBe(true);
+    expect(isReservedLedgerKey("prompt_activate:x")).toBe(true);
+    expect(isReservedLedgerKey("my-tool_run:x")).toBe(false);
+  });
 });

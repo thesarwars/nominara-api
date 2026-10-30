@@ -8,7 +8,7 @@ import { WorkspaceLockBusyError } from "../../lib/billing/errors.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
-import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { incrementCounter, observeValue } from "../../lib/telemetry/metrics.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { appendMark, appendTombstone, findBrokenMark, readChainHead } from "../../modules/audit/audit-chain-marks.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
@@ -615,20 +615,54 @@ export async function expireAttributionDaily(
 // entities_found, pages_scanned, items_kept), sets status='expired'.
 // ---------------------------------------------------------------------------
 
+/** STORY-078 AC15 - one batch's size, and how many batches one workspace gets in one nightly pass (10,000 runs). */
+export const TOOL_SNAPSHOT_SWEEP_BATCH_SIZE = 500;
+export const TOOL_SNAPSHOT_SWEEP_MAX_BATCHES = 20;
+
+export interface ToolSnapshotSweepOptions {
+  readonly batchSize?: number;
+  readonly maxBatches?: number;
+}
+
+/**
+ * IDEMPOTENT (an expired run is not selected again), BATCHED (each batch is its own short transaction, so no lock outlives a batch) and
+ * BOUNDED (a workspace gets at most `maxBatches` batches a pass; the rest wait for the next night). `FOR UPDATE SKIP LOCKED`: a run being
+ * finished, pinned or converted at this moment is skipped and expires on the next pass, never blocks the sweep, and is never raced.
+ * Pinning is not read: a pinned run still expires.
+ */
 export async function expireToolSnapshotsForWorkspace(
   client: ClientBase,
   workspaceId: string,
   referenceDate: Date = new Date(),
+  options: ToolSnapshotSweepOptions = {},
 ): Promise<number> {
-  return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-    const result = await tx.query(
-      `UPDATE tool_runs
-          SET status = 'expired', result_json = NULL
-        WHERE workspace_id = $1 AND status <> 'expired' AND expires_at <= $2`,
-      [workspaceId, referenceDate.toISOString()],
-    );
-    return result.rowCount ?? 0;
-  });
+  const batchSize = options.batchSize ?? TOOL_SNAPSHOT_SWEEP_BATCH_SIZE;
+  const maxBatches = options.maxBatches ?? TOOL_SNAPSHOT_SWEEP_MAX_BATCHES;
+  let total = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const expired = await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+      const result = await tx.query(
+        `WITH due AS (
+           SELECT id FROM tool_runs
+            WHERE workspace_id = $1 AND status <> 'expired' AND expires_at <= $2
+            ORDER BY expires_at, id
+            LIMIT $3
+              FOR UPDATE SKIP LOCKED
+         )
+         UPDATE tool_runs t SET status = 'expired', result_json = NULL
+           FROM due WHERE t.id = due.id AND t.workspace_id = $1`,
+        [workspaceId, referenceDate.toISOString(), batchSize],
+      );
+      return result.rowCount ?? 0;
+    });
+    total += expired;
+    if (expired < batchSize) break;
+  }
+  if (total > 0) {
+    observeValue("nominara_tools_snapshots_expired_rows", total);
+    logger.log({ message: "tool snapshots expired", workspace_id: workspaceId, rows: total });
+  }
+  return total;
 }
 
 // ---------------------------------------------------------------------------

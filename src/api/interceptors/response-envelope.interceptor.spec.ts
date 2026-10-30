@@ -137,6 +137,13 @@ describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
   // STORY-023 and populated by nothing until now, which is how four list
   // endpoints shipped unbounded arrays while the published contract described
   // the shape that would have satisfied NFR-API-03.
+  it("[STORY-078] a 304 Not Modified carries no body at all - not an envelope around null", async () => {
+    const { context } = contextFor(new Wrapped(), "11111111-1111-1111-1111-111111111111");
+    const notModified = { ...context, switchToHttp: () => ({ ...context.switchToHttp(), getResponse: () => ({ header: vi.fn(), statusCode: 304 }) }) } as unknown as ExecutionContext;
+    const body = await lastValueFrom(new ResponseEnvelopeInterceptor(new Reflector()).intercept(notModified, handlerReturning(undefined)));
+    expect(body).toBeUndefined();
+  });
+
   describe("a Page becomes the pagination member", () => {
     const pagination = { cursor_next: "eyJ2IjoxLCJrIjpbMV19", has_more: true, limit: 50 };
 

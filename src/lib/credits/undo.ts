@@ -75,6 +75,8 @@ export async function refundableDebitFor(
   tx: ClientBase,
   workspaceId: string,
   runId: string,
+  // STORY-078: a tool run's debit is referenced as 'tool_run'; a capture run's stays 'run'.
+  referenceType: string = "run",
 ): Promise<RefundableDebit | null> {
   const result = await tx.query<{
     credits: string;
@@ -91,7 +93,7 @@ export async function refundableDebitFor(
          FROM credit_ledger c
         WHERE c.workspace_id = $1
           AND c.entry_type = 'commit'
-          AND c.reference_type = 'run'
+          AND c.reference_type = $3
           AND c.reference_id = $2
         ORDER BY c.seq DESC
         LIMIT 1
@@ -130,10 +132,10 @@ export async function refundableDebitFor(
             (SELECT count(*) FROM credit_ledger r
               WHERE r.workspace_id = d.workspace_id
                 AND r.entry_type = 'refund'
-                AND r.reference_type = 'run'
+                AND r.reference_type = $3
                 AND r.reference_id = d.reference_id)::text AS refunded
        FROM debit d`,
-    [workspaceId, runId],
+    [workspaceId, runId, referenceType],
   );
 
   const row = result.rows[0];
