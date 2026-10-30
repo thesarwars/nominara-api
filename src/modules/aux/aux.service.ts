@@ -1,4 +1,6 @@
-import { Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import type { ClientBase, Pool } from "pg";
 import { z } from "zod";
 import { AUX_CATEGORY_WEIGHTS } from "../../lib/scoring/aux.js";
 import type {
@@ -6,6 +8,8 @@ import type {
   AuxAuditListQuery,
   AuxFinding,
   AuxFindingListQuery,
+  TriggerAuxAuditRequest,
+  TriggerAuxAuditResponse,
   UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
 import { AUX_CATEGORIES } from "../../../contracts/aux/index.js";
@@ -13,12 +17,24 @@ import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, p
 import type { AuxPatch } from "../../../contracts/aux/index.js";
 import { guidanceFor } from "../../lib/aux/patches/guidance.js";
 import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
-import { ConflictError, NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { ConflictError, FeatureNotInPlanError, NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
+import { PG_POOL } from "../../db/pg-pool.js";
+import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../lib/aux/audit-constants.js";
+import { auxAuditPrice, auxAuditPricing } from "../../lib/aux/audit-price.js";
+import { crawlAuditIdempotencyKey } from "../../lib/aux/onboarding-audit.js";
+import { pageCapForPlan } from "../../lib/aux/page-selection.js";
+import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
+import { AUX_AUDIT_REFERENCE, refundAuxAuditCharge } from "../../lib/credits/aux-audit-refund.js";
+import { debitInTransaction, includedGrantOf } from "../../lib/credits/debit.js";
+import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
+import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 
 // NEW-C-10 (STORY-052; api-specification.md "AUX") — the AUX read side and the
 // two finding actions a client has. Owns `aux_audits` and `aux_findings`
@@ -84,8 +100,20 @@ const PATCH_SELECT = `
          p.risk_flags, p.created_at
     FROM patches p`;
 
+const manualAuditLogger = new Logger("aux.manual-audit");
+const tracer = trace.getTracer("nominara-api");
+
+/** The entitlement that says whether a plan has AUX audits at all (plans-and-entitlements.md: the Free tier has none). */
+const AUX_AUDITS_ENTITLEMENT = "aux.scheduled_audits";
+
 @Injectable()
 export class AuxService {
+  // Both optional so the read side stays constructible with no arguments (aux.spec.ts); `triggerAudit` refuses, before charging anything, when either is absent.
+  constructor(
+    @Optional() @Inject(PG_POOL) private readonly pool?: Pool,
+    @Optional() private readonly queues?: QueueProducer,
+  ) {}
+
   private readonly logger = new Logger(AuxService.name);
 
   /** `GET /v1/aux-audits/{id}` — score and category breakdown. */
@@ -268,6 +296,143 @@ export class AuxService {
     );
     const row = audit.rows[0];
     return row === undefined ? null : { robotsHash: row.robots_hash, llmsTxtPresent: row.llms_txt_present };
+  }
+
+  /**
+   * `POST /projects/{id}/aux-audits` - the manual re-audit (STORY-194; owner decision 34, item 3). The ONE priced AUX trigger: scheduled, onboarding and
+   * post-fix audits are 0 credits and never come through here.
+   *
+   * ONE TRANSACTION, the request's: the plan check, the debit (reserve and commit under the wallet lock, so a 402 rolls everything back and a refused
+   * request leaves no audit, no ledger entry and no job) and the queued audit row. The job is enqueued only AFTER COMMIT (KAD-06): a rollback never
+   * leaves a job for an audit that does not exist, and no transaction is held across the queue.
+   *
+   * PRICE: the plan's page cap, or 1 page for a single-URL audit (FR-TL-03: 10 credits for up to 25 pages, +1 per page after). Verification decides scope,
+   * not price, so an unverified domain pays the same. A partial audit is charged in full; an audit that delivers nothing is refunded in full, either by
+   * `crawl.audit` (no site file reachable) or here (the job could not be queued).
+   */
+  async triggerAudit(
+    projectId: string,
+    body: TriggerAuxAuditRequest,
+    actor: { readonly id: string | null; readonly type: "user" | "api_key" | "system" },
+  ): Promise<TriggerAuxAuditResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("AuxService.triggerAudit requires an active tenant context");
+    // Fail closed BEFORE anything is charged: a process built without the queue cannot run the audit it would be charging for.
+    const { pool, queues } = this;
+    if (pool === undefined || queues === undefined) throw new Error("AuxService.triggerAudit needs the pg pool and the queue producer");
+    const tx = store.client as ClientBase;
+    const workspaceId = store.context.workspaceId;
+
+    return tracer.startActiveSpan("aux.audit.trigger", async (span) => {
+      try {
+        await this.assertProjectVisible(projectId);
+        const plan = await tx.query<{ plan_key: string }>(
+          "SELECT w.plan_key FROM projects p JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = $1 AND p.deleted_at IS NULL",
+          [projectId],
+        );
+        const planKey = plan.rows[0]?.plan_key;
+        if (planKey === undefined) throw new NotFoundError({ message: "no such project" });
+
+        const resolved = await resolveEntitlements(tx, workspaceId);
+        const included = resolved.entitlements[AUX_AUDITS_ENTITLEMENT]?.value;
+        if (included === false || included === null || included === undefined) {
+          incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "feature_not_in_plan" });
+          const lowest = await tx.query<{ key: string }>(
+            `SELECT key FROM plans WHERE (entitlements -> $1 -> 'value') NOT IN ('false'::jsonb, 'null'::jsonb) ORDER BY sort_order ASC LIMIT 1`,
+            [AUX_AUDITS_ENTITLEMENT],
+          );
+          throw new FeatureNotInPlanError({
+            message: "AUX audits are not included in this plan",
+            details: { key: AUX_AUDITS_ENTITLEMENT, min_plan: lowest.rows[0]?.key ?? "unknown" },
+          });
+        }
+
+        const scope = body.scope ?? "key_pages";
+        const pages = scope === "single_url" ? 1 : pageCapForPlan(planKey);
+        const credits = auxAuditPrice(pages);
+        const auditId = uuidV7();
+
+        await debitInTransaction(tx, {
+          workspaceId,
+          actorId: actor.id,
+          actorType: actor.type,
+          actionCode: "aux_manual",
+          credits,
+          // The audit id IS the decision, so a repeat of it is a refused append (a rollback), never a second charge.
+          idempotencyKey: [AUX_AUDIT_REFERENCE, auditId].join(":"),
+          projectId,
+          referenceType: AUX_AUDIT_REFERENCE,
+          referenceId: auditId,
+          includedGrant: includedGrantOf(resolved.entitlements),
+          ...(autoTopupEnqueuerFor(queues) === undefined ? {} : { autoTopup: autoTopupEnqueuerFor(queues)! }),
+        });
+
+        await tx.query(
+          `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, triggered_by, scope, target_urls, rule_version, tokenizer, status)
+           VALUES ($1, $2, $3, 'manual', $4, $5, $6, $7, $8, 'queued')`,
+          [auditId, workspaceId, projectId, actor.type === "user" ? actor.id : null, scope, body.target_urls ?? [], AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER],
+        );
+
+        afterCommit(() => {
+          void queues
+            .enqueueTenantJob(
+              "crawl.audit",
+              workspaceId,
+              { projectId, auditId, trigger: "manual", scope, ...(body.target_urls === undefined ? {} : { targetUrls: body.target_urls }) },
+              { idempotencyKey: crawlAuditIdempotencyKey(projectId, auditId) },
+            )
+            .catch((error: unknown) => {
+              incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "dispatch_failed" });
+              // The error NAME only: a queue error's message can carry a connection string.
+              manualAuditLogger.error({
+                event: "aux.manual_audit.dispatch_failed",
+                workspace_id: workspaceId,
+                project_id: projectId,
+                audit_id: auditId,
+                error: error instanceof Error ? error.name : "unknown",
+              });
+              return this.failUndispatchedAudit(pool, workspaceId, auditId).catch((compensationError: unknown) => {
+                manualAuditLogger.error({
+                  event: "aux.manual_audit.compensation_failed",
+                  workspace_id: workspaceId,
+                  audit_id: auditId,
+                  error: compensationError instanceof Error ? compensationError.name : "unknown",
+                });
+              });
+            });
+        });
+
+        incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "queued" });
+        // IDs and the figure only: never the domain, the workspace's name or a target URL.
+        manualAuditLogger.log({ event: "aux.manual_audit.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, scope, credits });
+        span.setAttribute("nominara.aux.credits", credits);
+        return { audit_id: auditId, status: "queued" as const, trigger: "manual" as const, requested_scope: scope, credits_charged: credits, pricing: auxAuditPricing(pages) };
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  /**
+   * The audit was charged and queued, but the job never reached the queue, so it will never run: fail the row and give the charge back, in a fresh
+   * tenant transaction (the request's has committed). Only a row still `queued` is failed, so this cannot undo an audit that did start.
+   */
+  private async failUndispatchedAudit(pool: Pool, workspaceId: string, auditId: string): Promise<void> {
+    const client = await pool.connect();
+    try {
+      await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        const failed = await tx.query(
+          `UPDATE aux_audits SET status = 'failed', error_summary = '{"reason":"dispatch_failed"}'::jsonb, finished_at = now() WHERE id = $1 AND status = 'queued'`,
+          [auditId],
+        );
+        if ((failed.rowCount ?? 0) === 1) await refundAuxAuditCharge(tx, { workspaceId, auditId, reason: "dispatch_failed" });
+      });
+    } finally {
+      client.release();
+    }
   }
 
   /** The project lookup is the 404: RLS and the scope predicate make a foreign or out-of-scope project simply absent. */

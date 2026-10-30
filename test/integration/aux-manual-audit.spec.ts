@@ -82,7 +82,11 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
     vi.mocked(producer.enqueueTenantJob).mockClear();
     await seed("starter", 100);
   });
-  afterEach(() => vi.restoreAllMocks());
+  // The enqueue is fire-and-forget after commit: let a test's own job land before the next test resets `enqueued`.
+  afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    vi.restoreAllMocks();
+  });
 
   const service = (): AuxService => new AuxService(pool, producer);
   async function asTenant<T>(fn: () => Promise<T>, project = workspaceId): Promise<T> {
@@ -132,7 +136,7 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
     expect(a.rule_version).toBeTruthy();
     expect(a.tokenizer).toBeTruthy();
     const read = await asTenant(() => service().getAudit(res.audit_id));
-    expect(read).toMatchObject({ id: res.audit_id, status: "queued", trigger: "manual" });
+    expect(read).toMatchObject({ audit_id: res.audit_id, status: "queued", trigger: "manual" });
   });
 
   it("AUXLIVE-3 AC3 · the crawl.audit job is enqueued AFTER commit, keyed aux:{project}:{audit}, carrying the manual trigger and the asked-for scope", async () => {

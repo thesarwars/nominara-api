@@ -25,7 +25,9 @@ const cookieOf = (t: Cookie): string => `${ACCESS_COOKIE_NAME}=${t.accessToken};
 describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
+  // As the runtime role (RLS live): the cross-workspace scenario would pass for the wrong reason through the superuser.
   const harness = useApiHarness({
+    runAsAppRole: true,
     env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString }),
   });
   let pool: Pool;
@@ -73,7 +75,9 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
     } finally {
       client.release();
     }
-    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 2);
+    // The entitlement version the workspace is at NOW: a plan change bumps it, and a session claiming a stale one is refused (401 entitlement_stale).
+    const version = Number((await harness.db().query("SELECT entitlement_version FROM workspaces WHERE id = $1", [workspaceId])).rows[0].entitlement_version);
+    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, version);
     return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
 
@@ -131,7 +135,7 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
     // and the audit is readable at once, as queued with no score (null, not 0)
     const read = await harness.app().inject({ method: "GET", url: apiUrl(`/aux-audits/${body.audit_id}`), headers: headers(a, null) });
     expect(read.statusCode, read.body).toBe(200);
-    expect((read.json() as { data: Record<string, unknown> }).data).toMatchObject({ id: body.audit_id, status: "queued", trigger: "manual", aux_score: null });
+    expect((read.json() as { data: Record<string, unknown> }).data).toMatchObject({ audit_id: body.audit_id, status: "queued", trigger: "manual", aux_score: null });
   }, 90_000);
 
   it("AUXLIVE-3 H2 · no Idempotency-Key is refused (400) before anything is charged or written", async () => {
@@ -201,7 +205,9 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
     const a = await owner("starter");
     await fund(a);
     const projectId = await project(a);
-    for (const payload of [{ credits: 0 }, { scope: "public_surface" }, { scope: "domain_root" }, { scope: "single_url" }, { target_urls: ["file:///etc/passwd"] }]) {
+    // Three, not five: the rate limiter (burst 3) answers before validation does, so a fourth request would be a 429 for the wrong reason. The other
+    // refusals (domain_root, a non-http URL, more than 50 URLs) are in contracts/aux/trigger-aux-audit.schema.spec.ts.
+    for (const payload of [{ credits: 0 }, { scope: "public_surface" }, { scope: "single_url" }]) {
       const res = await post(a, projectId, payload);
       expect(res.statusCode, JSON.stringify(payload)).toBe(400);
     }
@@ -209,13 +215,13 @@ describe("AUXLIVE-3 · POST /projects/{id}/aux-audits over HTTP", () => {
     expect(await auditRows(a)).toBe(0);
   }, 90_000);
 
-  it("AUXLIVE-3 H8 · a project in another workspace is 404 and charges nothing", async () => {
+  it("AUXLIVE-3 H8 · a project in another workspace is refused and charges nothing", async () => {
     const a = await owner("starter");
     const b = await owner("starter");
     await fund(a);
     const theirs = await project(b);
     const res = await post(a, theirs);
-    expect([403, 404]).toContain(res.statusCode);
+    expect([403, 404], res.body).toContain(res.statusCode);
     expect(await debits(a)).toBe(0);
   }, 90_000);
 });

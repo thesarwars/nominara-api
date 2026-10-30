@@ -75,7 +75,10 @@ export async function refundableDebitFor(
   tx: ClientBase,
   workspaceId: string,
   runId: string,
-  // STORY-078: a tool run's debit is referenced as 'tool_run'; a capture run's stays 'run'.
+  /**
+   * What the debit's `reference_id` names. A capture run by default (`run`); a tool run's debit is `tool_run` (STORY-078) and a manual AUX audit's is
+   * `aux_audit`, each refunded by the same machinery. The pair (type, id) is what keeps one thing's debit from being read as another's.
+   */
   referenceType: string = "run",
 ): Promise<RefundableDebit | null> {
   const result = await tx.query<{

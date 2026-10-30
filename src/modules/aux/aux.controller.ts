@@ -1,21 +1,28 @@
-import { Body, Controller, Get, Param, Patch, Query } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from "@nestjs/common";
 import {
   auxAuditListQuerySchema,
   auxAuditSchema,
   auxFindingListQuerySchema,
   auxFindingSchema,
   auxPatchSchema,
+  triggerAuxAuditRequestSchema,
+  triggerAuxAuditResponseSchema,
   updateAuxFindingRequestSchema,
   type AuxAudit,
   type AuxAuditListQuery,
   type AuxFinding,
   type AuxFindingListQuery,
   type AuxPatch,
+  type TriggerAuxAuditRequest,
+  type TriggerAuxAuditResponse,
   type UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
 import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
+import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
+import type { RbacScopedRequest } from "../../api/guards/rbac.guard.js";
+import { RateLimitClass } from "../../api/rate-limit/route-class.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
@@ -50,6 +57,25 @@ export class AuxController {
     @Query(new ZodValidationPipe(auxAuditListQuerySchema)) query: AuxAuditListQuery,
   ): Promise<Page<AuxAudit>> {
     return this.service.listProjectAudits(id, query);
+  }
+
+  // `¢ ✚` in api-specification.md "AUX": priced and idempotent. 202, not 200: the audit is queued and its row exists, but nothing has been read yet.
+  // The price is variable (FR-TL-03: first page band flat, then per page), so it is computed in the service from the plan and shown in the response;
+  // `@Credits('...')` is the flat-price path and does not fit. §12's `project_aux_audits` (10/hour per user, 60/hour per workspace, burst 3) applies.
+  @Post("projects/:id/aux-audits")
+  @HttpCode(202)
+  @Idempotent()
+  @RateLimitClass("project_aux_audits")
+  @RequirePermission("aux:trigger")
+  @ProjectParam("id")
+  @Audit({ action: "aux_audit.triggered", resourceType: "project" })
+  @ApiContract({ operationId: "triggerAuxAudit", requestSchema: triggerAuxAuditRequestSchema, responseSchema: triggerAuxAuditResponseSchema })
+  triggerAudit(
+    @Req() req: RbacScopedRequest,
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(triggerAuxAuditRequestSchema)) body: TriggerAuxAuditRequest,
+  ): Promise<TriggerAuxAuditResponse> {
+    return this.service.triggerAudit(id, body, { id: req.auth?.sub ?? null, type: "user" });
   }
 
   @Get("projects/:id/aux-findings")

@@ -10,6 +10,7 @@ import {
   crawlManifestSchema,
   siteFileFindingSchema,
   type AuxErrorSummary,
+  type AuxRuleFinding,
   type CrawlManifest,
   type SiteFileFinding,
 } from "../../../../contracts/aux/index.js";
@@ -28,19 +29,21 @@ import {
   type LifecycleAction,
 } from "../../aux/lifecycle.js";
 import { crawlPages, NOMINARA_USER_AGENT, type PageRecord } from "../../aux/page-crawl.js";
+import { pageFindingFingerprint, runPageRules } from "../../aux/page-rules.js";
+import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "../../aux/rules/index.js";
 import { pageCapForPlan, selectPages, type SelectionScope } from "../../aux/page-selection.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../../aux/politeness.js";
 import { unavailableRenderer, type Renderer } from "../../aux/renderer.js";
 import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../../aux/robots.js";
-import { cl100kTokenizer } from "../../aux/tokenizer-cl100k.js";
-import { tokenizerLabel } from "../../aux/tokenizer.js";
+import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../aux/audit-constants.js";
+import { refundAuxAuditCharge } from "../../credits/aux-audit-refund.js";
 import { sanitiseText } from "../../aux/sanitise.js";
 import { AI_CRAWLER_AGENTS, evaluateSiteFiles, type SiteFile } from "../../aux/site-files.js";
 import { collectSitemap, MAX_SITEMAP_FILES, SitemapFetchSkipped, type SitemapResult } from "../../aux/sitemap.js";
 import { guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
 import { uuidV7 } from "../../ids/uuidv7.js";
 import { toRegistrableDomain } from "../../net/registrable-domain.js";
-import { auxScore, type AuxCountedFinding } from "../../scoring/aux.js";
+import { AUX_CATEGORY_WEIGHTS, auxScore, type AuxCategory, type AuxCountedFinding } from "../../scoring/aux.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
@@ -66,7 +69,14 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // can never ask for more than the domain's owner proved they own (STORY-048 AC6's consumer). The mirror column
 // `projects.domain_verified_at` is NOT consulted: the table is the authority, and a stale mirror must not widen a crawl.
 //
-// WHAT IS STILL NOT EVALUATED. Pages are fetched and stored, but the page-level rules are STORY-051, and AUX-R-005 (bot-hostile
+// THE PAGE RULES (STORY-051 AC13). After the pages are stored, `run` reads them back (from the copies it just wrote, held in memory for the
+// purpose), models each (loadDocumentSnapshot -> buildAuxDocument with cl100k) and evaluates the 22 document-model rules over every page
+// (evaluateDocuments), all in the fetch phase, so no transaction is open while it works. `commit` reconciles those findings in the same
+// lifecycle as the site-file ones (STORY-052). A rule is named in `excluded_rules` only when it did not run on ANY page: the codes in
+// AUX_RULES_NOT_EVALUATED always (incl. the held AUX-R-013), AUX-R-026/027 when no page had a rendered copy, AUX-R-029 when no page had a
+// measured timing. The partly-checked rules that did run (AUX_RULES_PARTIAL) are listed in `error_summary.rules_partial`.
+//
+// WHAT IS STILL NOT EVALUATED. AUX-R-005 (bot-hostile
 // edge rules) CANNOT be evaluated at all: OWNER DECISION 2026-10-22, Nominara sends every request as NominaraBot and never under
 // another crawler's name, so a firewall or CDN rule that blocks by user agent is not observable here. AI-bot access is judged
 // from what robots.txt publishes for each AI crawler token (`ai_bot_access` in the manifest; AUX-R-001/002 as findings).
@@ -92,7 +102,7 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // The wall-clock budget (CRAWL_WALL_CLOCK_BUDGET_MS) still bounds how long a worker SLOT is held, and the declared Crawl-delay is
 // honoured up to MAX_HONOURED_CRAWL_DELAY_MS (politeness.ts); both numbers are NOT FROM THE REFERENCE.
 
-export const RULE_VERSION = "2026.10.1";
+export const RULE_VERSION = AUX_AUDIT_RULE_VERSION;
 export const FETCH_TIMEOUT_MS = 10_000;
 /**
  * NOT FROM THE REFERENCE. The wall-clock budget for one audit's requests to the target. An honest crawl is ~80 requests at
@@ -103,7 +113,7 @@ export const CRAWL_WALL_CLOCK_BUDGET_MS = 10 * 60 * 1000;
 /** aux-and-geo-analysis.md §1: a 500 ms minimum interval between requests to one host. */
 export { MIN_INTERVAL_MS as POLITENESS_INTERVAL_MS } from "../../aux/politeness.js";
 // STORY-050 AC3: the tokenizer the audit's token-count thresholds are measured with (the embedding model's own), so a future change is visible.
-const TOKENIZER = tokenizerLabel(cl100kTokenizer.identity);
+const TOKENIZER = AUX_AUDIT_TOKENIZER;
 /** The one path every audit can speak for is the root. The same list is judged by evaluateRobotsTxt and used by the robots patch. */
 const AUDIT_TRACKED_PATHS: readonly string[] = ["/"];
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
@@ -157,10 +167,28 @@ type Fetched =
   /** `skipped`: NO request was sent because the wall-clock budget cannot cover it. That is not a failure of the site or of our fetch. */
   | { readonly responded: false; readonly skipped?: "crawl_delay_budget" };
 
+/** The page rules the engine runs (STORY-051): everything outside the site-file rules and AUX_RULES_NOT_EVALUATED. */
+const PAGE_RULE_CODES: readonly string[] = AUX_RULES.map((r) => r.code);
+const NOT_EVALUATED_CODES: readonly string[] = Object.keys(AUX_RULES_NOT_EVALUATED);
+/** Every rule that can open a finding: the site-file rules and the page rules. */
+const FINDING_RULE_CODES: readonly string[] = [...RAN_RULES, ...PAGE_RULE_CODES];
+
+/** What a lifecycle action needs from a detection: the stored evidence and the two numbers. A site-file finding and a page-rule finding both fit. */
+interface FindingSource {
+  readonly evidence: object;
+  readonly measured_value: number | null;
+  readonly threshold_value: number | null;
+  /** Page-rule findings carry the catalog's rule version; a site-file finding is stamped with RULE_VERSION. */
+  readonly rule_version?: string;
+}
+
 /** All 34 rule codes, from the reference (§2). */
 const ALL_RULE_CODES: readonly string[] = Array.from({ length: 34 }, (_, i) => `AUX-R-${String(i + 1).padStart(3, "0")}`);
 const RULES_NOT_RUN: readonly string[] = ALL_RULE_CODES.filter((c) => !(RAN_RULES as readonly string[]).includes(c));
-/** `page_crawl` is named only when no page was crawled: naming it after one was would be false. */
+/**
+ * Every rule an audit that modelled NO page did not run: all but the five site-file rules, and `page_crawl` (named only when no page was crawled:
+ * naming it after one was would be false). An audit that did model pages names fewer (see `commit`): the page rules that ran are dropped.
+ */
 export const EXCLUDED_RULES: readonly string[] = [...RULES_NOT_RUN, "page_crawl"];
 
 /**
@@ -255,6 +283,20 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     readonly runId: string;
     readonly evidence: { readonly citations: string[]; readonly tasks: string[] };
     readonly store: StoreFn;
+    /** The rule catalog, read (and its weights asserted) in `prepare`: the page rules need it in `run`, which has no client. */
+    readonly catalogRows: readonly CatalogRow[];
+    readonly catalog: AuxCatalog;
+  }
+
+  interface CatalogRow {
+    readonly code: string;
+    readonly category: string;
+    readonly title: string;
+    readonly weight: number;
+    readonly rule_version: string;
+    readonly thresholds: Record<string, unknown>;
+    readonly task_threshold: string;
+    readonly auto_fixable: boolean;
   }
 
   /** The unreachable case is decided in `run` and written by `commit`: not one of the four site files answered. */
@@ -271,8 +313,12 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     /** The site's own page URLs from its sitemap: the only source a generated llms.txt takes links from. */
     readonly sitemapUrls: readonly string[];
     readonly allSiteFileUrls: string[];
-    readonly detected: (DetectedFinding & { readonly source: SiteFileFinding })[];
+    readonly detected: (DetectedFinding & { readonly source: FindingSource })[];
     readonly covered: ReadonlySet<string>;
+    /** Per page the page rules looked at: the rules that could be decided on it. */
+    readonly pageEvaluated: ReadonlyMap<string, ReadonlySet<string>>;
+    /** Pages whose stored copy could not be read back or modelled. */
+    readonly unmodelledPages: number;
     readonly pagesToCrawl: readonly string[];
     readonly pagesCrawled: number;
     readonly pagesFailed: number;
@@ -302,6 +348,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     );
     if (project.rows.length === 0) {
       logger.log(`project ${payload.projectId} is gone; skipping audit`);
+      await failManualAudit(tx, payload, "project_deleted");
       return PHASES_DONE;
     }
     const { root_domain: rootDomain, root_url: rootUrl, plan_key: planKey } = project.rows[0]!;
@@ -313,6 +360,15 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       logger.log(`audit ${payload.auditId} already ran; skipping redelivery`);
       return PHASES_DONE;
     }
+
+    // The catalog is versioned data: assert its weights on every load (NFR-AUX-03) - all six categories and the category weights
+    // (STORY-051 AC6), not only crawler_access. Read HERE because the page rules run in `run`, which has no client.
+    const catalogResult = await tx.query<CatalogRow>(
+      "SELECT code, category, title, weight, rule_version, thresholds, task_threshold, auto_fixable FROM aux_rule_catalog",
+    );
+    const catalog: AuxCatalog = loadAuxCatalog(
+      catalogResult.rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, autoFixable: r.auto_fixable, thresholds: r.thresholds })),
+    );
 
     // AUTHORIZE (step 1). Fails closed: no verified row, no full scope.
     const verifiedRow = await tx.query(
@@ -353,6 +409,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       evidence,
       // Bound to THIS workspace here, inside the tenant context; the writer works later with no context and no transaction.
       store: deps.store ?? bindDefaultStore(context, deps.storagePort),
+      catalogRows: catalogResult.rows,
+      catalog,
     };
   }
 
@@ -363,6 +421,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         const outcome = await fetchPhase(prepared);
         span.setAttribute("nominara.crawl.kind", outcome.kind);
         span.setAttribute("nominara.crawl.pages_crawled", outcome.kind === "crawled" ? outcome.pagesCrawled : 0);
+        span.setAttribute("nominara.crawl.pages_evaluated", outcome.kind === "crawled" ? outcome.pageEvaluated.size : 0);
         span.setAttribute("nominara.crawl.requests", outcome.kind === "crawled" ? outcome.requests : 0);
         return outcome;
       } catch (error) {
@@ -375,7 +434,15 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   }
 
   async function fetchPhase(prepared: Prepared): Promise<Outcome> {
-    const { payload, rootUrl, origin, scope, pageCap, evidence, store, runId } = prepared;
+    const { payload, rootUrl, origin, scope, pageCap, evidence, store: writeObject, runId, catalog } = prepared;
+    // The page copies this audit stores are also what the page rules read back. They are held here, keyed by the stored key, until the rules
+    // have run: the gzipped bytes the crawl just wrote, so nothing is fetched again and the recorded hash still proves what is modelled.
+    const pageCopies = new Map<string, Buffer>();
+    const store: StoreFn = async (relative, body, contentType) => {
+      const key = await writeObject(relative, body, contentType);
+      if (contentType === "application/gzip") pageCopies.set(key, body);
+      return key;
+    };
     const siteFileInit = onSite(origin);
     const urls = {
       robots: new URL("/robots.txt", origin).href,
@@ -544,6 +611,37 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       }
     }
 
+    // EVALUATE (step 6): the page rules over the stored pages. No transaction is open (this is `run`), and nothing is fetched.
+    const pageRules = await tracer.startActiveSpan("crawl.audit.evaluate", async (span) => {
+      try {
+        const result = await runPageRules(
+          manifest.pages,
+          async (objectKey) => {
+            const copy = pageCopies.get(objectKey);
+            if (copy === undefined) throw new Error("page copy not held");
+            return copy;
+          },
+          catalog,
+          { projectId: payload.projectId },
+        );
+        span.setAttribute("nominara.aux.pages_evaluated", result.evaluated.size);
+        span.setAttribute("nominara.aux.page_findings", result.findings.length);
+        span.setAttribute("nominara.aux.pages_unmodelled", result.unmodelled.length);
+        return result;
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+    pageCopies.clear();
+    for (let i = 0; i < pageRules.evaluated.size; i += 1) incrementCounter("nominara_aux_page_rules_evaluated_total", {});
+    // The rules that ran on at least one page, and of those the ones that ran on an interim reading (AUX_RULES_PARTIAL): they get their own annotation.
+    const decidedAnywhere = new Set<string>();
+    for (const rules of pageRules.evaluated.values()) for (const code of rules) decidedAnywhere.add(code);
+    const rulesPartial = Object.keys(AUX_RULES_PARTIAL).filter((code) => decidedAnywhere.has(code)).sort();
+
     const pagesFailed = failedPages.length - partialPages.length;
     const pagesSkippedByDelay = delaySkippedRecords.length + skippedPages.filter((p) => p.skipped_reason === "crawl_delay_budget").length;
     // Present whenever the Crawl-delay or the wall-clock budget shaped the crawl: a skip, or a delay that was shortened to the cap.
@@ -552,9 +650,17 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     const summary: AuxErrorSummary = {
       ...(siteFilesFailed.length > 0 ? { site_files_failed: siteFilesFailed } : {}),
       ...(failedPages.length > 0 ? { failed_pages: failedPages.map((p) => ({ url: p.url, failures: p.failures })) } : {}),
-      ...(skippedPages.length > 0 || delaySkippedRecords.length > 0 || siteFilesSkipped.length > 0
-        ? { skipped_pages: [...siteFilesSkipped, ...skippedPages.map((p) => ({ url: p.url, reason: p.skipped_reason ?? "skipped" })), ...delaySkippedRecords] }
+      ...(skippedPages.length > 0 || delaySkippedRecords.length > 0 || siteFilesSkipped.length > 0 || pageRules.unmodelled.length > 0
+        ? {
+            skipped_pages: [
+              ...siteFilesSkipped,
+              ...skippedPages.map((p) => ({ url: p.url, reason: p.skipped_reason ?? "skipped" })),
+              ...delaySkippedRecords,
+              ...pageRules.unmodelled.map((p) => ({ url: sanitiseText(p.url, 2048), reason: p.reason })),
+            ],
+          }
         : {}),
+      ...(rulesPartial.length > 0 ? { rules_partial: rulesPartial } : {}),
       ...(partialPages.length > 0 ? { pages_partial: partialPages.length } : {}),
       ...(delayLimited
         ? {
@@ -599,17 +705,27 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     if (sitemap.responded) covered.add("AUX-R-007");
 
     const urlFor = (f: SiteFileFinding): string => (f.evidence.file === "robots.txt" ? urls.robots : f.evidence.file === "llms.txt" ? urls.llms : sitemapUrl);
-    const detected = evaluated
+    const siteDetected = evaluated
       .map((f) => siteFileFindingSchema.parse(f))
       .filter((f) => covered.has(f.rule_code))
       .map((f) => ({ f, url: urlFor(f) }))
-      .map(({ f, url }): DetectedFinding & { readonly source: SiteFileFinding } => ({
+      .map(({ f, url }): DetectedFinding & { readonly source: FindingSource } => ({
         fingerprint: findingFingerprint(f.rule_code, url, f.evidence),
         ruleCode: f.rule_code,
         url,
         severity: f.severity,
         source: f,
       }));
+    // Page-rule findings: identity over rule, URL and locator (STORY-052 AC4), evidence in the rule-finding shape. Only a finding on a page the
+    // rules actually decided counts as a detection; the lifecycle reads `pageEvaluated` for what a later audit may resolve.
+    const pageDetected = pageRules.findings.map((f: AuxRuleFinding): DetectedFinding & { readonly source: FindingSource } => ({
+      fingerprint: pageFindingFingerprint(f),
+      ruleCode: f.rule_code,
+      url: f.url,
+      severity: f.severity,
+      source: { evidence: f.evidence, measured_value: f.measured_value, threshold_value: f.threshold_value, rule_version: f.rule_version },
+    }));
+    const detected = [...siteDetected, ...pageDetected];
 
     const llmsPresent = [llms, llmsWellKnown].some((f) => f.responded && f.status >= 200 && f.status < 300)
       ? true
@@ -630,6 +746,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       allSiteFileUrls: [...Object.values(urls), sitemapUrl, ...pagesToCrawl],
       detected,
       covered,
+      pageEvaluated: pageRules.evaluated,
+      unmodelledPages: pageRules.unmodelled.length,
       pagesToCrawl,
       pagesCrawled,
       pagesFailed,
@@ -661,6 +779,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     if (project.rows.length === 0) {
       incrementCounter("nominara_aux_crawl_commit_total", { outcome: "project_gone" });
       logger.log(`project ${payload.projectId} was deleted during audit ${payload.auditId}; writing nothing`);
+      await failManualAudit(tx, payload, "project_deleted");
       return;
     }
     const claimed = await claimAudit(tx, prepared, outcome);
@@ -676,24 +795,20 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         "UPDATE aux_audits SET status = 'failed', pages_failed = $2, error_summary = $3::jsonb, finished_at = $4, excluded_rules = $5 WHERE id = $1",
         [payload.auditId, outcome.failed, JSON.stringify(summary), outcome.finishedAt, [...EXCLUDED_RULES, ...RAN_RULES]],
       );
+      // A manual audit that delivered nothing gives its charge back, in full and in this transaction (a partial audit is charged in full).
+      if (payload.trigger === "manual") await refundAuxAuditCharge(tx, { workspaceId: payload.workspaceId, auditId: payload.auditId, reason: "audit_failed" });
       incrementCounter("nominara_aux_audits_total", { status: "failed", trigger: payload.trigger });
       incrementCounter("nominara_aux_crawl_commit_total", { outcome: "written" });
       logger.log(`audit ${payload.auditId} (project ${payload.projectId}): no site file reachable`);
       return;
     }
 
-    // The catalog is versioned data: assert its weights on every load (NFR-AUX-03) — all six categories and the category weights
-    // (STORY-051 AC6), not only crawler_access.
-    const catalogRows = await tx.query<{ code: string; category: string; title: string; weight: number; rule_version: string; thresholds: Record<string, unknown>; task_threshold: string; auto_fixable: boolean }>(
-      "SELECT code, category, title, weight, rule_version, thresholds, task_threshold, auto_fixable FROM aux_rule_catalog",
-    );
-    const catalog: AuxCatalog = loadAuxCatalog(
-      catalogRows.rows.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, autoFixable: r.auto_fixable, thresholds: r.thresholds })),
-    );
-    const titles = new Map(catalogRows.rows.map((r) => [r.code, r.title]));
-    const taskThresholds = new Map(catalogRows.rows.map((r) => [r.code, r.task_threshold]));
+    // The catalog `prepare` read and asserted (NFR-AUX-03): the same rows the page rules were evaluated with.
+    const { catalog, catalogRows } = prepared;
+    const titles = new Map(catalogRows.map((r) => [r.code, r.title]));
+    const taskThresholds = new Map(catalogRows.map((r) => [r.code, r.task_threshold]));
 
-    const { detected, covered, finishedAt } = outcome;
+    const { detected, covered, finishedAt, pageEvaluated } = outcome;
     // Read HERE, under the lock on this audit row, so a delivery that committed a moment ago is already visible.
     const existingRows = await tx.query<{
       id: string; fp: string; rule_code: string; url: string | null; severity: AuxSeverityBand; status: FindingStatus; occurrence_count: number; resolved_at: Date | null; category: string | null;
@@ -701,13 +816,20 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       `SELECT f.id, encode(f.fingerprint, 'hex') AS fp, f.rule_code, f.url, f.severity, f.status, f.occurrence_count, f.resolved_at,
               (SELECT c.category FROM aux_rule_catalog c WHERE c.code = f.rule_code) AS category
          FROM aux_findings f WHERE f.project_id = $1 AND f.rule_code = ANY($2::text[])`,
-      [payload.projectId, [...RAN_RULES]],
+      [payload.projectId, [...FINDING_RULE_CODES]],
     );
     const existing: ExistingFinding[] = existingRows.rows.map((r) => ({
       id: r.id, fingerprint: r.fp, ruleCode: r.rule_code, url: r.url, severity: r.severity, status: r.status, occurrenceCount: r.occurrence_count, resolvedAt: r.resolved_at,
     }));
 
-    const inScope = (row: ExistingFinding): boolean => covered.has(row.ruleCode) && (row.url === null || row.url.startsWith(origin));
+    // A site-file finding is in scope when its input file got an answer. A PAGE finding is in scope only when this audit modelled that very page AND
+    // the rule could be decided on it: a page that failed to fetch, was skipped or was not selected, or a rule the page had no input for (AUX-R-026/027
+    // with no rendered copy, AUX-R-029 with no timing), is "we could not look" - never a resolution.
+    const pageRuleCodes = new Set(PAGE_RULE_CODES);
+    const inScope = (row: ExistingFinding): boolean =>
+      pageRuleCodes.has(row.ruleCode)
+        ? row.url !== null && (pageEvaluated.get(row.url)?.has(row.ruleCode) ?? false)
+        : covered.has(row.ruleCode) && (row.url === null || row.url.startsWith(origin));
 
     // STALE (AC8): the audits just before this one that also could not observe the place a finding lives. `excluded_rules` is the record
     // of which rules had no answer from their input file (a site file that did not respond, or an audit that reached nothing), so it
@@ -731,7 +853,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
 
     const actions = reconcileFindings({ existing, detected, inScope, unobservedBefore });
     const byFingerprint = new Map(detected.map((d) => [d.fingerprint, d.source]));
-    const sourceFor = (id: string): SiteFileFinding | undefined => {
+    const sourceFor = (id: string): FindingSource | undefined => {
       const row = existing.find((e) => e.id === id);
       return row === undefined ? undefined : byFingerprint.get(row.fingerprint);
     };
@@ -777,7 +899,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     };
     const patchStats = await tracer.startActiveSpan("crawl.audit.patches", async (span) => {
       try {
-        const stats = await writePatches(tx, { payload, detected, site, logger });
+        const stats = await writePatches(tx, { payload, detected: detected.filter((d) => (RAN_RULES as readonly string[]).includes(d.ruleCode)), site, logger });
         span.setAttribute("nominara.aux.patches_written", stats.written);
         span.setAttribute("nominara.aux.patches_rejected", stats.rejected);
         return stats;
@@ -826,31 +948,68 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     const counts = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const d of detected) if (d.severity in counts) counts[d.severity as keyof typeof counts] += 1;
 
-    // The crawler_access subscore over every finding still open for the
-    // project (including ones whose file we could not re-fetch, and stale ones: stale is not fixed). Site-file
-    // findings are domain-wide, so scope is 1 (affected 1 of 1).
-    const open = await tx.query<{ rule_code: string; severity: AuxSeverityBand }>(
-      "SELECT rule_code, severity FROM aux_findings WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[])",
-      [payload.projectId, SCORED_STATUSES, [...RAN_RULES]],
+    // THE SCORE (scoring-models.md section 7) over every finding still open for the project - including ones whose page or file this audit could not
+    // re-observe, and stale ones: stale is not fixed. A site-file finding is domain-wide, so it affects every page crawled (scope 1). A page finding
+    // affects the distinct pages it is open on (STORY-052 AC9), never more than the pages this audit crawled; the scope factor is floored at 0.25.
+    const open = await tx.query<{ rule_code: string; severity: AuxSeverityBand; url: string | null }>(
+      "SELECT rule_code, severity, url FROM aux_findings WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[])",
+      [payload.projectId, SCORED_STATUSES, [...FINDING_RULE_CODES]],
     );
-    const counted: AuxCountedFinding[] = open.rows.map((r) => ({
-      category: "crawler_access",
-      severity: r.severity,
-      ruleWeight: catalog.byCode.get(r.rule_code)?.weight ?? 0,
-      affectedPages: 1,
-    }));
-    const subscore = auxScore({ findings: counted, pagesCrawled: 1 }).subscores.crawler_access;
-    const capped = counted.some((c) => c.severity === "critical");
+    const pagesForScore = Math.max(1, pageEvaluated.size);
+    // scoring-models.md section 7 counts a FINDING with the pages it affects: scope(f) = affected_pages(f) / pages_crawled. The page rules open one row per
+    // page (and per place on it), so those rows are folded back to one counted finding per rule - its worst severity, over the distinct pages it is open on -
+    // or a rule broken on 3 pages would weigh 3 x 3/n instead of 3/n. A site-file finding is domain-wide: it affects every page crawled (scope 1).
+    const bands: readonly AuxSeverityBand[] = ["info", "low", "medium", "high", "critical"];
+    const perRule = new Map<string, { severity: AuxSeverityBand; urls: Set<string> }>();
+    const counted: AuxCountedFinding[] = [];
+    const asCategory = (code: string): AuxCategory => (catalog.byCode.get(code)?.category ?? "crawler_access") as AuxCategory;
+    for (const r of open.rows) {
+      if (!pageRuleCodes.has(r.rule_code)) {
+        counted.push({ category: asCategory(r.rule_code), severity: r.severity, ruleWeight: catalog.byCode.get(r.rule_code)?.weight ?? 0, affectedPages: pagesForScore });
+        continue;
+      }
+      const seen = perRule.get(r.rule_code) ?? { severity: r.severity, urls: new Set<string>() };
+      if (bands.indexOf(r.severity) > bands.indexOf(seen.severity)) seen.severity = r.severity;
+      seen.urls.add(r.url ?? "");
+      perRule.set(r.rule_code, seen);
+    }
+    for (const [code, { severity, urls }] of perRule) {
+      counted.push({ category: asCategory(code), severity, ruleWeight: catalog.byCode.get(code)?.weight ?? 0, affectedPages: Math.min(pagesForScore, urls.size) });
+    }
+    const scored = auxScore({ findings: counted, pagesCrawled: pagesForScore });
+    // A category is PUBLISHED only when something in it was actually evaluated in this audit; the headline score only when every category was.
+    // crawler_access always was (the site files answered, or the audit would have failed).
+    const categoriesRan = new Set<AuxCategory>(["crawler_access"]);
+    for (const rules of pageEvaluated.values()) {
+      for (const code of rules) {
+        const category = catalog.byCode.get(code)?.category as AuxCategory | undefined;
+        if (category !== undefined) categoriesRan.add(category);
+      }
+    }
+    const breakdown: Partial<Record<AuxCategory, number>> = {};
+    for (const category of Object.keys(AUX_CATEGORY_WEIGHTS) as AuxCategory[]) if (categoriesRan.has(category)) breakdown[category] = scored.subscores[category];
+    const allCategoriesRan = categoriesRan.size === Object.keys(AUX_CATEGORY_WEIGHTS).length;
+    const capped = counted.some((c) => c.category === "crawler_access" && c.severity === "critical");
 
-    const status = outcome.siteFilesFailed + outcome.pagesFailed + outcome.partialPages + skippedSiteFileCount(outcome) > 0 || outcome.manifestStored === false ? "partial" : "completed";
+    const status = outcome.siteFilesFailed + outcome.pagesFailed + outcome.partialPages + outcome.unmodelledPages + skippedSiteFileCount(outcome) > 0 || outcome.manifestStored === false ? "partial" : "completed";
     // Every rule that could not run is named: the ones outside this crawl, and any whose input file got no answer
     // (unreachable, or never asked for because the budget could not cover it).
-    const excluded = [...new Set([...(outcome.pagesCrawled > 0 ? RULES_NOT_RUN : EXCLUDED_RULES), ...RAN_RULES.filter((code) => !covered.has(code))])];
+    // A page rule is named only when it ran on NO page: AUX-R-026/027 with no rendered copy anywhere, AUX-R-029 with no measured timing anywhere.
+    // With no page modelled, every page rule is excluded (and `page_crawl` too when none was crawled at all).
+    const decidedAnywhere = new Set<string>();
+    for (const rules of pageEvaluated.values()) for (const code of rules) decidedAnywhere.add(code);
+    const notRunOnPages =
+      pageEvaluated.size > 0
+        ? [...NOT_EVALUATED_CODES, ...PAGE_RULE_CODES.filter((code) => !decidedAnywhere.has(code))]
+        : outcome.pagesCrawled > 0
+          ? RULES_NOT_RUN
+          : EXCLUDED_RULES;
+    const excluded = [...new Set([...notRunOnPages, ...RAN_RULES.filter((code) => !covered.has(code))])];
 
     await tx.query(
       `UPDATE aux_audits
           SET status = $2, pages_crawled = $3, pages_failed = $4, robots_snapshot = $5, robots_hash = $6, llms_txt_present = $7, sitemap_url_count = $8,
-              aux_score = NULL, score_capped = $9, score_breakdown = $10::jsonb,
+              aux_score = $20, score_capped = $9, score_breakdown = $10::jsonb,
               findings_critical = $11, findings_high = $12, findings_medium = $13, findings_low = $14, finished_at = $15,
               target_urls = $16, excluded_rules = $17, dom_object_prefix = $18, error_summary = $19::jsonb
         WHERE id = $1`,
@@ -859,9 +1018,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         // The snapshot is stored verbatim except for what Postgres text cannot hold; the hash is of the bytes as fetched.
         outcome.robotsSnapshot,
         outcome.robotsHash,
-        outcome.llmsPresent, outcome.sitemapCount, capped, JSON.stringify({ crawler_access: subscore }),
+        outcome.llmsPresent, outcome.sitemapCount, capped, JSON.stringify(breakdown),
         counts.critical, counts.high, counts.medium, counts.low, finishedAt,
         [...new Set(outcome.allSiteFileUrls)], excluded, outcome.domObjectPrefix, outcome.errorSummary,
+        // null = not every category ran, so there is no headline score; 0 would be a measured zero.
+        allCategoriesRan ? scored.score : null,
       ],
     );
 
@@ -878,6 +1039,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       pages_failed: outcome.pagesFailed,
       pages_partial: outcome.partialPages,
       pages_skipped: outcome.skippedPages,
+      pages_evaluated: pageEvaluated.size,
+      page_findings: detected.filter((d) => pageRuleCodes.has(d.ruleCode)).length,
       site_files_failed: outcome.siteFilesFailed,
       requests: outcome.requests,
       detected: detected.length,
@@ -919,6 +1082,21 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
   const skippedSiteFileCount = (outcome: Outcome): number =>
     outcome.kind !== "crawled" ? 0 : [outcome.robots, outcome.llms, outcome.llmsWellKnown, outcome.sitemap].filter((f) => !f.responded && f.skipped !== undefined).length;
 
+  /**
+   * A manual audit whose project is gone will never run: fail the row the producer queued and give the charge back. Any other trigger
+   * has no row and no charge, so there is nothing to do. Idempotent: the update only moves a row that is still queued or running, and the refund
+   * is idempotent in the ledger.
+   */
+  async function failManualAudit(tx: ClientBase, payload: { auditId: string; workspaceId: string; trigger: string }, reason: "project_deleted"): Promise<void> {
+    if (payload.trigger !== "manual") return;
+    await tx.query(
+      "UPDATE aux_audits SET status = 'failed', error_summary = $2::jsonb, finished_at = $3 WHERE id = $1 AND status IN ('queued','running')",
+      [payload.auditId, JSON.stringify(auxErrorSummarySchema.parse({ reason })), now()],
+    );
+    await refundAuxAuditCharge(tx, { workspaceId: payload.workspaceId, auditId: payload.auditId, reason });
+    incrementCounter("nominara_aux_audits_total", { status: "failed", trigger: payload.trigger });
+  }
+
   return phasedProcessor<Prepared, Outcome>({
     prepare: (tx, job) => prepare(tx, job),
     run: (prepared) => run(prepared),
@@ -946,7 +1124,7 @@ async function applyAction(
     titles: Map<string, string>;
     ruleVersion: string;
     at: Date;
-    sourceFor: (id: string) => SiteFileFinding | undefined;
+    sourceFor: (id: string) => FindingSource | undefined;
     categoryOf: Map<string, string | null>;
     severityOf: Map<string, AuxSeverityBand>;
   },
@@ -954,7 +1132,7 @@ async function applyAction(
   const { payload, at } = ctx;
   switch (action.kind) {
     case "insert": {
-      const src = (action.finding as DetectedFinding & { source: SiteFileFinding }).source;
+      const src = (action.finding as DetectedFinding & { source: FindingSource }).source;
       await tx.query(
         `INSERT INTO aux_findings
            (workspace_id, project_id, audit_id, rule_code, url, severity, fingerprint, title, evidence, measured_value, threshold_value,
@@ -963,7 +1141,7 @@ async function applyAction(
         [
           payload.workspaceId, payload.projectId, payload.auditId, action.finding.ruleCode, action.finding.url, action.finding.severity,
           action.finding.fingerprint, ctx.titles.get(action.finding.ruleCode) ?? action.finding.ruleCode, JSON.stringify(src.evidence),
-          src.measured_value, src.threshold_value, ctx.ruleVersion, at,
+          src.measured_value, src.threshold_value, src.rule_version ?? ctx.ruleVersion, at,
         ],
       );
       return false;
