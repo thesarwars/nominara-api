@@ -37,7 +37,7 @@ const logger = new Logger("credits.debit");
  * Ledger idempotency keys the SERVER writes from inside a handler. A client `Idempotency-Key` is used verbatim as a
  * ledger key by `CreditGuard`, so a client key in this namespace could collide with one of these; the guard refuses it.
  */
-export const RESERVED_LEDGER_KEY_PREFIXES = ["prompt_activate:"] as const;
+export const RESERVED_LEDGER_KEY_PREFIXES = ["prompt_activate:", "tool_run:"] as const;
 
 export function isReservedLedgerKey(key: string): boolean {
   const lowered = key.toLowerCase();
@@ -69,6 +69,12 @@ export interface InlineDebit {
    */
   readonly idempotencyKey: string;
   readonly projectId?: string;
+  /**
+   * What the debit is FOR, on both ledger entries (`reference_type` / `reference_id`). A refund finds its debit through this pair
+   * (`refundableDebitFor`), which is how a tool run that captured nothing is returned in full (STORY-078).
+   */
+  readonly referenceType?: string;
+  readonly referenceId?: string;
   readonly unitDetail?: LedgerUnitDetail;
   /** The plan's `credits.included_per_cycle`, for a workspace whose wallet does not exist yet. */
   readonly includedGrant: number;
@@ -141,6 +147,8 @@ export async function debitInTransaction(tx: ClientBase, debit: InlineDebit): Pr
     // Both halves name the project: unlike the guard, which reserves before the
     // handler has resolved what the request is about, this caller already knows.
     ...(debit.projectId === undefined ? {} : { projectId: debit.projectId }),
+    ...(debit.referenceType === undefined ? {} : { referenceType: debit.referenceType }),
+    ...(debit.referenceId === undefined ? {} : { referenceId: debit.referenceId }),
   } as const;
 
   if (!(await appendLedgerEntry(tx, { ...common, entryType: "reserve", after: reserved.wallet }))) {

@@ -39,6 +39,8 @@ export interface RunSettlementInput {
   readonly runId: string;
   /** Cells that produced an answer: live captures plus cache-served (suppressed) cells. */
   readonly deliveredCells: number;
+  /** What the debit was recorded against; `run` (a capture run) unless a tool run says `tool_run` (STORY-078). */
+  readonly referenceType?: string;
 }
 
 export interface RunSettlementOutcome {
@@ -49,7 +51,8 @@ export interface RunSettlementOutcome {
 export async function settleFinishedRunCredits(tx: ClientBase, input: RunSettlementInput): Promise<RunSettlementOutcome> {
   if (input.deliveredCells > 0) return { refunded: 0 };
 
-  const debit = await refundableDebitFor(tx, input.workspaceId, input.runId);
+  const referenceType = input.referenceType ?? "run";
+  const debit = await refundableDebitFor(tx, input.workspaceId, input.runId, referenceType);
   if (debit === null || debit.credits === 0 || debit.alreadyRefunded) return { refunded: 0 };
 
   let refunded = 0;
@@ -65,7 +68,7 @@ export async function settleFinishedRunCredits(tx: ClientBase, input: RunSettlem
         idempotencyKey: `${debit.idempotencyKey}:${bucket}`,
         actorId: null,
         actorType: "system",
-        referenceType: "run",
+        referenceType,
         referenceId: input.runId,
       },
       bucket,
