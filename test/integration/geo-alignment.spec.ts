@@ -1024,8 +1024,11 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     for (const id of [session, sibling]) {
       await db.query(`UPDATE geo_alignments SET coverage_ratio = 0.5, recommendations = '[{"x":1}]'::jsonb WHERE id = $1`, [id]);
     }
+    const stamp = async (id: string): Promise<number> => ((await sessionRow(id)).updated_at as Date).getTime();
+    const stampsBefore = [await stamp(session), await stamp(sibling)];
     await extractSemanticNodes(deps(), session);
-    for (const id of [session, sibling]) {
+    for (const [i, id] of [session, sibling].entries()) {
+      expect(await stamp(id), "the reset bumps updated_at so the GEO panel sees the change").toBeGreaterThan(stampsBefore[i]!);
       const row = await sessionRow(id);
       expect(row.coverage_ratio, "no alignment of the scope still claims a judgement").toBeNull();
       expect(row.recommendations).toEqual([]);

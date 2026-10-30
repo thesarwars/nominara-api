@@ -17,3 +17,16 @@ export async function lockNodeScope(tx: ClientBase, projectId: string, clusterId
 export async function lockNodeScopeShared(tx: ClientBase, projectId: string, clusterId: string | null): Promise<void> {
   await tx.query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text || ':' || COALESCE($2::text, ''), 0))", [projectId, clusterId]);
 }
+
+// Several scopes at once (STORY-057's rollup reads every cluster of a project): the locks are taken in ONE fixed order, the hash of the lock key
+// then (project, cluster NULLS LAST), the order embed-batch's semantic_nodes commit takes its exclusive locks in. Two transactions spanning several
+// scopes therefore cannot lock against each other. Callers take them once, up front, never scope by scope as the reads arrive.
+export async function lockNodeScopesShared(tx: ClientBase, projectId: string, clusterIds: readonly (string | null)[]): Promise<void> {
+  if (clusterIds.length === 0) return;
+  const ordered = await tx.query<{ cluster_id: string | null }>(
+    `SELECT cluster_id FROM (SELECT DISTINCT c AS cluster_id FROM unnest($2::uuid[]) AS c) s
+      ORDER BY hashtextextended($1::text || ':' || COALESCE(cluster_id::text, ''), 0), cluster_id NULLS LAST`,
+    [projectId, [...clusterIds]],
+  );
+  for (const scope of ordered.rows) await lockNodeScopeShared(tx, projectId, scope.cluster_id);
+}

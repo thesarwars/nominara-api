@@ -112,6 +112,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
 
   interface CaptureSpec {
     at: string;
+    prompt?: string;
     engine?: string;
     present: boolean | null;
     position?: number | null;
@@ -130,7 +131,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
          (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version,
           normalizer_version, content_hash, brand_present, brand_rank_position, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1','n1',$8,$9,$10,$11)`,
-      [id, workspaceId, projectId, randomUUID(), promptId, engine, spec.at, createHash("sha256").update(id).digest(), spec.present, spec.position ?? null, spec.status ?? "parsed"],
+      [id, workspaceId, projectId, randomUUID(), spec.prompt ?? promptId, engine, spec.at, createHash("sha256").update(id).digest(), spec.present, spec.position ?? null, spec.status ?? "parsed"],
     );
     const mention = async (type: string, entityId: string | null, label: string, position: number, cls: string, render: string): Promise<void> => {
       await db.query(
@@ -797,6 +798,56 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     }
     expect(await conceptGap()).toEqual([]);
   });
+
+  it("STORY-057 review 3 · HAZARD: the refresh takes its shared scope locks up front in hash order, so an embed batch locking two scopes in that order cannot deadlock with it (no 40P01)", async () => {
+    // Two clusters, ordered by the hash of their lock key: `lo` sorts before `hi`.
+    const [a, b] = [randomUUID(), randomUUID()];
+    const hashes = await db.query<{ cluster: string; h: string }>(
+      `SELECT c AS cluster, hashtextextended($1::text || ':' || c::text, 0)::text AS h FROM unnest($2::text[]) c`,
+      [projectId, [a, b]],
+    );
+    const sorted = [...hashes.rows].sort((x, y) => (BigInt(x.h) < BigInt(y.h) ? -1 : 1));
+    const lo = sorted[0]!.cluster;
+    const hi = sorted[1]!.cluster;
+    const secondPrompt = randomUUID();
+    await db.query(
+      `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status, cluster_id)
+       VALUES ($1,$2,$3,'q2',sha256('q2'::bytea),'recommendation','decision','active',$4)`,
+      [secondPrompt, workspaceId, projectId, lo],
+    );
+    await inCluster(hi);
+    // The first displaced cell (by captured_at) is in `hi`, the second in `lo`: per-cell locking would take S(hi) then S(lo).
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    await capture({ at: `${D1}T10:30:00Z`, prompt: secondPrompt, present: true, position: 1 });
+    await capture({ at: `${D2}T11:00:00Z`, prompt: secondPrompt, present: false, rival: { position: 1 } });
+    // The embed batch's order: X(lo) first, then X(hi).
+    const embedder = new Client({ connectionString: container.getConnectionUri() });
+    await embedder.connect();
+    try {
+      await embedder.query("BEGIN");
+      await lockNodeScope(embedder, projectId, lo);
+      const refreshing = run(D2).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      await new Promise((r) => setTimeout(r, 800));
+      const embedding = embedder.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))", [projectId, hi]).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      await embedding;
+      await embedder.query("COMMIT");
+      const refreshError = await refreshing;
+      expect(embedder).toBeDefined();
+      expect(refreshError, "the refresh finished without a deadlock").toBeUndefined();
+    } finally {
+      await embedder.query("ROLLBACK").catch(() => undefined);
+      await embedder.end();
+      await db.query("ROLLBACK").catch(() => undefined);
+    }
+    expect(await events()).toHaveLength(2);
+  }, 30_000);
 
   it("STORY-057 review 1 · FR-CO-03(d): a node whose evidence URL the displacer did not cite on the after-capture is not in the gap", async () => {
     await inCluster(clusterId);

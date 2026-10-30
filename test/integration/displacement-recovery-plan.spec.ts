@@ -314,7 +314,7 @@ describe("NEW-C-6 · displacement recovery plan", () => {
     expect((await plan(id)).map((t) => t.kind)).toEqual(["content"]);
   });
 
-  it("STORY-057 — a stored concept entry without evidence is not planned (a hand-written row cannot smuggle one in)", async () => {
+  it("STORY-057 — a stored concept entry without evidence is not planned (a hand-written row cannot smuggle one in; like citationGapSchema.parse, the violation surfaces as an unmapped throw - accepted precedent)", async () => {
     const id = await displacement({ conceptGap: [{ concept: "pricing", prevalence: 0.6 }] });
     await expect(plan(id)).rejects.toThrow();
     expect(await taskRows()).toHaveLength(0);

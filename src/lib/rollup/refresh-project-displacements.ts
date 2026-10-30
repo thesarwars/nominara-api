@@ -20,7 +20,7 @@ import { deriveConceptGap, type ConceptCandidate } from "../analytics/concept-ga
 import { isLowConfidence, suppressRecommendations } from "../geo/corpus/weights.js";
 import { classifyDomain } from "../parser/citation-url.js";
 import { displacementImpactForEvent, type FunnelStage } from "../scoring/displacement-impact.js";
-import { lockNodeScopeShared } from "../geo/alignment/scope-lock.js";
+import { lockNodeScopesShared } from "../geo/alignment/scope-lock.js";
 import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 import { datesWithFacts, measurementStatusSql } from "./aggregate-day.js";
@@ -95,12 +95,12 @@ export async function refreshProjectDisplacements(
   projectId: string,
   date: string,
   timezone: string,
-  options: { readonly observeLag?: boolean } = {},
+  options: { readonly observeLag?: boolean; readonly scopesLocked?: boolean } = {},
 ): Promise<number> {
   return tracer.startActiveSpan("displacement.refresh", async (span) => {
     try {
       const lags: number[] = [];
-      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true, lags);
+      const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true, lags, options.scopesLocked ?? false);
       emitLagObservations(lags);
       span.setAttribute("nominara.project_id", projectId);
       span.setAttribute("nominara.displacement.events", persisted);
@@ -136,6 +136,7 @@ async function refreshProjectDisplacementsInner(
   timezone: string,
   observeLag: boolean,
   lags: number[],
+  scopesLocked: boolean,
 ): Promise<number> {
   const project = await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId]);
   const workspaceId = project.rows[0]?.workspace_id;
@@ -153,6 +154,8 @@ async function refreshProjectDisplacementsInner(
     )
   ).rows;
   if (captures.length === 0) return 0;
+  // The concept read needs every cluster's scope quiet: take the shared locks once, up front, in the embed handler's order.
+  if (!scopesLocked) await lockProjectNodeScopes(tx, workspaceId, projectId);
 
   const competitorDomains = new Map(
     (
@@ -244,9 +247,13 @@ export async function backfillProjectDisplacements(
   toDate: string,
 ): Promise<number> {
   let total = 0;
+  const workspaceId = (await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId])).rows[0]?.workspace_id;
+  if (workspaceId === undefined) return 0; // not visible to this tenant context
+  // Once per transaction, not once per date: the locks are held to commit anyway, and one up-front pass keeps the lock order fixed.
+  await lockProjectNodeScopes(tx, workspaceId, projectId);
   for (const date of await datesWithFacts(tx, projectId, timezone, fromDate, toDate)) {
     // A backfill writes events long after their captures: its lag is not the live pipeline, so it is not observed.
-    total += await refreshProjectDisplacements(tx, projectId, date, timezone, { observeLag: false });
+    total += await refreshProjectDisplacements(tx, projectId, date, timezone, { observeLag: false, scopesLocked: true });
   }
   return total;
 }
@@ -477,13 +484,21 @@ interface ConceptNodes {
   readonly lowConfidence: boolean;
 }
 
+/** Every cluster scope of the project's prompts (and the unclustered scope), shared-locked in the one order embed-batch uses. */
+async function lockProjectNodeScopes(tx: ClientBase, workspaceId: string, projectId: string): Promise<void> {
+  const scopes = await tx.query<{ cluster_id: string | null }>(
+    `SELECT DISTINCT cluster_id FROM tracked_prompts WHERE workspace_id = $1 AND project_id = $2`,
+    [workspaceId, projectId],
+  );
+  await lockNodeScopesShared(tx, projectId, scopes.rows.map((r) => r.cluster_id));
+}
+
 async function loadConceptNodes(tx: ClientBase, workspaceId: string, projectId: string, promptId: string): Promise<ConceptNodes> {
   const clusterId =
     (await tx.query<{ cluster_id: string | null }>(`SELECT cluster_id FROM tracked_prompts WHERE id = $1 AND workspace_id = $2 AND project_id = $3`, [promptId, workspaceId, projectId]))
       .rows[0]?.cluster_id ?? null;
-  // The judged check and the node read are two statements with two snapshots (READ COMMITTED): wait out any extraction/analysis of the
-  // scope first, so a commit between them cannot pair "judged" with freshly reset (all-absent) nodes.
-  await lockNodeScopeShared(tx, projectId, clusterId);
+  // The judged check and the node read are two statements with two snapshots (READ COMMITTED); the scope's shared lock, taken up front
+  // by `lockProjectNodeScopes`, stops a commit between them pairing "judged" with freshly reset (all-absent) nodes.
   const judging = (
     await tx.query<{ min_sources: number | null }>(
       `SELECT min(centroid_source_count)::int AS min_sources
