@@ -4,6 +4,7 @@ import { UnrecoverableError, type Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { EmbeddingProviderError, type EmbeddingProvider } from "../../../modules/prompts/ports/embedding-provider.js";
 import { selectEmbeddingProvider } from "../../../modules/prompts/embedding-provider.selector.js";
+import { lockNodeScope } from "../../geo/alignment/scope-lock.js";
 import { CircuitBreaker, CircuitOpenError } from "../../resilience/circuit-breaker.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../usage/billing-period.js";
@@ -181,8 +182,9 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
             RETURNING t.id`,
   },
   corpus_passages: {
-    // The row carries its model from insert (NOT NULL) and ux_corpus_passages (workspace, hash, model) allows ONE row per
-    // content, so L7 is the unique key itself; a passage stored under another model is not this job's to embed.
+    // The row carries its model from insert (NOT NULL) and ux_corpus_passages_cluster (workspace, project, cluster, hash, model)
+    // allows ONE row per (cluster, content), so each cluster's copy of a shared text is embedded once for that cluster (owner
+    // decision 11); a passage stored under another model is not this job's to embed.
     pending: `SELECT id, text, encode(content_hash, 'hex') AS hash, false AS is_draft
                 FROM corpus_passages
                WHERE embedding IS NULL AND embedding_model = $2 AND id = ANY($1::uuid[]) AND workspace_id = app.current_workspace()
@@ -192,6 +194,23 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
                SET embedding = v.vec::halfvec(1536)
               FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
              WHERE t.id = v.id AND t.embedding IS NULL AND t.embedding_model = $3 AND t.workspace_id = app.current_workspace()
+            RETURNING t.id`,
+  },
+  semantic_nodes: {
+    // STORY-059 (owner decision 2026-10-28 #4): a node's phrase is embedded here, and the model is written WITH the vector, so a
+    // node is never half-stamped. A node with a vector under another model is re-embedded (EC-23: one model per comparison), and
+    // the table has no content hash, so there is no L7 copy: a phrase is a handful of tokens.
+    pending: `SELECT id, phrase AS text, NULL::text AS hash, false AS is_draft
+                FROM semantic_nodes
+               WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND $2::text IS NOT NULL
+                 AND (embedding IS NULL OR embedding_model IS DISTINCT FROM $2)
+               ORDER BY id`,
+    reuse: undefined,
+    write: `UPDATE semantic_nodes t
+               SET embedding = v.vec::halfvec(1536), embedding_model = $3
+              FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
+             WHERE t.id = v.id AND t.workspace_id = app.current_workspace()
+               AND (t.embedding IS NULL OR t.embedding_model IS DISTINCT FROM $3)
             RETURNING t.id`,
   },
 };
@@ -292,8 +311,23 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
 
   const commit = async (tx: ClientBase, prepared: EmbedPrepared, fetched: EmbedFetched): Promise<void> => {
     const { payload } = prepared;
+    const writeIds = prepared.writes.map((write) => write.id);
+    // STORY-059: `analyseNodes` bulk-UPDATEs a scope's semantic_nodes while holding that scope's advisory lock. This UPDATE touches rows
+    // of the same scope, so without the lock the two take row locks in different orders and can deadlock. Take it first, scope by scope in
+    // a fixed order (the lock key's own hash, the order the locks are taken in), so two jobs spanning several scopes cannot lock against each other either.
+    if (payload.table === "semantic_nodes") {
+      const scopes = await tx.query<{ project_id: string; prompt_cluster_id: string | null }>(
+        `SELECT project_id, prompt_cluster_id FROM (
+           SELECT DISTINCT project_id, prompt_cluster_id FROM semantic_nodes
+            WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[])
+         ) s
+          ORDER BY hashtextextended(project_id::text || ':' || COALESCE(prompt_cluster_id::text, ''), 0), project_id, prompt_cluster_id NULLS LAST`,
+        [writeIds],
+      );
+      for (const scope of scopes.rows) await lockNodeScope(tx, scope.project_id, scope.prompt_cluster_id);
+    }
     const written = await tx.query(TABLE_SQL[payload.table].write, [
-      prepared.writes.map((write) => write.id),
+      writeIds,
       prepared.writes.map((write) => fetched.vectors[write.textIndex]!),
       prepared.model,
     ]);

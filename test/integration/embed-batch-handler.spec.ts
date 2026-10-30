@@ -8,6 +8,7 @@ import { EMBED_PROVIDER_BATCH_SIZE, embedBatchKey } from "../../src/lib/embeddin
 import { embedBatchPayloadSchema } from "../../src/lib/embedding/embed-batch.js";
 import { requestPromptEmbeddings, type EnqueueEmbedBatch } from "../../src/lib/embedding/prompt-embedding-request.js";
 import { cellKey, probeSemanticReuse, type L2Candidate } from "../../src/lib/capture/l2-semantic-reuse.js";
+import { lockNodeScope } from "../../src/lib/geo/alignment/scope-lock.js";
 import { createEmbedBatchHandler } from "../../src/lib/queue/handlers/embed-batch.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
@@ -375,6 +376,66 @@ describe("STORY-133 · embed.batch", () => {
     await runAsWorker(handler(provider), job([id], "corpus_passages"));
     const row = await db.query<{ has: boolean }>("SELECT embedding IS NOT NULL AS has FROM corpus_passages WHERE id = $1", [id]);
     expect(row.rows[0]!.has).toBe(true);
+  }, 60_000);
+
+  // ---- STORY-059: the semantic_nodes path -------------------------------------------------------------------------------
+
+  async function addNode(phrase: string, cluster: string | null = null): Promise<string> {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO semantic_nodes (id, workspace_id, project_id, prompt_cluster_id, phrase, phrase_normalized, node_type, corpus_doc_ratio, evidence_url, evidence_snippet)
+       VALUES ($1, $2, $3, $4, $5, $5, 'capability', 0.5, 'https://doc.example/p', $5)`,
+      [id, workspaceId, projectId, cluster, phrase],
+    );
+    return id;
+  }
+
+  it("STORY-059 review round 3 - a semantic_nodes job redelivered makes ZERO provider calls, adds no usage_ledger row, and leaves the vector unchanged", async () => {
+    const provider = new CountingProvider();
+    const ids = [await addNode("audit logging"), await addNode("single sign on")];
+    const h = handler(provider);
+    await runAsWorker(h, job(ids, "semantic_nodes"));
+    const ledger = async (): Promise<number> => Number((await db.query<{ n: string }>("SELECT count(*) AS n FROM usage_ledger WHERE workspace_id = $1", [workspaceId])).rows[0]!.n);
+    const vectors = async () => (await db.query("SELECT id, embedding::text AS v, embedding_model FROM semantic_nodes WHERE id = ANY($1::uuid[]) ORDER BY id", [ids])).rows;
+    const first = await vectors();
+    expect(first.every((row) => row.v !== null && row.embedding_model === STAND_IN_EMBEDDING_MODEL)).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+    const ledgerAfterFirst = await ledger();
+    expect(ledgerAfterFirst).toBeGreaterThan(0);
+
+    await runAsWorker(h, job([...ids].reverse(), "semantic_nodes"));
+
+    expect(provider.calls, "no further provider call").toHaveLength(1);
+    expect(await ledger(), "no new usage_ledger row").toBe(ledgerAfterFirst);
+    expect(await vectors(), "the vector is unchanged").toEqual(first);
+  }, 60_000);
+
+  it("STORY-059 review round 3 - the semantic_nodes write takes the scope lock, so it cannot interleave with an analysis of the same (project, cluster)", async () => {
+    const provider = new CountingProvider();
+    const cluster = randomUUID();
+    const ids = [await addNode("audit logging", cluster), await addNode("single sign on", cluster)];
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      await lockNodeScope(holder, projectId, cluster); // an analysis of this scope is mid-flight
+      let settled = false;
+      const running = runAsWorker(handler(provider), job(ids, "semantic_nodes")).then(() => { settled = true; });
+      // Bounded poll: wait until the worker is queued on the scope's advisory lock (not granted), then assert it has not settled.
+      let queued = 0;
+      for (let i = 0; i < 200 && queued === 0; i += 1) {
+        queued = Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")).rows[0]!.n);
+        if (queued === 0) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(queued, "the worker is waiting on the scope's advisory lock").toBeGreaterThan(0);
+      expect(settled, "the write waits for the scope's lock").toBe(false);
+      expect((await db.query("SELECT count(*) AS n FROM semantic_nodes WHERE embedding IS NOT NULL")).rows[0]!.n).toBe("0");
+      await holder.query("COMMIT");
+      await running;
+      expect((await db.query("SELECT count(*) AS n FROM semantic_nodes WHERE embedding IS NOT NULL")).rows[0]!.n).toBe("2");
+    } finally {
+      await holder.query("ROLLBACK").catch(() => undefined);
+      holder.release();
+    }
   }, 60_000);
 
   // ---- metering never gates ---------------------------------------------------------------------------------------------

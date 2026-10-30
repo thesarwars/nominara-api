@@ -156,4 +156,6 @@ export const semanticNodes = pgTable("semantic_nodes", {
   evidenceSnippet: text("evidence_snippet").notNull(),
   requiresHumanReview: boolean("requires_human_review").notNull().default(sql`false`),
   computedAt: timestamp("computed_at", { withTimezone: true }).notNull().default(sql`now()`),
+  embeddingModel: text("embedding_model"),
+  collapsedIntoId: uuid("collapsed_into_id"),
 });
