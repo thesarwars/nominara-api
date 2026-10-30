@@ -100,6 +100,7 @@ describe("STORY-061 · A6 sentiment drivers (persisted, read)", () => {
 
   it("#10 · negative mentions across two engines citing one thread are one cluster, read back from the stored row", async () => {
     await many(30, { label: "positive", cite: null });
+    await many(30, { label: "positive", cite: null, at: "2026-08-15T10:00:00Z" }); // owner decision 22: a prior window with its own 30 answers, clean, so the rate ROSE
     await many(2, { engine: "gemini" });
     await mention({ engine: "claude", demo: true });
     await refresh();
@@ -112,11 +113,13 @@ describe("STORY-061 · A6 sentiment drivers (persisted, read)", () => {
     expect(d.clusters).toEqual([expect.objectContaining({ domain: "reddit.com", mention_count: 3, engine_count: 2 })]);
     expect(d.data_source).toBe("mixed");
     expect(d.mentions[0]).toMatchObject({ evidence_start: 0, evidence_end: 41, evidence_text: TEXT.slice(0, 41), factual_error: false });
-    expect(a.summary).toMatchObject({ status: "ready", verdict: "action", score: null });
+    // Owner decision 23: one demo mention makes the window "mixed" and the analysis asks for nothing (fail closed); it was "action" before the decision.
+    expect(a.summary).toMatchObject({ status: "ready", verdict: "no_action", score: null });
   });
 
   it("#11 · one action per distinct reason class, a title and no task id", async () => {
     await many(30, { label: "positive", cite: null });
+    await many(30, { label: "positive", cite: null, at: "2026-08-15T10:00:00Z" }); // owner decision 22: a prior window with its own 30 answers, clean, so the rate ROSE
     await many(2, { reasons: ["pricing_objection"] });
     await mention({ reasons: ["missing_feature"] });
     await refresh();

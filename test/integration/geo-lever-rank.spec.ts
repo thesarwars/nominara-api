@@ -16,6 +16,7 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 const AS_OF = new Date("2026-10-01T12:00:00Z"); // 30d window starts 2026-09-02; the 7d window does not contain IN_WINDOW
 const IN_WINDOW = "2026-09-20T10:00:00Z";
+const PRIOR_WINDOW = "2026-08-15T10:00:00Z";
 const TEXT = "Acme is clunky and the pricing is steep [thread](https://reddit.com/r/crm/1) today.";
 
 describe("NEW-C-13 · Top Three Levers (persisted)", () => {
@@ -60,25 +61,25 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     return { ws, project };
   }
 
-  async function mention(ws: string, project: string, label: "positive" | "negative"): Promise<void> {
+  async function mention(ws: string, project: string, label: "positive" | "negative", at = IN_WINDOW): Promise<void> {
     const id = randomUUID();
     await db.query(
       `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,status)
        VALUES ($1,$2,$3,$4,$5,'gemini',$6,'api','v1','v1','\\x00',$7::jsonb,'parsed')`,
-      [id, ws, project, randomUUID(), randomUUID(), IN_WINDOW, JSON.stringify({ format: "markdown", text: TEXT })],
+      [id, ws, project, randomUUID(), randomUUID(), at, JSON.stringify({ format: "markdown", text: TEXT })],
     );
     await db.query(
       `INSERT INTO mention_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_label,matched_alias,
          occurrence_index,char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,
          evidence_start,evidence_end,negative_reasons,position_class)
        VALUES ($1,$2,$3,$4,'gemini',$5,'brand','Acme','Acme',0,0,4,0,0.5,$6,0,0.5,'lexicon',0,41,$7::text[],'neutral_list')`,
-      [ws, project, id, randomUUID(), IN_WINDOW, label, label === "negative" ? ["complaint_thread_cited"] : []],
+      [ws, project, id, randomUUID(), at, label, label === "negative" ? ["complaint_thread_cited"] : []],
     );
     if (label === "negative") {
       await db.query(
         `INSERT INTO citation_facts (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,slot_index,raw_url,normalized_url,url_hash,domain,position_weight)
          VALUES ($1,$2,$3,$4,'gemini',$5,1,'https://reddit.com/r/crm/1','https://reddit.com/r/crm/1',sha256(convert_to('https://reddit.com/r/crm/1','UTF8')),'reddit.com',1)`,
-        [ws, project, id, randomUUID(), IN_WINDOW],
+        [ws, project, id, randomUUID(), at],
       );
     }
   }
@@ -88,6 +89,8 @@ describe("NEW-C-13 · Top Three Levers (persisted)", () => {
     ({ ws: workspaceId, project: projectId } = await makeProject());
     for (let i = 0; i < 30; i++) await mention(workspaceId, projectId, "positive");
     for (let i = 0; i < 2; i++) await mention(workspaceId, projectId, "negative");
+    // Owner decision 22: a crossing needs a RISE over a prior window with its own 30 answers. The prior window (2026-08-03 .. 2026-09-01) is clean.
+    for (let i = 0; i < 30; i++) await mention(workspaceId, projectId, "positive", PRIOR_WINDOW);
   });
 
   const refresh = () =>
