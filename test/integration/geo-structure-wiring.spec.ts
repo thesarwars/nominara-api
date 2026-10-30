@@ -94,10 +94,22 @@ describe("STORY-060 · A3 is computed by the rollup handler from parser output",
       } as unknown as Job),
     );
 
-  const rollup = () =>
-    createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
-      data: { payload: { workspaceId, kid: "k", projectId } },
-    } as unknown as Job);
+  // Inside a tenant transaction, as `withTenantJob` runs it, so `app.current_workspace()` is set: the loaders' workspace predicate
+  // (STORY-061 r4) reads nothing without it, which is the production behaviour. The context is set transaction-locally on the same
+  // connection; `withTenantContext` is not used because its after-commit hooks would reach for a queue this test does not have.
+  const rollup = async () => {
+    await db.query("BEGIN");
+    try {
+      await db.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
+      await createRollupMetricDailyHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext)(db, {
+        data: { payload: { workspaceId, kid: "k", projectId } },
+      } as unknown as Job);
+      await db.query("COMMIT");
+    } catch (error) {
+      await db.query("ROLLBACK");
+      throw error;
+    }
+  };
 
   const structureRows = async () =>
     (await db.query("SELECT * FROM geo_analyses WHERE project_id = $1 AND analysis = 'structure' ORDER BY window_days", [projectId])).rows;
