@@ -231,8 +231,9 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 
 | Method | Path | Permission | Notes |
 |---|---|---|---|
-| `POST` | `/projects/{id}/aux-audits` ✚ **¢** | `aux:trigger` | `{scope, target_urls}`. Scheduled, onboarding, and post-fix audits are **0** |
-| `GET` | `/aux-audits/{id}` | `aux:read` | score and category breakdown |
+| `POST` | `/projects/{id}/aux-audits` ✚ **¢** | `aux:trigger` | `{scope, target_urls}`. Scheduled, onboarding, and post-fix audits are **0**. Priced per FR-TL-03 (10 for <= 25 pages, +1/page); needs `X-Nominara-Confirmed-Credits` (400 absent, `409 price_changed` on a mismatch). `202` with the queued audit, `credits_charged` and the `pricing` breakdown. Refunded in full if the audit fails outright |
+| `POST` | `/projects/{id}/aux-audits/preview` | `aux:trigger` | **free, read-only** — same body; `credits` is the figure to echo in `X-Nominara-Confirmed-Credits`; no reservation, no ledger row, no job (audited as `aux_audit.previewed`) |
+| `GET` | `/aux-audits/{id}` | `aux:read` | score and category breakdown. `aux_score` is **partial** while a category is unmeasured (`score_partial`, `unmeasured_categories`); each category lists its `rules_not_evaluated` |
 | `GET` | `/projects/{id}/aux-findings` | `aux:read` | filter by severity, status, rule, URL. **Each finding carries its latest copy-ready `patch` (or `null`) and, for a rule with no patch, `guidance` with an alignment link (STORY-053).** `patch` is `null` when the latest patch was made against a file that has since changed |
 | `PATCH` | `/aux-findings/{id}` | `task:create` | acknowledge / `wont_fix` (reason required). **`resolved` is never settable by a client** |
 | `POST` | `/aux-findings/{id}/create-task` ✚ | `task:create` | manual promotion |
