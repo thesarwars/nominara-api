@@ -48,7 +48,7 @@ export const citationGapEntrySchema = z
   })
   .strict();
 
-/** STORY-057 AC5: a concept without evidence cannot exist. Stored as `[]` until STORY-058 builds the corpus. */
+/** STORY-057 AC5: a concept without evidence cannot exist. Derived from the judged semantic nodes of the prompt's cluster (src/lib/analytics/concept-gap.ts). */
 export const conceptGapEntrySchema = z
   .object({
     concept: z.string().min(1),

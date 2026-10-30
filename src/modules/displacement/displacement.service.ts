@@ -12,7 +12,9 @@ import { Page, pageFrom } from "../../api/pagination/page.js";
 import { ConflictError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { DEMO_SEED_MARKER } from "../../db/seed/demo/constants.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
-import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint, linkDisplacementToTask, recoveryTaskCount } from "../../lib/analytics/displacement-recovery.js";
+import {
+  actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint, conceptTaskFingerprint, contentTargets, linkDisplacementToTask, recoveryTaskCount,
+} from "../../lib/analytics/displacement-recovery.js";
 import type { Task } from "../../../contracts/tasks/index.js";
 import { acquireAdvisoryXactLock, projectQueueLockKey } from "../../lib/queue/locks.js";
 import { TasksService } from "../tasks/tasks.service.js";
@@ -71,6 +73,7 @@ interface StateRow {
   project_id: string;
   dismissed_at: Date | null;
   citation_gap: unknown;
+  concept_gap: unknown;
   task_id: string | null;
   in_scope: boolean;
 }
@@ -204,8 +207,8 @@ export class DisplacementService {
 
   /**
    * NEW-C-6 — `POST /displacements/{id}/recovery-plan` (STORY-057 AC6-AC9). One authority task per SEEDABLE
-   * citation gap, through `TasksService.createGeneratedTask`; a non-seedable gap stays on the record and in the
-   * feed but makes no task. Concept tasks are zero until STORY-058 stores concepts.
+   * citation gap, plus one content task per concept gap, through `TasksService.createGeneratedTask`; a non-seedable gap stays
+   * on the record and in the feed but makes no task.
    *
    * IDEMPOTENT. The fingerprint is `sha256('authority:{project_id}:{domain}')`, so a repeat call (or a second
    * displacement on the same domain) finds the open task and returns it: no duplicate, no consumed reference.
@@ -223,6 +226,8 @@ export class DisplacementService {
     if (peek.rows[0] !== undefined) await acquireAdvisoryXactLock(client, projectQueueLockKey("task.generate", peek.rows[0].project_id));
     const state = await this.lock(displacementId);
     const gap = citationGapSchema.parse(state.citation_gap);
+    // Parsed through the entry contract: a concept entry without evidence fails here rather than becoming a task.
+    const concepts = conceptGapSchema.parse(state.concept_gap);
 
     const domains = [...new Set(gap.map((g) => g.domain.toLowerCase()))];
     const seedable = await this.actionableDomains(state.project_id, domains);
@@ -242,6 +247,26 @@ export class DisplacementService {
         sourceDisplacementId: displacementId,
         sourceDomainId: seedable.get(domain) ?? null,
         affectedUrl: entry.url,
+      });
+      tasks.push(result.task);
+      if (result.created) created += 1;
+    }
+
+    // STORY-057 AC6 - one content task per distinct concept. The fingerprint is per project and concept, so a repeat call or a
+    // second displacement naming the same concept reuses the open task. A concept is a claim about what to say, so the
+    // description asks the customer to add it only if it is true of them (EC-25).
+    for (const entry of contentTargets(concepts)) {
+      const result = await this.tasks.createGeneratedTask({
+        projectId: state.project_id,
+        kind: "content",
+        origin: "auto",
+        ruleCode: null,
+        fingerprint: conceptTaskFingerprint(state.project_id, entry.concept),
+        title: `Cover "${entry.concept}" on your page`,
+        description: `${Math.round(entry.prevalence * 100)}% of the sources engines cite for this topic cover "${entry.concept}" (see ${entry.evidence_url}); your page does not. Add it only if it is true of your product.`,
+        sourceDisplacementId: displacementId,
+        sourceDomainId: null,
+        affectedUrl: entry.evidence_url,
       });
       tasks.push(result.task);
       if (result.created) created += 1;
@@ -284,7 +309,7 @@ export class DisplacementService {
   private async lock(displacementId: string): Promise<StateRow> {
     const { client, context } = this.store();
     const found = await client.query<StateRow>(
-      `SELECT id, project_id, dismissed_at, citation_gap, task_id,
+      `SELECT id, project_id, dismissed_at, citation_gap, concept_gap, task_id,
               (cardinality(app.current_scope_projects()) = 0 OR project_id = ANY(app.current_scope_projects())) AS in_scope
          FROM displacement_events WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
       [displacementId, context.workspaceId],

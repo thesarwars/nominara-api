@@ -6,6 +6,7 @@ import {
   conceptGapSchema,
   displacedBySchema,
   type CitationGapEntry,
+  type ConceptGapEntry,
 } from "../../../contracts/analytics/displacement-event.schema.js";
 import {
   detectDisplacement,
@@ -15,6 +16,7 @@ import {
   type SnapshotCitation,
   type SnapshotEntity,
 } from "../analytics/displacement.js";
+import { deriveConceptGap } from "../analytics/concept-gap.js";
 import { classifyDomain } from "../parser/citation-url.js";
 import { displacementImpactForEvent, type FunnelStage } from "../scoring/displacement-impact.js";
 import { SCORING_VERSION } from "../scoring/index.js";
@@ -37,7 +39,9 @@ import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js
 // A slot is attributed to a displacing entity only when it is a tracked
 // competitor whose `root_domain` the slot's domain matches. There is no stored
 // link from an UNTRACKED entity to a slot, so none is guessed: its gap is empty.
-// `concept_gap` is `[]` — no corpus exists (STORY-058).
+// `concept_gap` (STORY-057 AC4/AC5/AC10) comes from the prompt's cluster's JUDGED semantic nodes (`loadConceptGap`): at or above the
+// prevalence threshold, absent from the page, evidence-or-dropped. It is written when the event is first stored and never
+// replaced once non-empty, so a returning customer sees the same diagnosis (an empty gap is filled by a later run, once a corpus exists).
 //
 // A recovery that follows a COMPLETED task (ANY task reachable from the event — its linked
 // `task_id` (the plan's first task, or a deduped task shared from another displacement) or a task
@@ -184,6 +188,7 @@ async function refreshProjectDisplacementsInner(
 
     const context = await cellContext(tx, projectId, after, maxEngineWeight);
     const afterCitations = await loadCitationSlots(tx, after.id);
+    const conceptGap = await loadConceptGap(tx, workspaceId, projectId, after.prompt_id);
     for (const event of detected) {
       const gap = await citationGap(tx, workspaceId, event, afterCitations);
       const impact = displacementImpactForEvent({
@@ -205,13 +210,14 @@ async function refreshProjectDisplacementsInner(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16)
          ON CONFLICT (project_id, prompt_id, engine_key, kind, before_result_id, after_result_id) DO UPDATE
            SET displaced_by = EXCLUDED.displaced_by, citation_gap = EXCLUDED.citation_gap,
+               concept_gap = CASE WHEN jsonb_array_length(displacement_events.concept_gap) = 0 THEN EXCLUDED.concept_gap ELSE displacement_events.concept_gap END,
                impact_score = EXCLUDED.impact_score, scoring_version = EXCLUDED.scoring_version
          RETURNING (xmax = 0) AS inserted, extract(epoch FROM (detected_at - $17::timestamptz))::float8 AS lag_seconds`,
         [
           workspaceId, projectId, after.prompt_id, after.engine_key, event.kind, event.beforeResultId, event.afterResultId,
           event.beforePosition, event.afterPosition, event.beforePositionClass, event.afterPositionClass,
           JSON.stringify(displacedBySchema.parse(event.displacedBy.map(toStoredEntity))),
-          JSON.stringify(citationGapSchema.parse(gap)), JSON.stringify(conceptGapSchema.parse([])), impact, SCORING_VERSION,
+          JSON.stringify(citationGapSchema.parse(gap)), JSON.stringify(conceptGapSchema.parse(conceptGap)), impact, SCORING_VERSION,
           after.captured_at,
         ],
       );
@@ -435,6 +441,42 @@ async function citationGap(
     });
   }
   return gap.sort((a, b) => a.url.localeCompare(b.url));
+}
+
+/**
+ * STORY-057 AC4/AC5 - the concepts the cited-passage corpus carries above the prevalence threshold that the page lacks.
+ *
+ * Source: `semantic_nodes` of the prompt's cluster (STORY-059), live nodes only (not collapsed into a near-duplicate), absent from
+ * the content. A node counts only if an alignment analysis has JUDGED it: `present_in_content` defaults to false, so an
+ * unjudged node would read as "absent" and put a concept the page may already hold into the gap. A node is judged when its
+ * scope has an alignment analysed at or after the node's `computed_at` (analysis stamps both with its transaction's `now()`;
+ * a later extraction writes later nodes, which stay out until the next analysis). Fail closed.
+ *
+ * BUILDER READING: "the brand's page" is whatever page the latest analysis of the cluster read (draft or live, as that session
+ * chose); the reference names no page for a displacement. Flagged to the owner.
+ */
+async function loadConceptGap(tx: ClientBase, workspaceId: string, projectId: string, promptId: string): Promise<ConceptGapEntry[]> {
+  const clusterId = (await tx.query<{ cluster_id: string | null }>(`SELECT cluster_id FROM tracked_prompts WHERE id = $1`, [promptId])).rows[0]?.cluster_id ?? null;
+  const rows = (
+    await tx.query<{ phrase: string; prevalence: number; evidence_url: string | null }>(
+      `SELECT n.phrase, n.corpus_doc_ratio::float8 AS prevalence, n.evidence_url
+         FROM semantic_nodes n
+        WHERE n.workspace_id = $1 AND n.project_id = $2 AND n.prompt_cluster_id IS NOT DISTINCT FROM $3
+          AND n.collapsed_into_id IS NULL AND NOT n.present_in_content
+          AND EXISTS (
+            SELECT 1 FROM geo_alignments g
+             WHERE g.workspace_id = $1 AND g.project_id = $2 AND g.prompt_cluster_id IS NOT DISTINCT FROM $3
+               AND g.coverage_ratio IS NOT NULL AND g.updated_at >= n.computed_at)
+        ORDER BY n.priority_rank NULLS LAST, n.corpus_doc_ratio DESC, n.phrase_normalized, n.id`,
+      [workspaceId, projectId, clusterId],
+    )
+  ).rows;
+  const result = deriveConceptGap(rows.map((r) => ({ phrase: r.phrase, prevalence: r.prevalence, evidenceUrl: r.evidence_url })));
+  // Counts only: never a phrase or a URL (log hygiene). Zero is a measurement and is emitted.
+  observeValue("nominara_displacement_concept_gap_entries", result.entries.length, { outcome: "kept" });
+  observeValue("nominara_displacement_concept_gap_entries", result.droppedBelowThreshold, { outcome: "dropped_below_threshold" });
+  observeValue("nominara_displacement_concept_gap_entries", result.droppedNoEvidence, { outcome: "dropped_no_evidence" });
+  return result.entries;
 }
 
 /** From the verified index only; `null` when never verified — absence is not assumed. */

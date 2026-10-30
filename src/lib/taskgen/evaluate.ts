@@ -174,8 +174,9 @@ async function evaluateDisplacement(
   // evaluated day: see DISPLACEMENT_LOOKBACK_DAYS. `task_id` is what makes any reprocess of any date a no-op, and the
   // `enabled_since` TIMESTAMP is what keeps a re-enabled rule from reaching back into the period it was off.
   //
-  // TODO(STORY-058): a displacement's concept gap should yield one CONTENT task per concept (scoring-models.md §15,
-  // TG-DISPLACEMENT-RECOVER). `concept_gap` is always [] until the concept analysis ships, so only authority tasks exist.
+  // OPEN (STORY-057): a displacement's concept gap should also yield one CONTENT task per concept (scoring-models.md §15,
+  // TG-DISPLACEMENT-RECOVER). This rule is an authority rule and a content task needs its own rule row (owner approval), so only
+  // authority tasks come from this path; the on-demand recovery plan (DisplacementService.recoveryPlan) makes the content tasks.
   const events = await ctx.tx.query<{ id: string; engine_key: string; prompt_id: string; impact: number; citation_gap: unknown }>(
     `SELECT id, engine_key, prompt_id, impact_score::float8 AS impact, citation_gap
        FROM displacement_events

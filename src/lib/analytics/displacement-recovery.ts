@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ClientBase } from "pg";
 import type { CitationGapEntry, ConceptGapEntry } from "../../../contracts/analytics/index.js";
+import { normalisePhrase } from "../geo/alignment/phrases.js";
 
 // NEW-C-5 AC1 — how many tasks a recovery plan would create for a displacement.
 // STORY-057 AC6/AC8: one content task per concept gap, one authority task per
@@ -16,7 +17,33 @@ export function recoveryTaskCount(
   conceptGap: readonly Pick<ConceptGapEntry, "concept">[],
   seedableDomains: ReadonlySet<string>,
 ): number {
-  return authorityTargets(citationGap, seedableDomains).length + conceptGap.length;
+  return authorityTargets(citationGap, seedableDomains).length + contentTargets(conceptGap).length;
+}
+
+/**
+ * STORY-057 AC6 - the content tasks a plan makes: one per DISTINCT concept (normalised), in gap order. The fingerprint is per
+ * project and normalised concept, so two spellings of one concept are one task; counting them as two would make the feed's count
+ * promise a task the plan cannot create. The plan and `recoveryTaskCount` both go through this function.
+ */
+export function contentTargets<T extends Pick<ConceptGapEntry, "concept">>(conceptGap: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const targets: T[] = [];
+  for (const entry of conceptGap) {
+    const key = normalisePhrase(entry.concept);
+    if (key === "" || seen.has(key)) continue;
+    seen.add(key);
+    targets.push(entry);
+  }
+  return targets;
+}
+
+/**
+ * STORY-057 AC9 - `sha256('content:{project_id}:{normalised concept}')`. BUILDER READING: the owner fixed the authority formula
+ * (2026-10-08) and the story fixes no content formula; this is its twin, so a repeated displacement of the same concept finds
+ * the open task instead of making another.
+ */
+export function conceptTaskFingerprint(projectId: string, concept: string): Buffer {
+  return createHash("sha256").update(`content:${projectId}:${normalisePhrase(concept)}`).digest();
 }
 
 /**
