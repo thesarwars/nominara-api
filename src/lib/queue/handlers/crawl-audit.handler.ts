@@ -3,6 +3,7 @@ import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
+import { z } from "zod";
 import type { TaskGenerateJobPayload } from "../../../../contracts/tasks/index.js";
 import {
   auxErrorSummarySchema,
@@ -44,7 +45,7 @@ import { collectSitemap, MAX_SITEMAP_FILES, SitemapFetchSkipped, type SitemapRes
 import { guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
 import { uuidV7 } from "../../ids/uuidv7.js";
 import { toRegistrableDomain } from "../../net/registrable-domain.js";
-import { AUX_CATEGORY_WEIGHTS, auxScore, type AuxCategory, type AuxCountedFinding } from "../../scoring/aux.js";
+import { auxDecidedBasis, auxScore, type AuxCategory, type AuxCountedFinding } from "../../scoring/aux.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
@@ -81,9 +82,9 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // edge rules) CANNOT be evaluated at all: OWNER DECISION 2026-10-22, Nominara sends every request as NominaraBot and never under
 // another crawler's name, so a firewall or CDN rule that blocks by user agent is not observable here. AI-bot access is judged
 // from what robots.txt publishes for each AI crawler token (`ai_bot_access` in the manifest; AUX-R-001/002 as findings).
-// `excluded_rules` names all of this. THE HEADLINE (owner decision 38): when pages were judged, `aux_score` is computed over the categories that were
-// evaluated (every one but entity_clarity today: AUX-R-032/033/034 are not evaluated), renormalised to 100 and capped at 72 by a critical crawler_access
-// finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
+// `excluded_rules` names all of this. THE HEADLINE (owner decisions 38 and 52): when pages were judged, `aux_score` is computed over the RULES that were decided: a category is
+// scored on the decided rules only (its max_penalty is their weights' sum, so an unmeasured rule does not count as passed), a category with no decided rule is
+// dropped, and the sum is renormalised to 100 and capped at 72 by a critical crawler_access finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
 // (site files only) it stays null: one category's subscore is published, but that is not a headline. `score_capped` is set whenever a critical
 // crawler_access finding is open.
 //
@@ -1018,18 +1019,24 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       const lookedAt = [...urls].filter((u) => pageEvaluated.has(u)).length;
       counted.push({ category: asCategory(code), severity, ruleWeight: catalog.byCode.get(code)?.weight ?? 0, affectedPages: Math.min(pagesForScore, lookedAt) });
     }
-    // A category is PUBLISHED only when something in it was actually evaluated in this audit. crawler_access always was (the site files answered, or the audit
-    // would have failed). OWNER DECISION 38: the headline is computed over the categories that WERE evaluated, renormalised to 100, and the API labels it partial.
-    const categoriesRan = new Set<AuxCategory>(["crawler_access"]);
-    for (const rules of pageEvaluated.values()) {
-      for (const code of rules) {
-        const category = catalog.byCode.get(code)?.category as AuxCategory | undefined;
-        if (category !== undefined) categoriesRan.add(category);
-      }
+    // OWNER DECISION 52 (extending decision 38 to rule level). The rules that were DECIDED in this audit: the site-file rules whose file answered, and the page rules
+    // that ran on at least one page. A category is scored ONLY on those: max_penalty(cat) is the sum of the decided rules' weights, so a rule nobody could judge
+    // (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, the held AUX-R-013, ...) is out of the denominator instead of counting as passed. A category with no
+    // decided rule is dropped. A rule that still has an open finding from an earlier audit (stale is not fixed) is in the basis too, or its penalty would be
+    // weighed against a denominator that left it out; it stays listed in `excluded_rules` when this audit did not run it, so the headline is still partial.
+    const decidedAnywhere = new Set<string>();
+    for (const rules of pageEvaluated.values()) for (const code of rules) decidedAnywhere.add(code);
+    const decidedRules = new Set<string>(covered);
+    if (pageEvaluated.size > 0) {
+      for (const code of decidedAnywhere) decidedRules.add(code);
     }
-    const scored = auxScore({ findings: counted, pagesCrawled: pagesForScore, evaluatedCategories: [...categoriesRan] });
-    const breakdown: Partial<Record<AuxCategory, number>> = {};
-    for (const category of Object.keys(AUX_CATEGORY_WEIGHTS) as AuxCategory[]) if (categoriesRan.has(category)) breakdown[category] = scored.subscores[category];
+    for (const r of open.rows) if (pageEvaluated.size > 0 || (RAN_RULES as readonly string[]).includes(r.rule_code)) decidedRules.add(r.rule_code);
+    const basis = auxDecidedBasis(
+      [...decidedRules].flatMap((code) => {
+        const entry = catalog.byCode.get(code);
+        return entry === undefined ? [] : [{ category: entry.category as AuxCategory, weight: entry.weight }];
+      }),
+    );
     const capped = counted.some((c) => c.category === "crawler_access" && c.severity === "critical");
 
     const status = outcome.siteFilesFailed + outcome.pagesFailed + outcome.partialPages + outcome.unmodelledPages + skippedSiteFileCount(outcome) > 0 || outcome.manifestStored === false ? "partial" : "completed";
@@ -1037,8 +1044,6 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // (unreachable, or never asked for because the budget could not cover it).
     // A page rule is named only when it ran on NO page: AUX-R-026/027 with no rendered copy anywhere, AUX-R-029 with no measured timing anywhere.
     // With no page modelled, every page rule is excluded (and `page_crawl` too when none was crawled at all).
-    const decidedAnywhere = new Set<string>();
-    for (const rules of pageEvaluated.values()) for (const code of rules) decidedAnywhere.add(code);
     const notRunOnPages =
       pageEvaluated.size > 0
         ? [...NOT_EVALUATED_CODES, ...PAGE_RULE_CODES.filter((code) => !decidedAnywhere.has(code))]
@@ -1046,6 +1051,22 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
           ? RULES_NOT_RUN
           : EXCLUDED_RULES;
     const excluded = [...new Set([...notRunOnPages, ...RAN_RULES.filter((code) => !covered.has(code))])];
+
+    // The headline (decision 52): over the categories with a decided rule, each scored against its decided rules' weights, and PARTIAL whenever any rule went unmeasured
+    // (`excluded` names them). With no category decided there is nothing to score; with no page judged the site files alone are not a headline (it stays null).
+    const breakdown: Partial<Record<AuxCategory, number>> = {};
+    let headline: number | null = null;
+    if (basis.categories.length > 0) {
+      const scored = auxScore({
+        findings: counted,
+        pagesCrawled: pagesForScore,
+        evaluatedCategories: basis.categories,
+        categoryMaxPenalty: basis.categoryMaxPenalty,
+        unmeasuredRules: excluded.filter((code) => catalog.byCode.has(code)),
+      });
+      for (const category of basis.categories) breakdown[category] = scored.subscores[category];
+      if (pageEvaluated.size > 0) headline = scored.score;
+    }
 
     await tx.query(
       `UPDATE aux_audits
@@ -1063,8 +1084,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         counts.critical, counts.high, counts.medium, counts.low, finishedAt,
         [...new Set(outcome.allSiteFileUrls)], excluded, outcome.domObjectPrefix, outcome.errorSummary,
         // null = no page was judged, so the site files alone are not a headline score; 0 would be a measured zero. With pages judged it is the partial score of
-        // owner decision 38 (the API serves `score_partial` and `unmeasured_categories`, derived from this breakdown).
-        pageEvaluated.size > 0 ? scored.score : null,
+        // owner decisions 38 and 52 (the API serves `score_partial` and `unmeasured_categories`, derived from this breakdown and the excluded rules).
+        headline,
       ],
     );
 
@@ -1143,17 +1164,26 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // onboarding or scheduled job has no charge and no row: nothing to settle, so the failure stays visible in the DLQ.
     async recover(tx: ClientBase, job: Job, failure) {
       if (!isFinalAttempt(job) && !isUnretryable(job, failure.error)) return false;
-      const parsed = crawlAuditJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload);
-      if (!parsed.success || parsed.data.trigger !== "manual") return false;
-      const settled = await failManualAudit(tx, { workspaceId: parsed.data.workspaceId, auditId: parsed.data.auditId, reason: "job_failed", at: now() });
+      // A payload this build can no longer parse (a newer producer's field, a schema drift) is exactly the job that fails every attempt, so it must not be the one
+      // that is left unrefunded: read just the three fields a refund needs, each validated, from the signature-verified envelope. The write is still confined to the
+      // job's tenant (failManualAudit's workspace predicate), so a wrong id settles nothing. A payload with no readable audit id is left to the 60-minute reaper
+      // (aux/stale-audit-reaper.ts), which finds the row by status and age and needs no payload at all.
+      const raw = (job.data as { payload: unknown }).payload;
+      const parsed = crawlAuditJobPayloadSchema.safeParse(raw);
+      const settleable = parsed.success ? parsed.data : refundFieldsSchema.safeParse(raw).data;
+      if (settleable === undefined || settleable.trigger !== "manual") return false;
+      const settled = await failManualAudit(tx, { workspaceId: settleable.workspaceId, auditId: settleable.auditId, reason: "job_failed", at: now() });
       if (settled) {
         incrementCounter("nominara_aux_audit_job_recovered_total", { phase: failure.phase });
-        logger.warn({ event: "aux.audit.job_failed", workspace_id: parsed.data.workspaceId, audit_id: parsed.data.auditId, phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });
+        logger.warn({ event: "aux.audit.job_failed", workspace_id: settleable.workspaceId, audit_id: settleable.auditId, phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });
       }
       return settled;
     },
   });
 }
+
+/** The three fields a refund needs, for a payload the full schema rejects. Unknown keys are ignored here on purpose: this is the fallback for a payload we cannot parse. */
+const refundFieldsSchema = z.object({ auditId: z.string().uuid(), workspaceId: z.string().uuid(), trigger: z.string() });
 
 /** True when BullMQ will not retry this job whatever the attempt count says: an `UnrecoverableError` (by name, as dead-letter.ts does), or a job with no retry ladder at all. */
 function isUnretryable(job: Pick<Job, "opts">, error: unknown): boolean {

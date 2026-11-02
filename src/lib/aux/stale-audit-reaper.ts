@@ -14,30 +14,31 @@ import { failManualAudit } from "./fail-manual-audit.js";
 //
 // ONLY `manual`: an onboarding or scheduled audit has no charge and no row until it runs, so there is nothing to give back or to fail.
 //
-// RUNS ON THE SWEEP'S OWNER CONNECTION (it must see across tenants to find them), but every write is inside a per-audit withTenantContext, so RLS is the
-// guarantee for the refund. A job that is in fact still running when the bound passes loses the race to nothing: its commit finds a `failed` row and
+// RUNS ON THE SWEEP'S OWNER CONNECTION (it must see across tenants to find them). The owner connection is NOT bound by RLS, so RLS is not what protects the write:
+// every write is inside a per-audit withTenantContext (which sets the workspace for the transaction), and failManualAudit's UPDATE carries
+// `workspace_id = app.current_workspace()` itself, so it can only move an audit of the tenant the context was set to. The 60-minute cutoff is computed in SQL
+// (`now() - interval`), on the clock that stamped `created_at`, not from the sweep's application clock. A job that is in fact still running when the bound passes loses the race to nothing: its commit finds a `failed` row and
 // writes nothing (claimAudit), and the customer has their credits back.
 
 const logger = new Logger("aux.stale-audit-reaper");
 
 /** Owner decision 40: 60 minutes. */
 export const MANUAL_AUDIT_STALE_AFTER_MINUTES = 60;
-const MANUAL_AUDIT_STALE_AFTER_MS = MANUAL_AUDIT_STALE_AFTER_MINUTES * 60 * 1000;
 
-export async function reapStaleManualAudits(client: ClientBase, now: Date, boundMs: number = MANUAL_AUDIT_STALE_AFTER_MS): Promise<{ readonly reaped: number }> {
-  const cutoff = new Date(now.getTime() - boundMs);
+/** `now` stamps `finished_at` only; which audits are stale is decided by the database's clock. */
+export async function reapStaleManualAudits(client: ClientBase, now: Date, staleAfterMinutes: number = MANUAL_AUDIT_STALE_AFTER_MINUTES): Promise<{ readonly reaped: number }> {
   // IDs only: no tenant content is read.
   const stale = await client.query<{ id: string; workspace_id: string }>(
     `SELECT id, workspace_id FROM aux_audits
-      WHERE trigger = 'manual' AND status IN ('queued', 'running') AND created_at < $1
+      WHERE trigger = 'manual' AND status IN ('queued', 'running') AND created_at < now() - make_interval(mins => $1::int)
       ORDER BY created_at ASC LIMIT 500`,
-    [cutoff],
+    [staleAfterMinutes],
   );
   let reaped = 0;
   for (const row of stale.rows) {
     try {
       const done = await withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, (tx) =>
-        failManualAudit(tx, { workspaceId: row.workspace_id, auditId: row.id, reason: "stale", at: now, createdBefore: cutoff }),
+        failManualAudit(tx, { workspaceId: row.workspace_id, auditId: row.id, reason: "stale", at: now, olderThanMinutes: staleAfterMinutes }),
       );
       if (!done) continue;
       reaped += 1;

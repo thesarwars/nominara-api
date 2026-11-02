@@ -266,11 +266,11 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
     expect(new Set((await audits()).map((a) => a.id)).size).toBe(2);
   });
 
-  it("AUXLIVE-3 AC5 · the audit id and the ledger key are the derived ones, so the DATABASE refuses a replay: the audit id is manualAuditIdentity(workspace, key)", async () => {
+  it("AUXLIVE-3 AC5 · the audit id and the ledger key are the derived ones, so the DATABASE refuses a replay: the audit id is manualAuditIdentity(workspace, actor, project, key)", async () => {
     const key = randomUUID();
     const res = await trigger({}, projectId, { idempotencyKey: key });
     const { manualAuditIdentity } = await import("../../src/lib/aux/manual-audit-id.js");
-    const derived = manualAuditIdentity(workspaceId, key);
+    const derived = manualAuditIdentity(workspaceId, actorId, projectId, key);
     expect(res.audit_id).toBe(derived.auditId);
     expect((await ledger()).filter((r) => r.entry_type === "commit")[0]!.idempotency_key).toBe(derived.ledgerKey);
   });

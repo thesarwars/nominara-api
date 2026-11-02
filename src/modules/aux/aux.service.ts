@@ -24,7 +24,7 @@ import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoun
 import { PG_POOL } from "../../db/pg-pool.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../lib/aux/audit-constants.js";
 import { AUX_AUDIT_BASE_CREDITS, AUX_AUDIT_BASE_PAGES, AUX_AUDIT_EXTRA_PAGE_CREDITS, auxAuditPrice, auxAuditPricing } from "../../lib/aux/audit-price.js";
-import { IDEMPOTENCY_REPLAY_WINDOW_HOURS, manualAuditIdentity } from "../../lib/aux/manual-audit-id.js";
+import { IDEMPOTENCY_REPLAY_WINDOW_HOURS, manualAuditIdentity, type ManualAuditIdentity } from "../../lib/aux/manual-audit-id.js";
 import { AUX_AUDITS_ENTITLEMENT, auxAuditsIncluded, crawlAuditIdempotencyKey } from "../../lib/aux/onboarding-audit.js";
 import { pageCapForPlan } from "../../lib/aux/page-selection.js";
 import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
@@ -83,13 +83,18 @@ const AUDIT_SELECT = `
              FROM (SELECT c.category, jsonb_agg(c.code ORDER BY c.code) AS codes
                      FROM aux_rule_catalog c WHERE c.code = ANY(a.excluded_rules) GROUP BY c.category) g
          ), '{}'::jsonb) AS excluded_by_category,
-         (SELECT p.aux_score FROM aux_audits p
-           WHERE p.project_id = a.project_id AND p.aux_score IS NOT NULL
-             AND (p.created_at, p.id) < (a.created_at, a.id)
-           ORDER BY p.created_at DESC, p.id DESC LIMIT 1) AS previous_score,
+         a.excluded_rules AS excluded_codes,
+         prev.aux_score AS previous_score, prev.rule_version AS previous_rule_version, prev.excluded_rules AS previous_excluded_codes,
          ${SCOPE_OK.replace("%P%", "a.project_id")} AS in_scope
     FROM aux_audits a
-    JOIN projects pr ON pr.id = a.project_id AND pr.deleted_at IS NULL`;
+    JOIN projects pr ON pr.id = a.project_id AND pr.deleted_at IS NULL
+    -- the previous SCORED audit: its score, and how it was measured (rule version, unmeasured rules), so a delta is only shown between like audits
+    LEFT JOIN LATERAL (
+      SELECT p.aux_score, p.rule_version, p.excluded_rules FROM aux_audits p
+       WHERE p.project_id = a.project_id AND p.aux_score IS NOT NULL
+         AND (p.created_at, p.id) < (a.created_at, a.id)
+       ORDER BY p.created_at DESC, p.id DESC LIMIT 1
+    ) prev ON true`;
 
 const FINDING_SELECT = `
   SELECT f.id, f.audit_id, f.project_id, f.rule_code, f.title, c.category, f.severity, f.status,
@@ -328,7 +333,7 @@ export class AuxService {
    * refused request leaves no audit, no ledger entry and no job) and the queued audit row. The job is enqueued only AFTER COMMIT (KAD-06): a rollback never
    * leaves a job for an audit that does not exist, and no transaction is held across the queue.
    *
-   * IDENTITY IS THE CALLER'S IDEMPOTENCY KEY. The audit id and the ledger key are derived from (workspace, `Idempotency-Key`), so a replay is refused by the
+   * IDENTITY IS THE CALLER'S IDEMPOTENCY KEY. The audit id and the ledger key are derived from (workspace, user, project, `Idempotency-Key`), so a replay is refused by the
    * DATABASE - `ux_credit_ledger_idem`, the `aux_audits` primary key - whatever the Valkey `IdempotencyInterceptor` still holds (it fails open by design: allkeys-lru).
    * A transaction-scoped advisory lock on that identity makes a concurrent retry wait for the first attempt and then read its answer. A replay returns the
    * audit that already exists and charges nothing; the same key with a different body is `409 idempotency_conflict`.
@@ -356,6 +361,10 @@ export class AuxService {
     const workspaceId = store.context.workspaceId;
     // A malformed header is a 400 before any row is read; whether one is REQUIRED is decided from the recomputed price.
     const confirmed = parseConfirmedCredits(options.confirmedCredits);
+    // The identity is scoped by the actor (review round 5), as the Idempotency interceptor's record is by the user; without one there is nothing to scope by, so fail
+    // closed rather than let every actor-less caller share one identity.
+    const actorId = actor.id;
+    if (actorId === null) throw new Error("AuxService.triggerAudit requires an authenticated actor to scope the Idempotency-Key");
     const clientKey = options.idempotencyKey;
     if (clientKey === undefined || clientKey.length === 0 || clientKey.length > 255) {
       throw new ValidationFailedError({
@@ -368,13 +377,13 @@ export class AuxService {
       try {
         await this.assertProjectVisible(projectId);
         // Serialise attempts that share a client key (every generation of it): the second waits for the first to commit, then finds its audit below.
-        await acquireAdvisoryXactLock(tx, [AUX_AUDIT_REFERENCE, manualAuditIdentity(workspaceId, clientKey).auditId].join(":"));
+        await acquireAdvisoryXactLock(tx, [AUX_AUDIT_REFERENCE, manualAuditIdentity(workspaceId, actorId, projectId, clientKey).auditId].join(":"));
         // OWNER DECISION 48: walk the key's generations. One whose audit is inside the 24-hour window is REPLAYED; one past it is skipped (the key has outlived
         // it); the first with no audit is where a new one is made. Each skipped generation is a full window old, so the walk is as long as the key's age in days.
         let generation = 0;
-        let identity = manualAuditIdentity(workspaceId, clientKey, generation);
+        let identity = manualAuditIdentity(workspaceId, actorId, projectId, clientKey, generation);
         for (;;) {
-          const replay = await this.replayOf(tx, identity.auditId, clientKey, projectId, body);
+          const replay = await this.replayOf(tx, identity, workspaceId, actorId, clientKey, projectId, body);
           if (replay === null) break;
           if (replay !== "expired") {
             incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "replayed" });
@@ -382,7 +391,7 @@ export class AuxService {
             return replay;
           }
           generation += 1;
-          identity = manualAuditIdentity(workspaceId, clientKey, generation);
+          identity = manualAuditIdentity(workspaceId, actorId, projectId, clientKey, generation);
         }
         const { auditId, ledgerKey } = identity;
 
@@ -414,7 +423,7 @@ export class AuxService {
         await tx.query(
           `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, triggered_by, scope, target_urls, rule_version, tokenizer, status, request_hash)
            VALUES ($1, $2, $3, 'manual', $4, $5, $6, $7, $8, 'queued', $9)`,
-          [auditId, workspaceId, projectId, actor.type === "user" ? actor.id : null, quote.scope, body.target_urls ?? [], AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER, requestHashOf(projectId, body)],
+          [auditId, workspaceId, projectId, actor.type === "user" ? actor.id : null, quote.scope, body.target_urls ?? [], AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER, requestHashOf(actorId, projectId, body)],
         );
 
         afterCommit(() => {
@@ -497,7 +506,16 @@ export class AuxService {
    * (a first attempt), and `"expired"` when there is one but it was requested more than 24 hours ago (owner decision 48): the key has outlived its window, so
    * the caller moves to the key's next generation. Inside the window, the same identity asked for something else (another project, scope or URL list) is a conflict, never a quiet return of the wrong audit.
    */
-  private async replayOf(tx: ClientBase, auditId: string, clientKey: string, projectId: string, body: TriggerAuxAuditRequest): Promise<TriggerAuxAuditResponse | "expired" | null> {
+  private async replayOf(
+    tx: ClientBase,
+    identity: ManualAuditIdentity,
+    workspaceId: string,
+    actorId: string,
+    clientKey: string,
+    projectId: string,
+    body: TriggerAuxAuditRequest,
+  ): Promise<TriggerAuxAuditResponse | "expired" | null> {
+    const auditId = identity.auditId;
     // The request is compared with request_hash, written once at insert: scope and target_urls are REWRITTEN by crawl.audit (verification decides the scope; the
     // crawled pages replace the hints), so they cannot say what was asked. The status and the refunds are read live: a replay reports where the audit has got to.
     const found = await tx.query<{ request_hash: string | null; scope: NonNullable<TriggerAuxAuditRequest["scope"]>; status: TriggerAuxAuditResponse["status"]; created_at: Date; expired: boolean; charged: string | null; refunded: string }>(
@@ -508,10 +526,19 @@ export class AuxService {
       [auditId, AUX_AUDIT_REFERENCE, IDEMPOTENCY_REPLAY_WINDOW_HOURS],
     );
     const row = found.rows[0];
-    if (row === undefined) return null;
+    if (row === undefined) {
+      // No audit row, but the generation's ledger entry may outlive it: a project hard delete cascades `aux_audits`, and the append-only ledger keeps the charge. Taking
+      // this generation again would run into its ledger key (500), so an entry older than the window means the generation is spent - expired, the walk moves on.
+      // The age is the ledger entry's own (the first one this identity wrote), on the database clock.
+      const spent = await tx.query<{ expired: boolean }>(
+        `SELECT (min(occurred_at) <= now() - make_interval(hours => $3)) AS expired FROM credit_ledger WHERE workspace_id = $1 AND idempotency_key = $2 HAVING count(*) > 0`,
+        [workspaceId, identity.ledgerKey, IDEMPOTENCY_REPLAY_WINDOW_HOURS],
+      );
+      return spent.rows[0]?.expired === true ? "expired" : null;
+    }
     // Past the window the key means nothing for this audit: not a replay and not a conflict (a different body is a new request, as on every paid action).
     if (row.expired) return "expired";
-    if (row.request_hash !== requestHashOf(projectId, body)) {
+    if (row.request_hash !== requestHashOf(actorId, projectId, body)) {
       throw new IdempotencyConflictError({
         message: "this Idempotency-Key was already used for a different AUX audit request",
         // Hashes and a time only: never the key, the project or a URL.
@@ -557,9 +584,9 @@ export class AuxService {
   }
 }
 
-/** The immutable record of a manual audit request: project, the scope asked for (absent = key_pages) and the URL hints, in the order sent. */
-function requestHashOf(projectId: string, body: TriggerAuxAuditRequest): string {
-  return createHash("sha256").update(JSON.stringify([projectId, body.scope ?? "key_pages", body.target_urls ?? []])).digest("hex");
+/** The immutable record of a manual audit request: actor, project, the scope asked for (absent = key_pages) and the URL hints, in the order sent. */
+function requestHashOf(actorId: string, projectId: string, body: TriggerAuxAuditRequest): string {
+  return createHash("sha256").update(JSON.stringify([actorId, projectId, body.scope ?? "key_pages", body.target_urls ?? []])).digest("hex");
 }
 
 interface AuditRow {
@@ -587,6 +614,10 @@ interface AuditRow {
   excluded: { rule_code: string; title: string }[];
   excluded_by_category: Record<string, string[]>;
   previous_score: string | null;
+  /** How the previous scored audit was measured: a delta is shown only between audits measured the same way (owner decision 52). */
+  previous_rule_version: string | null;
+  excluded_codes: string[];
+  previous_excluded_codes: string[] | null;
   in_scope: boolean;
 }
 
@@ -676,6 +707,14 @@ function toAudit(row: AuditRow): AuxAudit {
   const previous = num(row.previous_score);
   const breakdown = row.score_breakdown ?? {};
   const unmeasured = AUX_CATEGORIES.filter((category) => typeof breakdown[category] !== "number");
+  // Owner decision 52: a published category that lists a rule it did not run was scored on the rules that WERE decided - not a full measurement either.
+  const rulesUnmeasured = Object.values(row.excluded_by_category).some((codes) => codes.length > 0);
+  // Two scores are comparable only when they were measured the same way: the same rule version and the same set of unmeasured rules.
+  const sameBasis =
+    previous !== null &&
+    row.previous_rule_version === row.rule_version &&
+    row.previous_excluded_codes !== null &&
+    [...row.excluded_codes].sort().join(",") === [...row.previous_excluded_codes].sort().join(",");
   return {
     audit_id: row.id,
     project_id: row.project_id,
@@ -688,11 +727,14 @@ function toAudit(row: AuditRow): AuxAudit {
     pages_crawled: row.pages_crawled,
     pages_failed: row.pages_failed,
     aux_score: score,
-    // Owner decision 38: the headline is over the categories that were measured, so it is labelled partial whenever one is missing. A null score is not partial.
-    score_partial: score !== null && unmeasured.length > 0,
+    // Owner decisions 38 and 52: the headline is over the rules that were decided, so it is labelled partial whenever a category is missing OR a rule went
+    // unmeasured inside a published one. A null score is not partial.
+    score_partial: score !== null && (unmeasured.length > 0 || rulesUnmeasured),
     unmeasured_categories: unmeasured,
     capped: row.score_capped,
-    delta: score === null || previous === null ? null : Math.round((score - previous) * 1000) / 1000,
+    // null when either score is absent, and null across audits measured differently (a rule-version bump, or a different set of unmeasured rules): that gap is the
+    // measurement changing, not the site. 0 stays 0.
+    delta: score === null || previous === null || !sameBasis ? null : Math.round((score - previous) * 1000) / 1000,
     rule_version: row.rule_version,
     categories: AUX_CATEGORIES.flatMap((category) => {
       const subscore = breakdown[category];

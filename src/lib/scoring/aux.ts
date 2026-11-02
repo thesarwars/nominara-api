@@ -102,6 +102,29 @@ export interface AuxScoreInput {
    * score of nothing, and `null` (not measured) must never be turned into `0` here.
    */
   readonly evaluatedCategories?: readonly AuxCategory[];
+  /**
+   * OWNER DECISION 52 (2026-11-02), rule level. The rules that went unmeasured in this audit (held, or with no input). A non-empty list makes the result
+   * `partial` even when every category was evaluated: a category scored without a rule is not a full measurement. The list does not change the arithmetic -
+   * `categoryMaxPenalty` (see `auxDecidedBasis`) is what keeps an undecided rule from counting as passed.
+   */
+  readonly unmeasuredRules?: readonly string[];
+}
+
+/** A rule that was DECIDED in this audit, reduced to what the basis needs: its category and its catalog weight. */
+export interface AuxDecidedRule {
+  readonly category: AuxCategory;
+  readonly weight: number;
+}
+
+/**
+ * OWNER DECISION 52. A category is scored only on the rules that were actually decided: `max_penalty(cat)` is the sum of the DECIDED rules' weights in it, so a
+ * rule nobody could judge is out of the denominator and so cannot count as passed. A category with no decided rule is absent from `categories` (it is
+ * dropped, as decision 38 already did for a whole category). The result feeds `auxScore` as `evaluatedCategories` and `categoryMaxPenalty`.
+ */
+export function auxDecidedBasis(rules: readonly AuxDecidedRule[]): { readonly categories: readonly AuxCategory[]; readonly categoryMaxPenalty: Partial<Record<AuxCategory, number>> } {
+  const categoryMaxPenalty: Partial<Record<AuxCategory, number>> = {};
+  for (const rule of rules) categoryMaxPenalty[rule.category] = (categoryMaxPenalty[rule.category] ?? 0) + rule.weight;
+  return { categories: AUX_CATEGORIES.filter((c) => (categoryMaxPenalty[c] ?? 0) > 0), categoryMaxPenalty };
 }
 
 export interface AuxScoreResult {
@@ -110,7 +133,7 @@ export interface AuxScoreResult {
   /** True only when the hard cap actually changed the value. */
   readonly capped: boolean;
   readonly subscores: Readonly<Record<AuxCategory, number>>;
-  /** True when `score` leaves categories out (`evaluatedCategories` named fewer than six). */
+  /** True when `score` leaves categories out (`evaluatedCategories` named fewer than six) OR any rule went unmeasured (`unmeasuredRules`, decision 52). */
   readonly partial: boolean;
   /** The categories left out of `score`, in the reference's order. */
   readonly unmeasured: readonly AuxCategory[];
@@ -157,5 +180,5 @@ export function auxScore(input: AuxScoreInput): AuxScoreResult {
   const rounded = Number(((100 * weighted) / weightSum).toFixed(1));
   const score = hasCriticalCrawlerAccess ? Math.min(rounded, AUX_HARD_CAP) : rounded;
 
-  return { score, capped: hasCriticalCrawlerAccess && rounded > AUX_HARD_CAP, subscores, partial: unmeasured.length > 0, unmeasured };
+  return { score, capped: hasCriticalCrawlerAccess && rounded > AUX_HARD_CAP, subscores, partial: unmeasured.length > 0 || (input.unmeasuredRules?.length ?? 0) > 0, unmeasured };
 }
