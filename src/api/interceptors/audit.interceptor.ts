@@ -7,6 +7,7 @@ import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { AUDIT_METADATA_KEY, type AuditOptions } from "../decorators/audit.decorator.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { SKIP_TENANT_CONTEXT_KEY } from "../decorators/skip-tenant-context.decorator.js";
+import { STREAMING_KEY } from "../decorators/streaming.decorator.js";
 import type { WorkspaceScopedRequest } from "../guards/workspace.guard.js";
 
 // STORY-020 — security-and-tenancy.md §12. Registered AFTER
@@ -167,6 +168,13 @@ export class AuditInterceptor implements NestInterceptor {
       this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [context.getHandler(), context.getClass()]) ||
       this.reflector.getAllAndOverride<boolean>(SKIP_TENANT_CONTEXT_KEY, [context.getHandler(), context.getClass()]);
     if (isExempt) {
+      return next.handle();
+    }
+
+    // STORY-079 - a @Streaming() route opens its own short transactions (streaming.decorator.ts), so there is no ambient store to append to and no response
+    // body to name a resource from. The marker already exempts the tenant-context, envelope and idempotency interceptors; this is the fourth. Such a route
+    // audits ITSELF, in the transaction in which it writes (VisibilityScanService.start), and the coverage sweep treats it as exempt (discover-routes.ts).
+    if (this.reflector.getAllAndOverride<boolean>(STREAMING_KEY, [context.getHandler(), context.getClass()]) === true) {
       return next.handle();
     }
 

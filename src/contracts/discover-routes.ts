@@ -7,6 +7,7 @@ import { AUDIT_METADATA_KEY } from "../api/decorators/audit.decorator.js";
 import { NO_ENVELOPE_KEY } from "../api/decorators/no-envelope.decorator.js";
 import { IS_PUBLIC_KEY } from "../api/decorators/public.decorator.js";
 import { SKIP_TENANT_CONTEXT_KEY } from "../api/decorators/skip-tenant-context.decorator.js";
+import { STREAMING_KEY } from "../api/decorators/streaming.decorator.js";
 
 // STORY-023 T3 — ADR-0002 says `contracts:generate` "must either boot the
 // Nest container or walk route metadata via DiscoveryService". Empirically
@@ -178,7 +179,7 @@ export async function discoverContractRoutes(): Promise<DiscoveredContractRoute[
           audited:
             Reflect.getMetadata(AUDIT_METADATA_KEY, handler) !== undefined ||
             Reflect.getMetadata(AUDIT_METADATA_KEY, exported) !== undefined,
-          auditExempt: [IS_PUBLIC_KEY, SKIP_TENANT_CONTEXT_KEY].some(
+          auditExempt: [IS_PUBLIC_KEY, SKIP_TENANT_CONTEXT_KEY, STREAMING_KEY].some(
             (key) =>
               (Reflect.getMetadata(key, handler) as boolean | undefined) === true ||
               (Reflect.getMetadata(key, exported) as boolean | undefined) === true,

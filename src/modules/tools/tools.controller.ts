@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Res } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Req, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import {
   convertToolRunRequestSchema,
   convertToolRunResponseSchema,
+  scanStreamCompletedSchema,
   toolRunConversionPreviewSchema,
   toolRunDetailSchema,
   toolRunIdSchema,
@@ -10,6 +11,8 @@ import {
   toolRunListResponseSchema,
   toolRunSchema,
   updateToolRunRequestSchema,
+  visibilityScanEstimateResponseSchema,
+  visibilityScanRequestSchema,
   type ConvertToolRunRequest,
   type ConvertToolRunResponse,
   type ToolRun,
@@ -17,8 +20,12 @@ import {
   type ToolRunDetail,
   type ToolRunListQuery,
   type UpdateToolRunRequest,
+  type VisibilityScanEstimateResponse,
+  type VisibilityScanRequest,
 } from "../../../contracts/tools/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { DailyCap } from "../../api/decorators/daily-cap.decorator.js";
+import { Streaming } from "../../api/decorators/streaming.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
@@ -27,7 +34,10 @@ import { entityTagFor, formatEntityTag } from "../../api/etag/entity-tag.js";
 import { ifNoneMatchMatches } from "../../api/etag/if-none-match.js";
 import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
+import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
+import { openSseReply } from "../../api/streaming/sse-reply.js";
 import { ToolsService } from "./tools.service.js";
+import { VisibilityScanService } from "./visibility-scan.service.js";
 
 // A controller resolves the request, calls one service method, and returns - no logic here (coding-standards.md section 1).
 // api-specification.md section 3 "Tools". Tool runs belong to the WORKSPACE, not to a project, so these routes name no project and
@@ -38,7 +48,46 @@ const idPipe = new ZodValidationPipe(toolRunIdSchema);
 
 @Controller("tools")
 export class ToolsController {
-  constructor(private readonly service: ToolsService) {}
+  constructor(
+    private readonly service: ToolsService,
+    private readonly scans: VisibilityScanService,
+  ) {}
+
+  // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
+  @Get("visibility-scan/estimate")
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "estimateVisibilityScan", responseSchema: visibilityScanEstimateResponseSchema })
+  estimateScan(): Promise<VisibilityScanEstimateResponse> {
+    return this.scans.estimate();
+  }
+
+  // STORY-079 - api-specification.md section 9. Refusals (400 / 402 / 409 / 429) are ordinary problem responses BEFORE the stream opens; once it has
+  // opened, every outcome - including all engines failing - ends with `scan.completed`. @Streaming(): the request holds no transaction across the stream.
+  @Post("visibility-scan")
+  @Streaming()
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @DailyCap("lookup")
+  @ApiContract({ operationId: "startVisibilityScan", requestSchema: visibilityScanRequestSchema, responseSchema: scanStreamCompletedSchema, requiresIdempotencyKey: true })
+  async scan(
+    @Body(new ZodValidationPipe(visibilityScanRequestSchema)) body: VisibilityScanRequest,
+    @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
+    @Headers("idempotency-key") idempotencyKey: string | undefined,
+    @Headers("user-agent") userAgent: string | undefined,
+    @Req() request: AuditableRequest,
+    @Res() reply: FastifyReply,
+  ): Promise<void> {
+    const tenant = request.tenant;
+    if (tenant === undefined) throw new Error("the scan route has no tenant context: WorkspaceGuard did not run");
+    const accepted = await this.scans.accept(
+      tenant,
+      body,
+      { confirmedCredits, idempotencyKey },
+      { actorType: request.authMethod === "apiKey" ? "api_key" : "user", ip: request.ip ?? null, userAgent: userAgent ?? null, requestId: String(request.id ?? "") },
+    );
+    await this.scans.stream(tenant, accepted, openSseReply(reply));
+  }
 
   @Get("runs")
   @RequirePermission("lookup:read_history")

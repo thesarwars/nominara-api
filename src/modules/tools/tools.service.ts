@@ -387,6 +387,15 @@ export class ToolsService {
     return toDetail(row);
   }
 
+  /** A read of one run for a caller that is not a person re-opening it (the scan's stream): the same row as `get`, without counting a re-open. */
+  async peek(id: string): Promise<ToolRunDetail> {
+    const { client } = this.store();
+    const found = await client.query<RunRow>(`SELECT ${COLUMNS} FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1`, [id]);
+    const row = found.rows[0];
+    if (row === undefined) throw new NotFoundError({ message: "no such tool run" });
+    return toDetail(row);
+  }
+
   /** AC10 - pinning is a flag that the `?pinned=` filter selects on (the timeline is not re-sorted by it). Owner decision 32 (2026-10-30). It touches no retention column: `expires_at` is not in this statement. */
   async setPinned(id: string, pinned: boolean): Promise<ToolRun> {
     const { client } = this.store();
