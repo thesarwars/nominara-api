@@ -513,6 +513,12 @@ export function isSameTemplate(a: readonly string[], b: readonly string[]): bool
   return shared / (left.size + right.size - shared) >= SAME_PAGE_SHINGLE_OVERLAP;
 }
 
+/** A word of at least ECHO_PREFIX_MIN_LENGTH characters that is a prefix of the nonce: the page printed a truncated copy of what it was given. */
+const ECHO_PREFIX_MIN_LENGTH = 5;
+function echoesPrefix(haystack: string, nonce: string): boolean {
+  return haystack.split(/[^\p{L}\p{N}]+/u).some((word) => word.length >= ECHO_PREFIX_MIN_LENGTH && nonce.startsWith(word));
+}
+
 type CanaryResult = "not_named" | "different" | "echoed_nonce" | "same_page" | "unbuildable" | "failed";
 
 function recordCanary(plan: SubmissionPlan, result: CanaryResult): void {
@@ -526,8 +532,9 @@ function recordCanary(plan: SubmissionPlan, result: CanaryResult): void {
  * Owner decision 46 - the test fetch. When `target` (the submitted URL, or the page the redirects ended on) names the brand in its path
  * or query, fetch the same URL with the brand replaced by a random nonce, through the same fetcher with the same domain and redirect
  * rules, and compare it with the page already fetched (`page`, the page at `target`). Null = proceed to verify the page.
- *   - the nonce is in the canary's text or final URL: the site reflects what it is given          -> url_echoes_brand
- *   - the canary is a 2xx page that is the SAME TEMPLATE once brand and nonce are removed          -> url_echoes_brand (any slug serves this page)
+ *   - the nonce (or a 5+ letter prefix of it) is in the canary's text: the site reflects what it is given -> url_echoes_brand
+ *   - the canary still names the brand, or ended on the original page's URL (decision 49)            -> null (verify: id-routed sites)
+ *   - the canary is a 2xx page that is the SAME TEMPLATE, brand and nonce removed, and no longer names the brand -> url_echoes_brand
  *   - the canary is 404/410, a redirect that was not followed, not text, or a different page      -> null (the site tells slugs apart)
  *   - the canary could not be fetched, or answered 5xx/429/403/...                                 -> FAIL CLOSED, with the fetch's own reason
  *   - no canary can be built (the token is split over two pieces, or cannot be located)            -> url_echoes_brand (fail closed)
@@ -566,13 +573,20 @@ async function canaryRefusal(
     return null;
   }
   const text = visibleText(response.body.toString("utf8"));
-  // The final URL counts only when a redirect LANDED somewhere that carries the nonce (the URL we asked for carries it by construction).
-  const landed = normalisedHref(response.finalUrl) === normalisedHref(canary.url) ? "" : decodeLoosely(response.finalUrl);
-  const haystack = `${text}\n${decodeLoosely(text)}\n${landed}`.toLowerCase();
-  if (canary.nonces.some((value) => haystack.includes(value.toLowerCase()))) {
+  // The text only: a redirect that keeps the slug (/tag/x -> /tag/x/) is not a reflection, so the landed URL is not read (round 6).
+  const haystack = `${text}\n${decodeLoosely(text)}`.toLowerCase();
+  const lowerNonces = canary.nonces.map((value) => value.toLowerCase());
+  if (lowerNonces.some((value) => haystack.includes(value) || echoesPrefix(haystack, value))) {
     recordCanary(plan, "echoed_nonce");
     return { status: "unverified", reason: "url_echoes_brand" };
   }
+  // Owner decision 49: the nonce is not reflected. A canary that still names the brand got it from the content; one redirected back
+  // to the canonical page is the site normalising the slug. Both mean the original page is a real page: verify.
+  if (mentionsBrand(text, plan.brand) || normalisedHref(response.finalUrl) === normalisedHref(page.finalUrl)) {
+    recordCanary(plan, "different");
+    return null;
+  }
+  // The same template that no longer names the brand: a disguised reflection.
   if (isSameTemplate(templateWords(page, plan.brand, []), templateWords(response, plan.brand, canary.nonces))) {
     recordCanary(plan, "same_page");
     return { status: "unverified", reason: "url_echoes_brand" };
