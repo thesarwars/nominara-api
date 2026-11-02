@@ -1,5 +1,7 @@
+import { randomInt } from "node:crypto";
 import { isIP } from "node:net";
 import { Logger } from "@nestjs/common";
+import { trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import { taskVerificationSubmittedPayloadSchema, type TaskVerificationFailedPayload } from "../../../contracts/tasks/index.js";
 import { GuardedFetchRefusal, type GuardedResponse } from "../net/guarded-fetch.js";
@@ -10,7 +12,7 @@ import { withProjectQueueLock } from "../queue/locks.js";
 import { refreshProjectSourceIndex } from "../rollup/refresh-project-source-index.js";
 import { refreshProjectTaskCounts } from "../rollup/refresh-project-task-counts.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { mentionsBrand, sourceSeededSourceId, seededTargetUrl, verifyUrlPresence, type BrandForMatching } from "./verify-presence.js";
+import { mentionsBrand, sourceSeededSourceId, seededTargetUrl, verifyUrlPresence, visibleText, type BrandForMatching } from "./verify-presence.js";
 
 // STORY-055 AC5-AC8 + AC11, owner decision 30 (plans-7day/decisions-2026-10-28.md) - the customer's contribution is verified, not
 // self-reported. Completing a SEEDING task takes a URL and sends the task to `in_review` (TasksService.completeTask); the
@@ -122,15 +124,15 @@ export async function prepareSubmissionVerification(tx: ClientBase, projectId: s
             to_char((now() AT TIME ZONE w.timezone)::date, 'YYYY-MM-DD') AS today,
             s.payload, s.actor_id::text AS actor_id,
             EXISTS (SELECT 1 FROM task_events a
-                     WHERE a.task_id = t.id AND a.payload->>'submission_id' = s.id::text
+                     WHERE a.task_id = t.id AND a.workspace_id = app.current_workspace() AND a.payload->>'submission_id' = s.id::text
                        AND a.event IN ('verification_failed', 'completed')) AS answered,
             NOT EXISTS (SELECT 1 FROM task_events n
-                         WHERE n.task_id = t.id AND n.event = 'verification_submitted'
+                         WHERE n.task_id = t.id AND n.workspace_id = app.current_workspace() AND n.event = 'verification_submitted'
                            AND (n.occurred_at, n.id) > (s.occurred_at, s.id)) AS latest
        FROM tasks t
        JOIN projects p   ON p.id = t.project_id AND p.deleted_at IS NULL
        JOIN workspaces w ON w.id = p.workspace_id
-       JOIN task_events s ON s.task_id = t.id AND s.id = $3 AND s.event = 'verification_submitted'
+       JOIN task_events s ON s.task_id = t.id AND s.workspace_id = app.current_workspace() AND s.id = $3 AND s.event = 'verification_submitted'
        LEFT JOIN source_domains sd ON sd.id = t.source_domain_id
       WHERE t.id = $2 AND t.project_id = $1 AND t.workspace_id = app.current_workspace() AND t.status = 'in_review' AND t.deleted_at IS NULL`,
     [projectId, taskId, submissionId],
@@ -164,25 +166,22 @@ export async function prepareSubmissionVerification(tx: ClientBase, projectId: s
  * for the length of the backoff, and a 404 and a connection reset are indistinguishable to us. The cost is that a one-off blip needs
  * a resubmit; the benefit is that no submission can sit pending behind a failing fetch.
  */
-export async function fetchSubmission(plan: SubmissionPlan, fetch: SubmissionFetcher): Promise<SubmissionOutcome> {
+export async function fetchSubmission(plan: SubmissionPlan, fetch: SubmissionFetcher, options: SubmissionFetchOptions = {}): Promise<SubmissionOutcome> {
   // FAIL CLOSED: `completeTask` refuses a seeding task with no source domain (`no_source_domain`), so none reaches here; if one
   // ever did, an unconstrained mention anywhere on the web must not close a gap.
   const domain = plan.domain;
   if (domain === null || seededTargetUrl(plan.url, domain) === null) return { status: "unverified", reason: "wrong_domain" };
-  // REFLECTION: the customer chooses the URL, and a site search, a tag page or a soft-404 echoes it into the page - so a brand name
-  // that is IN the URL would "appear" on a page that never mentioned it. Refused before any fetch (fails closed; no text is
-  // stripped, which would also strip a real mention).
-  if (urlEchoesBrand(plan.url, plan.brand)) return { status: "unverified", reason: "url_echoes_brand" };
+  // No hop is followed off the task's domain: a redirect is not fetched just to find out where it lands.
+  const onDomain = (next: string): boolean => seededTargetUrl(next, domain) !== null;
 
   // `verifyUrlPresence` folds every GuardedFetchRefusal into "refused" and drops the error. The reason matters here, so the wrapper
   // keeps the refusal itself: only a refusal about the ADDRESS, PORT or SCHEME is the customer's unsafe target.
   const seen: { response?: GuardedResponse; refusal?: GuardedFetchRefusal; offDomainRedirect?: boolean } = {};
   const outcome = await verifyUrlPresence(plan.url, plan.brand, async (url) => {
     try {
-      // No hop is followed off the task's domain: a redirect is not fetched just to find out where it lands.
       seen.response = await fetch(url, {
         followRedirect: (next) => {
-          const on = seededTargetUrl(next, domain) !== null;
+          const on = onDomain(next);
           if (!on) seen.offDomainRedirect = true;
           return on;
         },
@@ -199,31 +198,159 @@ export async function fetchSubmission(plan: SubmissionPlan, fetch: SubmissionFet
     const reason = outcome.reason === "refused" ? "unsafe_target" : outcome.reason === "not_text" ? "not_a_page" : outcome.reason === "no_aliases" ? "no_brand_names" : "unreachable";
     return { status: "unverified", reason };
   }
+  const page = seen.response;
   // Before present/absent: a page the redirects carried OFF the task's domain says nothing about a contribution THERE, whether or
   // not it names the brand (a customer told "no mention" would look for a mention on a page that was never theirs).
-  if (seen.response !== undefined && seededTargetUrl(seen.response.finalUrl, domain) === null) return { status: "unverified", reason: "wrong_domain" };
-  // The page the redirects ended on may echo the brand as well (a redirect to a search URL).
-  if (seen.response !== undefined && urlEchoesBrand(seen.response.finalUrl, plan.brand)) return { status: "unverified", reason: "url_echoes_brand" };
-  return outcome.status === "absent" ? { status: "unverified", reason: "no_mention" } : { status: "verified" };
+  if (page !== undefined && !onDomain(page.finalUrl)) return { status: "unverified", reason: "wrong_domain" };
+  if (outcome.status === "absent") return { status: "unverified", reason: "no_mention" };
+
+  // REFLECTION (owner decision 46): the customer chooses the URL, and a site search, a tag page or a soft-404 echoes it into the page -
+  // so a brand name that is IN the URL could "appear" on a page that never mentioned it. A brand in the URL is not refused at once
+  // (`/products/acme-analytics/` is a real page): the CANARY decides, on the submitted URL and again on the page the redirects ended on.
+  if (page !== undefined) {
+    const nonce = options.nonce ?? randomLetters;
+    const checked = new Set<string>();
+    for (const target of [plan.url, page.finalUrl]) {
+      const key = normalisedHref(target);
+      if (checked.has(key)) continue;
+      checked.add(key);
+      const refusal = await canaryRefusal(plan, target, page, fetch, onDomain, nonce);
+      if (refusal !== null) return refusal;
+    }
+  }
+  return { status: "verified" };
 }
 
-/** Percent-decodes (twice at most: a double-encoded name is still a name), leaving malformed escapes as they are. */
-function decodeLoosely(value: string): string {
-  let out = value;
-  for (let i = 0; i < 2; i += 1) {
-    try {
-      out = decodeURIComponent(out);
-    } catch {
-      return out;
+// ───────────────────────── URL reflection: lenient decoding, the echo test, and the canary (owner decision 46) ─────────────────────────
+
+/** How many times a URL component is percent-decoded before it is read: a name encoded up to four layers deep is still a name. */
+const DECODE_PASSES = 4;
+
+/** One UTF-16 code unit of a decoded string, and where it came from in the RAW string (`start`..`end`) and how (`styles`: "p" = %XX, "u" = %uXXXX, one letter per decode pass, first pass first). */
+interface DecodedUnit {
+  readonly ch: string;
+  readonly start: number;
+  readonly end: number;
+  readonly styles: string;
+}
+
+const ESCAPES = /(?:%[0-9A-Fa-f]{2})+|%u[0-9A-Fa-f]{4}/gu;
+
+function longestStyles(units: readonly DecodedUnit[]): string {
+  return units.reduce((best, unit) => (unit.styles.length > best.length ? unit.styles : best), "");
+}
+
+/** UTF-8 -> text with U+FFFD for each maximal invalid subpart (the WHATWG decoder's replacement behaviour), keeping which bytes each unit came from. */
+function decodeUtf8Run(bytes: readonly number[]): { str: string; from: number; to: number }[] {
+  const out: { str: string; from: number; to: number }[] = [];
+  let i = 0;
+  while (i < bytes.length) {
+    const lead = bytes[i]!;
+    if (lead < 0x80) {
+      out.push({ str: String.fromCharCode(lead), from: i, to: i + 1 });
+      i += 1;
+      continue;
     }
+    const need = lead >= 0xc2 && lead <= 0xdf ? 1 : lead >= 0xe0 && lead <= 0xef ? 2 : lead >= 0xf0 && lead <= 0xf4 ? 3 : 0;
+    if (need === 0) {
+      out.push({ str: "�", from: i, to: i + 1 });
+      i += 1;
+      continue;
+    }
+    let lower = 0x80;
+    let upper = 0xbf;
+    if (lead === 0xe0) lower = 0xa0;
+    else if (lead === 0xed) upper = 0x9f;
+    else if (lead === 0xf0) lower = 0x90;
+    else if (lead === 0xf4) upper = 0x8f;
+    let code = lead & (need === 1 ? 0x1f : need === 2 ? 0x0f : 0x07);
+    let taken = 1;
+    while (taken <= need) {
+      const next = bytes[i + taken];
+      if (next === undefined || next < lower || next > upper) break;
+      code = (code << 6) | (next & 0x3f);
+      lower = 0x80;
+      upper = 0xbf;
+      taken += 1;
+    }
+    out.push({ str: taken === need + 1 ? String.fromCodePoint(code) : "�", from: i, to: i + taken });
+    i += taken;
   }
   return out;
 }
 
+function decodePass(units: readonly DecodedUnit[]): DecodedUnit[] {
+  const text = units.map((unit) => unit.ch).join("");
+  const next: DecodedUnit[] = [];
+  let at = 0;
+  for (const match of text.matchAll(ESCAPES)) {
+    const from = match.index;
+    const to = from + match[0].length;
+    next.push(...units.slice(at, from));
+    if (match[0].startsWith("%u")) {
+      const covered = units.slice(from, to);
+      next.push({ ch: String.fromCharCode(Number.parseInt(match[0].slice(2), 16)), start: covered[0]!.start, end: covered[covered.length - 1]!.end, styles: `${longestStyles(covered)}u` });
+    } else {
+      const bytes: number[] = [];
+      for (let k = from; k < to; k += 3) bytes.push(Number.parseInt(text.slice(k + 1, k + 3), 16));
+      for (const part of decodeUtf8Run(bytes)) {
+        const covered = units.slice(from + part.from * 3, from + part.to * 3);
+        for (const ch of part.str) {
+          for (const unit of ch.length === 2 ? [ch[0]!, ch[1]!] : [ch]) next.push({ ch: unit, start: covered[0]!.start, end: covered[covered.length - 1]!.end, styles: `${longestStyles(covered)}p` });
+        }
+      }
+    }
+    at = to;
+  }
+  next.push(...units.slice(at));
+  return next;
+}
+
+/** The raw string as units, decoded to a fixed point (at most DECODE_PASSES passes). */
+function decodeUnits(raw: string): DecodedUnit[] {
+  let units: DecodedUnit[] = Array.from({ length: raw.length }, (_unused, i) => ({ ch: raw[i]!, start: i, end: i + 1, styles: "" }));
+  for (let pass = 0; pass < DECODE_PASSES; pass += 1) {
+    const next = decodePass(units);
+    if (next.length === units.length && next.every((unit, i) => unit.ch === units[i]!.ch)) break; // stable
+    units = next;
+  }
+  return units;
+}
+
 /**
- * True when the brand is named by the URL's own path segments, query keys or values, or fragment (a text fragment `#:~:text=Acme`
- * highlights it). Decoded first, and separators (`-`, `_`, `+`, `.`) read as spaces, so `?search=Acme+Analytics` and
- * `/acme-analytics-review` both match. The host is not read: a brand's own subdomain is not an echo of the request.
+ * Percent-decodes ESCAPE BY ESCAPE (round 5): a run of `%XX` is grouped into bytes and decoded as UTF-8 with U+FFFD for invalid bytes,
+ * `%uXXXX` is decoded, and a malformed escape (`%ZZ`, a lone `%`) is KEPT IN PLACE - one bad escape no longer leaves the whole
+ * segment raw, which is what `decodeURIComponent` did (it throws, and the segment was then read undecoded: `%41cme%C0` hid a name).
+ * Repeated until the string is stable, at most DECODE_PASSES times. Never throws.
+ */
+export function decodeLoosely(value: string): string {
+  return decodeUnits(value)
+    .map((unit) => unit.ch)
+    .join("");
+}
+
+/** The URL's request-bearing parts as RAW strings: path segments, then each query key and value. The fragment is never sent to the server, so it is not one. */
+function urlPieces(url: URL): { readonly segments: string[]; readonly query: { key: string; value: string | null }[] } {
+  const search = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  return {
+    segments: url.pathname.split("/"),
+    query:
+      search === ""
+        ? []
+        : search.split("&").map((pair) => {
+            const eq = pair.indexOf("=");
+            return eq === -1 ? { key: pair, value: null } : { key: pair.slice(0, eq), value: pair.slice(eq + 1) };
+          }),
+  };
+}
+
+const SEPARATORS = /[-_+.]+/gu;
+
+/**
+ * True when the brand is named by the URL's path segments or query keys or values - the parts the SERVER receives (the fragment stays in
+ * the browser, so it cannot be reflected). Decoded leniently first, and separators (`-`, `_`, `+`, `.`) read as spaces, so
+ * `?search=Acme+Analytics` and `/acme-analytics-review` both match. The host is not read: a brand's own subdomain is not an echo of the
+ * request. This only says the URL NAMES the brand; whether the site reflects it is the canary's question.
  */
 export function urlEchoesBrand(rawUrl: string, brand: BrandForMatching): boolean {
   let url: URL;
@@ -232,10 +359,226 @@ export function urlEchoesBrand(rawUrl: string, brand: BrandForMatching): boolean
   } catch {
     return false;
   }
-  const parts: string[] = url.pathname.split("/").map(decodeLoosely);
-  for (const [key, value] of url.searchParams) parts.push(decodeLoosely(key), decodeLoosely(value));
-  parts.push(decodeLoosely(url.hash));
-  return mentionsBrand(parts.join(" ").replace(/[-_+.]+/gu, " "), brand);
+  const { segments, query } = urlPieces(url);
+  const parts = [...segments, ...query.flatMap((pair) => (pair.value === null ? [pair.key] : [pair.key, pair.value]))].map(decodeLoosely);
+  return mentionsBrand(parts.join(" ").replace(SEPARATORS, " "), brand);
+}
+
+// ---- the canary
+
+/** A nonce is at least this long, so a chance appearance of it in a page is negligible. */
+const NONCE_MIN_LENGTH = 8;
+/** Pages are the same when their word 3-shingle sets (brand and nonce words removed) overlap at least this much (Jaccard). */
+export const SAME_PAGE_SHINGLE_OVERLAP = 0.9;
+const SHINGLE_WORDS = 3;
+
+export interface SubmissionFetchOptions {
+  /** Test seam: the nonce for one brand-token occurrence (letters only), given the length wanted. Default: random lowercase letters. */
+  readonly nonce?: (length: number) => string;
+}
+
+function randomLetters(length: number): string {
+  let out = "";
+  for (let i = 0; i < length; i += 1) out += String.fromCharCode(97 + randomInt(26));
+  return out;
+}
+
+function labelsOf(brand: BrandForMatching): string[] {
+  return [...new Set([brand.name, ...brand.aliases].map((value) => value.trim()).filter((value) => value.length > 0))].sort((a, b) => b.length - a.length);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/** A label as a token: its words in order, any run of separators between them, never inside a longer word. Null for a label with no word. */
+function labelPattern(label: string): RegExp | null {
+  const words = label.split(/[\s\-_+.]+/u).filter((word) => word.length > 0);
+  if (words.length === 0) return null;
+  return new RegExp(`(?<![\\p{L}\\p{N}])${words.map(escapeRegExp).join("[-_+.\\s]+")}(?![\\p{L}\\p{N}])`, "giu");
+}
+
+/** The brand tokens in `text` as [start, end) spans, longest label first and never overlapping. */
+function brandSpans(text: string, brand: BrandForMatching): [number, number][] {
+  const spans: [number, number][] = [];
+  for (const label of labelsOf(brand)) {
+    const pattern = labelPattern(label);
+    if (pattern === null) continue;
+    for (const match of text.matchAll(pattern)) {
+      const span: [number, number] = [match.index, match.index + match[0].length];
+      if (!spans.some(([from, to]) => span[0] < to && from < span[1])) spans.push(span);
+    }
+  }
+  return spans.sort((a, b) => a[0] - b[0]);
+}
+
+/** One decoded character written back as the escape(s) it came from: `styles` is the decode history, so the LAST pass's escape is made first and each earlier pass escapes its '%'. */
+function encodeLike(ch: string, styles: string): string {
+  if (styles === "") return ch;
+  const code = ch.charCodeAt(0);
+  const escape = (style: string, c: number): string => (style === "u" ? `%u${c.toString(16).toUpperCase().padStart(4, "0")}` : `%${c.toString(16).toUpperCase().padStart(2, "0")}`);
+  let out = escape(styles[styles.length - 1]!, code);
+  for (let k = styles.length - 2; k >= 0; k -= 1) out = escape(styles[k]!, 0x25) + out.slice(1);
+  return out;
+}
+
+/** One raw piece with every brand token replaced by a nonce encoded the way the token was; the rest is kept byte for byte. */
+function canaryPiece(raw: string, brand: BrandForMatching, nonce: (length: number) => string, used: string[]): string {
+  const units = decodeUnits(raw);
+  const spans = brandSpans(units.map((unit) => unit.ch).join(""), brand);
+  if (spans.length === 0) return raw;
+  let out = "";
+  let at = 0; // index into `units`
+  let rawEnd = 0; // how much of `raw` has been written
+  for (const [from, to] of spans) {
+    for (; at < from; at += 1) {
+      out += raw.slice(Math.max(units[at]!.start, rawEnd), units[at]!.end);
+      rawEnd = Math.max(rawEnd, units[at]!.end);
+    }
+    const value = nonce(Math.max(NONCE_MIN_LENGTH, to - from));
+    used.push(value);
+    for (let j = 0; j < value.length; j += 1) out += encodeLike(value[j]!, units[from + Math.min(j, to - from - 1)]!.styles);
+    rawEnd = Math.max(rawEnd, units[to - 1]!.end);
+    at = to;
+  }
+  for (; at < units.length; at += 1) {
+    out += raw.slice(Math.max(units[at]!.start, rawEnd), units[at]!.end);
+    rawEnd = Math.max(rawEnd, units[at]!.end);
+  }
+  return out + raw.slice(rawEnd);
+}
+
+/** The canary: the same URL (fragment dropped - never sent) with each brand token replaced by a random nonce. Null when no token could be located in a single piece (fail closed). */
+function buildCanary(rawUrl: string, brand: BrandForMatching, nonce: (length: number) => string): { readonly url: string; readonly nonces: readonly string[] } | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const used: string[] = [];
+  const { segments, query } = urlPieces(url);
+  const path = segments.map((segment) => canaryPiece(segment, brand, nonce, used)).join("/");
+  const search = query.map((pair) => (pair.value === null ? canaryPiece(pair.key, brand, nonce, used) : `${canaryPiece(pair.key, brand, nonce, used)}=${canaryPiece(pair.value, brand, nonce, used)}`)).join("&");
+  const built = `${url.origin}${path}${query.length > 0 ? `?${search}` : ""}`;
+  // The token must be GONE from the canary: one split over two pieces (`/acme/analytics`) or one this locator could not see leaves it.
+  if (used.length === 0 || urlEchoesBrand(built, brand)) return null;
+  return { url: built, nonces: used };
+}
+
+function normalisedHref(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).href;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function isTextResponse(response: GuardedResponse): boolean {
+  const raw = response.headers["content-type"];
+  const type = (Array.isArray(raw) ? raw[0] : raw)?.toLowerCase();
+  if (type === undefined || type.length === 0) return true;
+  return type.startsWith("text/") || type.includes("xml") || type.includes("json");
+}
+
+/** A page's words with the brand tokens and the nonces taken out: what is left is the TEMPLATE. */
+function templateWords(response: GuardedResponse, brand: BrandForMatching, nonces: readonly string[]): string[] {
+  let text = visibleText(response.body.toString("utf8")).normalize("NFKC").toLowerCase();
+  for (const label of labelsOf(brand)) {
+    const pattern = labelPattern(label);
+    if (pattern !== null) text = text.replace(pattern, " ");
+  }
+  for (const value of nonces) text = text.split(value.toLowerCase()).join(" ");
+  return text.split(/[^\p{L}\p{N}]+/u).filter((word) => word.length > 0);
+}
+
+/**
+ * THE SAME-PAGE RULE (documented, simple): two pages are the same when, with the brand tokens and the nonces removed, their words are
+ * identical, or - for pages of at least SHINGLE_WORDS words - their sets of 3-word shingles overlap by at least
+ * SAME_PAGE_SHINGLE_OVERLAP (Jaccard). The tolerance absorbs a counter or a date that differs between two fetches; a different
+ * page (a not-found template, a listing) shares almost no shingles. Two empty pages are the same: nothing distinguishes them.
+ */
+export function isSameTemplate(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length === b.length && a.every((word, i) => word === b[i])) return true;
+  if (a.length < SHINGLE_WORDS || b.length < SHINGLE_WORDS) return false;
+  const shingles = (words: readonly string[]): Set<string> => {
+    const set = new Set<string>();
+    for (let i = 0; i + SHINGLE_WORDS <= words.length; i += 1) set.add(words.slice(i, i + SHINGLE_WORDS).join(" "));
+    return set;
+  };
+  const left = shingles(a);
+  const right = shingles(b);
+  let shared = 0;
+  for (const shingle of left) if (right.has(shingle)) shared += 1;
+  return shared / (left.size + right.size - shared) >= SAME_PAGE_SHINGLE_OVERLAP;
+}
+
+type CanaryResult = "not_named" | "different" | "echoed_nonce" | "same_page" | "unbuildable" | "failed";
+
+function recordCanary(plan: SubmissionPlan, result: CanaryResult): void {
+  incrementCounter("nominara_tasks_url_canary_total", { result });
+  trace.getActiveSpan()?.setAttribute("nominara.tasks.url_canary", result);
+  // IDs and the result only - never the URL, the nonce, the brand or page text.
+  if (result !== "not_named") logger.log({ event: "task_verification_url_canary", workspaceId: plan.workspaceId, taskId: plan.taskId, result });
+}
+
+/**
+ * Owner decision 46 - the test fetch. When `target` (the submitted URL, or the page the redirects ended on) names the brand in its path
+ * or query, fetch the same URL with the brand replaced by a random nonce, through the same fetcher with the same domain and redirect
+ * rules, and compare it with the page already fetched (`page`, the page at `target`). Null = proceed to verify the page.
+ *   - the nonce is in the canary's text or final URL: the site reflects what it is given          -> url_echoes_brand
+ *   - the canary is a 2xx page that is the SAME TEMPLATE once brand and nonce are removed          -> url_echoes_brand (any slug serves this page)
+ *   - the canary is 404/410, a redirect that was not followed, not text, or a different page      -> null (the site tells slugs apart)
+ *   - the canary could not be fetched, or answered 5xx/429/403/...                                 -> FAIL CLOSED, with the fetch's own reason
+ *   - no canary can be built (the token is split over two pieces, or cannot be located)            -> url_echoes_brand (fail closed)
+ */
+async function canaryRefusal(
+  plan: SubmissionPlan,
+  target: string,
+  page: GuardedResponse,
+  fetch: SubmissionFetcher,
+  onDomain: (url: string) => boolean,
+  nonce: (length: number) => string,
+): Promise<SubmissionOutcome | null> {
+  if (!urlEchoesBrand(target, plan.brand)) return null;
+  const canary = buildCanary(target, plan.brand, nonce);
+  if (canary === null) {
+    recordCanary(plan, "unbuildable");
+    return { status: "unverified", reason: "url_echoes_brand" };
+  }
+  let response: GuardedResponse;
+  try {
+    response = await fetch(canary.url, { followRedirect: onDomain });
+  } catch (error) {
+    recordCanary(plan, "failed");
+    return { status: "unverified", reason: error instanceof GuardedFetchRefusal ? refusalReason(error) : "unreachable" };
+  }
+  if (response.status === 404 || response.status === 410 || (response.status >= 300 && response.status < 400)) {
+    recordCanary(plan, "different");
+    return null;
+  }
+  if (response.status < 200 || response.status >= 300) {
+    recordCanary(plan, "failed"); // a rate limit, a WAF block or an outage says nothing about whether the site reflects
+    return { status: "unverified", reason: "unreachable" };
+  }
+  if (!onDomain(response.finalUrl) || !isTextResponse(response)) {
+    recordCanary(plan, "different");
+    return null;
+  }
+  const text = visibleText(response.body.toString("utf8"));
+  // The final URL counts only when a redirect LANDED somewhere that carries the nonce (the URL we asked for carries it by construction).
+  const landed = normalisedHref(response.finalUrl) === normalisedHref(canary.url) ? "" : decodeLoosely(response.finalUrl);
+  const haystack = `${text}\n${decodeLoosely(text)}\n${landed}`.toLowerCase();
+  if (canary.nonces.some((value) => haystack.includes(value.toLowerCase()))) {
+    recordCanary(plan, "echoed_nonce");
+    return { status: "unverified", reason: "url_echoes_brand" };
+  }
+  if (isSameTemplate(templateWords(page, plan.brand, []), templateWords(response, plan.brand, canary.nonces))) {
+    recordCanary(plan, "same_page");
+    return { status: "unverified", reason: "url_echoes_brand" };
+  }
+  recordCanary(plan, "different");
+  return null;
 }
 
 /**
@@ -279,10 +622,11 @@ async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: Submi
       : await tx.query(
           `SELECT t.id FROM tasks t
             WHERE t.id = $1 AND t.project_id = $2 AND t.workspace_id = app.current_workspace() AND t.status = 'in_review' AND t.deleted_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.event = 'verification_submitted' AND n.id <> $3::uuid
-                                AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $3))
-              AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.payload->>'submission_id' = $3::text
-                                AND a.event IN ('verification_failed', 'completed'))`,
+              AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.workspace_id = app.current_workspace()
+                                AND n.event = 'verification_submitted' AND n.id <> $3::uuid
+                                AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $3 AND s.workspace_id = app.current_workspace()))
+              AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.workspace_id = app.current_workspace()
+                                AND a.payload->>'submission_id' = $3::text AND a.event IN ('verification_failed', 'completed'))`,
           [plan.taskId, plan.projectId, plan.submissionId],
         );
   if (current.rows.length === 0) {
@@ -384,11 +728,13 @@ export async function recordSubmissionGaveUp(tx: ClientBase, ids: { workspaceId:
     const current = await tx.query(
       `SELECT t.id FROM tasks t
         WHERE t.id = $1 AND t.workspace_id = app.current_workspace() AND t.status = 'in_review'
-          AND EXISTS (SELECT 1 FROM task_events s WHERE s.id = $2::uuid AND s.task_id = t.id AND s.event = 'verification_submitted')
-          AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.event = 'verification_submitted' AND n.id <> $2::uuid
-                            AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $2))
-          AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.payload->>'submission_id' = $2::text
-                            AND a.event IN ('verification_failed', 'completed'))`,
+          AND EXISTS (SELECT 1 FROM task_events s WHERE s.id = $2::uuid AND s.task_id = t.id AND s.workspace_id = app.current_workspace()
+                        AND s.event = 'verification_submitted')
+          AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.workspace_id = app.current_workspace()
+                            AND n.event = 'verification_submitted' AND n.id <> $2::uuid
+                            AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $2 AND s.workspace_id = app.current_workspace()))
+          AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.workspace_id = app.current_workspace()
+                            AND a.payload->>'submission_id' = $2::text AND a.event IN ('verification_failed', 'completed'))`,
       [ids.taskId, ids.submissionId],
     );
     if (current.rows.length === 0) return false;
