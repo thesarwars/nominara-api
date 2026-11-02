@@ -109,7 +109,8 @@ describe("STORY-079 · Visibility Scan", () => {
     enqueued = [];
     workers = [];
     // The production class lets one user spend 2 scans at once (5/min). Most scenarios here make more calls than that per user, so they run on the widest
-    // document the envelope allows (x10); the one scenario that is ABOUT the class removes it.
+    // document the envelope allows (x10). That the route IS in the class is asserted on the handler (src/modules/tools/tools.spec.ts): the guard reads its
+    // document through a 15 s memo, so a scenario that swaps documents mid-spec would have to sit out the memo.
     await harness.app().get<Cache>(CACHE).set(rateLimitConfigKey(cacheKeyNamespace()), widenedScanDocument(), { ttlMs: 3_600_000 });
     vi.spyOn(UrlGuard.prototype, "validateAndNormalize").mockImplementation(async (url: string) => ({ rootDomain: new URL(url).hostname }));
     // The queue seam: capture the job, then run the worker handler in-process (in the background, as a worker would).
@@ -466,15 +467,6 @@ describe("STORY-079 · Visibility Scan", () => {
     expect(accepted?.workspace_id).toBe(a.workspaceId);
     const everything = JSON.stringify(lines);
     for (const forbidden of ["Acme", "best crm for startups", "most common choice", "acme.test"]) expect(everything, forbidden).not.toContain(forbidden);
-  });
-
-  it("the scan is rate-limited as a capture-backed tool: on the shipped defaults a user's third immediate scan is refused 429 rate_limited", async () => {
-    const a = await owner("starter");
-    await harness.app().get<Cache>(CACHE).delete(rateLimitConfigKey(cacheKeyNamespace()));
-    const codes: number[] = [];
-    for (let i = 0; i < 3; i += 1) codes.push((await post(a)).statusCode);
-    expect(codes).toEqual([200, 200, 429]);
-    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(2);
   });
 
   it("the job is enqueued on the dedicated interactive pool, keyed by the run", async () => {
