@@ -3,6 +3,9 @@ import { scanStreamCompletedSchema } from "../../../contracts/tools/index.js";
 import { ConflictError, IdempotencyConflictError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { InMemoryCacheAdapter } from "../../lib/cache/in-memory-cache.adapter.js";
 import type { Cache } from "../../lib/cache/cache.port.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
+import { failureFor } from "../../lib/visibility-scan/scan-aggregate.js";
+import { writeScanEvent } from "../../lib/visibility-scan/scan-events.js";
 import { VisibilityScanService, type ScanAccepted } from "./visibility-scan.service.js";
 
 // STORY-079 review round 1 - the idempotency claim, and the stream's own deadline. The database and the queue are replaced by fakes: what is under
@@ -114,5 +117,30 @@ describe("STORY-079 review - the stream's own deadline does not make a money sta
     const { chunks, sink } = sinkOf();
     await service.stream(TENANT, accepted(), sink, { pollMs: 5, partialAfterMs: 50 });
     expect(terminal(chunks)).toMatchObject({ settled: false, credits: { charged: null, refunded: null } });
+  });
+});
+
+describe("STORY-079 review round 2", () => {
+  it("at the stream deadline an engine that already FAILED keeps its real reason; only a silent engine is deadline_exceeded", async () => {
+    const cache = new InMemoryCacheAdapter();
+    await writeScanEvent(cache, cacheKeyNamespace(), TENANT.workspaceId, RUN_ID, { kind: "engine_failed", failure: failureFor("perplexity", "engine_spend_ceiling_reached") });
+    const { service } = build(cache);
+    (service as unknown as { settled: unknown }).settled = vi.fn(async () => undefined);
+    const chunks: string[] = [];
+    await service.stream(TENANT, accepted({ startedAtMs: Date.now() - 10_000 }), { write: (c: string) => chunks.push(c), end: () => undefined, onClose: () => undefined }, { pollMs: 5, partialAfterMs: 50 });
+    const frame = chunks.join("").split("\n\n").find((c) => c.includes("event: scan.completed"));
+    const done = JSON.parse(/^data: (.+)$/m.exec(frame ?? "")![1]!) as { engine_failures: { engine: string; code: string }[] };
+    expect(done.engine_failures.map((f) => [f.engine, f.code])).toEqual([["perplexity", "engine_spend_ceiling_reached"], ["chatgpt", "deadline_exceeded"]]);
+  });
+
+  it("a start whose COMMIT failed after Postgres committed keeps the claim with the run id, so a retry attaches instead of charging again", async () => {
+    const cache = new InMemoryCacheAdapter();
+    const { service, start } = build(cache);
+    start.mockRejectedValueOnce(new Error("connection terminated during COMMIT"));
+    (service as unknown as { committedRunSince: unknown }).committedRunSince = vi.fn(async () => RUN_ID);
+    await expect(service.accept(TENANT, BODY, headers("k9"), META)).rejects.toThrow("COMMIT");
+    const again = await service.accept(TENANT, BODY, headers("k9"), META);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(again).toMatchObject({ runId: RUN_ID, resumed: true });
   });
 });

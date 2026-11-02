@@ -28,11 +28,11 @@ Built on the STORY-078 core (`tool_runs`, `ToolsService.startRun/finishRun`, the
 - **Reconnect** is a repeat of the same POST with the same `Idempotency-Key` and body: it attaches to the same run, replays what landed, resumes,
   charges nothing, starts nothing, and gives back the daily allowance the guard consumed. The same key with a different body is 409.
 - **Stream.** Polls the event keys (250 ms) and the run row (1 s); always ends with `scan.completed`. If the worker has not settled the run by 55 s the
-  stream ends with a `partial` terminal (`deadline_reached: true`) and the charge stands until the worker or the stale-run reaper settles it.
+  stream ends with a PROVISIONAL terminal (`status: running`, `settled: false`, `credits: { charged: null, refunded: null }`, `deadline_reached: true`); an engine that already failed keeps its real failure code there, only an engine with no event is `deadline_exceeded`. The charge stands until the worker or the stale-run reaper settles it.
 - **Cache age.** The shared L1 envelope gained an optional `capturedAt` (additive, still `v: 1`); `execute-cell.ts` writes it, the probe exposes it. A hit
   WITHOUT a capture time is not served by a scan (it could not be labelled), it falls through to a live capture.
 - **Spend ceiling (owner decision 26).** Every vendor call in the scan path is preceded by `SpendMeter.isCeilingReached`; reached -> the engine is not
-  called and the failure is `engine_spend_ceiling_reached`; an unreadable meter fails closed. Spend is recorded after the call, as in scheduled capture.
+  called and the failure is `engine_spend_ceiling_reached`; an unreadable meter fails closed. Spend is recorded after the call through the shared `recordEngineSpend` (also used by scheduled capture), which logs each new 80%/95% alert and the hard-stop crossing and counts the recording (`source: lookup`).
 - **Observability.** Spans `tools.scan.accept`, `tools.scan.stream`, `tools.scan.run`; metrics `nominara_tools_scan_requests_total{result}`,
   `_streams_total{outcome}`, `_engine_results_total{outcome,...}`, `_estimates_total`, `_spend_ceiling_blocked_total`, `_enqueue_failed_total`; log
   events `tools.scan.accepted|finished|stream_failed|job_failed` carry `workspace_id` and `run_id` only (asserted: no brand, query, answer or URL).
@@ -64,7 +64,7 @@ Fixed: `no_shared_cache` honoured (read and seed); redirect-wrapper citations no
 parser's `labelFor`; the stream's deadline terminal is provisional (`settled: false`, null credits); the idempotency claim is 24 h, never deleted after a charged start, split on the first colon,
 `IdempotencyConflictError`, reserved-prefix refusal; per-workspace `usage_ledger` cost rows (source `lookup`); detected competitors survive a redelivery.
 New tests: unit `visibility-scan.spec.ts` (sentiment band, Gemini recorded payload) and `visibility-scan.service.spec.ts` (claim, 24 h window, claim-write failure, stream deadline); integration
-`visibility-scan.spec.ts` (no_shared_cache, usage_ledger, mid-run drop and reattach, 20 same-key and 20 different-key concurrent POSTs) and `visibility-scan-rate-limit.spec.ts` (third immediate scan is 429 on the
+`visibility-scan.spec.ts` (no_shared_cache, usage_ledger, mid-run drop and reattach, 20 same-key and 19 different-key concurrent POSTs) and `visibility-scan-rate-limit.spec.ts` (third immediate scan is 429 on the
 shipped defaults - its own file, because the main spec installs a widened document and the guard memoises its config for 15 s).
 Red runs: `s079-r1-red-unit.log` (11 failing), `s079-r1-red-int.log` (4 failing on the pre-fix source; the same-key concurrency and the rate-limit test passed on the old code - they pin behaviour that already held).
 Not done, raised for the owner (see docs-carry 9, 10, 12, 14): a DB-level idempotency key, the reconnect-at-daily-cap case, the scoring constants, the streaming audit exemption.
@@ -78,3 +78,13 @@ stream was only ever fed by the final snapshot; the spec now shares one cache be
 Final gates on head after this round (logs `plans-7day/logs/s079-r1-*.log`): lint EXIT=0, typecheck EXIT=0, contracts:check EXIT=0, test:unit 6364 passed (one unrelated 5 s timeout in
 `contracts-worked-example` under load, rerun alone EXIT=0), visibility-scan + rate-limit + tool-runs-core + queue-interactive-pool integration 78/78, test:isolation 55/55, imagebuild EXIT=0, full
 test:integration 4719 passed / 1 failed: `seed-demo.spec.ts` (date-dependent default-partition constraint in `src/workers/rollup/maintenance.ts`; fixed by b9a0c265 on `fix/partition-default-rows`, not on main; no file in this diff touches it).
+
+## Review round 2
+
+- Spend alerts: the Tools path now uses the shared `src/lib/engines/record-spend.ts`; the meter's `newAlerts` / `hardStopped` are no longer dropped. A recording failure is logged and counted (`nominara_capture_cost_record_failed_total`), not swallowed.
+- usage_ledger: in-flight captures are aborted when the scan resolves and given `SCAN_LATE_COST_GRACE_MS` (2 s) to report their cost before the rows are fixed; a failed-but-paid capture now also gets a row. ACCEPTED LOSS: a vendor that ignores the abort and answers after the 2 s grace is on the spend meter but has no usage_ledger row. The dedupe is still `NOT EXISTS` (no unique index); commits for one run are serialised by the job lock, so a concurrent double commit is only possible after a lock expiry. A partial unique index on (reference_id, engine_key) for `source = 'lookup'` is a later migration if wanted.
+- Provisional terminal: `engine_failures` come from the landed `engine_failed` events.
+- Wrapper detection is limited to `REDIRECT_WRAPPER_HOSTS`; a hostname-looking title ('Next.js') no longer replaces the parsed domain.
+- Engine-row sentiment label is `labelFor(mean score)`, the same function as the headline. Owner ratification: docs-carry item 12.
+- Ambiguous COMMIT: when `start` throws, the database is asked for a run this actor's identical request committed since the claim; if one exists the claim is kept with that run id (logged `tools.scan.commit_ambiguous`), so a retry attaches. Best effort: if the database cannot be asked, the claim is released as before.
+- Process: this change touches the credit ledger, tenant context, the parser and scoring; it must go to dangerous-area-auditor as second engineer before merge.

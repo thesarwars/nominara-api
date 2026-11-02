@@ -23,6 +23,7 @@ import { engineKeySchema } from "../../engines/contract.js";
 import { CaptureFailureError, classifyCaptureFailure } from "../../engines/failure-taxonomy.js";
 import type { CaptureEngineGate } from "../../engines/capture-engine-gate.js";
 import { EngineRefusalError, resolveEngine } from "../../engines/registry.js";
+import { recordEngineSpend } from "../../engines/record-spend.js";
 import type { SpendMeter } from "../../engines/spend-meter.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
@@ -54,6 +55,8 @@ const tracer = trace.getTracer("nominara-api");
 export const SCAN_ENGINE_TIMEOUT_MS = 30_000;
 /** The latency deadline: at this point what has landed is returned (section 6.2, "all-settled or the 45 s deadline"). */
 export const SCAN_DEADLINE_MS = 45_000;
+/** After the deadline, how long a capture still in flight is given to report its cost before the usage_ledger rows are fixed. */
+export const SCAN_LATE_COST_GRACE_MS = 2_000;
 
 export interface LookupExecuteDeps {
   readonly cache?: Cache;
@@ -62,6 +65,7 @@ export interface LookupExecuteDeps {
   /** Test seam: the adapter for an engine. Production resolves it through the registry. */
   readonly resolveAdapter?: (engineKey: string) => CaptureAdapter;
   readonly deadlineMs?: number;
+  readonly lateCostGraceMs?: number;
   readonly now?: () => Date;
 }
 
@@ -145,6 +149,9 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
   const run = async (prepared: Prepared): Promise<Fetched> => {
     const { payload, windows, sharedCacheEnabled } = prepared;
     const liveCosts = new Map<string, number>();
+    // A capture still in flight when the deadline passes is aborted, and given a short grace to report what it cost before the costs are fixed.
+    const runAbort = new AbortController();
+    const inflight = new Set<Promise<LiveAnswer>>();
     const started = now();
     // IDEMPOTENT UNDER REDELIVERY: an engine that already published an event is not captured (or paid for) again.
     const resumed = await readScanEvents(await liveCache(), env, payload.workspaceId, payload.toolRunId, payload.engines);
@@ -166,7 +173,20 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         const structured = hit.payload["structured_citations"];
         return { text, ...(Array.isArray(structured) ? { structuredCitations: structured as CachedAnswer["structuredCitations"] & object } : {}), capturedAt: new Date(hit.capturedAt) };
       },
-      capture: async (engine): Promise<LiveAnswer> => {
+      capture: (engine): Promise<LiveAnswer> => {
+        const attempt = captureOne(engine);
+        inflight.add(attempt);
+        void attempt.then(
+          () => inflight.delete(attempt),
+          () => inflight.delete(attempt),
+        );
+        return attempt;
+      },
+      publish: async (event) => {
+        await writeScanEvent(await liveCache(), env, payload.workspaceId, payload.toolRunId, event);
+      },
+    };
+    const captureOne = async (engine: string): Promise<LiveAnswer> => {
         const window = windows.get(engine);
         const key = engineKeySchema.safeParse(engine);
         if (!key.success) throw new ScanCaptureError("engine_unavailable");
@@ -185,6 +205,7 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
           throw error;
         }
         const controller = new AbortController();
+        runAbort.signal.addEventListener("abort", () => controller.abort(), { once: true });
         const timer = setTimeout(() => controller.abort(), SCAN_ENGINE_TIMEOUT_MS);
         const costs = { usd: 0 };
         const ctx: CaptureContext = {
@@ -199,7 +220,10 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
           // `requestMode: "live"`: a person is watching, so a licensed-SERP engine takes its fast path (tracking-engine.md section 3).
           raw = await adapter.capture({ promptText: payload.queryText, locale: payload.locale, sampleIndex: 0, requireCitations: adapter.supportsCitations, requestMode: "live" }, ctx);
         } catch (error) {
-          if (costs.usd > 0) await spend().recordCost(key.data, costs.usd).catch(() => undefined);
+          if (costs.usd > 0) {
+            liveCosts.set(engine, costs.usd);
+            await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
+          }
           if (error instanceof CaptureFailureError) {
             await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
             if (classifyCaptureFailure(error.code) === null && error.code === "content_policy_refusal") throw new ScanCaptureError("content_policy_refusal");
@@ -210,8 +234,8 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
           clearTimeout(timer);
         }
         if (costs.usd > 0) {
-          await spend().recordCost(key.data, costs.usd).catch(() => undefined);
           liveCosts.set(engine, costs.usd);
+          await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
         }
         await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
         if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
@@ -225,10 +249,6 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         }
         const citations = raw.structuredCitations?.map((c) => ({ url: c.url, slot: c.slot, ...(c.title !== undefined ? { title: c.title } : {}) }));
         return { text: raw.text, ...(citations !== undefined ? { structuredCitations: citations } : {}), latencyMs: raw.latencyMs };
-      },
-      publish: async (event) => {
-        await writeScanEvent(await liveCache(), env, payload.workspaceId, payload.toolRunId, event);
-      },
     };
     const outcome = await tracer.startActiveSpan("tools.scan.run", async (span) => {
       try {
@@ -241,7 +261,9 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         span.end();
       }
     });
-    return { outcome, resumed, costs: liveCosts, durationMs: Math.max(0, now().getTime() - started.getTime()) };
+    runAbort.abort();
+    await Promise.race([Promise.allSettled([...inflight]), new Promise<void>((resolve) => setTimeout(resolve, deps.lateCostGraceMs ?? SCAN_LATE_COST_GRACE_MS).unref())]);
+    return { outcome, resumed, costs: new Map(liveCosts), durationMs: Math.max(0, now().getTime() - started.getTime()) };
   };
 
   const commit = async (tx: ClientBase, prepared: Prepared, fetched: Fetched): Promise<void> => {

@@ -13,6 +13,7 @@ import { ValkeyRealtimePublisher } from "../../cache/realtime-publisher.js";
 import { resolveEngineSpendCeilings } from "../../../config/env.schema.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { engineKeySchema } from "../../engines/contract.js";
+import { recordEngineSpend } from "../../engines/record-spend.js";
 import { SpendMeter, ValkeySpendMeterStore } from "../../engines/spend-meter.js";
 import { BreakerCaptureEngineGate, EngineRedelayError, type CaptureEngineGate, type EngineUnavailableSkipCode } from "../../engines/capture-engine-gate.js";
 import { EngineBreakerRegistry } from "../../engines/engine-breaker-registry.js";
@@ -195,19 +196,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     }
     return reached;
   };
-  const recordSpend = async (engineKey: string, usd: number): Promise<void> => {
-    const key = engineKeySchema.safeParse(engineKey);
-    if (!key.success) return;
-    const result = await meter().recordCost(key.data, usd);
-    incrementCounter("nominara_capture_cost_recorded_total", { engine_key: key.data });
-    for (const level of result.newAlerts) {
-      logger.warn(`engine spend alert ${level} for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
-    }
-    if (result.hardStopped) {
-      // Enforced by `ceilingReached` on the NEXT cell; this is the crossing itself.
-      logger.error(`engine spend ceiling crossed for ${key.data}: ${result.totalUsd.toFixed(2)} of ${String(result.ceilingUsd)} USD this month`);
-    }
-  };
+  const recordSpend = (engineKey: string, usd: number): Promise<void> => recordEngineSpend(meter(), logger, engineKey, usd);
 
   // `async`, so that BUILDING the producer is inside the promise too.
   //

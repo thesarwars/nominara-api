@@ -1,5 +1,6 @@
 import { SCAN_SAMPLE_STATEMENT, type ScanStreamEngineResult } from "../../../contracts/tools/index.js";
 import { parseCapture, type ParseResult } from "../parser/parse-capture.js";
+import { labelFor } from "../parser/sentiment/classify.js";
 import type { AliasEntry } from "../parser/entity-matcher.js";
 
 // STORY-079 - turning one engine's answer into the scan's per-engine result, and the per-engine results into the headline.
@@ -67,7 +68,7 @@ export interface ToEngineResultInput {
   readonly brandHost?: string | null;
 }
 
-/** Hosts that only redirect to the real source (Gemini grounding). Anything NOT listed is judged by the title rule in `toEngineResult`. */
+/** Hosts that only redirect to the real source (Gemini grounding). Only a listed host is treated as a wrapper; a hostname-looking TITLE alone is never evidence of one. */
 const REDIRECT_WRAPPER_HOSTS: ReadonlySet<string> = new Set(["vertexaisearch.cloud.google.com"]);
 
 const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/u;
@@ -83,16 +84,17 @@ function isHostOrSubdomain(host: string, root: string): boolean {
   return host === root || host.endsWith(`.${root}`);
 }
 
+/** The label is the PARSER's band for the clamped mean, so an engine row and the headline can never label one score two ways. */
+function sentimentOf(brandPresent: boolean, scores: readonly number[]): ScanStreamEngineResult["sentiment"] {
+  if (!brandPresent || scores.length === 0) return { label: "absent", score: null };
+  const score = Math.min(1, Math.max(-1, scores.reduce((a, b) => a + b, 0) / scores.length));
+  return { label: labelFor(score), score };
+}
+
 export function toEngineResult(input: ToEngineResultInput): ScanStreamEngineResult {
   const { parse } = input;
   const brand = parse.mentions.filter((m) => m.mention.entityType === "brand" && !m.mention.inLink);
   const scores = brand.map((m) => m.sentiment.score);
-  const labelCounts = new Map<string, number>();
-  for (const m of brand) labelCounts.set(m.sentiment.label, (labelCounts.get(m.sentiment.label) ?? 0) + 1);
-  const label = (["positive", "negative", "neutral"] as const).reduce<"positive" | "neutral" | "negative" | null>(
-    (best, candidate) => ((labelCounts.get(candidate) ?? 0) > (labelCounts.get(best ?? "") ?? 0) ? candidate : best),
-    null,
-  );
   return {
     engine: input.engine,
     cache_layer: input.cacheLayer,
@@ -101,13 +103,13 @@ export function toEngineResult(input: ToEngineResultInput): ScanStreamEngineResu
     brand_present: parse.brandPresent,
     rank_position: parse.brandRankPosition,
     sov: Math.min(1, Math.max(0, parse.brandSov)),
-    sentiment: !parse.brandPresent || label === null ? { label: "absent", score: null } : { label, score: Math.min(1, Math.max(-1, scores.reduce((a, b) => a + b, 0) / scores.length)) },
+    sentiment: sentimentOf(parse.brandPresent, scores),
     citations: parse.citations.map((c) => {
       const urlHost = hostOf(c.rawUrl);
       const hint = hostnameHint(c.title);
-      // A REDIRECT WRAPPER is a URL whose host is the engine's, not the source's - a known wrapper host, or a URL whose host contradicts the engine's own
-      // hostname title for it. It is not fetched on the interactive path, so its real host is only the hint, and its ownership is only as good as the hint.
-      const wrapper = REDIRECT_WRAPPER_HOSTS.has(urlHost) || (hint !== null && urlHost !== "" && !isHostOrSubdomain(hint, urlHost) && !isHostOrSubdomain(urlHost, hint));
+      // A REDIRECT WRAPPER is a URL whose host is the engine's, not the source's - a known wrapper host (a title that merely LOOKS like a hostname, such as
+      // 'Next.js', is not evidence of one). It is not fetched on the interactive path, so its real host is only the hint, and its ownership is only as good as the hint.
+      const wrapper = REDIRECT_WRAPPER_HOSTS.has(urlHost);
       if (!wrapper) return { slot: c.slotIndex, domain: c.domain === "" ? c.rawUrl : c.domain, is_owned: c.isOwned };
       // Unknown real host: null - neither foreign nor owned. The wrapper's own host is never reported as a source.
       if (hint === null) return { slot: c.slotIndex, domain: null, is_owned: null };

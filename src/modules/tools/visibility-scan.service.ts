@@ -5,6 +5,7 @@ import {
   SCAN_SAMPLE_STATEMENT,
   VISIBILITY_SCAN_CREDITS,
   visibilityScanResultSchema,
+  type ScanEngineFailure,
   type ScanStreamAccepted,
   type ScanStreamCompleted,
   type ScanStreamEngineResult,
@@ -222,8 +223,16 @@ export class VisibilityScanService {
         try {
           accepted = await this.start(tenant, body, meta);
         } catch (error) {
-          // ONLY a `start` that threw releases the claim: nothing was committed (or the caller cannot know it was), and a retry must be a real retry.
-          await this.cache.delete(claimKey).catch(() => undefined);
+          // A `start` that threw releases the claim - UNLESS the failure was the COMMIT itself (the connection dropped while Postgres committed): then the run and
+          // its debit exist, and releasing the claim would let a retry charge a second scan. So the database is asked first.
+          const committed = await this.committedRunSince(tenant, body, claimedAt);
+          if (committed === undefined) {
+            await this.cache.delete(claimKey).catch(() => undefined);
+            throw error;
+          }
+          logger.error({ event: "tools.scan.commit_ambiguous", workspace_id: tenant.workspaceId, run_id: committed });
+          incrementCounter("nominara_tools_scan_commit_ambiguous_total");
+          await this.recordRunOnClaim(claimKey, bodyHash, committed, claimedAt);
           throw error;
         }
         // From here the run exists, is charged, and its job is scheduled: the claim is NEVER deleted. A retry of the same key must find a claim, so it
@@ -247,6 +256,30 @@ export class VisibilityScanService {
         span.end();
       }
     });
+  }
+
+  /** The id of a scan this actor's identical request committed since the claim was taken, or undefined (also when the database cannot be asked). */
+  private async committedRunSince(tenant: TenantContext, body: VisibilityScanRequest, claimedAt: string): Promise<string | undefined> {
+    try {
+      const client = await this.pool.connect();
+      try {
+        return await withTenantContext(client, tenant, async (tx) => {
+          // A few seconds of tolerance: the claim time is this process's clock, `created_at` is the database's.
+          const rows = await tx.query<{ id: string }>(
+            `SELECT id FROM tool_runs
+              WHERE workspace_id = app.current_workspace() AND tool_key = 'visibility_scan' AND created_by = $1
+                AND brand_name = $2 AND query_text = $3 AND created_at >= $4::timestamptz - interval '5 seconds'
+              ORDER BY created_at DESC LIMIT 1`,
+            [tenant.actorId, body.brand_name, body.query_text, claimedAt],
+          );
+          return rows.rows[0]?.id;
+        });
+      } finally {
+        client.release();
+      }
+    } catch {
+      return undefined;
+    }
   }
 
   /** Writes the run id onto the claim, with a short retry. Best effort by design: the scan is already charged, so a failure here must not become a failure of the request. */
@@ -445,8 +478,10 @@ export class VisibilityScanService {
               // The worker has not settled the run in time. Return what landed rather than nothing; the charge stands until the worker (or the reaper) settles it.
               outcome = "deadline";
               await relay();
-              const landed = (await readScanEvents(this.cache, env, tenant.workspaceId, accepted.runId, accepted.engines)).flatMap((e) => (e.kind === "engine_result" ? [e.result] : []));
-              sse.send("scan.completed", provisionalTerminal(accepted, landed));
+              const events = await readScanEvents(this.cache, env, tenant.workspaceId, accepted.runId, accepted.engines);
+              const landed = events.flatMap((e) => (e.kind === "engine_result" ? [e.result] : []));
+              const failed = events.flatMap((e) => (e.kind === "engine_failed" ? [e.failure] : []));
+              sse.send("scan.completed", provisionalTerminal(accepted, landed, failed));
               return;
             }
           }
@@ -457,7 +492,7 @@ export class VisibilityScanService {
         span.setStatus({ code: SpanStatusCode.ERROR });
         logger.error({ event: "tools.scan.stream_failed", workspace_id: tenant.workspaceId, run_id: accepted.runId, error: error instanceof Error ? error.name : "unknown" });
         // A terminal event in EVERY case: the client must never wait on a dead stream. The run is still owned by the worker.
-        sse.send("scan.completed", provisionalTerminal(accepted, []));
+        sse.send("scan.completed", provisionalTerminal(accepted, [], []));
       } finally {
         sse.close();
         incrementCounter("nominara_tools_scan_streams_total", { outcome });
@@ -508,15 +543,20 @@ export function terminalFrom(run: ToolRunDetail, deadlineReached: boolean): Scan
  * the worker may still settle the run as failed and refund it in full, so `charged` / `refunded` are null (unknown, not 0) and `status` is `running`.
  * What landed is returned; the run resource holds the final status and figures.
  */
-function provisionalTerminal(accepted: ScanAccepted, landed: readonly ScanStreamEngineResult[]): ScanStreamCompleted {
-  const aggregate = aggregateScan(landed, [], accepted.engines);
+function provisionalTerminal(accepted: ScanAccepted, landed: readonly ScanStreamEngineResult[], failed: readonly ScanEngineFailure[]): ScanStreamCompleted {
+  const aggregate = aggregateScan(landed, failed, accepted.engines);
+  // An engine that already failed keeps its REAL reason; `deadline_exceeded` is only for an engine that has reported nothing at all.
+  const silent = accepted.engines.filter((engine) => !landed.some((r) => r.engine === engine) && !failed.some((f) => f.engine === engine));
   return {
     tool_run_id: accepted.runId,
     status: "running",
     settled: false,
     duration_ms: Math.max(0, Date.now() - accepted.startedAtMs),
     aggregate,
-    engine_failures: aggregate.engines_failed.map((engine) => ({ engine, code: "deadline_exceeded", reason: "The engine had not answered when the stream ended; the run is still being settled, and a scan that captures nothing is refunded in full." })),
+    engine_failures: [
+      ...failed,
+      ...silent.map((engine) => ({ engine, code: "deadline_exceeded", reason: "The engine had not answered when the stream ended; the run is still being settled, and a scan that captures nothing is refunded in full." })),
+    ],
     credits: { charged: null, refunded: null },
     deadline_reached: true,
     not_tracked: true,

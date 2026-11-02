@@ -516,6 +516,30 @@ describe("STORY-079 · Visibility Scan", () => {
     expect(rows).toEqual([{ engine_key: "perplexity", source: "lookup", unit_cost_usd: "0.004000", cache_layer: "live", reference_type: "tool_run" }]);
   });
 
+  it("round 2 - the spend meter's verdict on a Tools capture is reported: the call that crosses 80% logs the alert, and the crossing into the hard stop is logged", async () => {
+    const a = await owner("starter");
+    const warn = vi.spyOn(Logger.prototype, "warn");
+    const error = vi.spyOn(Logger.prototype, "error");
+    adapters = { perplexity: async (ctx) => { ctx.recordCost(0.004); return raw(ANSWER, 0.004); }, chatgpt: async () => raw("HubSpot is the most common choice for this.", 0) };
+    workerDeps = { spendMeter: { isCeilingReached: async () => false, recordCost: async () => ({ newAlerts: ["warn_80"], hardStopped: true, totalUsd: 81, ceilingUsd: 100 }) } as unknown as SpendMeter };
+    await post(a);
+    expect(warn.mock.calls.some((c) => typeof c[0] === "string" && c[0].includes("warn_80") && c[0].includes("perplexity"))).toBe(true);
+    expect(error.mock.calls.some((c) => typeof c[0] === "string" && c[0].includes("ceiling crossed"))).toBe(true);
+  });
+
+  it("round 2 - a capture that answers AFTER the scan deadline still has its vendor cost attributed to the workspace in usage_ledger", async () => {
+    const a = await owner("starter");
+    adapters = {
+      perplexity: async () => raw(),
+      chatgpt: (ctx) => new Promise<RawCapture>((resolve) => setTimeout(() => { ctx.recordCost(0.007); resolve(raw("HubSpot is the most common choice for this.", 0.007)); }, 600)),
+    };
+    workerDeps = { deadlineMs: 200, lateCostGraceMs: 3_000 };
+    await post(a);
+    const id = enqueued[0]!.payload["toolRunId"] as string;
+    const rows = (await harness.db().query<{ engine_key: string; unit_cost_usd: string }>("SELECT engine_key, unit_cost_usd FROM usage_ledger WHERE workspace_id = $1 AND reference_id = $2", [a.workspaceId, id])).rows;
+    expect(rows).toEqual([{ engine_key: "chatgpt", unit_cost_usd: "0.007000" }]);
+  });
+
   it("scenario 7 (mid-run) - a client that drops while an engine is still running does not stop the run; the same Idempotency-Key reattaches, is replayed what landed, and receives the rest - one run, one debit", async () => {
     const a = await owner("starter");
     const before = await available(a);

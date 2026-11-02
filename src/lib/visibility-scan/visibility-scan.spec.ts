@@ -323,3 +323,35 @@ describe("STORY-079 review - Gemini grounding redirects are unresolved, not fore
     expect(aggregateScan([r], [], ["gemini"]).owned_citation_count).toBe(0);
   });
 });
+
+// REVIEW ROUND 2.
+describe("STORY-079 review round 2 - wrapper detection and the engine row's sentiment label", () => {
+  it("a non-wrapper URL whose title merely looks like a hostname ('Next.js') keeps the parsed domain", async () => {
+    const parse = await parseScanAnswer({ engineKey: "perplexity", text: "Acme builds on Next.js.", structuredCitations: [{ url: "https://nextjs.org/docs", title: "Next.js", slot: 1 }], brandName: "Acme", brandUrl: "https://acme.test", competitors: [] });
+    const r = toEngineResult({ engine: "perplexity", parse, capturedAt: NOW, now: NOW, latencyMs: 1, cacheLayer: "none", excerpt: "x", brandHost: "acme.test" });
+    expect(r.citations).toEqual([{ slot: 1, domain: "nextjs.org", is_owned: false }]);
+  });
+
+  // Mention scores +0.2, +0.2, -0.9: a majority of positive labels, but a negative mean (-0.167).
+  const mention = (score: number, label: "positive" | "negative" | "neutral") => ({ mention: { entityType: "brand", inLink: false }, sentiment: { score, label } });
+  const mixed = (scores: [number, "positive" | "negative" | "neutral"][]) =>
+    toEngineResult({
+      engine: "perplexity",
+      parse: { brandPresent: true, brandRankPosition: 1, brandSov: 0.5, citations: [], mentions: scores.map(([s, l]) => mention(s, l)) } as never,
+      capturedAt: NOW,
+      now: NOW,
+      latencyMs: 1,
+      cacheLayer: "none",
+      excerpt: "x",
+    });
+  it("the row's label is the parser's band for its own mean score, so a mixed-mention row and the headline agree", () => {
+    const r = mixed([[0.2, "positive"], [0.2, "positive"], [-0.9, "negative"]]);
+    expect(r.sentiment.score).toBeCloseTo(-0.1667, 3);
+    expect(r.sentiment.label).toBe(aggregateScan([r], [], ["perplexity"]).sentiment_label);
+    expect(r.sentiment.label).not.toBe("positive");
+  });
+  it("the opposite mix (+0.9, -0.2, -0.2) is not labelled negative", () => {
+    const r = mixed([[0.9, "positive"], [-0.2, "negative"], [-0.2, "negative"]]);
+    expect(r.sentiment.label).toBe(aggregateScan([r], [], ["perplexity"]).sentiment_label);
+  });
+});

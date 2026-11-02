@@ -11,7 +11,7 @@
    `age_ms` (0 for a live capture; `captured_at` is the ANSWER's time), `estimated: true`, `sentiment.label` may be `absent` with `score: null` (brand not in the
    answer), `cache_layer` `l1|none`; `scan.completed` gains `engine_failures[{engine, code, reason}]`, `credits {charged, refunded}`, `deadline_reached`,
    `not_tracked`, `did_not_check`, `sample_statement`, `aggregate.estimated_fields`, and its `aggregate` figures are `null` (not 0) when nothing was captured;
-   `convert_cta` is `null` for a failed run. The stream ends at 55 s with a `partial` terminal if the worker has not settled the run (the charge stands until it does).
+   `convert_cta` is `null` for a failed run. If the worker has not settled the run by 55 s the stream ends with the provisional terminal of item 7 (`status: running`, `settled: false`, null credits); the charge stands until the worker or the reaper settles it.
 4. **system-architecture.md section 6.2** says CreditGuard "reserves" and total failure "RELEASES". As built (STORY-078) the flat price is a ledger DEBIT in the run's own
    transaction and a nothing-captured run is REFUNDED in full (`commit` + `refund` entries, wallet restored exactly). The story AC's "one release, one ledger entry" is
    satisfied as: exactly one `refund` entry of the full price.
@@ -35,7 +35,7 @@
     daily scan whose connection drops is refused (429) on reconnect, although the reconnect charges nothing. The documented route for that case is `GET /tools/runs/{id}`
     (free). Detecting the claim before the cap guard would move logic into a guard: not done without a decision.
 11. **Shared cache.** `no_shared_cache` is honoured: a flagged workspace neither reads nor seeds the cross-tenant L1 (integration test `no_shared_cache`).
-12. **Sentiment and share constants.** The scan's headline sentiment label now uses the parser's `labelFor` (band 0.15, exclusive). The headline `sov_estimate` is the mean of the
+12. **Sentiment and share constants.** The scan's headline AND per-engine sentiment labels now use the parser's `labelFor` (the row label is the band of the row's mean score, not a majority of mention labels; owner to ratify) (band 0.15, exclusive). The headline `sov_estimate` is the mean of the
     engines' shares and the headline sentiment score is a plain mean of scored engines; scoring-models.md section 3 (pooled ratio) and section 6 (prominence weighting) do not
     cover a single-sample estimate. The owner should ratify these two choices in scoring-models.md or direct the section 6 weighting (they are labelled estimates, and `scoring_version` is not stored for a scan).
 13. **AC wording.** STORY-079's "report-only ... asserted by the isolation suite": the isolation suite (`test/isolation`) asserts RLS structure per table, not behaviour; the behavioural
