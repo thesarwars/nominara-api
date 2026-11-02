@@ -18,7 +18,7 @@ import { actionItemEffortSchema, actionItemKindSchema, actionItemSeveritySchema,
  * `unverified`: the fetch finished and the task STAYS in review with a specific `reason` (the customer may submit another URL).
  * Null on every task that is not `in_review`.
  */
-export const TASK_VERIFICATION_REASONS = ["no_mention", "unreachable", "not_a_page", "unsafe_target", "wrong_domain", "no_brand_names"] as const;
+export const TASK_VERIFICATION_REASONS = ["no_mention", "unreachable", "not_a_page", "unsafe_target", "wrong_domain", "no_brand_names", "url_echoes_brand"] as const;
 export const taskVerificationReasonSchema = z.enum(TASK_VERIFICATION_REASONS);
 export const taskVerificationSchema = z
   .object({
@@ -59,6 +59,11 @@ export const taskSchema = z
     resurface_at: z.string().nullable(),
     completed_at: z.string().nullable(),
     affected_url: z.string().nullable(),
+    /**
+     * STORY-055: a SEEDING task (one with a playbook or a source class - the rule `POST /tasks/{id}/complete` applies) is completed with a
+     * contribution `url`. Served so the UI shows the URL form before the click instead of learning it from a 400.
+     */
+    seeding: z.boolean(),
     /** Owner decision 30: why a seeding task is `in_review`. Null on every other task. (Not the STORY-067 `verification` of the complete response.) */
     review: taskVerificationSchema.nullable(),
     created_at: z.string(),

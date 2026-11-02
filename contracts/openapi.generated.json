@@ -18273,6 +18273,9 @@
                               }
                             ]
                           },
+                          "seeding": {
+                            "type": "boolean"
+                          },
                           "review": {
                             "anyOf": [
                               {
@@ -18301,7 +18304,8 @@
                                           "not_a_page",
                                           "unsafe_target",
                                           "wrong_domain",
-                                          "no_brand_names"
+                                          "no_brand_names",
+                                          "url_echoes_brand"
                                         ]
                                       },
                                       {
@@ -18352,6 +18356,7 @@
                           "resurface_at",
                           "completed_at",
                           "affected_url",
+                          "seeding",
                           "review",
                           "created_at",
                           "updated_at"
@@ -44334,6 +44339,9 @@
                               }
                             ]
                           },
+                          "seeding": {
+                            "type": "boolean"
+                          },
                           "review": {
                             "anyOf": [
                               {
@@ -44362,7 +44370,8 @@
                                           "not_a_page",
                                           "unsafe_target",
                                           "wrong_domain",
-                                          "no_brand_names"
+                                          "no_brand_names",
+                                          "url_echoes_brand"
                                         ]
                                       },
                                       {
@@ -44413,6 +44422,7 @@
                           "resurface_at",
                           "completed_at",
                           "affected_url",
+                          "seeding",
                           "review",
                           "created_at",
                           "updated_at"
@@ -44950,6 +44960,9 @@
                             }
                           ]
                         },
+                        "seeding": {
+                          "type": "boolean"
+                        },
                         "review": {
                           "anyOf": [
                             {
@@ -44978,7 +44991,8 @@
                                         "not_a_page",
                                         "unsafe_target",
                                         "wrong_domain",
-                                        "no_brand_names"
+                                        "no_brand_names",
+                                        "url_echoes_brand"
                                       ]
                                     },
                                     {
@@ -45029,6 +45043,7 @@
                         "resurface_at",
                         "completed_at",
                         "affected_url",
+                        "seeding",
                         "review",
                         "created_at",
                         "updated_at"
@@ -53716,6 +53731,9 @@
                             }
                           ]
                         },
+                        "seeding": {
+                          "type": "boolean"
+                        },
                         "review": {
                           "anyOf": [
                             {
@@ -53744,7 +53762,8 @@
                                         "not_a_page",
                                         "unsafe_target",
                                         "wrong_domain",
-                                        "no_brand_names"
+                                        "no_brand_names",
+                                        "url_echoes_brand"
                                       ]
                                     },
                                     {
@@ -53795,6 +53814,7 @@
                         "resurface_at",
                         "completed_at",
                         "affected_url",
+                        "seeding",
                         "review",
                         "created_at",
                         "updated_at"
@@ -54738,6 +54758,9 @@
                                 }
                               ]
                             },
+                            "seeding": {
+                              "type": "boolean"
+                            },
                             "review": {
                               "anyOf": [
                                 {
@@ -54766,7 +54789,8 @@
                                             "not_a_page",
                                             "unsafe_target",
                                             "wrong_domain",
-                                            "no_brand_names"
+                                            "no_brand_names",
+                                            "url_echoes_brand"
                                           ]
                                         },
                                         {
@@ -54817,6 +54841,7 @@
                             "resurface_at",
                             "completed_at",
                             "affected_url",
+                            "seeding",
                             "review",
                             "created_at",
                             "updated_at"
@@ -67017,6 +67042,9 @@
                                   }
                                 ]
                               },
+                              "seeding": {
+                                "type": "boolean"
+                              },
                               "review": {
                                 "anyOf": [
                                   {
@@ -67045,7 +67073,8 @@
                                               "not_a_page",
                                               "unsafe_target",
                                               "wrong_domain",
-                                              "no_brand_names"
+                                              "no_brand_names",
+                                              "url_echoes_brand"
                                             ]
                                           },
                                           {
@@ -67096,6 +67125,7 @@
                               "resurface_at",
                               "completed_at",
                               "affected_url",
+                              "seeding",
                               "review",
                               "created_at",
                               "updated_at"
