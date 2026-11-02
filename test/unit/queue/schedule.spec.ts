@@ -98,6 +98,13 @@ const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; sou
     source:
       "STORY-064 AC5 / schemas/tasks-and-goals.md (dismissed tasks return after resurface_at) — the references state no time of day; 02:10 UTC is a chosen quiet window",
   },
+  "maintenance.integrity": {
+    cron: "10 3 * * *",
+    section: "STORY-013 AC6 / AC14 / AC16",
+    source:
+      "data-model.md §5 / §8 / §7 and STORY-013 — vector recall checked nightly, orphan scan nightly, purge failures alert; the references state " +
+      "no time of day, 03:10 UTC is a chosen quiet window ahead of the 03:20 partition tick, and the tick is READ-ONLY (no DDL, no rebuild)",
+  },
   "retention.purge": {
     cron: "40 3 * * *",
     section: "STORY-077 R4 / STORY-013",
@@ -166,9 +173,9 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(undatedSchedules().map((s) => s.queue).sort()).toEqual([...ON_DEMAND_ONLY].sort());
   });
 
-  it("STORY-140 AC11 · fourteen of sixteen cron queues are dated, two are on demand", () => {
+  it("STORY-140 AC11 · fifteen of seventeen cron queues are dated, two are on demand", () => {
     // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5).
-    expect(datedSchedules()).toHaveLength(14);
+    expect(datedSchedules()).toHaveLength(15);
     expect(undatedSchedules()).toHaveLength(2);
   });
 
@@ -224,6 +231,7 @@ describe("G12 · the schedule table matches the reference", () => {
       "credit.reconcile",
       "domain.reverify",
       "identity.sweep_unverified",
+      "maintenance.integrity",
       "maintenance.partition",
       "retention.purge",
       "task.resurface",
@@ -267,6 +275,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("14 of 16 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("15 of 17 cron queues state a time");
   });
 });

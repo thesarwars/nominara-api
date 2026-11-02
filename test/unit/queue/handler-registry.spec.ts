@@ -76,6 +76,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "identity.sweep_unverified",
       // STORY-079 - the Visibility Scan, on the dedicated interactive pool.
       "lookup.execute",
+      "maintenance.integrity",
       "maintenance.partition",
       "notify.dispatch",
       "report.build",
@@ -131,6 +132,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "domain.reverify",
       // STORY-064 AC5 — declared after domain.reverify in topology.ts.
       "task.resurface",
+      // STORY-013 AC6 / AC14 / AC16 — declared after task.resurface in topology.ts.
+      "maintenance.integrity",
     ]);
   });
 

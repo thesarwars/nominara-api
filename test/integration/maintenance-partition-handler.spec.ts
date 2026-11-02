@@ -24,10 +24,15 @@ import { PARTITION_LEAD_MONTHS } from "../../src/db/conventions.js";
 
 const connectedUrls: string[] = [];
 const counters: { name: string; labels: Record<string, string> }[] = [];
+const observations: { name: string; value: number; labels: Record<string, unknown> }[] = [];
 vi.mock("../../src/lib/telemetry/metrics.js", async () => {
   const actual = await vi.importActual<typeof import("../../src/lib/telemetry/metrics.js")>("../../src/lib/telemetry/metrics.js");
   return {
     ...actual,
+    observeValue: (name: string, value: number, labels: Record<string, string | number> = {}) => {
+      observations.push({ name, value, labels });
+      actual.observeValue(name, value, labels);
+    },
     incrementCounter: (name: string, labels: Record<string, string> = {}) => {
       counters.push({ name, labels });
       actual.incrementCounter(name, labels);
@@ -257,6 +262,35 @@ describe("STORY-142 · maintenance.partition handler", () => {
     const alerted = counters.filter((c) => c.name === "partition_default_rows_detected");
     expect(alerted).toHaveLength(1);
     expect(alerted[0]!.labels.table).toBe("answer_captures");
+  }, 60_000);
+
+  it("STORY-013 AC3 · rows stranded in a DEFAULT partition raise the alert hook: a gauge observation per table and an alert email, still without failing the job", async () => {
+    const { setAlertEmailerForTests } = await import("../../src/lib/alerts/alerts.js");
+    const sent: { message: string; context: Record<string, unknown> }[] = [];
+    setAlertEmailerForTests({
+      page: (message: string, context: Record<string, unknown>) => void sent.push({ message, context }),
+      notify: (message: string, context: Record<string, unknown>) => {
+        sent.push({ message, context });
+        return Promise.resolve();
+      },
+      drain: () => Promise.resolve(),
+    } as never);
+    try {
+      // The previous test left a 2030 row in the default partition; the case does not depend on that.
+      await insertCapture(new Date(Date.UTC(2030, 0, 16)).toISOString());
+      observations.length = 0;
+
+      await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).resolves.toBeUndefined();
+
+      const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
+      expect(gauge).toHaveLength(1);
+      expect(gauge[0]!.value).toBeGreaterThanOrEqual(1);
+      const alert = sent.find((a) => a.context.alertName === "partition_default_rows");
+      expect(alert).toBeDefined();
+      expect(alert!.context.table).toBe("answer_captures");
+    } finally {
+      setAlertEmailerForTests(undefined);
+    }
   }, 60_000);
 
   async function insertCapture(capturedAt: string): Promise<void> {

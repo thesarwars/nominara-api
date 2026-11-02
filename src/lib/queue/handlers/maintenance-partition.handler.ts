@@ -3,7 +3,9 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
-import { incrementCounter } from "../../telemetry/metrics.js";
+import { PARTITIONED_FACT_TABLES } from "../../../db/conventions.js";
+import { drainAlertEmails, emailAlert } from "../../alerts/alerts.js";
+import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -97,9 +99,23 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
           `rows are sitting in ${alert.table}'s DEFAULT partition (${String(alert.rowCount)}) — ` +
             `a partition covering their range can no longer be attached until they are moved`,
         );
+        // STORY-013 AC3 — the page hook. No pager exists (decision 45), so this is the email leg of the Pager contract
+        // (a no-op until ALERT_EMAIL_TO is set): table name and count only, never row content. The recovery is operator-run
+        // (`pnpm db:maintenance:catch-up`), deliberately not scheduled: it takes ACCESS EXCLUSIVE-class locks on live tables.
+        emailAlert(`rows are sitting in ${alert.table}'s default partition`, {
+          alertName: "partition_default_rows",
+          table: alert.table,
+          rowCount: alert.rowCount,
+        });
+      }
+      // ⚠ 0 IS AN OBSERVATION, NOT ABSENCE: every fact table reports each run, so a dashboard can tell "clean" from "did not run".
+      for (const table of PARTITIONED_FACT_TABLES) {
+        const stranded = result.defaultPartitionAlerts.find((alert) => alert.table === table);
+        observeValue("nominara_partition_default_rows", stranded?.rowCount ?? 0, { table });
       }
     } finally {
       await client.end();
+      await drainAlertEmails();
     }
   };
 }

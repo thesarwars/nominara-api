@@ -471,6 +471,22 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "taskresurf:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ NOT FROM §4 — STORY-013 AC6 / AC14 / AC16. The nightly integrity tick: the orphan scan ("pages on non-zero"), the purge-failure
+  // check ("alerts and blocks the next release train if unresolved") and the vector-recall check ("checked nightly"). All three were
+  // reachable only from hand-run scripts. A queue of its own, and not folded into `maintenance.partition`, because that tick is
+  // deliberately cheap and DDL-only (STORY-142) while the recall check runs forced sequential-scan exact queries; a DLQ entry should
+  // also name the check that paged. READ-ONLY: no DDL, no REINDEX. Not tenant-scoped (cross-tenant by definition, owner connection).
+  // Advisory-locked single-flight (`locks.ts`).
+  {
+    name: "maintenance.integrity",
+    producer: "cron daily (STORY-013; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "integrity:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

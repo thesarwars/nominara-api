@@ -15,6 +15,7 @@ import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handle
 import { createRetentionPurgeHandler } from "./handlers/retention-purge.handler.js";
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
+import { createMaintenanceIntegrityHandler } from "./handlers/maintenance-integrity.handler.js";
 import { createMaintenancePartitionHandler } from "./handlers/maintenance-partition.handler.js";
 import { createNotifyDispatchHandler } from "./handlers/notify-dispatch.handler.js";
 import { createReportBuildHandler } from "./handlers/report-build.handler.js";
@@ -126,6 +127,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "credit.housekeeping": (context) => createCreditHousekeepingHandler(context),
   "retention.purge": (context) => createRetentionPurgeHandler(context),
   "maintenance.partition": (context) => createMaintenancePartitionHandler(context),
+  "maintenance.integrity": (context) => createMaintenanceIntegrityHandler(context),
   "audit.verify": (context) => createAuditVerifyHandler(context),
   "identity.sweep_unverified": (context) => createIdentitySweepUnverifiedHandler(context),
   "source.verify_presence": (context) => createSourceVerifyPresenceHandler(context),
