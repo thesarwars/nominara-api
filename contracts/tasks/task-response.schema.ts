@@ -60,8 +60,9 @@ export const taskSchema = z
     completed_at: z.string().nullable(),
     affected_url: z.string().nullable(),
     /**
-     * STORY-055: a SEEDING task (one with a playbook or a source class - the rule `POST /tasks/{id}/complete` applies) is completed with a
-     * contribution `url`. Served so the UI shows the URL form before the click instead of learning it from a 400.
+     * STORY-055: true when the task CAN BE COMPLETED WITH A URL - it has a source domain (`source_domain_id IS NOT NULL`). A playbook-only
+     * task is refused by `POST /tasks/{id}/complete` (`no_source_domain`, nothing to verify the URL against), so it is false here: the UI
+     * must not offer a URL form that can only fail. Served so the UI shows the form before the click instead of learning it from a 400.
      */
     seeding: z.boolean(),
     /** Owner decision 30: why a seeding task is `in_review`. Null on every other task. (Not the STORY-067 `verification` of the complete response.) */
