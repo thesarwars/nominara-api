@@ -14,7 +14,7 @@ import type { ScanPublished } from "./run-scan.js";
 export const SCAN_EVENT_TTL_MS = 60 * 60 * 1000;
 
 const storedEventSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("engine_result"), result: scanStreamEngineResultSchema }).strict(),
+  z.object({ kind: z.literal("engine_result"), result: scanStreamEngineResultSchema, mentioned: z.array(z.string()).optional() }).strict(),
   z.object({ kind: z.literal("engine_failed"), failure: scanEngineFailureSchema }).strict(),
 ]);
 

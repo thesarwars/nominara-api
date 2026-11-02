@@ -6,13 +6,12 @@ import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../sr
 import { RATE_LIMIT_DEFAULTS } from "../../src/api/rate-limit/defaults.js";
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
-import { ValkeyCacheAdapter } from "../../src/lib/cache/valkey-cache.adapter.js";
 import { CACHE, type Cache } from "../../src/lib/cache/cache.port.js";
 import { rateLimitConfigKey } from "../../src/lib/cache/valkey-keys.js";
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { captureL1Key } from "../../src/lib/capture/l1-cache-key.js";
 import { adapterMajorOf } from "../../src/lib/capture/l1-exact-hash.js";
-import type { CaptureAdapter, RawCapture } from "../../src/lib/engines/contract.js";
+import type { CaptureAdapter, CaptureContext, RawCapture } from "../../src/lib/engines/contract.js";
 import { CaptureFailureError } from "../../src/lib/engines/failure-taxonomy.js";
 import type { SpendMeter } from "../../src/lib/engines/spend-meter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -21,6 +20,7 @@ import { createLookupExecuteHandler, type LookupExecuteDeps } from "../../src/li
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
+import { VisibilityScanService } from "../../src/modules/tools/visibility-scan.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
@@ -50,11 +50,11 @@ const ANSWER = "For subscription CRM, Acme is the most common choice. HubSpot is
 // A FRESH QUERY PER SCAN: a live capture seeds the shared L1 cache (by design), so a repeated query would be answered from an earlier test's capture.
 const body = (query = `best crm for startups ${uuidV7()}`) => ({ brand_name: "Acme", brand_url: "https://acme.test", query_text: query, competitors: ["HubSpot", "Zoho"] });
 
-function raw(text = ANSWER): RawCapture {
-  return { text, format: "markdown", truncated: false, responseTokensEst: 20, latencyMs: 40, costUsd: 0 };
+function raw(text = ANSWER, costUsd = 0): RawCapture {
+  return { text, format: "markdown", truncated: false, responseTokensEst: 20, latencyMs: 40, costUsd };
 }
-function adapter(engineKey: string, capture: () => Promise<RawCapture>): CaptureAdapter {
-  return { engineKey: engineKey as CaptureAdapter["engineKey"], captureMode: "api", adapterVersion: "1.0.0", supportsCitations: true, concurrencyPerTask: 1, capture, healthProbe: async () => ({ ok: true, latencyMs: 1 }) };
+function adapter(engineKey: string, capture: (ctx: CaptureContext) => Promise<RawCapture>): CaptureAdapter {
+  return { engineKey: engineKey as CaptureAdapter["engineKey"], captureMode: "api", adapterVersion: "1.0.0", supportsCitations: true, concurrencyPerTask: 1, capture: async (_request, ctx) => await capture(ctx), healthProbe: async () => ({ ok: true, latencyMs: 1 }) };
 }
 const frames = (body: string): Frame[] =>
   body.split("\n\n").flatMap((chunk) => {
@@ -84,11 +84,15 @@ function widenedScanDocument(): string {
 describe("STORY-079 · Visibility Scan", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
-  const harness = useApiHarness({ env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString }) });
+  // The app and the worker share ONE cache, as they do in production (one Valkey). Under the test runner the app's own cache is a per-process in-memory
+  // adapter, so a worker holding its own Valkey connection would publish events the stream could never see - and the stream would only ever be fed by the
+  // stored snapshot at the end, which is exactly the path that must NOT be the only one tested.
+  const sharedCache = new InMemoryCacheAdapter();
+  const harness = useApiHarness({ cache: () => sharedCache, env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString }) });
   let pool: Pool;
   let sessions: SessionService;
-  let workerCache: ValkeyCacheAdapter;
-  let adapters: Record<string, () => Promise<RawCapture>>;
+  let workerCache: Cache;
+  let adapters: Record<string, (ctx: CaptureContext) => Promise<RawCapture>>;
   let workerDeps: Partial<LookupExecuteDeps>;
   let enqueued: { workspaceId: string; payload: Record<string, unknown>; options: Record<string, unknown> }[];
   let workers: Promise<unknown>[];
@@ -102,8 +106,7 @@ describe("STORY-079 · Visibility Scan", () => {
   beforeEach(async () => {
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
     sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
-    workerCache = new ValkeyCacheAdapter(cacheValkey.url);
-    await workerCache.connect();
+    workerCache = sharedCache;
     adapters = { perplexity: async () => raw(), chatgpt: async () => raw("HubSpot is the most common choice for this.") };
     workerDeps = {};
     enqueued = [];
@@ -123,7 +126,6 @@ describe("STORY-079 · Visibility Scan", () => {
   afterEach(async () => {
     const settled = await Promise.allSettled(workers);
     vi.restoreAllMocks();
-    await workerCache.onModuleDestroy();
     await pool.end();
     // A worker that threw would otherwise be invisible (the stream would simply report a partial): surface it.
     const failed = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
@@ -150,7 +152,7 @@ describe("STORY-079 · Visibility Scan", () => {
     })();
   }
 
-  async function owner(plan: "free" | "starter" | "growth" | "business" = "starter"): Promise<Actor> {
+  async function owner(plan: "free" | "starter" | "growth" | "business" = "starter", overrides: Record<string, unknown> = {}): Promise<Actor> {
     const userId = uuidV7();
     await harness.db().query(`INSERT INTO users (id, email, email_verified_at, status, created_at, updated_at) VALUES ($1,$2,now(),'active',now(),now())`, [userId, `${userId}@example.test`]);
     const tokens = await sessions.createSession(userId);
@@ -168,6 +170,8 @@ describe("STORY-079 · Visibility Scan", () => {
     } finally {
       client.release();
     }
+    // Overrides are applied BEFORE the session enters the workspace, because they bump the entitlement version the session is minted against.
+    if (Object.keys(overrides).length > 0) await harness.db().query("UPDATE workspaces SET entitlement_overrides = $2::jsonb, entitlement_version = entitlement_version + 1 WHERE id = $1", [workspaceId, JSON.stringify(overrides)]);
     const version = (await harness.db().query<{ entitlement_version: number }>("SELECT entitlement_version FROM workspaces WHERE id = $1", [workspaceId])).rows[0]!.entitlement_version;
     const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, version);
     return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken, plan };
@@ -261,7 +265,7 @@ describe("STORY-079 · Visibility Scan", () => {
       expect(f.data["estimated"]).toBe(true);
     }
     expect(fs.at(-1)!.event).toBe("scan.completed");
-    expect(fs.at(-1)!.data).toMatchObject({ status: "completed", credits: { charged: 10, refunded: 0 }, not_tracked: true });
+    expect(fs.at(-1)!.data).toMatchObject({ status: "completed", settled: true, credits: { charged: 10, refunded: 0 }, not_tracked: true });
     expect(await available(a)).toBe(before - 10);
   });
 
@@ -468,6 +472,115 @@ describe("STORY-079 · Visibility Scan", () => {
     const everything = JSON.stringify(lines);
     for (const forbidden of ["Acme", "best crm for startups", "most common choice", "acme.test"]) expect(everything, forbidden).not.toContain(forbidden);
   });
+
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  // REVIEW ROUND 1
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  const l1KeyFor = async (engineKey: string, query: string): Promise<string> => {
+    const engine = (await harness.db().query<{ cache_ttl_seconds: number; adapter_version: string }>("SELECT cache_ttl_seconds, adapter_version FROM engines WHERE key = $1", [engineKey])).rows[0]!;
+    return captureL1Key({ env: cacheKeyNamespace(), engineKey: engineKey as never, adapterMajor: adapterMajorOf(engine.adapter_version), promptText: query, locale: "en-US", personaHint: null, ttlSeconds: engine.cache_ttl_seconds, nowMs: Date.now() });
+  };
+
+  it("no_shared_cache - a flagged workspace neither reads another tenant's cached answer nor leaves its own in the shared cache; an unflagged one does both", async () => {
+    const flagged = await owner("starter", { no_shared_cache: true });
+    const seeded = body();
+    await workerCache.set(
+      await l1KeyFor("perplexity", seeded.query_text),
+      JSON.stringify({ v: 1, contentHash: "b".repeat(64), payload: { format: "markdown", text: "ANOTHER TENANT'S ANSWER about Acme" }, excerpt: "x", capturedAt: new Date(Date.now() - 3_600_000).toISOString() }),
+      { ttlMs: 60_000 },
+    );
+    let liveCalls = 0;
+    adapters = { perplexity: async () => { liveCalls += 1; return raw(); }, chatgpt: async () => { liveCalls += 1; return raw(); } };
+    const res = await post(flagged, { body: seeded });
+    const results = frames(res.body).filter((f) => f.event === "scan.engine_result");
+    expect(results, res.body).toHaveLength(2);
+    expect(results.map((f) => f.data["cache_layer"])).toEqual(["none", "none"]);
+    expect(liveCalls).toBe(2);
+    // The flagged workspace's own live answers were NOT written to the shared namespace: the only entry under the seeded key is still the other tenant's.
+    expect(await workerCache.get(await l1KeyFor("chatgpt", seeded.query_text))).toBeUndefined();
+    expect(await workerCache.get(await l1KeyFor("perplexity", seeded.query_text))).toContain("ANOTHER TENANT'S ANSWER");
+
+    // Control: an unflagged workspace DOES seed the shared cache.
+    const open = await owner("starter");
+    const fresh = body();
+    await post(open, { body: fresh });
+    expect(await workerCache.get(await l1KeyFor("chatgpt", fresh.query_text))).toBeDefined();
+  });
+
+  it("usage_ledger - a live capture with a vendor cost is attributed to the workspace (source lookup, reference the run); a cached answer and a redelivered commit add nothing", async () => {
+    const a = await owner("starter");
+    adapters = { perplexity: async (ctx) => { ctx.recordCost(0.004); return raw(ANSWER, 0.004); }, chatgpt: async () => raw("HubSpot is the most common choice for this.", 0) };
+    await post(a);
+    const id = enqueued[0]!.payload["toolRunId"] as string;
+    const rows = (await harness.db().query<{ engine_key: string; source: string; unit_cost_usd: string; cache_layer: string; reference_type: string }>("SELECT engine_key, source, unit_cost_usd, cache_layer, reference_type FROM usage_ledger WHERE workspace_id = $1 AND reference_id = $2", [a.workspaceId, id])).rows;
+    expect(rows).toEqual([{ engine_key: "perplexity", source: "lookup", unit_cost_usd: "0.004000", cache_layer: "live", reference_type: "tool_run" }]);
+  });
+
+  it("scenario 7 (mid-run) - a client that drops while an engine is still running does not stop the run; the same Idempotency-Key reattaches, is replayed what landed, and receives the rest - one run, one debit", async () => {
+    const a = await owner("starter");
+    const before = await available(a);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    adapters = { perplexity: async () => raw(), chatgpt: async () => { await gate; return raw("HubSpot is the most common choice for this."); } };
+    const service = harness.app().get(VisibilityScanService);
+    const tenant = { workspaceId: a.workspaceId, actorId: a.userId };
+    const key = uuidV7();
+    const asked = body();
+    const accepted = await service.accept(tenant, asked, { confirmedCredits: "10", idempotencyKey: key }, { actorType: "user", ip: null, userAgent: null, requestId: "R" });
+    const chunks: string[] = [];
+    let drop!: () => void;
+    const first = service.stream(tenant, accepted, { write: (c) => chunks.push(c), end: () => undefined, onClose: (cb) => { drop = cb; } }, { pollMs: 20 });
+    await vi.waitFor(() => expect(frames(chunks.join("")).some((f) => f.event === "scan.engine_result")).toBe(true), { timeout: 15_000 });
+    drop();
+    await first;
+    // The first connection saw one engine and NO terminal event; the run itself is untouched.
+    expect(frames(chunks.join("")).map((f) => f.event)).not.toContain("scan.completed");
+    expect((await runRow(accepted.runId)).status).toBe("running");
+    const reattached = post(a, { key, body: asked });
+    release();
+    const res = await reattached;
+    const fs = frames(res.body);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(fs.filter((f) => f.event === "scan.engine_result").map((f) => f.data["engine"]).sort()).toEqual(["chatgpt", "perplexity"]);
+    expect(fs.at(-1)).toMatchObject({ event: "scan.completed", data: { status: "completed", settled: true } });
+    expect(enqueued).toHaveLength(1);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(1);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit'", [a.workspaceId])).toBe(1);
+    expect(await available(a)).toBe(before - 10);
+  });
+
+  it("concurrency - twenty simultaneous POSTs with the SAME Idempotency-Key start one run and take 10 credits once", async () => {
+    const a = await owner("starter");
+    const before = await available(a);
+    const key = uuidV7();
+    const same = body();
+    const responses = await Promise.all(Array.from({ length: 20 }, () => post(a, { key, body: same })));
+    for (const r of responses) {
+      expect(r.statusCode, r.body).toBe(200);
+      expect(frames(r.body).at(-1)!.event).toBe("scan.completed");
+    }
+    expect(enqueued).toHaveLength(1);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(1);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit'", [a.workspaceId])).toBe(1);
+    expect(await available(a)).toBe(before - 10);
+  }, 60_000);
+
+  it("concurrency - nineteen simultaneous POSTs with DIFFERENT keys against a wallet that holds exactly one scan: one succeeds, eighteen are 402, the balance is 0 and never negative", async () => {
+    const a = await owner("starter");
+    expect((await post(a)).statusCode).toBe(200);
+    await harness.db().query("UPDATE credit_wallets SET included_balance = 10, purchased_balance = 0, reserved = 0 WHERE workspace_id = $1", [a.workspaceId]);
+    const runsBefore = await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId]);
+    // 19, not 20: the widened rate-limit burst is 20 and the provisioning scan above has spent one token.
+    const responses = await Promise.all(Array.from({ length: 19 }, () => post(a)));
+    const codes = responses.map((r) => r.statusCode);
+    expect(codes.filter((c) => c === 200), codes.join(",")).toHaveLength(1);
+    expect(codes.filter((c) => c === 402), codes.join(",")).toHaveLength(18);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(runsBefore + 1);
+    expect(await available(a)).toBe(0);
+    const w = (await harness.db().query<{ included_balance: number; purchased_balance: number }>("SELECT included_balance, purchased_balance FROM credit_wallets WHERE workspace_id = $1", [a.workspaceId])).rows[0]!;
+    expect(w.included_balance).toBeGreaterThanOrEqual(0);
+    expect(w.purchased_balance).toBeGreaterThanOrEqual(0);
+  }, 60_000);
 
   it("the job is enqueued on the dedicated interactive pool, keyed by the run", async () => {
     const a = await owner("starter");

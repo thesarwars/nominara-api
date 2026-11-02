@@ -12,14 +12,16 @@ import {
   type VisibilityScanEstimateResponse,
   type VisibilityScanRequest,
 } from "../../../contracts/tools/index.js";
-import { ConflictError, PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, IdempotencyConflictError, PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { SseStream } from "../../api/streaming/sse-stream.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
 import { hashIdempotencyKey, requestBodyHash, tenantKey } from "../../lib/cache/valkey-keys.js";
+import { isReservedLedgerKey } from "../../lib/credits/debit.js";
 import { parseConfirmedCredits, requireConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
 import { readWallet } from "../../lib/credits/wallet.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
+import type { ResolvedEntitlementsResponse } from "../../lib/entitlements/resolution.js";
 import { captureReadyEngineKeys } from "../../lib/engines/registry.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -54,7 +56,8 @@ export const SCAN_POLL_MS = 250;
 const SETTLE_CHECK_MS = 1_000;
 /** NFR-API-09: a stream terminates at 60 s with a terminal event. Ours ends at 55 s with a PARTIAL one, so the helper's own deadline is only a backstop. */
 export const SCAN_STREAM_PARTIAL_MS = 55_000;
-const IDEMPOTENCY_TTL_MS = 60 * 60 * 1000;
+/** api-specification.md section 1: a billable POST replays for 24 hours. A shorter claim lets a late retry of the same key start (and charge) a second scan. */
+export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const CLAIM_WAIT_MS = 3_000;
 
 export interface ScanAccepted {
@@ -89,6 +92,38 @@ function firstHeader(value: string | readonly string[] | undefined): string | un
   return Array.isArray(value) ? (value[0] as string | undefined) : (value as string | undefined);
 }
 
+interface Claim {
+  readonly bodyHash: string;
+  /** Absent while the request is still being accepted (`pending`). */
+  readonly runId: string | undefined;
+  /** When the claim was first made (ISO), for the conflict's `original_recorded_at`. */
+  readonly at: string;
+}
+
+// A claim is a VALUE (not a key): the tenant-namespaced key is built by `tenantKey`. Its parts are joined, never interpolated, so nothing here reads as a key.
+const CLAIM_PENDING = "pending";
+const CLAIM_SEPARATOR = ":";
+const CLAIM_AT = "@";
+
+/** `pending : <hash> @ <iso>` while the run is being started; `<hash> : <runId> @ <iso>` once it exists. */
+function claimValue(bodyHash: string, runId: string | undefined, at: string): string {
+  const head = runId === undefined ? [CLAIM_PENDING, bodyHash] : [bodyHash, runId];
+  return head.join(CLAIM_SEPARATOR) + CLAIM_AT + at;
+}
+
+function parseClaim(value: string): Claim {
+  const atIndex = value.lastIndexOf(CLAIM_AT);
+  const at = atIndex < 0 ? new Date(0).toISOString() : value.slice(atIndex + 1);
+  const head = atIndex < 0 ? value : value.slice(0, atIndex);
+  const separator = head.indexOf(CLAIM_SEPARATOR);
+  if (separator < 0) return { bodyHash: head, runId: undefined, at };
+  // Split on the FIRST separator only: the run id is everything after it, whatever shape the hash takes.
+  const first = head.slice(0, separator);
+  const rest = head.slice(separator + 1);
+  if (first === CLAIM_PENDING) return { bodyHash: rest, runId: undefined, at };
+  return { bodyHash: first, runId: rest === "" ? undefined : rest, at };
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 @Injectable()
@@ -109,7 +144,9 @@ export class VisibilityScanService {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("VisibilityScanService requires an active tenant context");
     const { client, context } = store;
-    const engines = await this.engineSet(client, context.workspaceId);
+    // The version is read on the AMBIENT connection and `resolve` (cache-first) is used, so the request does not take a second pool connection while it holds one.
+    const version = (await client.query<{ entitlement_version: number }>("SELECT entitlement_version FROM workspaces WHERE id = app.current_workspace()")).rows[0]?.entitlement_version ?? 0;
+    const engines = await this.engineSet(client, await this.entitlements.resolve(context.workspaceId, version));
     const wallet = await readWallet(client, context.workspaceId);
     const available = wallet?.available ?? 0;
     incrementCounter("nominara_tools_scan_estimates_total");
@@ -126,8 +163,7 @@ export class VisibilityScanService {
   }
 
   /** The plan's engine set, with display names, for one workspace. */
-  private async engineSet(client: ClientBase, workspaceId: string): Promise<{ engine_key: string; display_name: string }[]> {
-    const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
+  private async engineSet(client: ClientBase, resolved: ResolvedEntitlementsResponse): Promise<{ engine_key: string; display_name: string }[]> {
     const size = Number(resolved.entitlements["tools.engine_set"]?.value);
     // The plan floor is compared in the database (plans.sort_order), exactly as the catalog's entitled-engines view does: no tier name is parsed in code.
     const rows = await client.query<{ key: string; display_name: string }>(
@@ -162,28 +198,43 @@ export class VisibilityScanService {
             details: { issues: [{ path: ["idempotency-key"], message: "required" }] },
           });
         }
+        // The same namespace guard every credit-spending route has (CreditGuard): a client-chosen key must not collide with a server-written ledger key.
+        if (isReservedLedgerKey(key)) {
+          throw new ValidationFailedError({
+            message: "this Idempotency-Key is in a namespace reserved for the server",
+            details: { issues: [{ path: ["idempotency-key"], message: "must not start with a reserved internal prefix" }] },
+          });
+        }
         const env = cacheKeyNamespace();
         const claimKey = tenantKey(env, tenant.workspaceId, "tool-scan-idem", hashIdempotencyKey(key));
         const bodyHash = requestBodyHash(JSON.stringify(body));
-        const claimed = await this.cache.set(claimKey, `pending:${bodyHash}`, { ttlMs: IDEMPOTENCY_TTL_MS, onlyIfAbsent: true });
+        const claimedAt = new Date().toISOString();
+        const claimed = await this.cache.set(claimKey, claimValue(bodyHash, undefined, claimedAt), { ttlMs: IDEMPOTENCY_TTL_MS, onlyIfAbsent: true });
         if (!claimed) {
-          const attached = await this.attach(tenant, claimKey, bodyHash);
+          const attached = await this.attach(tenant, claimKey, hashIdempotencyKey(key), bodyHash);
           // A reattach is not a new scan: the daily allowance the guard consumed for this request is given back.
           await this.giveBackDailyAllowance(tenant);
           span.setAttribute("nominara.scan.resumed", true);
           incrementCounter("nominara_tools_scan_requests_total", { result: "resumed" });
           return attached;
         }
+        let accepted: ScanAccepted;
         try {
-          const accepted = await this.start(tenant, body, meta);
-          created = true;
-          await this.cache.set(claimKey, `${bodyHash}:${accepted.runId}`, { ttlMs: IDEMPOTENCY_TTL_MS });
-          incrementCounter("nominara_tools_scan_requests_total", { result: "started" });
-          return accepted;
+          accepted = await this.start(tenant, body, meta);
         } catch (error) {
+          // ONLY a `start` that threw releases the claim: nothing was committed (or the caller cannot know it was), and a retry must be a real retry.
           await this.cache.delete(claimKey).catch(() => undefined);
           throw error;
         }
+        // From here the run exists, is charged, and its job is scheduled: the claim is NEVER deleted. A retry of the same key must find a claim, so it
+        // attaches (or waits as in-flight) instead of starting - and charging - a second scan.
+        created = true;
+        if (!(await this.recordRunOnClaim(claimKey, bodyHash, accepted.runId, claimedAt))) {
+          logger.error({ event: "tools.scan.claim_unrecorded", workspace_id: tenant.workspaceId, run_id: accepted.runId });
+          incrementCounter("nominara_tools_scan_claim_unrecorded_total");
+        }
+        incrementCounter("nominara_tools_scan_requests_total", { result: "started" });
+        return accepted;
       } catch (error) {
         span.setStatus({ code: SpanStatusCode.ERROR });
         if (!created) {
@@ -198,11 +249,27 @@ export class VisibilityScanService {
     });
   }
 
+  /** Writes the run id onto the claim, with a short retry. Best effort by design: the scan is already charged, so a failure here must not become a failure of the request. */
+  private async recordRunOnClaim(claimKey: string, bodyHash: string, runId: string, claimedAt: string): Promise<boolean> {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await this.cache.set(claimKey, claimValue(bodyHash, runId, claimedAt), { ttlMs: IDEMPOTENCY_TTL_MS });
+        return true;
+      } catch {
+        if (attempt < 3) await sleep(50 * attempt);
+      }
+    }
+    return false;
+  }
+
   private async start(tenant: TenantContext, body: VisibilityScanRequest, meta: ScanRequestMeta): Promise<ScanAccepted> {
+    // RESOLVED BEFORE A CONNECTION IS TAKEN. `resolveForWorkspace` opens its own pooled connection; doing it while holding one made N concurrent scans
+    // need 2N connections, and a burst as large as the pool deadlocked every request waiting on its second one.
+    const resolved = await this.entitlements.resolveForWorkspace(tenant.workspaceId);
     const client = await this.pool.connect();
     try {
       return await withTenantContext(client, tenant, async (tx) => {
-        const engines = await this.engineSet(tx, tenant.workspaceId);
+        const engines = await this.engineSet(tx, resolved);
         // Refused BEFORE the debit: a scan with no engine able to answer is not charged and then refunded - it is not started.
         if (engines.length === 0) {
           throw new PreconditionUnmetError({
@@ -218,6 +285,7 @@ export class VisibilityScanService {
           queryText: body.query_text,
           engineKeys,
           credits: VISIBILITY_SCAN_CREDITS,
+          entitlements: resolved.entitlements,
         });
         const wallet = await readWallet(tx, tenant.workspaceId);
         // A streaming route has no AuditInterceptor, so it audits itself - in the transaction that wrote the run and the debit, so neither exists without the row.
@@ -243,6 +311,8 @@ export class VisibilityScanService {
           queryText: body.query_text,
           competitors: body.competitors ?? [],
           engines: engineKeys,
+          // `no_shared_cache` (plans-and-entitlements.md): the worker neither reads nor seeds the cross-tenant L1 for a flagged workspace. Signed with the job.
+          sharedCacheEnabled: resolved.entitlements["no_shared_cache"]?.value !== true,
           locale: "en-US",
           startedAt: new Date().toISOString(),
         };
@@ -278,15 +348,20 @@ export class VisibilityScanService {
     }
   }
 
-  private async attach(tenant: TenantContext, claimKey: string, bodyHash: string): Promise<ScanAccepted> {
+  private async attach(tenant: TenantContext, claimKey: string, keyHash: string, bodyHash: string): Promise<ScanAccepted> {
     const deadline = Date.now() + CLAIM_WAIT_MS;
+    const reused = (claim: Claim): Error =>
+      new IdempotencyConflictError({
+        message: "this Idempotency-Key was already used with a different request body",
+        details: { key_hash: keyHash, original_request_hash: claim.bodyHash, original_recorded_at: claim.at },
+      });
     for (;;) {
       const value = await this.cache.get(claimKey);
-      if (value !== undefined && !value.startsWith("pending:")) {
-        const [storedHash, runId] = value.split(":");
-        if (storedHash !== bodyHash || runId === undefined) {
-          throw new ConflictError({ message: "this Idempotency-Key was already used with a different request", details: { current_state: "idempotency_key_reused" } });
-        }
+      if (value === undefined) throw new ConflictError({ message: "the request this Idempotency-Key belonged to did not complete: retry", details: { current_state: "idempotent_request_failed" } });
+      const claim = parseClaim(value);
+      if (claim.bodyHash !== bodyHash) throw reused(claim);
+      if (claim.runId !== undefined) {
+        const runId = claim.runId;
         const client = await this.pool.connect();
         try {
           const run = await withTenantContext(client, tenant, async () => await this.tools.peek(runId));
@@ -296,8 +371,6 @@ export class VisibilityScanService {
           client.release();
         }
       }
-      if (value === undefined) throw new ConflictError({ message: "the request this Idempotency-Key belonged to did not complete: retry", details: { current_state: "idempotent_request_failed" } });
-      if (value !== `pending:${bodyHash}`) throw new ConflictError({ message: "this Idempotency-Key was already used with a different request", details: { current_state: "idempotency_key_reused" } });
       if (Date.now() > deadline) throw new ConflictError({ message: "the request this Idempotency-Key belongs to is still being accepted: retry shortly", details: { current_state: "idempotent_request_in_flight" } });
       await sleep(100);
     }
@@ -373,7 +446,7 @@ export class VisibilityScanService {
               outcome = "deadline";
               await relay();
               const landed = (await readScanEvents(this.cache, env, tenant.workspaceId, accepted.runId, accepted.engines)).flatMap((e) => (e.kind === "engine_result" ? [e.result] : []));
-              sse.send("scan.completed", partialTerminal(accepted, landed, VISIBILITY_SCAN_CREDITS));
+              sse.send("scan.completed", provisionalTerminal(accepted, landed));
               return;
             }
           }
@@ -384,7 +457,7 @@ export class VisibilityScanService {
         span.setStatus({ code: SpanStatusCode.ERROR });
         logger.error({ event: "tools.scan.stream_failed", workspace_id: tenant.workspaceId, run_id: accepted.runId, error: error instanceof Error ? error.name : "unknown" });
         // A terminal event in EVERY case: the client must never wait on a dead stream. The run is still owned by the worker.
-        sse.send("scan.completed", partialTerminal(accepted, [], VISIBILITY_SCAN_CREDITS));
+        sse.send("scan.completed", provisionalTerminal(accepted, []));
       } finally {
         sse.close();
         incrementCounter("nominara_tools_scan_streams_total", { outcome });
@@ -414,6 +487,7 @@ export function terminalFrom(run: ToolRunDetail, deadlineReached: boolean): Scan
   return {
     tool_run_id: run.id,
     status,
+    settled: true,
     duration_ms: run.duration_ms ?? 0,
     aggregate,
     engine_failures: failures,
@@ -429,16 +503,21 @@ export function terminalFrom(run: ToolRunDetail, deadlineReached: boolean): Scan
   };
 }
 
-/** The terminal event when the run has not settled in time: what landed, charged as the run stands. */
-function partialTerminal(accepted: ScanAccepted, landed: readonly ScanStreamEngineResult[], charged: number): ScanStreamCompleted {
+/**
+ * The terminal event when the STREAM ends before the worker has settled the run (its own deadline, or a fault in the stream). It claims no money figure:
+ * the worker may still settle the run as failed and refund it in full, so `charged` / `refunded` are null (unknown, not 0) and `status` is `running`.
+ * What landed is returned; the run resource holds the final status and figures.
+ */
+function provisionalTerminal(accepted: ScanAccepted, landed: readonly ScanStreamEngineResult[]): ScanStreamCompleted {
   const aggregate = aggregateScan(landed, [], accepted.engines);
   return {
     tool_run_id: accepted.runId,
-    status: landed.length === 0 ? "failed" : "partial",
+    status: "running",
+    settled: false,
     duration_ms: Math.max(0, Date.now() - accepted.startedAtMs),
     aggregate,
-    engine_failures: aggregate.engines_failed.map((engine) => ({ engine, code: "deadline_exceeded", reason: "The engine had not answered when the stream's latency deadline was reached; the run is still being settled." })),
-    credits: { charged, refunded: 0 },
+    engine_failures: aggregate.engines_failed.map((engine) => ({ engine, code: "deadline_exceeded", reason: "The engine had not answered when the stream ended; the run is still being settled, and a scan that captures nothing is refunded in full." })),
+    credits: { charged: null, refunded: null },
     deadline_reached: true,
     not_tracked: true,
     did_not_check: DID_NOT_CHECK.visibility_scan,

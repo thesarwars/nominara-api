@@ -1,3 +1,4 @@
+import { labelFor } from "../parser/sentiment/classify.js";
 import type { ScanEngineFailure, ScanStreamCompleted, ScanStreamEngineResult } from "../../../contracts/tools/index.js";
 
 // STORY-079 - the parser-free half of the scan's result handling: failure wording and the headline. Kept apart from scan-result.ts (which imports the
@@ -35,8 +36,9 @@ export function aggregateScan(results: readonly ScanStreamEngineResult[], failur
   return {
     sov_estimate: results.reduce((a, r) => a + r.sov, 0) / results.length,
     citation_count: results.reduce((a, r) => a + r.citations.length, 0),
-    owned_citation_count: results.reduce((a, r) => a + r.citations.filter((c) => c.is_owned).length, 0),
-    sentiment_label: meanScore === null ? "absent" : meanScore >= 0.2 ? "positive" : meanScore <= -0.2 ? "negative" : "neutral",
+    owned_citation_count: ownedCitationCount(results),
+    // The PARSER's band (classify.ts `labelFor`), so an engine row and the headline can never label the same score two ways.
+    sentiment_label: meanScore === null ? "absent" : labelFor(meanScore),
     brand_present: results.some((r) => r.brand_present),
     engines_succeeded: succeeded,
     engines_failed: failed,
@@ -44,3 +46,10 @@ export function aggregateScan(results: readonly ScanStreamEngineResult[], failur
   };
 }
 
+
+/** Owned citations among those whose ownership is KNOWN. If there are citations and none has a known ownership, the count is unknown (null), not 0. */
+function ownedCitationCount(results: readonly ScanStreamEngineResult[]): number | null {
+  const all = results.flatMap((r) => r.citations);
+  if (all.length > 0 && all.every((c) => c.is_owned === null)) return null;
+  return all.filter((c) => c.is_owned === true).length;
+}

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  type ScanStreamEngineResult,
   scanStreamCompletedSchema,
   scanStreamEngineResultSchema,
   visibilityScanRequestSchema,
@@ -254,6 +255,7 @@ describe("STORY-079 · running the engines", () => {
     const parsed = scanStreamCompletedSchema.safeParse({
       tool_run_id: "0197d3a0-0000-7000-8000-000000000001",
       status: "failed",
+      settled: true,
       duration_ms: 1200,
       aggregate: aggregateScan([], [failureFor("gemini", "timeout")], ["gemini"]),
       engine_failures: [failureFor("gemini", "timeout")],
@@ -265,5 +267,59 @@ describe("STORY-079 · running the engines", () => {
       convert_cta: null,
     });
     expect(parsed.success, JSON.stringify(parsed.error?.issues)).toBe(true);
+  });
+});
+
+// REVIEW ROUND 1 - the sentiment label is the PARSER's label function, not a neighbouring constant.
+describe("STORY-079 review - the headline sentiment label uses the parser's band", () => {
+  const engineWith = (engine: string, score: number | null): ScanStreamEngineResult =>
+    ({ engine, cache_layer: "none", captured_at: NOW.toISOString(), latency_ms: 1, brand_present: score !== null, rank_position: score === null ? null : 1, sov: 0.5, sentiment: score === null ? { label: "absent", score: null } : { label: "positive", score }, citations: [], excerpt: "x", age_ms: 0, estimated: true });
+  it.each([
+    [0.16, "positive"],
+    [0.15, "neutral"],
+    [0.2, "positive"],
+    [-0.15, "neutral"],
+    [-0.16, "negative"],
+    [0, "neutral"],
+  ] as const)("a mean score of %s is %s (parser band 0.15, exclusive)", (score, label) => {
+    expect(aggregateScan([engineWith("perplexity", score)], [], ["perplexity"]).sentiment_label).toBe(label);
+  });
+  it("no scored engine is `absent`, never neutral (null is not 0)", () => {
+    expect(aggregateScan([engineWith("perplexity", null)], [], ["perplexity"]).sentiment_label).toBe("absent");
+  });
+});
+
+// REVIEW ROUND 1 - an unresolved Gemini redirect is NOT a foreign source. The recorded payload goes through the parser and the result mapping.
+describe("STORY-079 review - Gemini grounding redirects are unresolved, not foreign", async () => {
+  const { normalGrounded } = await import("../engines/gemini/fixtures/gemini-recorded.js");
+  const chunks = (normalGrounded.candidates[0]!.groundingMetadata as { groundingChunks: { web: { uri: string; title?: string } }[] }).groundingChunks;
+  const structured = chunks.map((c, i) => ({ url: c.web.uri, ...(c.web.title !== undefined ? { title: c.web.title } : {}), slot: i + 1 }));
+  const text = normalGrounded.candidates[0]!.content.parts[0]!.text;
+  const run = async (brandUrl: string | null, citations = structured) => {
+    const parse = await parseScanAnswer({ engineKey: "gemini", text, structuredCitations: citations, brandName: "Salesforce", brandUrl, competitors: [] });
+    return toEngineResult({ engine: "gemini", parse, capturedAt: NOW, now: NOW, latencyMs: 1, cacheLayer: "none", excerpt: text, brandHost: brandUrl === null ? null : new URL(brandUrl).hostname });
+  };
+  it("the redirect wrapper's host is never reported as a source domain", async () => {
+    const r = await run("https://acme.test");
+    expect(r.citations.length).toBeGreaterThan(0);
+    expect(r.citations.map((c) => c.domain)).not.toContain("vertexaisearch.cloud.google.com");
+    expect(scanStreamEngineResultSchema.safeParse(r).success).toBe(true);
+  });
+  it("the structured title (the real host) is the domain hint, and ownership follows it", async () => {
+    const r = await run("https://www.salesforce.com");
+    expect(r.citations.find((c) => c.domain === "salesforce.com")?.is_owned).toBe(true);
+    expect(r.citations.find((c) => c.domain === "monday.com")?.is_owned).toBe(false);
+    expect(aggregateScan([r], [], ["gemini"]).owned_citation_count).toBeGreaterThan(0);
+  });
+  it("a title that is not a hostname leaves domain and ownership null, and a run with only such citations has a NULL owned count (not 0)", async () => {
+    const r = await run("https://acme.test", [{ url: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x", title: "A Great Article", slot: 1 }]);
+    expect(r.citations).toEqual([{ slot: 1, domain: null, is_owned: null }]);
+    const agg = aggregateScan([r], [], ["gemini"]);
+    expect(agg.owned_citation_count).toBeNull();
+    expect(agg.citation_count).toBe(1);
+  });
+  it("no citations at all is an owned count of 0, which is a measurement", async () => {
+    const r = await run("https://acme.test", []);
+    expect(aggregateScan([r], [], ["gemini"]).owned_citation_count).toBe(0);
   });
 });

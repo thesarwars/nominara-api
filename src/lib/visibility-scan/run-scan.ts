@@ -1,6 +1,6 @@
 import type { ScanEngineFailure, ScanStreamEngineResult } from "../../../contracts/tools/index.js";
 import { failureFor } from "./scan-aggregate.js";
-import { parseScanAnswer, toEngineResult } from "./scan-result.js";
+import { hostOf, parseScanAnswer, toEngineResult } from "./scan-result.js";
 
 // STORY-079 - run a scan's engines in parallel and report each one AS IT LANDS (AC "results stream per engine").
 //
@@ -32,7 +32,8 @@ export interface LiveAnswer {
 }
 
 export type ScanPublished =
-  | { readonly kind: "engine_result"; readonly result: ScanStreamEngineResult }
+  /** `mentioned`: the hinted competitors this answer named. Not on the wire; kept so a redelivered job can still report every competitor the run detected. */
+  | { readonly kind: "engine_result"; readonly result: ScanStreamEngineResult; readonly mentioned?: readonly string[] | undefined }
   | { readonly kind: "engine_failed"; readonly failure: ScanEngineFailure };
 
 export interface ScanPorts {
@@ -105,10 +106,12 @@ export async function runVisibilityScan(input: RunScanInput, ports: ScanPorts): 
         latencyMs: live?.latencyMs ?? 0,
         cacheLayer: cached === undefined ? "none" : "l1",
         excerpt: parse.normalizedText,
+        brandHost: input.brandUrl === null ? null : hostOf(input.brandUrl),
       });
-      for (const mention of parse.mentions) if (mention.mention.entityType === "competitor") mentioned.add(mention.mention.entityLabel);
+      const named = [...new Set(parse.mentions.filter((m) => m.mention.entityType === "competitor").map((m) => m.mention.entityLabel))];
+      for (const name of named) mentioned.add(name);
       results.push(result);
-      await ports.publish({ kind: "engine_result", result }).catch(() => undefined);
+      await ports.publish({ kind: "engine_result", result, mentioned: named }).catch(() => undefined);
     } catch (error) {
       await fail(engine, error instanceof ScanCaptureError ? error.code : "engine_error");
     }

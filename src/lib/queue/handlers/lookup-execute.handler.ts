@@ -73,9 +73,13 @@ interface EngineWindow {
 interface Prepared {
   readonly payload: LookupExecuteJobPayload & { workspaceId: string };
   readonly windows: ReadonlyMap<string, EngineWindow>;
+  /** False for a workspace whose plan carries `no_shared_cache`: it neither reads nor writes the cross-tenant L1. */
+  readonly sharedCacheEnabled: boolean;
 }
 
 interface Fetched {
+  /** The vendor cost of each LIVE capture this delivery made, per engine (USD). Zero-cost fixtures are absent. */
+  readonly costs: ReadonlyMap<string, number>;
   readonly outcome: ScanRunOutcome;
   readonly resumed: readonly ScanPublished[];
   readonly durationMs: number;
@@ -129,11 +133,18 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
       "SELECT key, cache_ttl_seconds, adapter_version FROM engines WHERE key = ANY($1::text[])",
       [payload.engines],
     );
-    return { payload, windows: new Map(engines.rows.map((row) => [row.key, { ttlSeconds: row.cache_ttl_seconds, adapterVersion: row.adapter_version }])) };
+    // THE PLAN'S L1 DECISION travels in the signed payload (`start` resolved it before any connection was taken): `no_shared_cache` bypasses the cross-tenant cache
+    // both ways (system-architecture.md "Cross-tenant L1 sharing"). Absent means "do not share".
+    return {
+      payload,
+      windows: new Map(engines.rows.map((row) => [row.key, { ttlSeconds: row.cache_ttl_seconds, adapterVersion: row.adapter_version }])),
+      sharedCacheEnabled: payload.sharedCacheEnabled,
+    };
   };
 
   const run = async (prepared: Prepared): Promise<Fetched> => {
-    const { payload, windows } = prepared;
+    const { payload, windows, sharedCacheEnabled } = prepared;
+    const liveCosts = new Map<string, number>();
     const started = now();
     // IDEMPOTENT UNDER REDELIVERY: an engine that already published an event is not captured (or paid for) again.
     const resumed = await readScanEvents(await liveCache(), env, payload.workspaceId, payload.toolRunId, payload.engines);
@@ -146,7 +157,7 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         const window = windows.get(engine);
         if (window === undefined) return undefined;
         const candidate = { promptId: payload.toolRunId, promptText: payload.queryText, engineKey: engine, sampleIndex: 0, ttlSeconds: window.ttlSeconds, adapterVersion: window.adapterVersion };
-        const hits = await probeExactHash(await liveCache(), { env, locale: payload.locale, personaHint: null, nowMs: now().getTime(), sharedCacheEnabled: true }, [candidate]);
+        const hits = await probeExactHash(await liveCache(), { env, locale: payload.locale, personaHint: null, nowMs: now().getTime(), sharedCacheEnabled }, [candidate]);
         const hit = [...hits.values()][0];
         // A hit with no capture time cannot be labelled with its true age, so it is not served as a cached answer.
         if (hit === undefined || hit.capturedAt === null) return undefined;
@@ -198,10 +209,13 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         } finally {
           clearTimeout(timer);
         }
-        if (costs.usd > 0) await spend().recordCost(key.data, costs.usd).catch(() => undefined);
+        if (costs.usd > 0) {
+          await spend().recordCost(key.data, costs.usd).catch(() => undefined);
+          liveCosts.set(engine, costs.usd);
+        }
         await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
         if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
-        if (window !== undefined) {
+        if (window !== undefined && sharedCacheEnabled) {
           await seedSharedCache(
             await liveCache(),
             { workspaceId: payload.workspaceId, projectId: payload.toolRunId, runId: payload.toolRunId, promptId: payload.toolRunId, promptText: payload.queryText, engineKey: engine, sampleIndex: 0, adapterVersion: window.adapterVersion, ttlSeconds: window.ttlSeconds, locale: payload.locale, personaHint: null, normalizerVersion: NORMALIZER_VERSION },
@@ -227,11 +241,10 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         span.end();
       }
     });
-    return { outcome, resumed, durationMs: Math.max(0, now().getTime() - started.getTime()) };
+    return { outcome, resumed, costs: liveCosts, durationMs: Math.max(0, now().getTime() - started.getTime()) };
   };
 
   const commit = async (tx: ClientBase, prepared: Prepared, fetched: Fetched): Promise<void> => {
-    void tx;
     const { payload } = prepared;
     const results: ScanStreamEngineResult[] = [...fetched.resumed.flatMap((e) => (e.kind === "engine_result" ? [e.result] : [])), ...fetched.outcome.results];
     const failures: ScanEngineFailure[] = [...fetched.resumed.flatMap((e) => (e.kind === "engine_failed" ? [e.failure] : [])), ...fetched.outcome.failures];
@@ -240,7 +253,9 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     results.sort((a, b) => order(a.engine) - order(b.engine));
     failures.sort((a, b) => order(a.engine) - order(b.engine));
     const aggregate = aggregateScan(results, failures, payload.engines);
-    const detected = fetched.resumed.length === 0 ? fetched.outcome.competitors : payload.competitors.filter((name) => fetched.outcome.competitors.includes(name));
+    // Every competitor ANY engine named: this delivery's engines, and the engines a previous delivery had already reported (their events carry the names).
+    const named = new Set<string>([...fetched.outcome.competitors, ...fetched.resumed.flatMap((e) => (e.kind === "engine_result" ? (e.mentioned ?? []) : []))]);
+    const detected = payload.competitors.filter((name) => named.has(name));
     const snapshot = visibilityScanResultSchema.parse({
       schema_version: 1,
       sample_statement: SCAN_SAMPLE_STATEMENT,
@@ -250,6 +265,16 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
       competitors: detected,
       deadline_reached: fetched.outcome.deadlineReached,
     });
+    // WHAT THE SCAN COST US, per workspace (usage_ledger, source 'lookup'): one row per live capture with a real cost, written once per (run, engine) so a
+    // redelivered commit adds nothing. A cached answer cost nothing and has no row. The customer's own charge is the run's credit_ledger entry.
+    for (const [engine, usd] of fetched.costs) {
+      await tx.query(
+        `INSERT INTO usage_ledger (workspace_id, metric, quantity, unit_cost_usd, engine_key, source, credits_charged, reference_type, reference_id, cache_layer)
+         SELECT app.current_workspace(), 'capture', 1, $1::numeric, $2, 'lookup', 0, 'tool_run', $3::uuid, 'live'
+          WHERE NOT EXISTS (SELECT 1 FROM usage_ledger WHERE workspace_id = app.current_workspace() AND reference_type = 'tool_run' AND reference_id = $3::uuid AND engine_key = $2)`,
+        [usd.toFixed(6), engine, payload.toolRunId],
+      );
+    }
     await (await tools()).finishRun(payload.toolRunId, {
       enginesSucceeded: aggregate.engines_succeeded,
       enginesFailed: aggregate.engines_failed,

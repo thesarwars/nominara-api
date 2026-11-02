@@ -17,3 +17,29 @@
    satisfied as: exactly one `refund` entry of the full price.
 5. **STORY-079 status.** Update the AC table from the evidence in `docs/plans/evidence/STORY-079.md`.
 6. **ADR-0003 / streaming.** A `@Streaming()` route is now also exempt from AuditInterceptor and the audit-coverage sweep and audits itself in its own transaction.
+
+## Review round 1 additions
+
+7. **api-specification.md section 9 / `scan.completed`.** Gains `settled` (boolean). When the STREAM ends before the worker has settled the run (its 55 s deadline or a fault) the
+   terminal event has `settled: false`, `status: "running"`, and `credits: {charged: null, refunded: null}` - the money is not final (a run that captures nothing is refunded in
+   full by the worker), and the client reads `GET /tools/runs/{id}` for the final figures. `scan.engine_result.citations[].domain` and `.is_owned` are nullable: a citation
+   that is an unfetched redirect wrapper (Gemini grounding) reports the engine's own hostname title as the domain hint, or `null` when there is none; `aggregate.owned_citation_count`
+   is `null` (not 0) when there are citations and none has a known ownership.
+8. **Status code.** The route answers `200` with `text/event-stream`; system-architecture.md 6.2 step 6 says `202`. 200 is what an EventSource accepts. The doc should say 200.
+9. **Idempotency.** The claim lasts 24 hours (api-specification.md section 1) and is never deleted once the run is charged. A mismatched body is `409 idempotency_conflict`; a
+   key starting `prompt_activate:` or `tool_run:` is a 400. Residual risk, stated plainly: if the process dies (or the cache is down) between COMMIT of the run and the claim
+   write, the claim stays `pending` and a retry of that key is `409 idempotent_request_in_flight` until the 24 h claim expires - the client must use a new key; the scan it
+   was charged for completes and is on `GET /tools/runs`. A stronger guarantee (the hashed key on `tool_runs` with a unique index, in the debit's transaction) needs a
+   schema change this story did not name: raised for the owner.
+10. **Reconnect and the daily cap.** A reconnect passes `@DailyCap("lookup")` and the rate-limit class before `accept` can recognise it as a reattach, so a user on their last
+    daily scan whose connection drops is refused (429) on reconnect, although the reconnect charges nothing. The documented route for that case is `GET /tools/runs/{id}`
+    (free). Detecting the claim before the cap guard would move logic into a guard: not done without a decision.
+11. **Shared cache.** `no_shared_cache` is honoured: a flagged workspace neither reads nor seeds the cross-tenant L1 (integration test `no_shared_cache`).
+12. **Sentiment and share constants.** The scan's headline sentiment label now uses the parser's `labelFor` (band 0.15, exclusive). The headline `sov_estimate` is the mean of the
+    engines' shares and the headline sentiment score is a plain mean of scored engines; scoring-models.md section 3 (pooled ratio) and section 6 (prominence weighting) do not
+    cover a single-sample estimate. The owner should ratify these two choices in scoring-models.md or direct the section 6 weighting (they are labelled estimates, and `scoring_version` is not stored for a scan).
+13. **AC wording.** STORY-079's "report-only ... asserted by the isolation suite": the isolation suite (`test/isolation`) asserts RLS structure per table, not behaviour; the behavioural
+    assertion (zero rows in the fact tables after a scan) is integration scenario 11. Reword the AC to "asserted by the integration suite". Scenario 15 (interactive latency under a scheduled
+    batch) is evidenced by `test/integration/queue-interactive-pool-isolation.spec.ts` plus the enqueue-option assertion in `visibility-scan.spec.ts`; no end-to-end latency test was written.
+14. **Audit.** `@Streaming()` still exempts a route from the AuditInterceptor and the audit-coverage sweep wholesale. A per-route "self-audited" marker would be a new pattern (decorator +
+    sweep rule): raised for the owner (see also the `billing-subscription.service.ts` note that streaming is a pattern decision).

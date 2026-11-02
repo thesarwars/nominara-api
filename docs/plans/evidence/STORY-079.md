@@ -57,3 +57,14 @@ coverage sweep, and audits itself), `src/lib/queue/handlers.ts` (registers the h
 Red runs: `s079-red-unit.log` (modules absent), `s079-red-l1.log` (capturedAt), `s079-red-audit.log` (streaming exemption, coverage sweep), `s079-red-guards.log` (rate-limit class).
 The integration spec was written after the route existed (it needs the route); its first runs were red for the DI cycle above, the missing audit exemption, and test isolation
 (a live capture seeds the shared L1 cache by design, so each scan in the spec uses a fresh query).
+
+## Review round 1 (head 0f3c3250 -> this commit)
+
+Fixed: `no_shared_cache` honoured (read and seed); redirect-wrapper citations no longer reported as foreign/owned (null, with the engine's hostname title as a hint); headline sentiment uses the
+parser's `labelFor`; the stream's deadline terminal is provisional (`settled: false`, null credits); the idempotency claim is 24 h, never deleted after a charged start, split on the first colon,
+`IdempotencyConflictError`, reserved-prefix refusal; per-workspace `usage_ledger` cost rows (source `lookup`); detected competitors survive a redelivery.
+New tests: unit `visibility-scan.spec.ts` (sentiment band, Gemini recorded payload) and `visibility-scan.service.spec.ts` (claim, 24 h window, claim-write failure, stream deadline); integration
+`visibility-scan.spec.ts` (no_shared_cache, usage_ledger, mid-run drop and reattach, 20 same-key and 20 different-key concurrent POSTs) and `visibility-scan-rate-limit.spec.ts` (third immediate scan is 429 on the
+shipped defaults - its own file, because the main spec installs a widened document and the guard memoises its config for 15 s).
+Red runs: `s079-r1-red-unit.log` (11 failing), `s079-r1-red-int.log` (4 failing on the pre-fix source; the same-key concurrency and the rate-limit test passed on the old code - they pin behaviour that already held).
+Not done, raised for the owner (see docs-carry 9, 10, 12, 14): a DB-level idempotency key, the reconnect-at-daily-cap case, the scoring constants, the streaming audit exemption.
