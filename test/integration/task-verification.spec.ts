@@ -606,6 +606,7 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
       const TOUCHES = /\b(?:FROM|JOIN|UPDATE|INTO)\s+(?:ONLY\s+)?(?:tasks|task_events|project_source_index)\b/iu;
       const touching = seen.filter((sql) => TOUCHES.test(sql));
       expect(touching.length).toBeGreaterThanOrEqual(15);
+      expect(touching.some((s) => /SET status = 'done'/.test(s))).toBe(true);
 
       // THE EXEMPTION LIST. Each entry is the FULL, EXACT text (whitespace folded) of one statement of the shared rollup index rebuild
       // (src/lib/rollup/refresh-project-source-index.ts, refresh-project-source-coverage.ts and refresh-project-task-counts.ts), which every presence write

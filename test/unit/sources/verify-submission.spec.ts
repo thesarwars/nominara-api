@@ -134,7 +134,16 @@ describe("STORY-055 · fetchSubmission", () => {
     const url = "https://en.wikipedia.org/wiki/Special:Go";
     const landed = "https://en.wikipedia.org/w/index.php?search=Acme+Analytics";
     // decision 49: the canary is the same (empty) template once the brand is gone, and does not name the brand: a disguised reflection
-    const fetch = vi.fn().mockImplementation(async (u: string) => (u === url ? res("Acme Analytics", { finalUrl: landed }) : res("", { finalUrl: u })));
+    // A realistic search template: the canary's body drops the brand and differs from the original only by a counter, so the refusal
+    // is reached through same_page on real text, not through two empty word lists.
+    const SEARCH_TEXT = (term: string, hits: number) =>
+      `Search results. You searched for ${term}. Showing ${hits} results. Use the main navigation to browse categories, read the latest articles, ` +
+      "or check the help pages for tips on how to refine your search and find what you are looking for. Results are ordered by relevance and then by the date " +
+      "of the most recent edit, and every entry links to the full article, its revision history, its talk page, and the list of other pages that point to it. " +
+      "Contributors may also filter by namespace, language, license or length, and may download the whole result set in a machine readable format for offline study.";
+    const fetch = vi.fn().mockImplementation(async (u: string) =>
+      u === url ? res(`${SEARCH_TEXT("Acme Analytics", 12)}`, { finalUrl: landed }) : res(SEARCH_TEXT("", 3), { finalUrl: u }),
+    );
     await expect(fetchSubmission(WIKI(url), fetch)).resolves.toEqual({ status: "unverified", reason: "url_echoes_brand" });
   });
 
@@ -278,14 +287,21 @@ describe("STORY-055 · fetchSubmission", () => {
 
     it("decision 49 - Stack Overflow /questions/123/acme-analytics-vs-globex, canary 301'd back to the canonical URL: verified", async () => {
       const url = "https://stackoverflow.com/questions/123/acme-analytics-vs-globex";
-      const fetch = vi.fn().mockImplementation(async (u: string) => res(PAGE_TEXT, { finalUrl: isCanary(u) ? url : u }));
+      const fetch = vi.fn().mockImplementation(async (u: string) => res(isCanary(u) ? NO_BRAND : PAGE_TEXT, { finalUrl: isCanary(u) ? url : u }));
       await expect(fetchSubmission(plan({ url, domain: "stackoverflow.com" }), fetch, { nonce: nonces() })).resolves.toEqual({ status: "verified" });
     });
 
     it("decision 49 - Medium title-slug-<id> serves the same story for any slug: verified", async () => {
       const url = "https://medium.com/@someone/acme-analytics-review-a1b2c3d4e5f6";
-      const fetch = vi.fn().mockImplementation(async (u: string) => res(PAGE_TEXT, { finalUrl: isCanary(u) ? url : u }));
+      const fetch = vi.fn().mockImplementation(async (u: string) => res(isCanary(u) ? NO_BRAND : PAGE_TEXT, { finalUrl: isCanary(u) ? url : u }));
       await expect(fetchSubmission(plan({ url, domain: "medium.com" }), fetch, { nonce: nonces() })).resolves.toEqual({ status: "verified" });
+    });
+
+    it("ECHO_PREFIX_MIN_LENGTH - a 4-letter nonce prefix on the canary is not an echo (the original is verified); a 5-letter one is", async () => {
+      const four = vi.fn().mockImplementation(async (u: string) => res(isCanary(u) ? `${NO_BRAND} Ask zqxj about it.` : PAGE_TEXT, { finalUrl: u }));
+      await expect(fetchSubmission(G2(), four, { nonce: nonces() })).resolves.toEqual({ status: "verified" });
+      const five = vi.fn().mockImplementation(async (u: string) => res(isCanary(u) ? `${NO_BRAND} Ask zqxjv about it.` : PAGE_TEXT, { finalUrl: u }));
+      await expect(fetchSubmission(G2(), five, { nonce: nonces() })).resolves.toEqual({ status: "unverified", reason: "url_echoes_brand" });
     });
 
     it("a clearly different 200 (a generic not-found template that does not echo) verifies the original", async () => {

@@ -109,8 +109,11 @@ function fetchSubmissionTraced(plan: SubmissionPlan, fetch: SubmissionFetcher): 
  * STORY-055 (review r7) / STORY-049 AC7 - every fetch this job makes (the submission's page and canary, the seeded target, the periodic
  * presence page) identifies itself. Wikipedia and Reddit answered 403 to an anonymous request and 200 to this one.
  */
-export function identifiedFetcher(guarded: (url: string, init: Parameters<typeof guardedFetch>[1]) => Promise<GuardedResponse> = guardedFetch): SubmissionFetcher {
-  return (url, init) => guarded(url, { ...init, headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" } });
+export function identifiedFetcher(
+  guarded: (url: string, init: Parameters<typeof guardedFetch>[1]) => Promise<GuardedResponse> = guardedFetch,
+): (url: string, init?: { readonly followRedirect?: (nextUrl: string) => boolean; readonly headers?: Readonly<Record<string, string>> }) => Promise<GuardedResponse> {
+  // A caller's headers survive; ours win on the two that identify the crawler.
+  return (url, init) => guarded(url, { ...init, headers: { ...init?.headers, "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" } });
 }
 
 export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {

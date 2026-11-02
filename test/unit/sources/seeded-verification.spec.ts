@@ -281,6 +281,12 @@ describe("STORY-055 / STORY-049 AC7 - the seeding fetches identify themselves", 
     expect(guarded).toHaveBeenNthCalledWith(2, "https://en.wikipedia.org/wiki/Acme-canary-nonce", { headers });
   });
 
+  it("the identified fetcher keeps a caller's header, and our User-Agent and Accept win over the caller's", async () => {
+    const guarded = vi.fn(async () => page("x"));
+    await identifiedFetcher(guarded)("https://en.wikipedia.org/wiki/Acme", { headers: { "x-trace": "abc", "user-agent": "evil", accept: "*/*" } });
+    expect(guarded).toHaveBeenCalledWith("https://en.wikipedia.org/wiki/Acme", { headers: { "x-trace": "abc", ...headers } });
+  });
+
   it("the handler's default fetcher (periodic verify-presence path) is that identified fetcher", async () => {
     const mocked = vi.mocked(guardedFetch);
     mocked.mockReset();
