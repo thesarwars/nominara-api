@@ -1782,6 +1782,93 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     });
   });
 
+  // OWNER DECISION 47 - a Free project's onboarding audit is the free SITE-FILES-ONLY check (robots.txt, llms.txt, sitemap): no page is selected, fetched
+  // or judged, whatever the verification state. plans-and-entitlements.md: "Site-file AUX checks ... are free and unlimited" (Free); the page audit is paid.
+  describe("owner decision 47 · the site-files-only onboarding audit (Free)", () => {
+    const SITE_FILES = [
+      "https://acme.com/.well-known/llms.txt",
+      "https://acme.com/llms.txt",
+      "https://acme.com/robots.txt",
+      "https://acme.com/sitemap.xml",
+    ];
+    const siteFilesJob = (over: Record<string, unknown> = {}): Job => job({ trigger: "onboarding", siteFilesOnly: true, ...over });
+    const asReader = async <T>(fn: () => Promise<T>): Promise<T> => {
+      const c = new Client({ connectionString: container.getConnectionUri() });
+      await c.connect();
+      try {
+        let out!: T;
+        await withTenantContext(c as never, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async () => { out = await fn(); });
+        return out;
+      } finally {
+        await c.end();
+      }
+    };
+
+    it("D47 · asks for the site files and the sitemap and for NO page - not the supplied URL, not a sitemap page - and records an audit with no page crawled", async () => {
+      const requested: string[] = [];
+      await run(siteFilesJob(), depsServing(withSitemap(SITEMAP_PAGES), requested));
+      expect(requested.sort()).toEqual(SITE_FILES);
+      expect(rendered).toEqual([]);
+      const [a] = await audits();
+      expect(a).toMatchObject({ trigger: "onboarding", status: "completed", pages_crawled: 0, pages_failed: 0, aux_score: null, llms_txt_present: true });
+      expect(a.scope).toBe("public_surface");
+    });
+
+    it("D47 · a VERIFIED domain is still site-files-only: the flag, not the verification state, holds the crawl to the site files", async () => {
+      await verifyDomain();
+      const requested: string[] = [];
+      await run(siteFilesJob({ scope: "key_pages" }), depsServing(withSitemap(SITEMAP_PAGES), requested));
+      expect(requested.sort()).toEqual(SITE_FILES);
+      expect((await audits())[0]).toMatchObject({ pages_crawled: 0, aux_score: null });
+    });
+
+    it("D47 · the site-file findings are still raised, and no page-rule finding is: a blocked AI crawler is found, nothing else is invented", async () => {
+      await run(siteFilesJob(), depsServing(healthy(BLOCKED)));
+      const rows = await findings();
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.some((f) => f.rule_code === "AUX-R-001")).toBe(true);
+      expect(rows.every((f) => ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"].includes(f.rule_code as string))).toBe(true);
+    });
+
+    it("D47 · the audit is free: nothing touches the credit ledger or the wallet", async () => {
+      await run(siteFilesJob(), depsServing(healthy(OPEN)));
+      expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
+      expect((await db.query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
+    });
+
+    it("D47 · the AUX read endpoints show it on a Free workspace: the audit by id, the project's audit list and its findings", async () => {
+      expect((await db.query("SELECT plan_key FROM workspaces WHERE id = $1", [workspaceId])).rows[0].plan_key).toBe("free");
+      await run(siteFilesJob(), depsServing(healthy(BLOCKED)));
+      const [stored] = await audits();
+      const service = new AuxService();
+      const one = await asReader(() => service.getAudit(stored.id));
+      expect(one).toMatchObject({ audit_id: stored.id, trigger: "onboarding", status: "completed", pages_crawled: 0, aux_score: null, score_partial: false });
+      // the one published category is the site-file one; nothing else is claimed
+      expect(one.categories.map((c) => c.category)).toEqual(["crawler_access"]);
+      const list = await asReader(() => service.listProjectAudits(projectId, { limit: 10 }));
+      expect(list.items.map((a) => a.audit_id)).toEqual([stored.id]);
+      const found = await asReader(() => service.listProjectFindings(projectId, { limit: 50 }));
+      expect(found.items.length).toBeGreaterThan(0);
+    });
+
+    it("D47 · a paid plan's onboarding job WITHOUT the flag still gets the full page audit", async () => {
+      await db.query("UPDATE workspaces SET plan_key = 'starter' WHERE id = $1", [workspaceId]);
+      const requested: string[] = [];
+      await run(job({ trigger: "onboarding" }), depsServing(healthy(OPEN), requested));
+      expect(requested).toContain("https://acme.com/");
+      const [a] = await audits();
+      expect(a.pages_crawled).toBe(1);
+      expect(Number(a.aux_score)).toBe(100);
+    });
+
+    it("D47 · a MANUAL job can never be site-files-only: it is refused at the boundary and nothing is fetched or written", async () => {
+      const requested: string[] = [];
+      await expect(run(job({ trigger: "manual", siteFilesOnly: true }), depsServing(healthy(OPEN), requested))).rejects.toThrow();
+      expect(requested).toEqual([]);
+      expect(await audits()).toHaveLength(0);
+    });
+  });
+
   it("NEW-C-9 AC1.8 · the handler source adds no workspace_id predicate of its own", () => {
     const src = readFileSync(new URL("../../src/lib/queue/handlers/crawl-audit.handler.ts", import.meta.url), "utf8");
     expect(src).not.toMatch(/workspace_id\s*=\s*\$/i);

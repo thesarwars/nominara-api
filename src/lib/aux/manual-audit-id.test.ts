@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { isReservedLedgerKey } from "../credits/debit.js";
 import { manualAuditIdentity } from "./manual-audit-id.js";
@@ -35,5 +36,33 @@ describe("AUXLIVE-3 · manualAuditIdentity", () => {
 
   it("is not the onboarding audit's id for the same input (separate namespaces)", () => {
     expect(manualAuditIdentity(WS_A, "p").auditId).not.toBe(onboardingAuditId("p"));
+  });
+
+  // OWNER DECISION 48 - the 24-hour replay window. Past it, the same client key must mean a NEW audit and a NEW ledger key, so the identity carries a
+  // generation. Generation 0 is the identity as it has always been (every audit already made keeps its id and its ledger key).
+  it("D48 · generation 0 is the original identity, byte for byte (audits already made keep their ids)", () => {
+    const digest = createHash("sha256").update(["nominara.aux.manual-audit.v1", WS_A, "key-1"].join("|")).digest();
+    const id = manualAuditIdentity(WS_A, "key-1", 0);
+    expect(id).toEqual(manualAuditIdentity(WS_A, "key-1"));
+    expect(id.ledgerKey).toBe(["aux_audit", digest.toString("hex")].join(":"));
+  });
+
+  it("D48 · each later generation is a different audit id and a different ledger key, still deterministic and still in the reserved namespace", () => {
+    const seen = new Set<string>();
+    const ledger = new Set<string>();
+    for (let g = 0; g < 5; g += 1) {
+      const id = manualAuditIdentity(WS_A, "key-1", g);
+      expect(manualAuditIdentity(WS_A, "key-1", g)).toEqual(id);
+      expect(id.auditId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(isReservedLedgerKey(id.ledgerKey)).toBe(true);
+      seen.add(id.auditId);
+      ledger.add(id.ledgerKey);
+    }
+    expect(seen.size).toBe(5);
+    expect(ledger.size).toBe(5);
+  });
+
+  it("D48 · a generation is never confused with a key: (key-1, generation 1) is not the identity of the key 'key-1|1'", () => {
+    expect(manualAuditIdentity(WS_A, "key-1", 1).auditId).not.toBe(manualAuditIdentity(WS_A, "key-1|1", 0).auditId);
   });
 });

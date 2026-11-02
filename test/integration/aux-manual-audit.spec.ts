@@ -9,8 +9,12 @@ import { auxAuditPrice } from "../../src/lib/aux/audit-price.js";
 import type { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { AuxService } from "../../src/modules/aux/aux.service.js";
 import { reapStaleManualAudits, MANUAL_AUDIT_STALE_AFTER_MINUTES } from "../../src/lib/aux/stale-audit-reaper.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { refundAuxAuditCharge } from "../../src/lib/credits/aux-audit-refund.js";
+import { createCrawlAuditHandler } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
+import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
+import type { Job } from "bullmq";
 
 // AUXLIVE-3 (owner decision 34 item 3, STORY-194) - POST /projects/{id}/aux-audits, the manual re-audit, against a real database.
 //
@@ -589,5 +593,177 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
       expect(new Set(balances.map((r) => r.workspace_id))).toEqual(new Set([firstWorkspace, otherWs]));
       expect(firstProject).toBeDefined();
     });
+  });
+
+  // OWNER DECISION 48 - the Idempotency-Key is honoured for 24 HOURS, as on every paid action. The database-backed replay is bounded by the audit's own
+  // created_at; after the window the same key starts a NEW audit (a new identity, a new ledger key) and charges normally.
+  describe("owner decision 48 · the replay window is 24 hours", () => {
+    const ageBy = (auditId: string, hours: number, minutes = 0): Promise<unknown> =>
+      db.query("UPDATE aux_audits SET created_at = now() - make_interval(hours => $2, mins => $3) WHERE id = $1", [auditId, hours, minutes]);
+    const commits = async (): Promise<number> => (await db.query("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit'", [workspaceId])).rows[0].n;
+
+    it("AUXLIVE-3 D48 · a replay at 23 hours returns the ORIGINAL audit: same id, no new audit, no new charge, no new job", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await settle();
+      await ageBy(first.audit_id, 23);
+      const replay = await trigger({}, projectId, { idempotencyKey: key });
+      expect(replay).toEqual(first);
+      expect(await audits()).toHaveLength(1);
+      expect(await commits()).toBe(1);
+      expect(await wallet()).toMatchObject({ included: 90, spent: 10 });
+      await settle();
+      expect(enqueued).toHaveLength(1);
+    });
+
+    it("AUXLIVE-3 D48 · a request at 25 hours with the same key and body is a NEW audit with a NEW charge and its own job", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await settle();
+      await ageBy(first.audit_id, 25);
+      const second = await trigger({}, projectId, { idempotencyKey: key });
+      expect(second.audit_id).not.toBe(first.audit_id);
+      expect(second).toMatchObject({ status: "queued", credits_charged: 10, credits_refunded: 0 });
+      expect(await audits()).toHaveLength(2);
+      expect(await commits()).toBe(2);
+      expect(await wallet()).toMatchObject({ included: 80, spent: 20 });
+      // two different ledger keys: the second charge is not the first one's replay
+      const keys = (await ledger()).filter((r) => r.entry_type === "commit").map((r) => r.idempotency_key);
+      expect(new Set(keys).size).toBe(2);
+      await settle();
+      expect(enqueued.map((e) => e.payload.auditId)).toEqual([first.audit_id, second.audit_id]);
+      // the first audit is untouched
+      expect((await audits()).find((a) => a.id === first.audit_id)).toMatchObject({ status: "queued" });
+    });
+
+    it("AUXLIVE-3 D48 · boundary: 23h59m replays, 24h01m starts a new audit", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await ageBy(first.audit_id, 23, 59);
+      expect((await trigger({}, projectId, { idempotencyKey: key })).audit_id).toBe(first.audit_id);
+      await ageBy(first.audit_id, 24, 1);
+      expect((await trigger({}, projectId, { idempotencyKey: key })).audit_id).not.toBe(first.audit_id);
+      expect(await commits()).toBe(2);
+    });
+
+    it("AUXLIVE-3 D48 · after the new audit, the same key replays THAT audit inside ITS window - the window restarts, it does not charge a third time", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await ageBy(first.audit_id, 30);
+      const second = await trigger({}, projectId, { idempotencyKey: key });
+      const again = await trigger({}, projectId, { idempotencyKey: key });
+      expect(again).toEqual(second);
+      expect(await commits()).toBe(2);
+      // and a third window later is a third audit
+      await ageBy(second.audit_id, 25);
+      const third = await trigger({}, projectId, { idempotencyKey: key });
+      expect(new Set([first.audit_id, second.audit_id, third.audit_id]).size).toBe(3);
+      expect(await commits()).toBe(3);
+    });
+
+    it("AUXLIVE-3 D48 · past the window the key is free again: the same key with a DIFFERENT body is a new audit, not 409 idempotency_conflict (inside it, it still is)", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      const inside = await trigger({ scope: "sitemap_sample" }, projectId, { idempotencyKey: key }).then(() => null, (e: unknown) => e);
+      expect(codeOf(inside)).toBe("idempotency_conflict");
+      await ageBy(first.audit_id, 25);
+      const after = await trigger({ scope: "sitemap_sample" }, projectId, { idempotencyKey: key });
+      expect(after).toMatchObject({ requested_scope: "sitemap_sample", credits_charged: 10 });
+      expect(after.audit_id).not.toBe(first.audit_id);
+    });
+
+    it("AUXLIVE-3 D48 · an old audit that FAILED and was refunded is not replayed after the window either: the key starts a new, charged audit", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await db.query("UPDATE aux_audits SET created_at = now() - make_interval(hours => 25) WHERE id = $1", [first.audit_id]);
+      expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 1 });
+      expect(await wallet()).toMatchObject({ included: 100 });
+      const second = await trigger({}, projectId, { idempotencyKey: key });
+      expect(second.audit_id).not.toBe(first.audit_id);
+      expect(await wallet()).toMatchObject({ included: 90 });
+    });
+
+    it("AUXLIVE-3 D48 · five CONCURRENT attempts with one expired key start ONE new audit and charge once", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await ageBy(first.audit_id, 25);
+      const results = await Promise.all(Array.from({ length: 5 }, () => trigger({}, projectId, { idempotencyKey: key })));
+      expect(new Set(results.map((r) => r.audit_id)).size).toBe(1);
+      expect(results[0]!.audit_id).not.toBe(first.audit_id);
+      expect(await commits()).toBe(2);
+      expect(await audits()).toHaveLength(2);
+    });
+  });
+
+  // OWNER DECISION 47 - Free gets the free site-files-only check (no charge), but still cannot buy the priced page re-audit: plans-and-entitlements.md
+  // section 3, Free: "No exports, integrations, share links, alignment analysis, or AUX audits"; aux.scheduled_audits is off on Free.
+  it("AUXLIVE-3 D47 · a Free workspace that HAS its site-files onboarding audit still cannot POST a priced re-audit (403 feature_not_in_plan) nor preview one: no debit, no row, no job", async () => {
+    await seed("free", 60);
+    await db.query(
+      `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, excluded_rules, rule_version, tokenizer, status)
+       VALUES ($1,$2,$3,'onboarding','public_surface','{}','{}','2026.10.1','cl100k','completed')`,
+      [randomUUID(), workspaceId, projectId],
+    );
+    const err = await trigger().then(() => null, (e: unknown) => e);
+    expect(codeOf(err)).toBe("feature_not_in_plan");
+    expect(codeOf(await asTenant(() => service().previewAudit(projectId, {})).then(() => null, (e: unknown) => e))).toBe("feature_not_in_plan");
+    expect(await audits()).toHaveLength(1);
+    expect(await ledger()).toEqual([]);
+    await settle();
+    expect(enqueued).toEqual([]);
+  });
+
+  // Review minor (round 3) - the replay after crawl.audit REALLY ran, through the real handler (prepare, run, commit), not a hand-written UPDATE.
+  it("AUXLIVE-3 AC5 round 4 · a manual audit on an UNVERIFIED domain is run by the real crawl.audit handler (scope becomes public_surface, target_urls is rewritten); a replay with the ORIGINAL body is the same audit, no second debit, no 409", async () => {
+    const key = randomUUID();
+    const body = { scope: "sitemap_sample" as const, target_urls: ["https://acme.com/a", "https://acme.com/b"] };
+    const first = await trigger(body, projectId, { idempotencyKey: key });
+    await settle();
+    const before = (await audits())[0];
+    expect(before).toMatchObject({ scope: "sitemap_sample", target_urls: body.target_urls, status: "queued" });
+
+    const served: Record<string, string> = {
+      "/robots.txt": "User-agent: *\nAllow: /\nSitemap: https://acme.com/sitemap.xml\n",
+      "/llms.txt": "# Acme\n- [Docs](https://acme.com/docs)\n",
+      "/.well-known/llms.txt": "",
+      "/sitemap.xml": "<urlset><url><loc>https://acme.com/</loc></url></urlset>",
+      "/": "<html><head><title>Acme</title></head><body><h1>Acme</h1></body></html>",
+    };
+    const fetch = async (url: string): Promise<GuardedResponse> => {
+      const path = new URL(url).pathname;
+      const hit = served[path];
+      return { status: hit === undefined || path === "/.well-known/llms.txt" ? 404 : 200, headers: {}, body: Buffer.from(hit ?? ""), finalUrl: url };
+    };
+    const handler = createCrawlAuditHandler(
+      { pool: {} as never, env: {} as never },
+      {
+        fetch,
+        now: () => new Date(),
+        sleep: async () => undefined,
+        renderer: { render: async (url) => ({ html: served[new URL(url).pathname] ?? "", finalUrl: url, status: 200 }) },
+        store: async (relative) => `crawl/test/ws/${relative}`,
+        enqueueTaskGenerate: async () => undefined,
+      },
+    );
+    const crawlJob = { data: { payload: { projectId, auditId: first.audit_id, trigger: "manual", workspaceId, kid: "k1", scope: "sitemap_sample", targetUrls: body.target_urls } } } as unknown as Job;
+    const worker = await pool.connect();
+    try {
+      await withTenantContext(worker, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => handler(tx, crawlJob));
+    } finally {
+      worker.release();
+    }
+
+    const after = (await audits())[0];
+    expect(after.id).toBe(first.audit_id);
+    expect(["completed", "partial"]).toContain(after.status);
+    // the worker REWROTE the row: verification decided the scope, and the crawled pages replaced the hints
+    expect(after.scope).toBe("public_surface");
+    expect(after.target_urls).not.toEqual(body.target_urls);
+
+    const replay = await trigger(body, projectId, { idempotencyKey: key });
+    expect(replay).toMatchObject({ audit_id: first.audit_id, requested_scope: "sitemap_sample", credits_charged: 10, credits_refunded: 0, status: after.status });
+    expect(await audits()).toHaveLength(1);
+    expect(await ledger().then((rows) => rows.filter((r) => r.entry_type === "commit"))).toHaveLength(1);
+    expect(await wallet()).toMatchObject({ included: 90, spent: 10 });
   });
 });

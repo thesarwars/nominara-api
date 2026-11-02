@@ -449,9 +449,9 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
   });
 
-  // review round 1 (major): Free has no AUX audits (plans-and-entitlements.md: aux.scheduled_audits is false), so its first scan crawls nothing. "Free
-  // of credits" is not "free to the Free tier".
-  it("AUXLIVE-1 AC10 · a Free workspace's first scan enqueues NO onboarding audit (aux.scheduled_audits is off): the plan, and the scan, still go ahead", async () => {
+  // OWNER DECISION 47 (supersedes the round-3 reading that skipped Free): plans-and-entitlements.md says "Site-file AUX checks ... are free and unlimited" on
+  // Free, while the full page audit (aux.scheduled_audits) is a paid-plan feature. So a Free first scan enqueues a SITE-FILES-ONLY onboarding audit, at no charge.
+  it("AUXLIVE-1 D47 · a Free workspace's first scan enqueues ONE onboarding audit marked siteFilesOnly, with zero debit: the plan, and the scan, still go ahead", async () => {
     await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [wsA]);
     const lines: unknown[] = [];
     vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
@@ -459,16 +459,60 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     });
     await processor()(signedJob(wsA, projA));
     await settle();
-    expect(audits).toEqual([]);
-    // the skip is counted, with no workspace name in it
-    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_skipped_total")).toMatchObject({ reason: "not_in_plan" });
-    // nothing about the audit is left behind either: no row, no ledger entry
-    expect((await db.query("SELECT 1 FROM aux_audits WHERE project_id = $1", [projA])).rowCount).toBe(0);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      workspaceId: wsA,
+      payload: { projectId: projA, auditId: onboardingAuditId(projA), trigger: "onboarding", siteFilesOnly: true },
+      key: `aux:${projA}:${onboardingAuditId(projA)}`,
+    });
+    expect(audits[0]!.payload).not.toHaveProperty("scope");
+    // the job is one the contract accepts
+    const { crawlAuditJobPayloadSchema } = await import("../../contracts/aux/index.js");
+    expect(crawlAuditJobPayloadSchema.safeParse({ ...audits[0]!.payload, workspaceId: wsA, kid: "k" }).success).toBe(true);
+    // zero debit: no ledger entry, no reservation, no audit row made here (crawl.audit makes it)
     expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
-    // and the project WAS claimed and handled (the skip is the entitlement's, not the claim's): the plan job reported an outcome other than "skipped"
+    // the request is counted as a site-files-only one, and the old "not in plan" skip is gone
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_requested_total")).toMatchObject({ kind: "site_files_only" });
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_skipped_total")).toBeUndefined();
+    // and the project WAS claimed and handled
     const outcome = lines.find((l) => (l as { metric?: string }).metric === "nominara_capture_plan_runs_total") as { outcome?: string } | undefined;
     expect(outcome?.outcome).toBeDefined();
     expect(outcome?.outcome).not.toBe("skipped");
+  });
+
+  it("AUXLIVE-1 D47 · a Free workspace still gets it ONCE: a second scan, or one after any audit exists, enqueues nothing more", async () => {
+    await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [wsA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(1);
+    audits.length = 0;
+    await db.query(
+      `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, excluded_rules, rule_version, tokenizer, status)
+       VALUES ($1,$2,$3,'onboarding','public_surface','{}','{}','2026.10.1','cl100k','completed')`,
+      [onboardingAuditId(projA), wsA, projA],
+    );
+    await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' WHERE id = $1", [projA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toEqual([]);
+  });
+
+  it("AUXLIVE-1 D47 · a plan that includes AUX audits keeps the FULL onboarding audit: no siteFilesOnly on the job, and the request is counted as full", async () => {
+    const lines: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      lines.push(message);
+    });
+    for (const plan of ["starter", "growth", "business"]) {
+      audits.length = 0;
+      await db.query("UPDATE workspaces SET plan_key = $2 WHERE id = $1", [wsA, plan]);
+      await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' WHERE id = $1", [projA]);
+      await db.query("DELETE FROM aux_audits WHERE project_id = $1", [projA]);
+      await processor()(signedJob(wsA, projA));
+      await settle();
+      expect(audits, plan).toHaveLength(1);
+      expect(audits[0]!.payload, plan).not.toHaveProperty("siteFilesOnly");
+    }
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_requested_total")).toMatchObject({ kind: "full" });
   });
 
   it("AUXLIVE-1 AC10 · every plan that includes AUX audits gets the onboarding audit: starter, growth and business", async () => {
