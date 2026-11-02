@@ -1414,8 +1414,11 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     }
     const manualJob = (auditId: string): Job => job({ trigger: "manual", auditId, scope: "key_pages" });
     /** The job runs in a tenant transaction in production (withTenantJob); the harness hands the handler a bare client, so wrap the run in one. */
+    // Production runs every phase inside withTenantJob, i.e. with the job's workspace set for the transaction; the write that fails an audit is confined to it.
+    const inTenant = (): Promise<unknown> => db.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
     const runTx = async (j: Job, deps: CrawlAuditDeps): Promise<void> => {
       await db.query("BEGIN");
+      await inTenant();
       try {
         await run(j, deps);
         await db.query("COMMIT");
@@ -1624,6 +1627,78 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(audit).toMatchObject({ aux_score: 88.5, score_partial: false, unmeasured_categories: [] });
     });
 
+    // OWNER DECISION 52 - a category is scored on the rules that were DECIDED; the headline is partial whenever any rule went unmeasured.
+    const SEVERITY_FACTOR: Record<string, number> = { critical: 1, high: 0.6, medium: 0.3, low: 0.1, info: 0 };
+    /** Σ weight of the category's catalog rules that this audit did NOT list in excluded_rules: the decided rules, read from the data, not from the code under test. */
+    const decidedWeight = async (category: string, excluded: readonly string[]): Promise<number> =>
+      Number((await db.query("SELECT COALESCE(SUM(weight), 0) AS w FROM aux_rule_catalog WHERE category = $1 AND NOT (code = ANY($2::text[]))", [category, excluded])).rows[0].w);
+    const slow = (deps: CrawlAuditDeps): CrawlAuditDeps => {
+      const inner = deps.fetch!;
+      return { ...deps, fetch: async (url, init) => ({ ...(await inner(url, init)), ttfbMs: 9_000, loadMs: 9_500 }) };
+    };
+
+    it("D52 · with the production unavailableRenderer and a measured timing, AUX-R-026/027 are unmeasured and render_mode is NOT scored as if they had passed: it is scored on AUX-R-029 alone", async () => {
+      await run(job(), slow(depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer })));
+      const [a] = await audits();
+      const f = (await findings()).filter((x) => x.rule_code === "AUX-R-029");
+      expect(f).toHaveLength(1);
+      const w029 = await weightOf("AUX-R-029");
+      const decided = await decidedWeight("render_mode", a.excluded_rules);
+      expect(decided).toBeCloseTo(w029, 9); // 026, 027 and 028 are excluded, so 029 is the only decided rule
+      const expected = 1 - (w029 * SEVERITY_FACTOR[f[0].severity]!) / decided;
+      expect(Number(a.score_breakdown.render_mode)).toBeCloseTo(expected, 5);
+      // the old denominator (1.000) would have said 1 - w029 * factor, i.e. nearly 1
+      expect(Number(a.score_breakdown.render_mode)).toBeLessThan(1 - w029 * SEVERITY_FACTOR[f[0].severity]! - 0.01);
+      expect(a.excluded_rules).toEqual(expect.arrayContaining(["AUX-R-026", "AUX-R-027", "AUX-R-028"]));
+    });
+
+    it("D52 · the headline is the decided-rule subscores renormalised over the categories that have one, and the API labels it partial and lists the unmeasured rules per category", async () => {
+      await run(job(), slow(depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer })));
+      const [a] = await audits();
+      const weights: Record<string, number> = { crawler_access: 0.28, structured_data: 0.22, context_fitness: 0.2, render_mode: 0.15, entity_clarity: 0.09, freshness: 0.06 };
+      const present = Object.keys(a.score_breakdown);
+      const expected = Number(((100 * present.reduce((t, c) => t + weights[c]! * Number(a.score_breakdown[c]), 0)) / present.reduce((t, c) => t + weights[c]!, 0)).toFixed(1));
+      expect(Number(a.aux_score)).toBe(expected);
+      const audit = await asTenantAudit();
+      expect(audit.score_partial).toBe(true);
+      const cats = Object.fromEntries(audit.categories.map((c) => [c.category, c.rules_not_evaluated]));
+      expect(cats.render_mode).toEqual(expect.arrayContaining(["AUX-R-026", "AUX-R-027", "AUX-R-028"]));
+    });
+
+    it("D52 · AUX-R-013 (held, decision 8) is left out of the structured_data denominator: one critical AUX-R-008 weighs w008 / (Σ structured_data weights - w013)", async () => {
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
+      const [a] = await audits();
+      expect(a.excluded_rules).toContain("AUX-R-013");
+      const total = await decidedWeight("structured_data", []);
+      const decided = await decidedWeight("structured_data", a.excluded_rules);
+      expect(decided).toBeCloseTo(total - (await weightOf("AUX-R-013")), 9);
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (await weightOf("AUX-R-008")) / decided, 5);
+      expect(Number(a.score_breakdown.structured_data)).toBeLessThan(1 - (await weightOf("AUX-R-008")) - 0.01);
+    });
+
+    it("D52 · a fully measured category scores as before: context_fitness lists no unmeasured rule, its decided weights sum to 1, and a clean page is 1", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      const [a] = await audits();
+      expect(await decidedWeight("context_fitness", a.excluded_rules)).toBeCloseTo(1, 9);
+      expect(Number(a.score_breakdown.context_fitness)).toBe(1);
+      const audit = await asTenantAudit();
+      expect(audit.categories.find((c) => c.category === "context_fitness")?.rules_not_evaluated).toEqual([]);
+    });
+
+    it("D52 · a category with no decided rule is dropped (render_mode with no renderer and no timing), and the headline is still partial", async () => {
+      await run(job(), depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer }));
+      const [a] = await audits();
+      expect(Object.keys(a.score_breakdown)).not.toContain("render_mode");
+      const audit = await asTenantAudit();
+      expect(audit.score_partial).toBe(true);
+      expect(audit.unmeasured_categories).toEqual(expect.arrayContaining(["render_mode", "entity_clarity"]));
+    });
+
+    it("D52 · the audit's rule_version is the bumped one (the formula changed)", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      expect((await audits())[0].rule_version).toBe("2026.11.1");
+    });
+
     async function asTenantAudit(id?: string) {
       const c = new Client({ connectionString: container.getConnectionUri() });
       await c.connect();
@@ -1664,8 +1739,11 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       return auditId;
     }
     const manualJob = (auditId: string): Job => job({ trigger: "manual", auditId, scope: "key_pages" });
+    // Production runs every phase inside withTenantJob, i.e. with the job's workspace set for the transaction; the write that fails an audit is confined to it.
+    const inTenant = (): Promise<unknown> => db.query("SELECT set_config('app.current_workspace_id', $1, true)", [workspaceId]);
     const runTx = async (j: Job, deps: CrawlAuditDeps): Promise<void> => {
       await db.query("BEGIN");
+      await inTenant();
       try {
         await run(j, deps);
         await db.query("COMMIT");
@@ -1679,6 +1757,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const phases = phasesOf(processor)!;
       const j = { data: { payload: { projectId, auditId, trigger, workspaceId, kid: "k1", scope: "key_pages" } }, attemptsMade, opts: { attempts: 5 } } as unknown as Job;
       await db.query("BEGIN");
+      await inTenant();
       try {
         const settled = await phases.recover!(db as never, j, { phase: "run", error: new Error("boom") });
         await db.query("COMMIT");
@@ -1739,6 +1818,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const phases = phasesOf(processor)!;
       const j = { data: { payload: { projectId, auditId, trigger: "manual", workspaceId, kid: "k1", scope: "key_pages" } }, ...job } as unknown as Job;
       await db.query("BEGIN");
+      await inTenant();
       try {
         const settled = await phases.recover!(db as never, j, { phase: "run", error });
         await db.query("COMMIT");
@@ -1748,6 +1828,30 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
         throw e;
       }
     };
+
+    it("R5 nit · a manual job whose payload no longer PARSES still refunds through the audit id when one can be read safely (a uuid audit, a uuid workspace, trigger manual)", async () => {
+      const auditId = await charged();
+      const processor = createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(healthy(OPEN)));
+      const phases = phasesOf(processor)!;
+      const j = { data: { payload: { projectId, auditId, trigger: "manual", workspaceId, kid: "k1", scope: "key_pages", surprise: "a field this build does not know" } }, attemptsMade: 4, opts: { attempts: 5 } } as unknown as Job;
+      await db.query("BEGIN");
+      await inTenant();
+      const settled = await phases.recover!(db as never, j, { phase: "prepare", error: new Error("boom") });
+      await db.query("COMMIT");
+      expect(settled).toBe(true);
+      expect((await audits())[0].status).toBe("failed");
+      expect(await refunds()).toEqual([{ credits: 10 }]);
+    });
+
+    it("R5 nit · a payload with no readable audit id settles nothing and does not throw: the reaper is the backstop", async () => {
+      const processor = createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(healthy(OPEN)));
+      const phases = phasesOf(processor)!;
+      const j = { data: { payload: { trigger: "manual", auditId: "not-a-uuid", workspaceId } }, attemptsMade: 4, opts: { attempts: 5 } } as unknown as Job;
+      await db.query("BEGIN");
+      await inTenant();
+      expect(await phases.recover!(db as never, j, { phase: "prepare", error: new Error("boom") })).toBe(false);
+      await db.query("COMMIT");
+    });
 
     it("AUXLIVE-3 review round 2 · an UnrecoverableError on an EARLY attempt settles the manual audit at once: BullMQ will not retry it, so the refund is not left to the 60-minute reaper", async () => {
       const auditId = await charged();

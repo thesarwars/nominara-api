@@ -11,6 +11,7 @@ import { AuxService } from "../../src/modules/aux/aux.service.js";
 import { reapStaleManualAudits, MANUAL_AUDIT_STALE_AFTER_MINUTES } from "../../src/lib/aux/stale-audit-reaper.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { failManualAudit } from "../../src/lib/aux/fail-manual-audit.js";
 import { refundAuxAuditCharge } from "../../src/lib/credits/aux-audit-refund.js";
 import { createCrawlAuditHandler } from "../../src/lib/queue/handlers/crawl-audit.handler.js";
 import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
@@ -106,10 +107,10 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
   const trigger = (
     body: Parameters<AuxService["triggerAudit"]>[1] = {},
     project = projectId,
-    options: { idempotencyKey?: string; confirmedCredits?: string | undefined } = {},
+    options: { idempotencyKey?: string; confirmedCredits?: string | undefined; actor?: string } = {},
   ) =>
     asTenant(() =>
-      service().triggerAudit(project, body, { id: actorId, type: "user" }, {
+      service().triggerAudit(project, body, { id: options.actor ?? actorId, type: "user" }, {
         idempotencyKey: options.idempotencyKey ?? randomUUID(),
         confirmedCredits: "confirmedCredits" in options ? options.confirmedCredits : "10",
       }),
@@ -692,6 +693,100 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
       expect(results[0]!.audit_id).not.toBe(first.audit_id);
       expect(await commits()).toBe(2);
       expect(await audits()).toHaveLength(2);
+    });
+  });
+
+  describe("review round 5 · the identity is scoped like the Idempotency interceptor's record: (workspace, user, project, key)", () => {
+    const commits = async (): Promise<number> => (await db.query("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit'", [workspaceId])).rows[0].n;
+    const newUser = async (): Promise<string> => (await db.query("INSERT INTO users (email, status) VALUES ($1, 'active') RETURNING id", [`b-${randomUUID()}@example.com`])).rows[0].id;
+
+    it("R5 · two users in one workspace with the SAME key, project and body get two separate audits, each charged once - B is not served A's audit", async () => {
+      const userB = await newUser();
+      const key = randomUUID();
+      const a = await trigger({}, projectId, { idempotencyKey: key });
+      const b = await trigger({}, projectId, { idempotencyKey: key, actor: userB });
+      expect(b.audit_id).not.toBe(a.audit_id);
+      expect(await audits()).toHaveLength(2);
+      expect(await commits()).toBe(2);
+      expect(await wallet()).toMatchObject({ included: 80, spent: 20 });
+      const rows = await audits();
+      expect(rows.find((r) => r.id === a.audit_id)).toMatchObject({ triggered_by: actorId });
+      expect(rows.find((r) => r.id === b.audit_id)).toMatchObject({ triggered_by: userB });
+      // each user's own retry still replays their own audit, once
+      expect((await trigger({}, projectId, { idempotencyKey: key, actor: userB })).audit_id).toBe(b.audit_id);
+      expect(await commits()).toBe(2);
+    });
+
+    it("R5 · the same key with a DIFFERENT body from another user is that user's own new audit - never a 409 that carries the first user's request hash", async () => {
+      const userB = await newUser();
+      const key = randomUUID();
+      const a = await trigger({}, projectId, { idempotencyKey: key });
+      const b = await trigger({ scope: "sitemap_sample" }, projectId, { idempotencyKey: key, actor: userB }).then((r) => r, (e: unknown) => e);
+      expect(codeOf(b)).toBeUndefined();
+      expect(b).toMatchObject({ requested_scope: "sitemap_sample", credits_charged: 10 });
+      expect((b as { audit_id: string }).audit_id).not.toBe(a.audit_id);
+      // and the first user, same key, different body: still their own conflict (decision 48, inside the window)
+      const conflict = await trigger({ scope: "single_url" }, projectId, { idempotencyKey: key }).then(() => null, (e: unknown) => e);
+      expect(codeOf(conflict)).toBe("idempotency_conflict");
+      expect(JSON.stringify((conflict as { details?: unknown }).details)).not.toContain(await requestHashOfAudit((b as { audit_id: string }).audit_id));
+    });
+
+    const requestHashOfAudit = async (id: string): Promise<string> => (await db.query("SELECT request_hash FROM aux_audits WHERE id = $1", [id])).rows[0].request_hash;
+
+    it("R5 · one user, one key, two projects: two audits (the project is part of the identity, as it is in the interceptor's route scope)", async () => {
+      const second = randomUUID();
+      await db.query(
+        `INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, status, cadence) VALUES ($1,$2,'P2',$3,'https://two.example','two.example','active','weekly')`,
+        [second, workspaceId, `p-${randomUUID().slice(0, 8)}`],
+      );
+      const key = randomUUID();
+      const one = await trigger({}, projectId, { idempotencyKey: key });
+      const two = await trigger({}, second, { idempotencyKey: key });
+      expect(two.audit_id).not.toBe(one.audit_id);
+      expect(await commits()).toBe(2);
+    });
+
+    it("R5 · a hard-deleted project's audit is gone (aux_audits cascaded) but its ledger key is not: past 24 hours the walk treats that generation as EXPIRED and moves on, instead of hitting the old ledger key", async () => {
+      const key = randomUUID();
+      const first = await trigger({}, projectId, { idempotencyKey: key });
+      await settle();
+      // the audit row vanishes (a project hard delete cascades it); the append-only ledger entry stays, and is 25 hours old
+      await db.query("DELETE FROM aux_audits WHERE id = $1", [first.audit_id]);
+      await db.query("ALTER TABLE credit_ledger DISABLE TRIGGER USER");
+      try {
+        await db.query("UPDATE credit_ledger SET occurred_at = now() - make_interval(hours => 25) WHERE workspace_id = $1", [workspaceId]);
+      } finally {
+        await db.query("ALTER TABLE credit_ledger ENABLE TRIGGER USER");
+      }
+      const second = await trigger({}, projectId, { idempotencyKey: key });
+      expect(second.audit_id).not.toBe(first.audit_id);
+      expect(second).toMatchObject({ status: "queued", credits_charged: 10 });
+      expect(await audits()).toHaveLength(1);
+      expect(await commits()).toBe(2);
+    });
+  });
+
+  describe("review round 5 · the reaper's write is confined to the tenant", () => {
+    it("R5 · failManualAudit inside workspace B's context cannot fail workspace A's audit, and refunds nothing", async () => {
+      const res = await trigger();
+      const other = randomUUID();
+      await db.query("INSERT INTO workspaces (id,name,slug,plan_key,timezone) VALUES ($1,'O',$2,'starter','UTC')", [other, `o-${randomUUID().slice(0, 8)}`]);
+      const moved = await withTenantContext(db, { workspaceId: other, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+        failManualAudit(tx, { workspaceId: other, auditId: res.audit_id, reason: "stale", at: new Date() }),
+      );
+      expect(moved).toBe(false);
+      expect((await audits())[0].status).toBe("queued");
+      expect(await wallet()).toMatchObject({ included: 90 });
+    });
+
+    it("R5 · the 60-minute cutoff is the DATABASE clock's: a caller whose app clock is a day fast or slow reaps the same audits", async () => {
+      const res = await trigger();
+      await db.query("UPDATE aux_audits SET created_at = now() - make_interval(mins => 30) WHERE id = $1", [res.audit_id]);
+      // an app clock a day AHEAD must not make a 30-minute-old audit stale
+      expect(await reapStaleManualAudits(db, new Date(Date.now() + 24 * 3_600_000))).toEqual({ reaped: 0 });
+      await db.query("UPDATE aux_audits SET created_at = now() - make_interval(mins => 61) WHERE id = $1", [res.audit_id]);
+      // an app clock a day BEHIND must not hide a 61-minute-old one
+      expect(await reapStaleManualAudits(db, new Date(Date.now() - 24 * 3_600_000))).toEqual({ reaped: 1 });
     });
   });
 

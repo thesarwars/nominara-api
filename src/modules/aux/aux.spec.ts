@@ -81,6 +81,9 @@ function auditRow(over: Record<string, unknown> = {}) {
     excluded: [{ rule_code: "AUX-R-010", title: "Product schema" }],
     excluded_by_category: { structured_data: ["AUX-R-010"], crawler_access: ["AUX-R-005"] },
     previous_score: "60.000",
+    previous_rule_version: "2026.10.1",
+    excluded_codes: ["AUX-R-010", "AUX-R-005"],
+    previous_excluded_codes: ["AUX-R-005", "AUX-R-010"],
     in_scope: true,
     ...over,
   };
@@ -237,9 +240,46 @@ describe("NEW-C-10 · AuxService.getAudit", () => {
     expect(none.unmeasured_categories).toHaveLength(6);
   });
 
-  it("AUXLIVE-5 (decision 38) · all six categories published: a full score, partial false, nothing unmeasured", async () => {
-    const full = await serviceWith(() => [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 0.5, freshness: 1 } })]).getAudit(AUDIT_ID);
+  it("AUXLIVE-5 (decision 38, 52) · all six categories published AND every rule decided: a full score, partial false, nothing unmeasured", async () => {
+    // Decision 52 changes this test: it used to take the default fixture, whose published categories list rules_not_evaluated and so are NOT fully measured.
+    const full = await serviceWith(() =>
+      [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 0.5, freshness: 1 }, excluded_by_category: {}, excluded: [], excluded_codes: [], previous_excluded_codes: [] })],
+    ).getAudit(AUDIT_ID);
     expect(full).toMatchObject({ score_partial: false, unmeasured_categories: [] });
+  });
+
+  it("D52 · all six categories published but a rule went unmeasured (rules_not_evaluated non-empty): the headline is partial", async () => {
+    const audit = await serviceWith(() =>
+      [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 1, freshness: 1 }, excluded_by_category: { structured_data: ["AUX-R-013"] } })],
+    ).getAudit(AUDIT_ID);
+    expect(audit.unmeasured_categories).toEqual([]);
+    expect(audit.score_partial).toBe(true);
+  });
+
+  it("D52 · a null score is not partial even when rules are listed as unmeasured", async () => {
+    const audit = await serviceWith(() => [auditRow({ aux_score: null, previous_score: null, score_breakdown: { crawler_access: 1 } })]).getAudit(AUDIT_ID);
+    expect(audit.score_partial).toBe(false);
+  });
+
+  it("D52 · delta is suppressed when the two audits' unmeasured rule sets differ", async () => {
+    const audit = await serviceWith(() => [auditRow({ previous_excluded_codes: ["AUX-R-005", "AUX-R-010", "AUX-R-026"] })]).getAudit(AUDIT_ID);
+    expect(audit.aux_score).toBe(68.5);
+    expect(audit.delta).toBeNull();
+  });
+
+  it("D52 · delta is suppressed when the two audits' rule versions differ", async () => {
+    const audit = await serviceWith(() => [auditRow({ previous_rule_version: "2026.10.1", rule_version: "2026.11.1" })]).getAudit(AUDIT_ID);
+    expect(audit.delta).toBeNull();
+  });
+
+  it("D52 · delta stays when the unmeasured sets are the same in a different order and the versions agree", async () => {
+    const audit = await serviceWith(() => [auditRow({ excluded_codes: ["AUX-R-010", "AUX-R-005"], previous_excluded_codes: ["AUX-R-005", "AUX-R-010"] })]).getAudit(AUDIT_ID);
+    expect(audit.delta).toBe(8.5);
+  });
+
+  it("D52 · a delta of 0 between like audits is 0, not null", async () => {
+    const audit = await serviceWith(() => [auditRow({ previous_score: "68.500" })]).getAudit(AUDIT_ID);
+    expect(audit.delta).toBe(0);
   });
 
   it("[NEW-C-10 AC4] a real site-file audit: aux_score null stays null, delta null, no breakdown beyond what ran, 0 and null distinguished", async () => {
