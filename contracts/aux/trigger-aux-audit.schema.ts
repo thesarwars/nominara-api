@@ -9,6 +9,11 @@ import { CRAWL_AUDIT_REQUESTED_SCOPES } from "./crawl-audit-job.schema.js";
 // first page band, then per page). The site-files check is free and is not this route. The price is the plan's page cap, never the pages that
 // turned out reachable: "domain verification controls scope, not price", so an unverified domain (one page, public surface) pays the same.
 //
+// IDEMPOTENCY (api-specification.md section 1; owner decision 48): the `Idempotency-Key` is honoured for 24 HOURS, as on every paid action. Inside the
+// window a replay (same key, same body) returns the recorded first answer (the Valkey record) or, if that record was evicted, the audit's live `status` and
+// `credits_refunded` from the database; either way nothing is charged twice, and the same key with another body is `409 idempotency_conflict`. After 24
+// hours from the original request the same key starts a NEW audit and charges normally. A client reads live state from `GET /aux-audits/{id}`.
+//
 // `scope` is what the caller may ASK for. `public_surface` and `domain_root` are not here: verification decides them inside `crawl.audit`, so no
 // request can ask for more than the domain's owner proved they own (STORY-048 AC6).
 

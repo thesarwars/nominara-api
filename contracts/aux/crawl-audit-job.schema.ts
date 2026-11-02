@@ -30,6 +30,12 @@ export const crawlAuditJobPayloadSchema = z
     trigger: crawlAuditTriggerSchema,
     /** Absent = `key_pages`. An unverified domain is held to public_surface whatever this says. */
     scope: crawlAuditRequestedScopeSchema.optional(),
+    /**
+     * OWNER DECISION 47: the free site-files-only check (robots.txt, llms.txt, sitemap) - no page is selected, fetched or judged, whatever the
+     * verification state. The producer sets it for a Free project's onboarding audit (plans-and-entitlements.md: "Site-file AUX checks ... are free and
+     * unlimited"; the full page audit is a paid-plan feature). Absent = the full audit. Never for a `manual` audit: that one is priced, and it is a page audit.
+     */
+    siteFilesOnly: z.boolean().optional(),
     /** Required, with exactly one entry, for `single_url`. Each is re-guarded when fetched. */
     targetUrls: z
       .array(
@@ -46,6 +52,10 @@ export const crawlAuditJobPayloadSchema = z
     kid: z.string(),
   })
   .strict()
+  .refine((p) => p.siteFilesOnly !== true || p.trigger !== "manual", {
+    message: "a manual audit is a priced page audit, never site-files-only",
+    path: ["siteFilesOnly"],
+  })
   .refine((p) => p.scope !== "single_url" || p.targetUrls?.length === 1, {
     message: "single_url needs exactly one target URL",
     path: ["targetUrls"],

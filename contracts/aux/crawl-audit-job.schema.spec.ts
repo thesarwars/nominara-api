@@ -43,3 +43,16 @@ describe("STORY-049 · crawl.audit job payload", () => {
     expect(crawlAuditJobPayloadSchema.safeParse({ ...base, extra: 1 }).success).toBe(false);
   });
 });
+
+describe("owner decision 47 · site-files-only", () => {
+  it("D47 · siteFilesOnly is optional, and true is accepted for onboarding and scheduled", () => {
+    expect(crawlAuditJobPayloadSchema.parse(base).siteFilesOnly).toBeUndefined();
+    expect(crawlAuditJobPayloadSchema.parse({ ...base, trigger: "onboarding", siteFilesOnly: true }).siteFilesOnly).toBe(true);
+    expect(crawlAuditJobPayloadSchema.parse({ ...base, siteFilesOnly: true }).siteFilesOnly).toBe(true);
+  });
+
+  it("D47 · a manual audit is never site-files-only (it is priced and it is a page audit)", () => {
+    expect(crawlAuditJobPayloadSchema.safeParse({ ...base, trigger: "manual", siteFilesOnly: true }).success).toBe(false);
+    expect(crawlAuditJobPayloadSchema.safeParse({ ...base, trigger: "manual", siteFilesOnly: false }).success).toBe(true);
+  });
+});
