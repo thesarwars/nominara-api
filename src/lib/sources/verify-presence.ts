@@ -382,7 +382,14 @@ export async function verifyProjectSourcePresence(tx: ClientBase, projectId: str
 // NULL (its playbook has no page), so without the fallback AC8 never fired for it. The fallback is still fetched PAST the cache
 // and pinned at completion: the completion is the trigger, and the most-cited page is where the engines look.
 
-/** The task's target, when it is an http(s) page on the task's own domain (or a subdomain of it); otherwise null. */
+/**
+ * The task's target, when it is an http(s) page on the task's own domain (or a subdomain of it); otherwise null.
+ *
+ * KNOWN RESIDUAL (STORY-055 review r5, recorded not fixed): only the HOST is read. A domain that hands out WILDCARD SUBDOMAINS to
+ * anyone (`<anything>.github.io`, `<name>.substack.com`, `<name>.wordpress.com`) is "on the domain" for every subdomain, so a task on
+ * such a platform accepts a page the customer controls on a subdomain of their own. That page is the customer's own, which is the
+ * point of seeding on a community platform, but it also means "on the domain" proves the platform, not the thread.
+ */
 export function seededTargetUrl(affectedUrl: string | null, domain: string): string | null {
   if (affectedUrl === null || affectedUrl.length === 0) return null;
   let url: URL;

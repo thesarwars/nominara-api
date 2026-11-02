@@ -1,6 +1,6 @@
 -- STORY-055 AC5/AC6/AC11, owner decision 30 (plans-7day/decisions-2026-10-28.md): a seeding task whose contribution URL has been
 -- submitted but not yet verified is `in_review`. EXPAND phase: both CHECKs only widen, so every existing row still satisfies them
--- (NOT VALID, as 0030 and 0036 did: no scan under ACCESS EXCLUSIVE).
+-- (written NOT VALID first, as 0030 and 0036 did; see the VALIDATE note below for what that does and does not buy).
 --
 -- WHERE THE URL AND THE REASON LIVE: no column is added. The submitted URL and the verification reason are `task_events` rows
 -- (`verification_submitted` carries `{ "url": ... }`; `verification_failed` carries `{ "submission_id", "reason" }`), because they
@@ -22,8 +22,12 @@ ALTER TABLE task_events
                    'goal_linked','completed','reopened','dismissed','evidence_refreshed',
                    'due_changed','verification_submitted','verification_failed')) NOT VALID;
 
--- Validated in a LATER statement than the ADD: the ADD took its lock without a scan, and the scan (a SHARE UPDATE EXCLUSIVE lock,
--- which does not block reads or writes) happens here, so a NOT VALID constraint is not left behind to be mistaken for a checked one.
+-- NOT VALID, then VALIDATE in a later statement - but in the SAME TRANSACTION: the migrate-runner wraps the whole file in one
+-- transaction, so the ACCESS EXCLUSIVE lock the ADD took is held until COMMIT, the VALIDATE scan runs under it, and NOT VALID buys NO
+-- lock relief here (the scan blocks reads and writes on `tasks` and `task_events` for its duration). The split is kept only so that
+-- the constraint is checked rather than left NOT VALID (a NOT VALID constraint has not been checked against existing rows and is easy to
+-- mistake for a checked one). It is acceptable because both CHECKs only WIDEN and the scan is one pass over each table; a table large enough
+-- to make the scan matter would need the VALIDATE in a migration of its own (one transaction per file), which is the shape to use then.
 ALTER TABLE tasks VALIDATE CONSTRAINT tasks_status_check;
 ALTER TABLE task_events VALIDATE CONSTRAINT task_events_event_check;
 

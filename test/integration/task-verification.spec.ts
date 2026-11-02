@@ -8,7 +8,9 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import type { GuardedResponse } from "../../src/lib/net/guarded-fetch.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { attemptsFor } from "../../src/lib/queue/queue-factory.js";
 import { phasesOf } from "../../src/lib/queue/worker-factory.js";
+import { topologyFor } from "../../src/lib/queue/topology.js";
 import {
   commitSubmissionVerification,
   prepareSubmissionVerification,
@@ -535,7 +537,31 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
       expect(out.task.review).toMatchObject({ state: "pending" });
     });
 
-    it("review r4 - every new statement against tasks, task_events and project_source_index carries workspace_id = app.current_workspace()", async () => {
+    it("review r5 - recover uses the topology's REAL attempt count (attemptsFor), and the answer it writes is announced as task.moved", async () => {
+      await openGap();
+      const id = await task();
+      await submit(id, URL_OK);
+      const submission = await lastSubmission(id);
+      const attempts = attemptsFor(topologyFor("source.verify_presence"));
+      const handler = createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch: vi.fn(), realtime });
+      const phases = phasesOf(handler)!;
+      const jobAt = (attempt: number) =>
+        ({ attemptsMade: attempt - 1, opts: { attempts }, data: { payload: { workspaceId, kid: "k", projectId, taskId: id, submissionId: submission } } }) as unknown as Job;
+      const recover = (job: Job) => withTenantContext(db, { workspaceId, actorId }, (tx) => phases.recover!(tx, job, { error: new Error("db down"), phase: "commit" }));
+
+      expect(attempts).toBeGreaterThan(1);
+      realtime.published.length = 0;
+      await expect(recover(jobAt(attempts - 1))).resolves.toBe(false); // the attempt before the last: the queue retries
+      expect(realtime.published).toEqual([]);
+      await expect(recover(jobAt(attempts))).resolves.toBe(true); // the last attempt the topology allows
+      expect((await events(id)).filter((e) => e.event === "verification_failed")).toHaveLength(1);
+      expect(realtime.published).toEqual([expect.objectContaining({ event: "task.moved", payload: { task_id: id, project_id: projectId } })]);
+      realtime.published.length = 0;
+      await expect(recover(jobAt(attempts))).resolves.toBe(false); // answered already: nothing written, nothing announced
+      expect(realtime.published).toEqual([]);
+    });
+
+    it("review r5 - EVERY statement against tasks, task_events or project_source_index carries workspace_id = app.current_workspace(), bar a short explicit list", async () => {
       await openGap();
       const id = await task();
       const seen: string[] = [];
@@ -546,24 +572,49 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
         if (text !== undefined && recording) seen.push(text);
         return original(...args);
       };
+      const lookup = async <T>(fn: () => Promise<T>): Promise<T> => {
+        recording = false; // this spec's own helpers run as the superuser; they are not production SQL
+        try {
+          return await fn();
+        } finally {
+          recording = true;
+        }
+      };
       try {
-        await submit(id, URL_OK);
-        recording = false; // `lastSubmission` is this spec's own helper (it runs as the superuser), not production SQL
-        const submissionId = await lastSubmission(id);
-        recording = true;
-        await job(id, submissionId, vi.fn().mockResolvedValue(page("Acme Analytics")));
+        await submit(id, URL_OK); // the request: lock, submission insert, status update, readTask
+        const first = await lookup(() => lastSubmission(id));
+        await job(id, first, vi.fn().mockResolvedValue(page("Globex only"))); // a failed check: prepare + commitLocked + the failure insert
+        await expect(submit(id, "https://reviews.dev/threads/second")).resolves.toBeDefined(); // a resubmit after the failure
+        const second = await lookup(() => lastSubmission(id));
+        await expect(submit(id, "https://reviews.dev/threads/third")).rejects.toBeInstanceOf(ConflictError); // the pending 409 path
+        await job(id, second, vi.fn().mockResolvedValue(page("Acme Analytics"))); // the verified path: milestones, index, counts
+        await inTenant(() => service.listProjectTasks(projectId, { sort: "impact", limit: 50 } as never)); // REVIEW_SELECT
+        // the give-up path
+        const other = await lookup(() => task()); // spec setup, not production SQL
+        await submit(other, URL_OK);
+        const stuck = await lookup(() => lastSubmission(other));
+        const handler = createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch: vi.fn(), realtime });
+        const gaveUp = { attemptsMade: 0, opts: { attempts: 1 }, data: { payload: { workspaceId, kid: "k", projectId, taskId: other, submissionId: stuck } } } as unknown as Job;
+        await withTenantContext(db, { workspaceId, actorId }, (tx) => phasesOf(handler)!.recover!(tx, gaveUp, { error: new Error("db down"), phase: "commit" }));
       } finally {
         (db as unknown as { query: unknown }).query = original;
       }
-      const mine = seen.filter(
-        (sql) =>
-          /FOR NO KEY UPDATE/u.test(sql) && /FROM tasks/u.test(sql) ||
-          /verification_submitted/u.test(sql) && /FROM task_events|INSERT INTO task_events/u.test(sql) ||
-          /UPDATE tasks SET status = '(done|in_review)'/u.test(sql) ||
-          /SET brand_present_on_domain = true/u.test(sql),
-      );
-      expect(mine.length).toBeGreaterThanOrEqual(6);
-      for (const sql of mine) expect(sql, sql).toContain("app.current_workspace()");
+
+      const TOUCHES = /\b(?:FROM|JOIN|UPDATE|INTO)\s+(?:ONLY\s+)?(?:tasks|task_events|project_source_index)\b/iu;
+      const touching = seen.filter((sql) => TOUCHES.test(sql));
+      expect(touching.length).toBeGreaterThanOrEqual(15);
+
+      // THE EXEMPTION LIST. A statement here is bounded by RLS and by its project_id / primary key, and is not THIS story's SQL: the
+      // shared rollup index rebuild (src/lib/rollup, STORY-066) that every presence write calls. Each is a DELETE/INSERT/SELECT over a
+      // whole project's index, never a task selected by a caller-supplied id. Adding to this list needs a reason.
+      const EXEMPT: ReadonlyArray<{ readonly pattern: RegExp; readonly why: string }> = [
+        { pattern: /\bproject_source_index\b[\s\S]*\bproject_id = \$1\b/iu, why: "refreshProjectSourceIndex: a whole-project recompute; the rollup's own statements" },
+        { pattern: /^\s*INSERT INTO project_source_index\s*\(\s*workspace_id\b/iu, why: "the index rebuild's INSERT names workspace_id as a column (a $ parameter); RLS WITH CHECK pins it to the context's workspace" },
+      ];
+      const offenders = touching.filter((sql) => !sql.includes("app.current_workspace()") && !EXEMPT.some((e) => e.pattern.test(sql)));
+      expect(offenders, offenders.join("\n---\n")).toEqual([]);
+      // the exemptions are not a loophole: each must actually be used, or it is dead weight to delete
+      for (const e of EXEMPT) expect(touching.some((sql) => !sql.includes("app.current_workspace()") && e.pattern.test(sql)), e.why).toBe(true);
     });
 
     it("another workspace's context cannot verify (or fetch for) this task", async () => {
@@ -598,7 +649,7 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
       expect(portal.completed).toEqual([]);
     });
 
-    it("review r4 - the served task says whether it is a seeding task (playbook OR source class), in the list and in a response", async () => {
+    it("review r5 - the served task says whether it CAN BE COMPLETED WITH A URL (it has a source domain), in the list and in a response", async () => {
       await openGap();
       const both = await task();
       const playbookOnly = await task({ domain: null });
@@ -606,10 +657,13 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
       const plain = await task({ playbook: null, domain: null, kind: "content" });
       const listed = (await inTenant(() => service.listProjectTasks(projectId, { sort: "impact", limit: 50 } as never))).items;
       const seedingOf = (id: string) => listed.find((t) => t.id === id)!.seeding;
-      expect([both, playbookOnly, domainOnly, plain].map(seedingOf)).toEqual([true, true, true, false]);
+      // `seeding` = "can be completed with a URL" = has a source domain. A playbook-only task is refused with no_source_domain, so it is false.
+      expect([both, playbookOnly, domainOnly, plain].map(seedingOf)).toEqual([true, false, true, false]);
       for (const t of listed) expect(taskSchema.parse(t)).toEqual(t);
       expect((await submit(both, URL_OK)).task.seeding).toBe(true);
       expect((await submit(plain)).task.seeding).toBe(false);
+      // and the flag matches what the request does: the playbook-only task it calls false is the one completeTask refuses
+      await expect(submit(playbookOnly, URL_OK)).rejects.toMatchObject({ details: expect.objectContaining({ reason: "no_source_domain" }) });
     });
 
     it("the status filter finds a task in review, and a goal counts it in tasks_total but never in tasks_done", async () => {

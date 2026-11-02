@@ -182,12 +182,11 @@ export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, 
       if (!isFinalAttempt(job)) return false;
       const payload = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
       if (!payload.success || payload.data.taskId === undefined || payload.data.submissionId === undefined) return false;
-      return recordSubmissionGaveUp(tx, {
-        workspaceId: payload.data.workspaceId,
-        projectId: payload.data.projectId,
-        taskId: payload.data.taskId,
-        submissionId: payload.data.submissionId,
-      });
+      const { workspaceId, projectId, taskId, submissionId } = payload.data;
+      const wrote = await recordSubmissionGaveUp(tx, { workspaceId, projectId, taskId, submissionId });
+      // The same announcement the commit makes, after COMMIT: the task now shows its review reason, so the board must refresh.
+      if (wrote) afterCommit(() => realtime().toWorkspace(workspaceId, "task.moved", { task_id: taskId, project_id: projectId }));
+      return wrote;
     },
   });
 }
