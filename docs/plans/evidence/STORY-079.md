@@ -43,3 +43,17 @@ The story names no files. Edits outside `src/modules/tools` + `contracts/tools`,
 `src/lib/capture/l1-exact-hash.ts` + `execute-cell.ts` (optional `capturedAt` in the L1 envelope; `seedSharedCache` exported),
 `src/api/interceptors/audit.interceptor.ts` + `src/contracts/discover-routes.ts` (a `@Streaming()` route is exempt from the interceptor and from the
 coverage sweep, and audits itself), `src/lib/queue/handlers.ts` (registers the handler), `src/api/streaming/sse-reply.ts` (new, Fastify -> SSE sink).
+
+## Two defects the gates found (kept here so they are not re-introduced)
+
+- **Import cycle.** `ProjectsService` imports the queue handler registry (`handlerFor`); the scan handler needs `ToolsService`, which imports `ProjectsService`. A static import
+  closed the loop and Nest read `ProjectsService` as undefined ("can't resolve dependencies of ToolsService") - but only in the processes that loaded the registry first, so the
+  integration suite passed and 14 unit files failed. The handler imports `ToolsService` when first used.
+- **Cache adapter.** `ValkeyCacheAdapter` is lazily connected with no offline queue, so its first command fails unless `connect()` was called. The handler connects it once before use
+  (capture-execute does not; it is rescued by its retry ladder - not changed here).
+
+## Gates (logs in plans-7day/logs/s079-*.log)
+
+Red runs: `s079-red-unit.log` (modules absent), `s079-red-l1.log` (capturedAt), `s079-red-audit.log` (streaming exemption, coverage sweep), `s079-red-guards.log` (rate-limit class).
+The integration spec was written after the route existed (it needs the route); its first runs were red for the DI cycle above, the missing audit exemption, and test isolation
+(a live capture seeds the shared L1 cache by design, so each scan in the spec uses a fresh query).
