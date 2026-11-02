@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { GuardedFetchRefusal, type GuardedResponse } from "../../../src/lib/net/guarded-fetch.js";
-import { fetchSubmission, type SubmissionPlan } from "../../../src/lib/sources/verify-submission.js";
+import { fetchSubmission, urlEchoesBrand, type SubmissionPlan } from "../../../src/lib/sources/verify-submission.js";
 
 // STORY-055 AC6 + AC11 (scenarios 6 and 7) - the fetch phase of a submitted URL: no database, a fake guarded fetcher, and the
 // mapping from what the fetch found to the SPECIFIC reason the customer sees. A reason is never generic.
 
-const URL_OK = "https://reviews.dev/threads/acme";
+const URL_OK = "https://reviews.dev/threads/best-tools";
 const plan = (over: Partial<SubmissionPlan> = {}): SubmissionPlan => ({
   workspaceId: "w", projectId: "p", taskId: "t", submissionId: "s", url: URL_OK, submittedBy: null, title: "Contribute", sourceDomainId: "d",
   domain: "reviews.dev", today: "2026-10-07", brand: { name: "Acme Analytics", aliases: ["Acme"], negativeAliases: [] }, ...over,
@@ -18,7 +18,7 @@ describe("STORY-055 · fetchSubmission", () => {
   it("a page that names the brand, on the task's domain, is verified", async () => {
     const fetch = vi.fn().mockResolvedValue(res("Acme Analytics is great"));
     await expect(fetchSubmission(plan(), fetch)).resolves.toEqual({ status: "verified" });
-    expect(fetch).toHaveBeenCalledWith(URL_OK);
+    expect(fetch).toHaveBeenCalledWith(URL_OK, expect.objectContaining({ followRedirect: expect.any(Function) }));
   });
 
   it("scenario 6 - a page that resolves but names no brand is no_mention", async () => {
@@ -87,5 +87,68 @@ describe("STORY-055 · fetchSubmission", () => {
     const fetch = vi.fn().mockResolvedValue(res("Acme Analytics", { finalUrl: "https://anywhere.org/p" }));
     await expect(fetchSubmission(plan({ domain: null, sourceDomainId: null, url: "https://anywhere.org/p" }), fetch)).resolves.toEqual({ status: "unverified", reason: "wrong_domain" });
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  // ---- review r4 (dangerous-area audit) --------------------------------------------------------------------------------------
+  // The customer chooses the URL. A site search, a tag page and a soft-404 ECHO it, so a brand in the URL would "appear" on a page
+  // that never mentioned it. Fails closed, before any fetch.
+  const WIKI = (url: string, over: Partial<SubmissionPlan> = {}) => plan({ url, domain: "wikipedia.org", ...over });
+  const echoPage = (u: string): GuardedResponse => {
+    const q = decodeURIComponent(new URL(u).search + new URL(u).pathname);
+    return res(`Search results for ${q}. There were no results matching the query ${q}.`, { finalUrl: u });
+  };
+
+  it.each([
+    ["a site search (the auditor's probe)", "https://en.wikipedia.org/w/index.php?search=Acme+Analytics&fulltext=1"],
+    ["a search with a percent-encoded query", "https://en.wikipedia.org/w/index.php?search=acme%20analytics"],
+    ["a double-encoded query", "https://en.wikipedia.org/w/index.php?search=%2541cme+Analytics"],
+    ["a tag page", "https://en.wikipedia.org/wiki/Tag/acme-analytics"],
+    ["a soft-404 that echoes the path", "https://en.wikipedia.org/wiki/Acme_Analytics_does_not_exist"],
+    ["an alias in the query key", "https://en.wikipedia.org/w/index.php?Acme=1"],
+    ["a text fragment", "https://en.wikipedia.org/wiki/Foo#:~:text=Acme%20Analytics"],
+  ])("review r4 - %s is url_echoes_brand and is never fetched", async (_name, url) => {
+    const fetch = vi.fn().mockImplementation(async (u: string) => echoPage(u));
+    await expect(fetchSubmission(WIKI(url), fetch)).resolves.toEqual({ status: "unverified", reason: "url_echoes_brand" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("review r4 - a real article that names the brand in its TEXT, at a URL that does not, still verifies", async () => {
+    const url = "https://en.wikipedia.org/wiki/Product_analytics";
+    const fetch = vi.fn().mockResolvedValue(res("Tools such as Acme Analytics are widely used.", { finalUrl: url }));
+    await expect(fetchSubmission(WIKI(url), fetch)).resolves.toEqual({ status: "verified" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("review r4 - a redirect that lands on a search URL echoing the brand is url_echoes_brand even though the page names it", async () => {
+    const url = "https://en.wikipedia.org/wiki/Special:Go";
+    const landed = "https://en.wikipedia.org/w/index.php?search=Acme+Analytics";
+    await expect(fetchSubmission(WIKI(url), vi.fn().mockResolvedValue(res("Acme Analytics", { finalUrl: landed })))).resolves.toEqual({ status: "unverified", reason: "url_echoes_brand" });
+  });
+
+  it("review r4 - urlEchoesBrand reads path, query and fragment, not the host, and a URL without the brand is clean", () => {
+    const brand = { name: "Acme Analytics", aliases: ["Acme"], negativeAliases: [] };
+    expect(urlEchoesBrand("https://acme.substack.com/p/our-launch", brand)).toBe(false);
+    expect(urlEchoesBrand("https://reddit.com/r/saas/comments/abc/best_tools/", brand)).toBe(false);
+    expect(urlEchoesBrand("https://reddit.com/r/saas/comments/abc/acme_vs_globex/", brand)).toBe(true);
+    expect(urlEchoesBrand("not a url", brand)).toBe(false);
+    expect(urlEchoesBrand("https://x.dev/%E0%A4%A", brand)).toBe(false); // a malformed escape never throws
+  });
+
+  it("review r4 - no hop is followed off the task's domain: followRedirect is false off it and true on it, and an off-domain redirect is wrong_domain", async () => {
+    const asked: Record<string, boolean> = {};
+    const fetch = vi.fn().mockImplementation(async (u: string, init?: { followRedirect?: (n: string) => boolean }) => {
+      asked["https://evil.org/landing"] = init!.followRedirect!("https://evil.org/landing");
+      asked["https://reviews.dev/moved"] = init!.followRedirect!("https://reviews.dev/moved");
+      asked["https://sub.reviews.dev/moved"] = init!.followRedirect!("https://sub.reviews.dev/moved");
+      asked["https://reviews.dev.evil.org/x"] = init!.followRedirect!("https://reviews.dev.evil.org/x");
+      return res("", { status: 301, finalUrl: u, headers: { location: "https://evil.org/landing" } });
+    });
+    await expect(fetchSubmission(plan(), fetch)).resolves.toEqual({ status: "unverified", reason: "wrong_domain" });
+    expect(asked).toEqual({
+      "https://evil.org/landing": false,
+      "https://reviews.dev/moved": true,
+      "https://sub.reviews.dev/moved": true,
+      "https://reviews.dev.evil.org/x": false,
+    });
   });
 });

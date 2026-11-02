@@ -22,6 +22,11 @@ ALTER TABLE task_events
                    'goal_linked','completed','reopened','dismissed','evidence_refreshed',
                    'due_changed','verification_submitted','verification_failed')) NOT VALID;
 
+-- Validated in a LATER statement than the ADD: the ADD took its lock without a scan, and the scan (a SHARE UPDATE EXCLUSIVE lock,
+-- which does not block reads or writes) happens here, so a NOT VALID constraint is not left behind to be mistaken for a checked one.
+ALTER TABLE tasks VALIDATE CONSTRAINT tasks_status_check;
+ALTER TABLE task_events VALIDATE CONSTRAINT task_events_event_check;
+
 DROP INDEX ix_tasks_open;
 CREATE INDEX ix_tasks_open ON tasks (workspace_id, impact_score DESC, priority DESC)
   WHERE status IN ('todo','in_progress','in_review') AND deleted_at IS NULL;

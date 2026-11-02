@@ -11,7 +11,6 @@ import {
   fetchSeededTarget,
   preparePresenceRun,
   prepareSeededVerification,
-  type PresenceFetcher,
   type PresenceOutcome,
   type PresenceResult,
   type PresenceRunPlan,
@@ -20,6 +19,8 @@ import {
 import {
   commitSubmissionVerification,
   fetchSubmission,
+  recordSubmissionGaveUp,
+  type SubmissionFetcher,
   prepareSubmissionVerification,
   type SubmissionOutcome,
   type SubmissionPlan,
@@ -27,7 +28,7 @@ import {
 import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
 import { afterCommit } from "../../../tenancy/tenant-context.js";
 import type { QueueHandlerContext } from "../handlers.js";
-import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure } from "../worker-factory.js";
 
 // NEW-C-15 / STORY-054 AC4 + AC11 — `source.verify_presence`: for one project,
 // fetch the top cited URL per domain (through the guarded fetcher) and record
@@ -69,7 +70,7 @@ const payloadSchema = z
   .strict();
 
 export interface SourceVerifyPresenceDeps {
-  readonly fetch?: PresenceFetcher;
+  readonly fetch?: SubmissionFetcher;
   /** STORY-055 - the realtime publisher a changed task announces itself on (`task.moved`). Built lazily in production; injected in tests. */
   readonly realtime?: RealtimePublisher;
   readonly now?: () => Date;
@@ -88,7 +89,7 @@ type Fetched =
 const tracer = trace.getTracer("nominara-api");
 
 /** The submission's guarded fetch, in a span: the one outbound call of this job mode. IDs only - never the URL. */
-function fetchSubmissionTraced(plan: SubmissionPlan, fetch: PresenceFetcher): Promise<SubmissionOutcome> {
+function fetchSubmissionTraced(plan: SubmissionPlan, fetch: SubmissionFetcher): Promise<SubmissionOutcome> {
   return tracer.startActiveSpan("tasks.verify_submission", async (span) => {
     try {
       const outcome = await fetchSubmission(plan, fetch);
@@ -105,7 +106,7 @@ function fetchSubmissionTraced(plan: SubmissionPlan, fetch: PresenceFetcher): Pr
 
 export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {
   const logger = new Logger("source.verify_presence");
-  const fetch = deps.fetch ?? ((url: string) => guardedFetch(url));
+  const fetch: SubmissionFetcher = deps.fetch ?? ((url, init) => guardedFetch(url, init));
   const clock = deps.now ?? (() => new Date());
   // Built on the first submission job, not at boot: a worker group without a reachable cache must still boot (as task.generate's).
   let publisher: RealtimePublisher | undefined;
@@ -174,5 +175,26 @@ export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, 
         await commitPresenceRun(tx, prepared.projectId, prepared.plan, fetched.results, prepared.now, prepared.today);
       }
     },
+    // STORY-055 (review r4) - a SUBMISSION job whose last attempt fails (a database error in prepare or commit, retries spent) answers
+    // `unreachable`, so the task does not stay `pending` for ever with every resubmit a 409. The fetch itself never throws (every fetch
+    // failure is an answer), so only the database can bring a job here. The other modes keep the queue's own failure handling.
+    async recover(tx: ClientBase, job: Job, _failure: PhaseFailure<Prepared, Fetched>) {
+      if (!isFinalAttempt(job)) return false;
+      const payload = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
+      if (!payload.success || payload.data.taskId === undefined || payload.data.submissionId === undefined) return false;
+      return recordSubmissionGaveUp(tx, {
+        workspaceId: payload.data.workspaceId,
+        projectId: payload.data.projectId,
+        taskId: payload.data.taskId,
+        submissionId: payload.data.submissionId,
+      });
+    },
   });
+}
+
+/** BullMQ increments `attemptsMade` when an attempt fails, so during attempt N it is N-1. An unknown attempt count is "not known to be final". */
+function isFinalAttempt(job: Pick<Job, "attemptsMade" | "opts">): boolean {
+  const attempts = job.opts?.attempts;
+  if (attempts === undefined) return false;
+  return (job.attemptsMade ?? 0) + 1 >= attempts;
 }

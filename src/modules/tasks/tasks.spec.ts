@@ -266,6 +266,14 @@ describe("STORY-055 · complete takes an optional strict body", () => {
     expect(options.actionFrom({ task: { status: "done" } })).toBe("task.completed");
   });
 
+  it("review r4 - the audit chain keeps the outcome status only, never the customer's submitted URL", () => {
+    const options = Reflect.getMetadata("auditOptions", TasksController.prototype.complete) as { afterState: (body: unknown) => unknown };
+    const body = { task: { status: "in_review", review: { state: "pending", url: "https://reddit.com/r/secret-path", reason: null }, title: "t" }, milestone: null, verification: null };
+    expect(options.afterState(body)).toEqual({ status: "in_review" });
+    expect(JSON.stringify(options.afterState(body))).not.toContain("reddit");
+    expect(options.afterState({})).toEqual({ status: null });
+  });
+
   it("no body at all is {} (a content task completes exactly as before)", () => {
     expect(bodyPipe().transform(undefined)).toEqual({});
   });

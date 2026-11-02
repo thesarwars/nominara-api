@@ -134,6 +134,17 @@ function isTextual(response: GuardedResponse): boolean {
 }
 
 /**
+ * True when `text` names the brand (its name or an alias, case/diacritic-insensitively, as the presence match does). The same
+ * matcher `verifyUrlPresence` applies to a page; exported so STORY-055 can ask the same question of the submitted URL ITSELF.
+ */
+export function mentionsBrand(text: string, brand: BrandForMatching): boolean {
+  const unique = [...new Set([brand.name, ...brand.aliases].map((value) => value.trim()).filter((value) => value.length > 0))];
+  if (unique.length === 0) return false;
+  const aliases: AliasEntry[] = unique.map((alias) => ({ entityType: "brand", entityId: null, label: brand.name, alias }));
+  return matchEntities({ text: normalize(text), aliases, negativeAliases: brand.negativeAliases }).some((mention) => mention.entityType === "brand");
+}
+
+/**
  * Fetches `url` (via the injected guarded fetcher) and reports whether the brand
  * is on the page. Never throws: every failure is a `failed` outcome, which the
  * caller must leave NULL.

@@ -128,6 +128,9 @@ export class TasksController {
     // A seeding task is only SUBMITTED for review here; the job audits the completion (`task.verification_completed`).
     actionFrom: (body) => ((body as { task?: { status?: string } }).task?.status === "in_review" ? "task.verification_submitted" : "task.completed"),
     resourceType: "task",
+    // The audit chain is append-only and long-lived: it keeps the OUTCOME (the status), never the customer's submitted URL
+    // (`task.review.url`) or any other part of the response.
+    afterState: (body) => ({ status: (body as { task?: { status?: string } }).task?.status ?? null }),
   })
   @ApiContract({ operationId: "completeTask", requestSchema: completeTaskRequestSchema, responseSchema: completeTaskResponseSchema })
   complete(

@@ -10,7 +10,7 @@ import { withProjectQueueLock } from "../queue/locks.js";
 import { refreshProjectSourceIndex } from "../rollup/refresh-project-source-index.js";
 import { refreshProjectTaskCounts } from "../rollup/refresh-project-task-counts.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { sourceSeededSourceId, seededTargetUrl, verifyUrlPresence, type BrandForMatching, type PresenceFetcher } from "./verify-presence.js";
+import { mentionsBrand, sourceSeededSourceId, seededTargetUrl, verifyUrlPresence, type BrandForMatching } from "./verify-presence.js";
 
 // STORY-055 AC5-AC8 + AC11, owner decision 30 (plans-7day/decisions-2026-10-28.md) - the customer's contribution is verified, not
 // self-reported. Completing a SEEDING task takes a URL and sends the task to `in_review` (TasksService.completeTask); the
@@ -74,6 +74,9 @@ export function checkSubmittedUrl(raw: string): SubmittedUrlCheck {
   return internal ? { ok: false, reason: "address_not_global" } : { ok: true, url: url.href };
 }
 
+/** The guarded fetcher, as the submission job calls it: `followRedirect` lets it refuse a hop (the guarded fetch supports it natively). */
+export type SubmissionFetcher = (url: string, init?: { readonly followRedirect?: (nextUrl: string) => boolean }) => Promise<GuardedResponse>;
+
 /** What the job read: everything `fetchSubmission` and `commitSubmissionVerification` need, and nothing else. */
 export interface SubmissionPlan {
   readonly workspaceId: string;
@@ -129,7 +132,7 @@ export async function prepareSubmissionVerification(tx: ClientBase, projectId: s
        JOIN workspaces w ON w.id = p.workspace_id
        JOIN task_events s ON s.task_id = t.id AND s.id = $3 AND s.event = 'verification_submitted'
        LEFT JOIN source_domains sd ON sd.id = t.source_domain_id
-      WHERE t.id = $2 AND t.project_id = $1 AND t.status = 'in_review' AND t.deleted_at IS NULL`,
+      WHERE t.id = $2 AND t.project_id = $1 AND t.workspace_id = app.current_workspace() AND t.status = 'in_review' AND t.deleted_at IS NULL`,
     [projectId, taskId, submissionId],
   );
   const row = found.rows[0];
@@ -161,23 +164,36 @@ export async function prepareSubmissionVerification(tx: ClientBase, projectId: s
  * for the length of the backoff, and a 404 and a connection reset are indistinguishable to us. The cost is that a one-off blip needs
  * a resubmit; the benefit is that no submission can sit pending behind a failing fetch.
  */
-export async function fetchSubmission(plan: SubmissionPlan, fetch: PresenceFetcher): Promise<SubmissionOutcome> {
+export async function fetchSubmission(plan: SubmissionPlan, fetch: SubmissionFetcher): Promise<SubmissionOutcome> {
   // FAIL CLOSED: `completeTask` refuses a seeding task with no source domain (`no_source_domain`), so none reaches here; if one
   // ever did, an unconstrained mention anywhere on the web must not close a gap.
-  if (plan.domain === null || seededTargetUrl(plan.url, plan.domain) === null) return { status: "unverified", reason: "wrong_domain" };
+  const domain = plan.domain;
+  if (domain === null || seededTargetUrl(plan.url, domain) === null) return { status: "unverified", reason: "wrong_domain" };
+  // REFLECTION: the customer chooses the URL, and a site search, a tag page or a soft-404 echoes it into the page - so a brand name
+  // that is IN the URL would "appear" on a page that never mentioned it. Refused before any fetch (fails closed; no text is
+  // stripped, which would also strip a real mention).
+  if (urlEchoesBrand(plan.url, plan.brand)) return { status: "unverified", reason: "url_echoes_brand" };
 
   // `verifyUrlPresence` folds every GuardedFetchRefusal into "refused" and drops the error. The reason matters here, so the wrapper
   // keeps the refusal itself: only a refusal about the ADDRESS, PORT or SCHEME is the customer's unsafe target.
-  const seen: { response?: GuardedResponse; refusal?: GuardedFetchRefusal } = {};
+  const seen: { response?: GuardedResponse; refusal?: GuardedFetchRefusal; offDomainRedirect?: boolean } = {};
   const outcome = await verifyUrlPresence(plan.url, plan.brand, async (url) => {
     try {
-      seen.response = await fetch(url);
+      // No hop is followed off the task's domain: a redirect is not fetched just to find out where it lands.
+      seen.response = await fetch(url, {
+        followRedirect: (next) => {
+          const on = seededTargetUrl(next, domain) !== null;
+          if (!on) seen.offDomainRedirect = true;
+          return on;
+        },
+      });
     } catch (error) {
       if (error instanceof GuardedFetchRefusal) seen.refusal = error;
       throw error;
     }
     return seen.response;
   });
+  if (seen.offDomainRedirect === true) return { status: "unverified", reason: "wrong_domain" };
   if (outcome.status === "failed") {
     if (outcome.reason === "refused" && seen.refusal !== undefined) return { status: "unverified", reason: refusalReason(seen.refusal) };
     const reason = outcome.reason === "refused" ? "unsafe_target" : outcome.reason === "not_text" ? "not_a_page" : outcome.reason === "no_aliases" ? "no_brand_names" : "unreachable";
@@ -185,8 +201,41 @@ export async function fetchSubmission(plan: SubmissionPlan, fetch: PresenceFetch
   }
   // Before present/absent: a page the redirects carried OFF the task's domain says nothing about a contribution THERE, whether or
   // not it names the brand (a customer told "no mention" would look for a mention on a page that was never theirs).
-  if (seen.response !== undefined && seededTargetUrl(seen.response.finalUrl, plan.domain) === null) return { status: "unverified", reason: "wrong_domain" };
+  if (seen.response !== undefined && seededTargetUrl(seen.response.finalUrl, domain) === null) return { status: "unverified", reason: "wrong_domain" };
+  // The page the redirects ended on may echo the brand as well (a redirect to a search URL).
+  if (seen.response !== undefined && urlEchoesBrand(seen.response.finalUrl, plan.brand)) return { status: "unverified", reason: "url_echoes_brand" };
   return outcome.status === "absent" ? { status: "unverified", reason: "no_mention" } : { status: "verified" };
+}
+
+/** Percent-decodes (twice at most: a double-encoded name is still a name), leaving malformed escapes as they are. */
+function decodeLoosely(value: string): string {
+  let out = value;
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      out = decodeURIComponent(out);
+    } catch {
+      return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * True when the brand is named by the URL's own path segments, query keys or values, or fragment (a text fragment `#:~:text=Acme`
+ * highlights it). Decoded first, and separators (`-`, `_`, `+`, `.`) read as spaces, so `?search=Acme+Analytics` and
+ * `/acme-analytics-review` both match. The host is not read: a brand's own subdomain is not an echo of the request.
+ */
+export function urlEchoesBrand(rawUrl: string, brand: BrandForMatching): boolean {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  const parts: string[] = url.pathname.split("/").map(decodeLoosely);
+  for (const [key, value] of url.searchParams) parts.push(decodeLoosely(key), decodeLoosely(value));
+  parts.push(decodeLoosely(url.hash));
+  return mentionsBrand(parts.join(" ").replace(/[-_+.]+/gu, " "), brand);
 }
 
 /**
@@ -216,16 +265,26 @@ export async function commitSubmissionVerification(tx: ClientBase, plan: Submiss
 }
 
 async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: SubmissionOutcome, now: Date): Promise<boolean> {
-  const current = await tx.query(
-    `SELECT t.id FROM tasks t
-      WHERE t.id = $1 AND t.project_id = $2 AND t.status = 'in_review' AND t.deleted_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.event = 'verification_submitted' AND n.id <> $3::uuid
-                          AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $3))
-        AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.payload->>'submission_id' = $3::text
-                          AND a.event IN ('verification_failed', 'completed'))
-      FOR NO KEY UPDATE OF t`,
-    [plan.taskId, plan.projectId, plan.submissionId],
+  // TWO STATEMENTS, on purpose. In READ COMMITTED a `SELECT ... FOR UPDATE` that waits for a row lock re-checks that row's own
+  // columns when it wakes, but not its subqueries over OTHER tables: with the checks in the same statement, a resubmission that
+  // committed while this one waited (it holds the task row lock, not the rollup's) would be invisible to them and this stale answer
+  // would complete the task. The lock first, then the checks in a statement that takes a fresh snapshot.
+  const locked = await tx.query(
+    `SELECT id FROM tasks WHERE id = $1 AND project_id = $2 AND workspace_id = app.current_workspace() AND deleted_at IS NULL FOR NO KEY UPDATE`,
+    [plan.taskId, plan.projectId],
   );
+  const current =
+    locked.rows.length === 0
+      ? locked
+      : await tx.query(
+          `SELECT t.id FROM tasks t
+            WHERE t.id = $1 AND t.project_id = $2 AND t.workspace_id = app.current_workspace() AND t.status = 'in_review' AND t.deleted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.event = 'verification_submitted' AND n.id <> $3::uuid
+                                AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $3))
+              AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.payload->>'submission_id' = $3::text
+                                AND a.event IN ('verification_failed', 'completed'))`,
+          [plan.taskId, plan.projectId, plan.submissionId],
+        );
   if (current.rows.length === 0) {
     logger.log({ event: "task_verification_stale", workspaceId: plan.workspaceId, projectId: plan.projectId, taskId: plan.taskId });
     return false;
@@ -252,7 +311,7 @@ async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: Submi
     [plan.projectId, plan.title, plan.taskId, plan.submittedBy],
   );
   const completedAt = completed.rows[0]!.occurred_at; // the completion instant: the task's, both milestones', and STORY-067's window anchor
-  await tx.query(`UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1`, [
+  await tx.query(`UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1 AND workspace_id = app.current_workspace()`, [
     plan.taskId,
     completedAt,
     plan.submittedBy,
@@ -265,7 +324,7 @@ async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: Submi
   );
 
   if (plan.sourceDomainId !== null) {
-    await tx.query(`UPDATE project_source_index SET brand_present_on_domain = true, verified_at = $3 WHERE project_id = $1 AND source_domain_id = $2`, [
+    await tx.query(`UPDATE project_source_index SET brand_present_on_domain = true, verified_at = $3 WHERE project_id = $1 AND source_domain_id = $2 AND workspace_id = app.current_workspace()`, [
       plan.projectId,
       plan.sourceDomainId,
       now,
@@ -307,4 +366,40 @@ async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: Submi
     severity: "info",
   });
   return true;
+}
+
+/**
+ * The job's LAST attempt failed (a database error in `prepare` or `commit`, retries spent): answer the submission `unreachable` so the
+ * task does not sit `pending` for ever with every resubmit a 409. Called from the handler's `recover` hook in a fresh tenant
+ * transaction; the same lock-then-check shape as `commitLocked`, so a submission that was answered, superseded or moved out of review
+ * meanwhile writes nothing. Returns true when it wrote the answer.
+ */
+export async function recordSubmissionGaveUp(tx: ClientBase, ids: { workspaceId: string; projectId: string; taskId: string; submissionId: string }): Promise<boolean> {
+  return withProjectQueueLock(tx, PRESENCE_WRITE_LOCK, ids.projectId, async () => {
+    const locked = await tx.query(
+      `SELECT id FROM tasks WHERE id = $1 AND project_id = $2 AND workspace_id = app.current_workspace() AND deleted_at IS NULL FOR NO KEY UPDATE`,
+      [ids.taskId, ids.projectId],
+    );
+    if (locked.rows.length === 0) return false;
+    const current = await tx.query(
+      `SELECT t.id FROM tasks t
+        WHERE t.id = $1 AND t.workspace_id = app.current_workspace() AND t.status = 'in_review'
+          AND EXISTS (SELECT 1 FROM task_events s WHERE s.id = $2::uuid AND s.task_id = t.id AND s.event = 'verification_submitted')
+          AND NOT EXISTS (SELECT 1 FROM task_events n WHERE n.task_id = t.id AND n.event = 'verification_submitted' AND n.id <> $2::uuid
+                            AND (n.occurred_at, n.id) > (SELECT s.occurred_at, s.id FROM task_events s WHERE s.id = $2))
+          AND NOT EXISTS (SELECT 1 FROM task_events a WHERE a.task_id = t.id AND a.payload->>'submission_id' = $2::text
+                            AND a.event IN ('verification_failed', 'completed'))`,
+      [ids.taskId, ids.submissionId],
+    );
+    if (current.rows.length === 0) return false;
+    await tx.query(
+      `INSERT INTO task_events (workspace_id, task_id, actor_type, event, from_value, to_value, payload, occurred_at)
+       VALUES (app.current_workspace(), $1, 'system', 'verification_failed', 'in_review', 'in_review', $2::jsonb, clock_timestamp())`,
+      [ids.taskId, JSON.stringify({ submission_id: ids.submissionId, reason: "unreachable" } satisfies TaskVerificationFailedPayload)],
+    );
+    incrementCounter("nominara_tasks_verification_total", { outcome: "gave_up" });
+    incrementCounter("nominara_tasks_events_written_total", { event: "verification_failed" });
+    logger.warn({ event: "task_verification_gave_up", workspaceId: ids.workspaceId, projectId: ids.projectId, taskId: ids.taskId });
+    return true;
+  });
 }

@@ -228,6 +228,7 @@ export class TasksService {
            t.source_finding_id, t.source_domain_id, t.source_displacement_id,
            t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
            t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
+           (t.playbook_slug IS NOT NULL OR t.source_domain_id IS NOT NULL) AS seeding,
            ${REVIEW_SELECT},
            ${SORT_KEYS[query.sort]}
          FROM tasks t
@@ -593,6 +594,7 @@ export class TasksService {
               t.source_finding_id, t.source_domain_id, t.source_displacement_id,
               t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
               t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
+              (t.playbook_slug IS NOT NULL OR t.source_domain_id IS NOT NULL) AS seeding,
               ${REVIEW_SELECT}
          FROM tasks t
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
@@ -951,7 +953,7 @@ export class TasksService {
         `SELECT s.id, NOT EXISTS (SELECT 1 FROM task_events a
                              WHERE a.task_id = s.task_id AND a.event = 'verification_failed' AND a.payload->>'submission_id' = s.id::text) AS pending
            FROM task_events s
-          WHERE s.task_id = $1 AND s.event = 'verification_submitted'
+          WHERE s.task_id = $1 AND s.workspace_id = app.current_workspace() AND s.event = 'verification_submitted'
           ORDER BY s.occurred_at DESC, s.id DESC LIMIT 1`,
         [taskId],
       );
@@ -961,8 +963,12 @@ export class TasksService {
         // ever, and every resubmit would land here. So the 409 RE-QUEUES THE SAME SUBMISSION: the key is the submission's, so a job
         // that does exist is not duplicated and one that does not is created. Not deferred to after-commit: this request is about to
         // roll back, and the submission it names was committed long ago.
+        // THE BOUND: BullMQ ignores an add whose job id it still holds - a job that is queued or running, and one that ENDED, for 1 hour
+        // after completion (removeOnComplete age 3600) and 7 days after failure. So within that time a re-queue changes nothing for a job
+        // that exists, and a job that was never created is the case it repairs. A job that exists and ends without answering is closed
+        // by the handler's `recover` (a terminal failure writes `unreachable`), so a resubmit is never refused for ever.
         this.enqueueVerification(store.context.workspaceId, current.project_id, taskId, pending.id);
-        throw new ConflictError({ message: "the submitted URL is still being verified", details: { current_state: "in_review" } });
+        throw new ConflictError({ message: "the submitted URL is still being verified; it is queued again, so check back shortly - if the check cannot finish it will answer \"unreachable\" and you can submit again", details: { current_state: "in_review" } });
       }
     }
 
@@ -974,7 +980,7 @@ export class TasksService {
       [taskId, actorId, current.status, JSON.stringify({ url: checked.url })],
     );
     const submissionId = submitted.rows[0]!.id;
-    await client.query(`UPDATE tasks SET status = 'in_review' WHERE id = $1`, [taskId]);
+    await client.query(`UPDATE tasks SET status = 'in_review' WHERE id = $1 AND workspace_id = app.current_workspace()`, [taskId]);
 
     incrementCounter("nominara_tasks_events_written_total", { event: "verification_submitted" });
     incrementCounter("nominara_tasks_verification_submitted_total", {});
@@ -1461,7 +1467,7 @@ const REVIEW_SELECT = `CASE WHEN t.status = 'in_review' THEN (
                       'reason', f.payload->>'reason')
                FROM task_events s
                LEFT JOIN task_events f ON f.task_id = s.task_id AND f.event = 'verification_failed' AND f.payload->>'submission_id' = s.id::text
-              WHERE s.task_id = t.id AND s.event = 'verification_submitted'
+              WHERE s.task_id = t.id AND s.workspace_id = app.current_workspace() AND s.event = 'verification_submitted'
               ORDER BY s.occurred_at DESC, s.id DESC LIMIT 1)
            END AS review`;
 
@@ -1491,6 +1497,7 @@ interface TaskRow {
   affected_url: string | null;
   created_at: Date;
   updated_at: Date;
+  seeding: boolean;
   review: { url: string; submitted_at: string; reason: TaskVerification["reason"] } | null;
   k1_key: string;
   k2_key: string;
@@ -1521,6 +1528,7 @@ function toTask(row: TaskRow): Task {
     resurface_at: row.resurface_at?.toISOString() ?? null,
     completed_at: row.completed_at?.toISOString() ?? null,
     affected_url: row.affected_url,
+    seeding: row.seeding,
     review:
       row.review === null || row.review === undefined
         ? null

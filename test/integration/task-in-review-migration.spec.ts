@@ -71,6 +71,14 @@ describe("STORY-055 · migration 0155 - task status in_review", () => {
     await expect(event(id, "verification_passed")).rejects.toThrow(/violates check constraint/i);
   });
 
+  it("S055-MIG-7 · review r4 - both widened CHECKs are VALIDATED, not left NOT VALID", async () => {
+    const rows = await client.query("SELECT conname, convalidated FROM pg_constraint WHERE conname IN ('tasks_status_check','task_events_event_check') ORDER BY conname");
+    expect(rows.rows).toEqual([
+      { conname: "task_events_event_check", convalidated: true },
+      { conname: "tasks_status_check", convalidated: true },
+    ]);
+  });
+
   it("S055-MIG-3 · ix_tasks_open covers in_review, so the open-task queue stays one index scan", async () => {
     const def = (await client.query("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_tasks_open'")).rows[0].indexdef as string;
     expect(def).toMatch(/in_review/);
