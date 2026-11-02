@@ -19,6 +19,7 @@ import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, p
 import type { AuxPatch } from "../../../contracts/aux/index.js";
 import { guidanceFor } from "../../lib/aux/patches/guidance.js";
 import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
+import { failManualAudit } from "../../lib/aux/fail-manual-audit.js";
 import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../lib/aux/audit-constants.js";
@@ -27,7 +28,7 @@ import { manualAuditIdentity } from "../../lib/aux/manual-audit-id.js";
 import { AUX_AUDITS_ENTITLEMENT, auxAuditsIncluded, crawlAuditIdempotencyKey } from "../../lib/aux/onboarding-audit.js";
 import { pageCapForPlan } from "../../lib/aux/page-selection.js";
 import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
-import { AUX_AUDIT_REFERENCE, refundAuxAuditCharge } from "../../lib/credits/aux-audit-refund.js";
+import { AUX_AUDIT_REFERENCE } from "../../lib/credits/aux-audit-refund.js";
 import { parseConfirmedCredits, requireConfirmedCredits } from "../../lib/credits/confirmed-credits.js";
 import { debitInTransaction, includedGrantOf } from "../../lib/credits/debit.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
@@ -402,9 +403,9 @@ export class AuxService {
         });
 
         await tx.query(
-          `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, triggered_by, scope, target_urls, rule_version, tokenizer, status)
-           VALUES ($1, $2, $3, 'manual', $4, $5, $6, $7, $8, 'queued')`,
-          [auditId, workspaceId, projectId, actor.type === "user" ? actor.id : null, quote.scope, body.target_urls ?? [], AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER],
+          `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, triggered_by, scope, target_urls, rule_version, tokenizer, status, request_hash)
+           VALUES ($1, $2, $3, 'manual', $4, $5, $6, $7, $8, 'queued', $9)`,
+          [auditId, workspaceId, projectId, actor.type === "user" ? actor.id : null, quote.scope, body.target_urls ?? [], AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER, requestHashOf(projectId, body)],
         );
 
         afterCommit(() => {
@@ -440,7 +441,7 @@ export class AuxService {
         // IDs and the figure only: never the domain, the workspace's name or a target URL.
         manualAuditLogger.log({ event: "aux.manual_audit.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, scope: quote.scope, credits: quote.credits });
         span.setAttribute("nominara.aux.credits", quote.credits);
-        return { audit_id: auditId, status: "queued" as const, trigger: "manual" as const, requested_scope: quote.scope, credits_charged: quote.credits, pricing: auxAuditPricing(quote.pages) };
+        return { audit_id: auditId, status: "queued" as const, trigger: "manual" as const, requested_scope: quote.scope, credits_charged: quote.credits, credits_refunded: 0, pricing: auxAuditPricing(quote.pages) };
       } catch (error) {
         span.setStatus({ code: SpanStatusCode.ERROR });
         throw error;
@@ -487,24 +488,24 @@ export class AuxService {
    * (a first attempt). The same identity asked for something else (another project, scope or URL list) is a conflict, never a quiet return of the wrong audit.
    */
   private async replayOf(tx: ClientBase, auditId: string, clientKey: string, projectId: string, body: TriggerAuxAuditRequest): Promise<TriggerAuxAuditResponse | null> {
-    const found = await tx.query<{ project_id: string; scope: NonNullable<TriggerAuxAuditRequest["scope"]>; target_urls: string[]; created_at: Date; charged: string | null }>(
-      `SELECT a.project_id, a.scope, a.target_urls, a.created_at,
-              (SELECT l.credits::text FROM credit_ledger l WHERE l.entry_type = 'commit' AND l.reference_type = $2 AND l.reference_id = a.id ORDER BY l.seq DESC LIMIT 1) AS charged
+    // The request is compared with request_hash, written once at insert: scope and target_urls are REWRITTEN by crawl.audit (verification decides the scope; the
+    // crawled pages replace the hints), so they cannot say what was asked. The status and the refunds are read live: a replay reports where the audit has got to.
+    const found = await tx.query<{ request_hash: string | null; scope: NonNullable<TriggerAuxAuditRequest["scope"]>; status: TriggerAuxAuditResponse["status"]; created_at: Date; charged: string | null; refunded: string }>(
+      `SELECT a.request_hash, a.scope, a.status, a.created_at,
+              (SELECT l.credits::text FROM credit_ledger l WHERE l.entry_type = 'commit' AND l.reference_type = $2 AND l.reference_id = a.id ORDER BY l.seq DESC LIMIT 1) AS charged,
+              (SELECT COALESCE(SUM(l.credits), 0)::text FROM credit_ledger l WHERE l.entry_type = 'refund' AND l.reference_type = $2 AND l.reference_id = a.id) AS refunded
          FROM aux_audits a WHERE a.id = $1`,
       [auditId, AUX_AUDIT_REFERENCE],
     );
     const row = found.rows[0];
     if (row === undefined) return null;
-    const wantedUrls = body.target_urls ?? [];
-    const sameRequest =
-      row.project_id === projectId && row.scope === (body.scope ?? "key_pages") && row.target_urls.length === wantedUrls.length && row.target_urls.every((u, i) => u === wantedUrls[i]);
-    if (!sameRequest) {
+    if (row.request_hash !== requestHashOf(projectId, body)) {
       throw new IdempotencyConflictError({
         message: "this Idempotency-Key was already used for a different AUX audit request",
         // Hashes and a time only: never the key, the project or a URL.
         details: {
           key_hash: createHash("sha256").update(clientKey).digest("hex"),
-          original_request_hash: createHash("sha256").update([row.project_id, row.scope, ...row.target_urls].join("|")).digest("hex"),
+          original_request_hash: row.request_hash ?? "unrecorded",
           original_recorded_at: row.created_at.toISOString(),
         },
       });
@@ -512,8 +513,10 @@ export class AuxService {
     const charged = row.charged === null ? null : Number(row.charged);
     if (charged === null || !Number.isInteger(charged) || charged < 1) throw new Error(`manual audit ${auditId} exists without a recorded charge`);
     // The page count the figure was reached with: beyond the first band it is exact; inside it, a single-URL audit priced 1 page and any other the (clamped) cap.
-    const pages = charged > AUX_AUDIT_BASE_CREDITS ? AUX_AUDIT_BASE_PAGES + (charged - AUX_AUDIT_BASE_CREDITS) / AUX_AUDIT_EXTRA_PAGE_CREDITS : row.scope === "single_url" ? 1 : AUX_AUDIT_BASE_PAGES;
-    return { audit_id: auditId, status: "queued", trigger: "manual", requested_scope: row.scope, credits_charged: charged, pricing: auxAuditPricing(pages) };
+    // The REQUESTED scope is not on the row any more (crawl.audit rewrites `scope`), so it is the body's - which the hash has just proved is the original's.
+    const requested = body.scope ?? "key_pages";
+    const pages = charged > AUX_AUDIT_BASE_CREDITS ? AUX_AUDIT_BASE_PAGES + (charged - AUX_AUDIT_BASE_CREDITS) / AUX_AUDIT_EXTRA_PAGE_CREDITS : requested === "single_url" ? 1 : AUX_AUDIT_BASE_PAGES;
+    return { audit_id: auditId, status: row.status, trigger: "manual", requested_scope: requested, credits_charged: charged, credits_refunded: Number(row.refunded), pricing: auxAuditPricing(pages) };
   }
 
   /**
@@ -524,11 +527,8 @@ export class AuxService {
     const client = await pool.connect();
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-        const failed = await tx.query(
-          `UPDATE aux_audits SET status = 'failed', error_summary = '{"reason":"dispatch_failed"}'::jsonb, finished_at = now() WHERE id = $1 AND status = 'queued'`,
-          [auditId],
-        );
-        if ((failed.rowCount ?? 0) === 1) await refundAuxAuditCharge(tx, { workspaceId, auditId, reason: "dispatch_failed" });
+        // The one failure function (aux/fail-manual-audit.ts): only a still-queued or running manual audit moves, the refund follows the row, the counter moves.
+        await failManualAudit(tx, { workspaceId, auditId, reason: "dispatch_failed", at: new Date() });
       });
     } finally {
       client.release();
@@ -543,6 +543,11 @@ export class AuxService {
     );
     if (project.rows.length === 0) throw new NotFoundError({ message: "no such project" });
   }
+}
+
+/** The immutable record of a manual audit request: project, the scope asked for (absent = key_pages) and the URL hints, in the order sent. */
+function requestHashOf(projectId: string, body: TriggerAuxAuditRequest): string {
+  return createHash("sha256").update(JSON.stringify([projectId, body.scope ?? "key_pages", body.target_urls ?? []])).digest("hex");
 }
 
 interface AuditRow {

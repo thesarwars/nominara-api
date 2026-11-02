@@ -968,7 +968,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     for (const d of detected) if (d.severity in counts) counts[d.severity as keyof typeof counts] += 1;
 
     // STORY-052 AC9: the pages a page rule's findings are open on are RECORDED on each of its rows (the distinct URLs, across every audit's findings that are still
-    // scored), so the column a client reads agrees with what the score counts. A site-file finding is domain-wide and keeps its 1.
+    // scored). The COLUMN is project-wide - it counts pages this audit did not model too (stale is not fixed) - while the SCORE below counts only the pages this
+    // audit modelled (`lookedAt`, floored at the scope floor); the two agree only when every open page was modelled now. A site-file finding keeps its 1.
     await tx.query(
       `UPDATE aux_findings f SET affected_pages = s.n
          FROM (SELECT rule_code, count(DISTINCT url)::int AS n FROM aux_findings
@@ -1132,7 +1133,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // Only a row that is still queued or running moves, so an audit another delivery finished keeps its charge and the original error reaches the queue. An
     // onboarding or scheduled job has no charge and no row: nothing to settle, so the failure stays visible in the DLQ.
     async recover(tx: ClientBase, job: Job, failure) {
-      if (!isFinalAttempt(job)) return false;
+      if (!isFinalAttempt(job) && !isUnretryable(job, failure.error)) return false;
       const parsed = crawlAuditJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload);
       if (!parsed.success || parsed.data.trigger !== "manual") return false;
       const settled = await failManualAudit(tx, { workspaceId: parsed.data.workspaceId, auditId: parsed.data.auditId, reason: "job_failed", at: now() });
@@ -1143,6 +1144,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       return settled;
     },
   });
+}
+
+/** True when BullMQ will not retry this job whatever the attempt count says: an `UnrecoverableError` (by name, as dead-letter.ts does), or a job with no retry ladder at all. */
+function isUnretryable(job: Pick<Job, "opts">, error: unknown): boolean {
+  return (error instanceof Error && error.name === "UnrecoverableError") || job.opts?.attempts === undefined;
 }
 
 /** True on the job's last attempt: the queue has no ladder left, so whatever this job owes has to be settled now. */

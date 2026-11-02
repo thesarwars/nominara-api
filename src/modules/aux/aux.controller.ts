@@ -91,6 +91,7 @@ export class AuxController {
   @Post("projects/:id/aux-audits/preview")
   @HttpCode(200)
   @RequirePermission("aux:trigger")
+  @RateLimitClass("reads")
   @ProjectParam("id")
   @Audit({ action: "aux_audit.previewed", resourceType: "project" })
   @ApiContract({ operationId: "previewAuxAudit", requestSchema: triggerAuxAuditRequestSchema, responseSchema: triggerAuxAuditPreviewResponseSchema })
