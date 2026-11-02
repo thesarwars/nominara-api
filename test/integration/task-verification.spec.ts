@@ -596,6 +596,9 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
         const handler = createSourceVerifyPresenceHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, { fetch: vi.fn(), realtime });
         const gaveUp = { attemptsMade: 0, opts: { attempts: 1 }, data: { payload: { workspaceId, kid: "k", projectId, taskId: other, submissionId: stuck } } } as unknown as Job;
         await withTenantContext(db, { workspaceId, actorId }, (tx) => phasesOf(handler)!.recover!(tx, gaveUp, { error: new Error("db down"), phase: "commit" }));
+        // the non-seeding path of completeTask: milestone insert, the status update, the event
+        const plainTask = await lookup(() => task({ playbook: null, domain: null, kind: "content" }));
+        await submit(plainTask);
       } finally {
         (db as unknown as { query: unknown }).query = original;
       }
@@ -604,17 +607,34 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
       const touching = seen.filter((sql) => TOUCHES.test(sql));
       expect(touching.length).toBeGreaterThanOrEqual(15);
 
-      // THE EXEMPTION LIST. A statement here is bounded by RLS and by its project_id / primary key, and is not THIS story's SQL: the
-      // shared rollup index rebuild (src/lib/rollup, STORY-066) that every presence write calls. Each is a DELETE/INSERT/SELECT over a
-      // whole project's index, never a task selected by a caller-supplied id. Adding to this list needs a reason.
-      const EXEMPT: ReadonlyArray<{ readonly pattern: RegExp; readonly why: string }> = [
-        { pattern: /\bproject_source_index\b[\s\S]*\bproject_id = \$1\b/iu, why: "refreshProjectSourceIndex: a whole-project recompute; the rollup's own statements" },
-        { pattern: /^\s*INSERT INTO project_source_index\s*\(\s*workspace_id\b/iu, why: "the index rebuild's INSERT names workspace_id as a column (a $ parameter); RLS WITH CHECK pins it to the context's workspace" },
+      // THE EXEMPTION LIST. Each entry is the FULL, EXACT text (whitespace folded) of one statement of the shared rollup index rebuild
+      // (src/lib/rollup/refresh-project-source-index.ts, refresh-project-source-coverage.ts and refresh-project-task-counts.ts), which every presence write
+      // calls. They are bounded by RLS and by project_id, over a whole project's index, never a task selected by a caller-supplied id.
+      // A pattern is NOT enough: a looser match once also covered commitLocked's own UPDATE on project_source_index. Adding needs a reason.
+      const fold = (sql: string) => sql.replace(/\s+/gu, " ").trim();
+      const EXEMPT: ReadonlyArray<{ readonly text: string; readonly why: string }> = [
+        {
+          text: "SELECT DISTINCT ON (sd.domain) sd.domain, psi.brand_present_on_domain AS present, psi.verified_at::text AS verified_at FROM project_source_index psi JOIN source_domains sd ON sd.id = psi.source_domain_id WHERE psi.project_id = $1 AND psi.verified_at IS NOT NULL AND psi.brand_present_on_domain IS NOT NULL ORDER BY sd.domain, psi.verified_at DESC",
+          why: "refreshProjectSourceIndex: carries verified presence across the rebuild",
+        },
+        { text: "WITH open_tasks AS ( SELECT t.id, COALESCE(af.severity, psi.gap_severity) AS severity FROM tasks t LEFT JOIN aux_findings af ON af.id = t.source_finding_id LEFT JOIN LATERAL ( SELECT gap_severity FROM project_source_index WHERE source_domain_id = t.source_domain_id AND project_id = t.project_id AND engine_key = $2 AND window_days = $3 ORDER BY window_start DESC LIMIT 1 ) psi ON t.source_domain_id IS NOT NULL WHERE t.project_id = $1 AND t.status IN ('todo', 'in_progress', 'in_review') AND t.deleted_at IS NULL ) SELECT count(*) FILTER (WHERE severity = 'critical')::text AS critical, count(*) FILTER (WHERE severity = 'high')::text AS high, count(*) FILTER (WHERE severity = 'medium')::text AS medium, count(*) FILTER (WHERE severity = 'low')::text AS low, count(*)::text AS total FROM open_tasks", why: "refreshProjectTaskCounts (src/lib/rollup/refresh-project-task-counts.ts): the whole-project open-task recount" },
+        { text: "DELETE FROM project_source_index WHERE project_id = $1", why: "refreshProjectSourceIndex: replaces the project's index" },
+        {
+          text: "SELECT max(window_start)::text AS window_start FROM project_source_index WHERE project_id = $1 AND engine_key = $2 AND window_days = $3",
+          why: "refreshProjectSourceCoverage: latest window",
+        },
+        {
+          text: "SELECT context_weight::text, gap_severity FROM project_source_index WHERE project_id = $1 AND engine_key = $2 AND window_days = $3 AND window_start = $4::date",
+          why: "refreshProjectSourceCoverage: the window's rows",
+        },
       ];
-      const offenders = touching.filter((sql) => !sql.includes("app.current_workspace()") && !EXEMPT.some((e) => e.pattern.test(sql)));
+      const INDEX_INSERT = /^INSERT INTO project_source_index \( ?workspace_id,/iu; // the rebuild's INSERT names workspace_id as a column; RLS WITH CHECK pins it
+      const isExempt = (sql: string) => EXEMPT.some((e) => fold(sql) === e.text) || INDEX_INSERT.test(fold(sql));
+      const offenders = touching.filter((sql) => !sql.includes("app.current_workspace()") && !isExempt(sql));
       expect(offenders, offenders.join("\n---\n")).toEqual([]);
       // the exemptions are not a loophole: each must actually be used, or it is dead weight to delete
-      for (const e of EXEMPT) expect(touching.some((sql) => !sql.includes("app.current_workspace()") && e.pattern.test(sql)), e.why).toBe(true);
+      for (const e of EXEMPT) expect(touching.some((sql) => fold(sql) === e.text), e.why).toBe(true);
+      expect(touching.some((sql) => INDEX_INSERT.test(fold(sql)))).toBe(true);
     });
 
     it("another workspace's context cannot verify (or fetch for) this task", async () => {

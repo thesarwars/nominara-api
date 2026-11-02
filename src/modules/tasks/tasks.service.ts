@@ -894,7 +894,7 @@ export class TasksService {
     );
     const pinned = milestone.rows[0]!;
     await client.query(
-      `UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1`,
+      `UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1 AND workspace_id = app.current_workspace()`,
       [taskId, pinned.occurred_at, actorId, pinned.id],
     );
     await client.query(
