@@ -74,17 +74,24 @@ export const auxAuditSchema = z
     pages_crawled: z.number().int(),
     pages_failed: z.number().int(),
     /**
-     * 0..100, or null when the audit did not produce a score. When `score_partial` is true it is computed over the categories that were measured,
-     * renormalised to 100 (owner decision 38) - never present it as a full score.
+     * 0..100, or null when the audit did not produce a score. When `score_partial` is true it is computed over the RULES that were decided (owner
+     * decisions 38 and 52): a category is scored on the decided rules only, a category with none is left out, and the sum is renormalised to 100.
+     * Never present it as a full score.
      */
     aux_score: z.number().nullable(),
-    /** True when `aux_score` leaves out categories no rule could measure yet. False for a full score and for no score. */
+    /**
+     * True when any rule went unmeasured (owner decision 52): a category is missing, or a published category lists `rules_not_evaluated`.
+     * False only for a score in which every rule of every category was decided, and for no score.
+     */
     score_partial: z.boolean(),
     /** The categories with no published subscore in this audit (all six when nothing was measured). Never empty on a partial score. */
     unmeasured_categories: z.array(auxCategorySchema),
     /** True when the critical-access hard cap applied; the interface states it whenever it is. */
     capped: z.boolean(),
-    /** aux_score minus the previous scored audit's; null when either is absent. */
+    /**
+     * aux_score minus the previous scored audit's; null when either is absent, and null when the two audits were not measured the same way (a different
+     * `rule_version`, or a different set of unmeasured rules): two scores over different rules are not a movement.
+     */
     delta: z.number().nullable(),
     rule_version: z.string(),
     categories: z.array(auxAuditCategorySchema),
