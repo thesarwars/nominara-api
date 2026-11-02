@@ -190,6 +190,8 @@ describe("NEW-C-10 · controller", () => {
     expect(meta(PROJECT_PARAM_KEY, "previewAudit")).toBe("id");
     expect(meta(AUDIT_METADATA_KEY, "previewAudit")).toMatchObject({ action: "aux_audit.previewed", resourceType: "project" });
     expect(meta(IDEMPOTENT_KEY, "previewAudit")).toBeUndefined();
+    // review round 2: a quote is a read - an explicit class, not the POST default of "writes".
+    expect(meta(RATE_LIMIT_CLASS_KEY, "previewAudit")).toBe("reads");
     expect(meta(CREDITS_KEY, "previewAudit")).toBeUndefined();
   });
 

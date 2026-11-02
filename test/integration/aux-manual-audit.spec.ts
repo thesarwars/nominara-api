@@ -198,6 +198,62 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
     expect(await wallet()).toMatchObject({ included: 90 });
   });
 
+  // Review round 2 (major): the replay compares the request with an IMMUTABLE record of it, not with columns crawl.audit rewrites. claimAudit sets `scope` to
+  // the scope verification decided (an unverified domain becomes public_surface) and `commit` sets `target_urls` to the pages it crawled.
+  const workerRewrites = (id: string, status: string): Promise<unknown> =>
+    db.query(
+      "UPDATE aux_audits SET scope = 'public_surface', target_urls = ARRAY['https://acme.com/robots.txt','https://acme.com/llms.txt','https://acme.com/'], status = $2, started_at = now(), finished_at = now() WHERE id = $1",
+      [id, status],
+    );
+
+  it("AUXLIVE-3 AC5 round 2 · a retry with the same key and body AFTER crawl.audit ran (scope and target_urls rewritten) and the Valkey record is gone gets the ORIGINAL answer, not 409, and no new charge", async () => {
+    const key = randomUUID();
+    const first = await trigger({ scope: "sitemap_sample", target_urls: ["https://acme.com/a", "https://acme.com/b"] }, projectId, { idempotencyKey: key });
+    await settle();
+    await workerRewrites(first.audit_id, "completed");
+    const replay = await trigger({ scope: "sitemap_sample", target_urls: ["https://acme.com/a", "https://acme.com/b"] }, projectId, { idempotencyKey: key });
+    expect(replay).toMatchObject({ audit_id: first.audit_id, requested_scope: "sitemap_sample", credits_charged: 10, credits_refunded: 0, status: "completed" });
+    expect(await audits()).toHaveLength(1);
+    expect(await wallet()).toMatchObject({ included: 90, spent: 10 });
+    expect(enqueued).toHaveLength(1);
+  });
+
+  it("AUXLIVE-3 AC5 round 2 · after crawl.audit ran, the same key with a DIFFERENT body is still 409 idempotency_conflict (the record is of the request, not of the rewritten row)", async () => {
+    const key = randomUUID();
+    const first = await trigger({}, projectId, { idempotencyKey: key });
+    await workerRewrites(first.audit_id, "completed");
+    const err = await trigger({ scope: "sitemap_sample" }, projectId, { idempotencyKey: key }).then(() => null, (e: unknown) => e);
+    expect(codeOf(err)).toBe("idempotency_conflict");
+    // a body equal to what the worker REWROTE it to is not the original request either
+    const err2 = await trigger({ target_urls: ["https://acme.com/robots.txt", "https://acme.com/llms.txt", "https://acme.com/"] }, projectId, { idempotencyKey: key }).then(() => null, (e: unknown) => e);
+    expect(codeOf(err2)).toBe("idempotency_conflict");
+    expect(await wallet()).toMatchObject({ included: 90 });
+  });
+
+  it("AUXLIVE-3 AC5 round 2 · a replay of an audit that FAILED and was refunded says so: its real status, the charge and the refund - not 'queued' and an unrefunded 10", async () => {
+    const key = randomUUID();
+    const first = await trigger({}, projectId, { idempotencyKey: key });
+    await db.query("UPDATE aux_audits SET created_at = now() - make_interval(mins => 61) WHERE id = $1", [first.audit_id]);
+    expect(await reapStaleManualAudits(db, new Date())).toEqual({ reaped: 1 });
+    const replay = await trigger({}, projectId, { idempotencyKey: key });
+    expect(replay).toMatchObject({ audit_id: first.audit_id, status: "failed", credits_charged: 10, credits_refunded: 10 });
+    expect(await wallet()).toMatchObject({ included: 100 });
+    expect(await audits()).toHaveLength(1);
+  });
+
+  it("AUXLIVE-3 AC5 round 2 · the first answer reports credits_refunded 0", async () => {
+    expect(await trigger()).toMatchObject({ status: "queued", credits_charged: 10, credits_refunded: 0 });
+  });
+
+  it("AUXLIVE-3 AC10 round 2 · the dispatch failure goes through the one failure function: the failed-audit counter moves too", async () => {
+    enqueueFails = true;
+    const counts: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => { counts.push(m); });
+    await trigger();
+    await settle();
+    expect(counts.find((l) => (l as { metric?: string }).metric === "nominara_aux_audits_total" && (l as { status?: string }).status === "failed")).toMatchObject({ trigger: "manual" });
+  });
+
   it("AUXLIVE-3 AC5 · two DIFFERENT keys are two audits and two charges; another workspace's identical key is a different audit", async () => {
     await trigger();
     await trigger();

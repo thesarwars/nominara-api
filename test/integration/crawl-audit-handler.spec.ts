@@ -1734,6 +1734,42 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(await refunds()).toEqual([]);
     });
 
+    const recoverWith = async (auditId: string, job: Record<string, unknown>, error: Error): Promise<boolean> => {
+      const processor = createCrawlAuditHandler({ pool: {} as never, env: {} as never }, depsServing(healthy(OPEN)));
+      const phases = phasesOf(processor)!;
+      const j = { data: { payload: { projectId, auditId, trigger: "manual", workspaceId, kid: "k1", scope: "key_pages" } }, ...job } as unknown as Job;
+      await db.query("BEGIN");
+      try {
+        const settled = await phases.recover!(db as never, j, { phase: "run", error });
+        await db.query("COMMIT");
+        return settled;
+      } catch (e) {
+        await db.query("ROLLBACK");
+        throw e;
+      }
+    };
+
+    it("AUXLIVE-3 review round 2 · an UnrecoverableError on an EARLY attempt settles the manual audit at once: BullMQ will not retry it, so the refund is not left to the 60-minute reaper", async () => {
+      const auditId = await charged();
+      const unrecoverable = Object.assign(new Error("tampered"), { name: "UnrecoverableError" });
+      expect(await recoverWith(auditId, { attemptsMade: 0, opts: { attempts: 5 } }, unrecoverable)).toBe(true);
+      expect((await audits())[0].status).toBe("failed");
+      expect(await refunds()).toEqual([{ credits: 10 }]);
+    });
+
+    it("AUXLIVE-3 review round 2 · a job enqueued with no opts.attempts has no retry ladder: its first failure is final and settles the audit", async () => {
+      const auditId = await charged();
+      expect(await recoverWith(auditId, { attemptsMade: 0, opts: {} }, new Error("boom"))).toBe(true);
+      expect((await audits())[0].status).toBe("failed");
+      expect(await refunds()).toEqual([{ credits: 10 }]);
+    });
+
+    it("AUXLIVE-3 review round 2 · an ordinary error on an early attempt of a job WITH a ladder still settles nothing", async () => {
+      const auditId = await charged();
+      expect(await recoverWith(auditId, { attemptsMade: 1, opts: { attempts: 5 } }, new Error("boom"))).toBe(false);
+      expect((await audits())[0].status).toBe("queued");
+    });
+
     it("AUXLIVE-3 review · an ONBOARDING job failing on its last attempt has no charge and no row to settle: the failure goes to the queue", async () => {
       expect(await recoverTx(randomUUID(), 4, "onboarding")).toBe(false);
     });
