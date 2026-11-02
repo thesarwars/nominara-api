@@ -24,6 +24,7 @@ import {
   type VisibilityScanRequest,
 } from "../../../contracts/tools/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
+import { RateLimitClass } from "../../api/rate-limit/route-class.js";
 import { DailyCap } from "../../api/decorators/daily-cap.decorator.js";
 import { Streaming } from "../../api/decorators/streaming.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
@@ -69,6 +70,7 @@ export class ToolsController {
   @RequirePermission("lookup:execute")
   @ScopedByQuery()
   @DailyCap("lookup")
+  @RateLimitClass("capture_backed_tools")
   @ApiContract({ operationId: "startVisibilityScan", requestSchema: visibilityScanRequestSchema, responseSchema: scanStreamCompletedSchema, requiresIdempotencyKey: true })
   async scan(
     @Body(new ZodValidationPipe(visibilityScanRequestSchema)) body: VisibilityScanRequest,

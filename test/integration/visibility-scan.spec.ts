@@ -3,9 +3,12 @@ import { Pool } from "pg";
 import type { Job } from "bullmq";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
+import { RATE_LIMIT_DEFAULTS } from "../../src/api/rate-limit/defaults.js";
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { ValkeyCacheAdapter } from "../../src/lib/cache/valkey-cache.adapter.js";
+import { CACHE, type Cache } from "../../src/lib/cache/cache.port.js";
+import { rateLimitConfigKey } from "../../src/lib/cache/valkey-keys.js";
 import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { captureL1Key } from "../../src/lib/capture/l1-cache-key.js";
 import { adapterMajorOf } from "../../src/lib/capture/l1-exact-hash.js";
@@ -60,6 +63,24 @@ const frames = (body: string): Frame[] =>
     return event === undefined || data === undefined ? [] : [{ event, data: JSON.parse(data) as Record<string, unknown> }];
   });
 
+function widenedScanDocument(): string {
+  return JSON.stringify(
+    RATE_LIMIT_DEFAULTS.map((entry) =>
+      entry.route_class === "capture_backed_tools"
+        ? {
+            route_class: "capture_backed_tools",
+            burst: 20,
+            buckets: [
+              { scope: "user", limit: 50, window: "rolling", window_ms: 60_000 },
+              { scope: "user", limit: 400, window: "rolling", window_ms: 86_400_000 },
+              { scope: "workspace", limit: 200, window: "rolling", window_ms: 60_000 },
+            ],
+          }
+        : entry,
+    ),
+  );
+}
+
 describe("STORY-079 · Visibility Scan", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
@@ -87,6 +108,9 @@ describe("STORY-079 · Visibility Scan", () => {
     workerDeps = {};
     enqueued = [];
     workers = [];
+    // The production class lets one user spend 2 scans at once (5/min). Most scenarios here make more calls than that per user, so they run on the widest
+    // document the envelope allows (x10); the one scenario that is ABOUT the class removes it.
+    await harness.app().get<Cache>(CACHE).set(rateLimitConfigKey(cacheKeyNamespace()), widenedScanDocument(), { ttlMs: 3_600_000 });
     vi.spyOn(UrlGuard.prototype, "validateAndNormalize").mockImplementation(async (url: string) => ({ rootDomain: new URL(url).hostname }));
     // The queue seam: capture the job, then run the worker handler in-process (in the background, as a worker would).
     vi.spyOn(QueueProducer.prototype, "enqueueTenantJob").mockImplementation(async (name, workspaceId, payload, options) => {
@@ -442,6 +466,15 @@ describe("STORY-079 · Visibility Scan", () => {
     expect(accepted?.workspace_id).toBe(a.workspaceId);
     const everything = JSON.stringify(lines);
     for (const forbidden of ["Acme", "best crm for startups", "most common choice", "acme.test"]) expect(everything, forbidden).not.toContain(forbidden);
+  });
+
+  it("the scan is rate-limited as a capture-backed tool: on the shipped defaults a user's third immediate scan is refused 429 rate_limited", async () => {
+    const a = await owner("starter");
+    await harness.app().get<Cache>(CACHE).delete(rateLimitConfigKey(cacheKeyNamespace()));
+    const codes: number[] = [];
+    for (let i = 0; i < 3; i += 1) codes.push((await post(a)).statusCode);
+    expect(codes).toEqual([200, 200, 429]);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(2);
   });
 
   it("the job is enqueued on the dedicated interactive pool, keyed by the run", async () => {
