@@ -414,3 +414,8 @@ export const rateLimited429 = { error: { code: 429, message: "Rate limit exceede
 export const upstreamError502 = { error: { code: 502, message: "Provider returned error", metadata: { provider_name: "OpenAI" } } } as const;
 export const invalidKey401 = { error: { code: 401, message: "No auth credentials found" } } as const;
 export const noNativeSearch404 = { error: { code: 404, message: "The requested model does not support native web search. Use engine: \"auto\" or \"exa\" instead." } } as const;
+
+/** DOCUMENTED shape (OpenRouter errors page, 403), not a recorded call: the chosen model requires moderation and the input was flagged. */
+export const moderation403 = { error: { code: 403, message: "Your chosen model requires moderation and your input was flagged", metadata: { reasons: ["harassment"], flagged_input: "(redacted)", provider_name: "OpenAI", model_slug: "openai/gpt-5.4" } } } as const;
+/** A 403 with no moderation metadata: not a refusal, and not a credential fault either. */
+export const forbidden403 = { error: { code: 403, message: "Forbidden" } } as const;

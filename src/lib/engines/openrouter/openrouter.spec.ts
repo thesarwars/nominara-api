@@ -18,7 +18,9 @@ import {
   claudeReasoningTruncated,
   freeGemma,
   gptSearchInlineUrl,
+  forbidden403,
   insufficientCredits402,
+  moderation403,
   invalidKey401,
   malformedPayload,
   noModelField,
@@ -195,9 +197,9 @@ describe("STORY-028 · scenario 8 · grounding is required and refused BEFORE di
     const sonar = buildOpenRouterRequest("perplexity", "perplexity/sonar", input);
     expect(() => assertGrounded("perplexity", { ...sonar, model: "openai/gpt-5.4" })).toThrow(UngroundedRequestError);
   });
-  it("a perplexity adapter configured with a non-search model never dispatches", async () => {
+  it("a perplexity adapter configured with a non-search model cannot be built, so it never dispatches", () => {
     const fetchImpl = fetchReturning(sonarAnnotations);
-    await expect(adapterFor("perplexity", fetchImpl, { model: "openai/gpt-5.4" }).capture(input, makeCtx().ctx)).rejects.toBeInstanceOf(UngroundedRequestError);
+    expect(() => adapterFor("perplexity", fetchImpl, { model: "openai/gpt-5.4" })).toThrow(UngroundedRequestError);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
   it("AC 8 - one single user turn, no conversational state", () => {
@@ -236,15 +238,23 @@ describe("failure taxonomy mapping", () => {
     ["502 upstream", upstreamError502, 502, "upstream_5xx"],
     ["503", { error: { code: 503, message: "x" } }, 503, "upstream_5xx"],
     ["401 bad key", invalidKey401, 401, "auth_failed"],
-    ["403", { error: { code: 403, message: "x" } }, 403, "auth_failed"],
+    ["403 without moderation metadata is blocked, not a bad credential", forbidden403, 403, "blocked"],
     ["408 timeout", { error: { code: 408, message: "x" } }, 408, "timeout"],
-    ["404 no native search / no model", noNativeSearch404, 404, "malformed_response"],
+    ["404 no native search / no model is a configuration fault, not a payload fault", noNativeSearch404, 404, "blocked"],
     ["400 bad request", { error: { code: 400, message: "x" } }, 400, "malformed_response"],
   ];
   it.each(cases)("%s", async (_name, body, status, code) => {
     for (const engine of ENGINES) {
       expect((await failureOf(adapterFor(engine, fetchReturning(body, status)).capture(input, makeCtx().ctx))).code).toBe(code);
     }
+  });
+  it.each(ENGINES)("%s: a moderation 403 is a stored refusal (data, NFR-SIM-07), not a failure and not auth_failed", async (engine) => {
+    const { ctx } = makeCtx();
+    const result = await adapterFor(engine, fetchReturning(moderation403, 403)).capture(input, ctx);
+    expect(rawCaptureSchema.safeParse(result).success).toBe(true);
+    expect(result.flags).toContain("engine_refused_to_answer");
+    expect(result.text).toBe("");
+    expect(JSON.stringify(result)).not.toContain("(redacted)");
   });
   it("a 200 carrying an error envelope is mapped by its code, not read as an answer", async () => {
     expect((await failureOf(adapterFor("chatgpt", fetchReturning(insufficientCredits402, 200)).capture(input, makeCtx().ctx))).code).toBe("quota_exhausted");
@@ -333,6 +343,8 @@ describe("registry binding", () => {
     vi.stubEnv("OPENROUTER_MODEL_CHATGPT", "");
     vi.stubEnv("OPENROUTER_MODEL_CLAUDE", "");
     vi.stubEnv("OPENROUTER_MODEL_PERPLEXITY", "");
+    vi.stubEnv("ENGINE_OPENROUTER", "");
+    vi.stubEnv("ENGINE_SIMULATION", "");
   };
   it("without OPENROUTER_API_KEY the three engines stay fixture-backed and not capture-ready", () => {
     clearKeys();
@@ -341,9 +353,28 @@ describe("registry binding", () => {
       expect(captureReadyEngineKeys()).not.toContain(engine);
     }
   });
-  it("with the key, each is a real OpenRouterAdapter stamped with its own engine key and is capture-ready", () => {
+  it.each(["", "off"])("the key alone (ENGINE_OPENROUTER=%j) binds no OpenRouterAdapter: the paid path needs an explicit opt-in (decision 44)", (optIn) => {
     clearKeys();
     vi.stubEnv("OPENROUTER_API_KEY", FAKE_KEY);
+    vi.stubEnv("ENGINE_OPENROUTER", optIn);
+    for (const engine of ENGINES) {
+      expect(resolveEngine(engine)).not.toBeInstanceOf(OpenRouterAdapter);
+      expect(captureReadyEngineKeys()).not.toContain(engine);
+    }
+  });
+  it("a perplexity model that is not a sonar model is never capture-ready: refused at binding, not on every cell", () => {
+    clearKeys();
+    vi.stubEnv("OPENROUTER_API_KEY", FAKE_KEY);
+    vi.stubEnv("ENGINE_OPENROUTER", "paid");
+    vi.stubEnv("OPENROUTER_MODEL_PERPLEXITY", "openai/gpt-5.4");
+    expect(captureReadyEngineKeys()).not.toContain("perplexity");
+    expect(resolveEngine("perplexity")).not.toBeInstanceOf(OpenRouterAdapter);
+    expect(() => new OpenRouterAdapter({ engineKey: "perplexity", apiKey: FAKE_KEY, timeoutMs: 5000, model: "openai/gpt-5.4" })).toThrow(UngroundedRequestError);
+  });
+  it("with the key AND ENGINE_OPENROUTER=paid, each is a real OpenRouterAdapter stamped with its own engine key and is capture-ready", () => {
+    clearKeys();
+    vi.stubEnv("OPENROUTER_API_KEY", FAKE_KEY);
+    vi.stubEnv("ENGINE_OPENROUTER", "paid");
     for (const engine of ENGINES) {
       const adapter = resolveEngine(engine);
       expect(adapter).toBeInstanceOf(OpenRouterAdapter);
@@ -354,6 +385,7 @@ describe("registry binding", () => {
   it("the model id is configurable per engine", async () => {
     clearKeys();
     vi.stubEnv("OPENROUTER_API_KEY", FAKE_KEY);
+    vi.stubEnv("ENGINE_OPENROUTER", "paid");
     vi.stubEnv("OPENROUTER_MODEL_CHATGPT", "openai/gpt-5.4-mini");
     const fetchImpl = fetchReturning(gptSearchInlineUrl);
     vi.stubGlobal("fetch", fetchImpl);
@@ -367,6 +399,7 @@ describe("registry binding", () => {
   it("a ':free' model configured for a tracked engine leaves it NOT capture-ready (fixture-backed): a free model never serves a tracked engine", () => {
     clearKeys();
     vi.stubEnv("OPENROUTER_API_KEY", FAKE_KEY);
+    vi.stubEnv("ENGINE_OPENROUTER", "paid");
     vi.stubEnv("OPENROUTER_MODEL_CLAUDE", "google/gemma-4-26b-a4b-it:free");
     expect(resolveEngine("claude")).not.toBeInstanceOf(OpenRouterAdapter);
     expect(captureReadyEngineKeys()).not.toContain("claude");
@@ -375,8 +408,10 @@ describe("registry binding", () => {
 });
 
 describe("spend ceilings and pacing", () => {
-  it("chatgpt, claude and perplexity have 5 USD placeholder ceilings", () => {
-    expect(DEFAULT_ENGINE_SPEND_CEILINGS_USD).toMatchObject({ chatgpt: 5, claude: 5, perplexity: 5 });
+  it("chatgpt, claude and perplexity have placeholder ceilings (pending the owner) that together fit inside the 10 USD key limit", () => {
+    const { chatgpt, claude, perplexity } = DEFAULT_ENGINE_SPEND_CEILINGS_USD;
+    expect([chatgpt, claude, perplexity]).toEqual([4, 4, 1]);
+    expect(chatgpt! + claude! + perplexity!).toBeLessThanOrEqual(10);
   });
   it("OPENROUTER_REQUESTS_PER_MINUTE builds a one-token bucket for each of the three engines (and not for others)", () => {
     const buckets = {

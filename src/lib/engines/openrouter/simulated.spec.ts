@@ -92,6 +92,14 @@ describe("decision 43 · what a simulated capture stores", () => {
     const real = new OpenRouterAdapter({ engineKey: "perplexity", apiKey: FAKE_KEY, fetchImpl: fetchReturning({ ...freeGemma, model: "perplexity/sonar" }), timeoutMs: 5000 });
     expect((await real.capture(input, makeCtx().ctx)).flags ?? []).not.toContain("simulated");
   });
+  it("D43-S6 a free model that omits usage.cost is metered at 0, never at the token-priced fallback", async () => {
+    const { usage: _usage, ...noUsage } = freeGemma;
+    const withTokens = { ...noUsage, usage: { prompt_tokens: 100000, completion_tokens: 4000 } };
+    const { ctx, recordCost } = makeCtx();
+    const result = await simulated("chatgpt", fetchReturning(withTokens)).capture(input, ctx);
+    expect(result.costUsd).toBe(0);
+    expect(recordCost).toHaveBeenCalledWith(0);
+  });
   it("D43-S5 a 402 and a 429 on the simulated path are typed failures, not untyped throws", async () => {
     const e402 = await simulated("chatgpt", fetchReturning(insufficientCredits402, 402)).capture(input, makeCtx().ctx).then(() => undefined, (e: unknown) => e);
     expect(e402).toBeInstanceOf(CaptureFailureError);
@@ -103,6 +111,7 @@ describe("decision 43 · what a simulated capture stores", () => {
 
 describe("decision 43 · the registry", () => {
   beforeEach(() => {
+    vi.stubEnv("ENGINE_OPENROUTER", "");
     vi.stubEnv("OPENROUTER_API_KEY", FAKE_KEY);
     for (const k of ["CHATGPT", "CLAUDE", "PERPLEXITY"]) {
       vi.stubEnv(`OPENROUTER_MODEL_${k}`, "");
@@ -161,6 +170,7 @@ describe("decision 43 · the registry", () => {
   it("D43-R6 without the flag the slots are the paid adapter (not simulated) and the free probe is still unreachable", () => {
     vi.stubEnv("NODE_ENV", "development");
     vi.stubEnv("ENGINE_SIMULATION", "");
+    vi.stubEnv("ENGINE_OPENROUTER", "paid");
     expect(resolveEngine("chatgpt")).toBeInstanceOf(OpenRouterAdapter);
     expect((resolveEngine("chatgpt") as OpenRouterAdapter).isSimulated).toBe(false);
   });

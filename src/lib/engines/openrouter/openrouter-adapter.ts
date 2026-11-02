@@ -21,8 +21,10 @@ import {
 // Whether production goes direct to each vendor is decided per engine later, where citation accuracy matters (decision 42); this
 // adapter is stamped with the engine key it serves, never inferred from a payload.
 //
-// A FREE MODEL NEVER SERVES A TRACKED ENGINE. A ':free' model id is refused at construction (FreeModelPathError). The free models exist
-// only behind the dev-only free probe (a sibling file), which is not a CaptureAdapter and cannot be resolved as an engine.
+// A FREE MODEL NEVER SERVES A TRACKED ENGINE IN REAL USE. A ':free' model id is refused at construction (FreeModelPathError) UNLESS the
+// adapter is built as a development-only simulated slot (owner decision 43, `simulated`, see openrouter-simulated.ts), which is
+// guarded against production and flags every result. The plain free models otherwise exist only behind the dev-only free probe (a
+// sibling file), which is not a CaptureAdapter and cannot be resolved as an engine.
 
 export type OpenRouterEngineKey = "chatgpt" | "claude" | "perplexity";
 export const OPENROUTER_ENGINE_KEYS: readonly OpenRouterEngineKey[] = ["chatgpt", "claude", "perplexity"];
@@ -115,8 +117,10 @@ export class OpenRouterAdapter extends BaseCaptureAdapter {
       assertSimulatedModel(this.modelId);
       // The mode is implied by constructing a simulated adapter, so ask the guard as if the flag were set.
       assertSimulationAllowed({ NODE_ENV: config.simulated.nodeEnv, ENGINE_SIMULATION: ENGINE_SIMULATION_MODE });
-    } else if (isFreeModel(this.modelId)) {
-      throw new FreeModelPathError(`a free model cannot serve the tracked engine '${config.engineKey}'`);
+    } else {
+      if (isFreeModel(this.modelId)) throw new FreeModelPathError(`a free model cannot serve the tracked engine '${config.engineKey}'`);
+      // Grounding is a property of the binding (engine + model), so a misconfigured model fails HERE, typed, not on every cell.
+      assertGrounded(config.engineKey, buildOpenRouterRequest(config.engineKey, this.modelId, { promptText: "", locale: "en-US", sampleIndex: 0, requireCitations: true }));
     }
   }
 
@@ -156,7 +160,7 @@ export class OpenRouterAdapter extends BaseCaptureAdapter {
       throw malformed;
     }
 
-    const chat = normaliseChat(parsed.data);
+    const chat = normaliseChat(parsed.data, this.isSimulated || isFreeModel(this.modelId));
     ctx.span.setAttribute("engine.key", this.engineKey);
     ctx.span.setAttribute("engine.latency_ms", latencyMs);
     if (this.isSimulated) ctx.span.setAttribute("engine.simulated", true);

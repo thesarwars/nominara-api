@@ -2,7 +2,7 @@ import type { CaptureAdapter, EngineKey } from "./contract.js";
 import { engineKeySchema } from "./contract.js";
 import { FIXTURE_ADAPTERS } from "./fixtures/index.js";
 import { GeminiApiAdapter } from "./gemini/gemini-api-adapter.js";
-import { isFreeModel, OPENROUTER_DEFAULT_MODELS, OPENROUTER_ENGINE_KEYS, OpenRouterAdapter, type OpenRouterEngineKey } from "./openrouter/openrouter-adapter.js";
+import { isFreeModel, OPENROUTER_DEFAULT_MODELS, OPENROUTER_ENGINE_KEYS, OpenRouterAdapter, type OpenRouterEngineKey, UngroundedRequestError } from "./openrouter/openrouter-adapter.js";
 import { assertSimulatedModel, assertSimulationAllowed, SIMULATED_DEFAULT_MODELS, simulationEnabled } from "./openrouter/openrouter-simulated.js";
 import { LicensedSerpAdapter, SERP_CAPTURE_TIMEOUT_MS, type LicensedSurface } from "./serp/licensed-serp.js";
 import { SerpApiProvider } from "./serp/serpapi-provider.js";
@@ -109,7 +109,7 @@ const OPENROUTER_CAPTURE_TIMEOUT_MS = 60_000;
 const openRouterAdapterCache = new Map<OpenRouterEngineKey, { readonly cacheKey: string; readonly adapter: OpenRouterAdapter }>();
 
 /**
- * The OpenRouter adapter for a tracked engine, or undefined when its configured model is a ':free' one. A free model NEVER serves a
+ * The OpenRouter adapter for a tracked engine, or undefined when the paid path is not opted into (ENGINE_OPENROUTER=paid), or its configured model is a ':free' one, or cannot ground the engine. A free model NEVER serves a
  * tracked engine: the engine is then left fixture-backed and not capture-ready, rather than silently measuring with a free model.
  */
 function openRouterAdapterFor(engineKey: OpenRouterEngineKey, apiKey: string): OpenRouterAdapter | undefined {
@@ -127,13 +127,23 @@ function openRouterAdapterFor(engineKey: OpenRouterEngineKey, apiKey: string): O
     openRouterAdapterCache.set(engineKey, { cacheKey: simKey, adapter: simulated });
     return simulated;
   }
+  // Decision 44 - the PAID path is an explicit opt-in (ENGINE_OPENROUTER=paid), exactly as EMBEDDING_PROVIDER is: the key alone (it is also
+  // the free dev-embedding key) never starts spending credit or switches a tracked engine to a placeholder model.
+  if (process.env.ENGINE_OPENROUTER !== "paid") return undefined;
   const override = process.env[`OPENROUTER_MODEL_${engineKey.toUpperCase()}`]?.trim();
   const model = override !== undefined && override.length > 0 ? override : OPENROUTER_DEFAULT_MODELS[engineKey];
   if (isFreeModel(model)) return undefined;
   const cacheKey = `${apiKey}|${model}`;
   const cached = openRouterAdapterCache.get(engineKey);
   if (cached?.cacheKey === cacheKey) return cached.adapter;
-  const adapter = new OpenRouterAdapter({ engineKey, apiKey, model, timeoutMs: OPENROUTER_CAPTURE_TIMEOUT_MS });
+  let adapter: OpenRouterAdapter;
+  try {
+    adapter = new OpenRouterAdapter({ engineKey, apiKey, model, timeoutMs: OPENROUTER_CAPTURE_TIMEOUT_MS });
+  } catch (error) {
+    // A model that cannot ground the engine (e.g. a non-sonar perplexity) is a configuration defect: leave the engine unbound.
+    if (error instanceof UngroundedRequestError) return undefined;
+    throw error;
+  }
   openRouterAdapterCache.set(engineKey, { cacheKey, adapter });
   return adapter;
 }

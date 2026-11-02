@@ -10,8 +10,9 @@ import { normaliseChat, OPENROUTER_MAX_TOKENS, OpenRouterCallError, parseChat, p
 //      RawCapture shape, so nothing that persists a capture can be handed one (a type error, and rawCaptureSchema rejects it at runtime).
 //   2. registry.ts never imports this file (asserted by a source-scan test), so resolveEngine() cannot return it.
 //   3. It accepts ONLY ':free' model ids and refuses to be built under NODE_ENV=production (FreeModelPathError); free providers may log input.
-//   4. The mirror image: OpenRouterAdapter refuses a ':free' model id, and the registry leaves a tracked engine fixture-backed rather than
-//      binding one.
+//   4. The mirror image: OpenRouterAdapter refuses a ':free' model id unless it is constructed as a development-only SIMULATED slot
+//      (owner decision 43, openrouter-simulated.ts: production-guarded, every result flagged `simulated`), and the registry leaves a
+//      tracked engine fixture-backed rather than binding a free model on the real path.
 // It sends no web plugin: search costs money even on a free model, and a probe is not a measurement.
 
 export interface FreeProbeResult {
@@ -64,7 +65,7 @@ export class OpenRouterFreeProbe {
     }
     const parsed = parseChat(body);
     if (!parsed.ok) throw new FreeProbeError("malformed_response");
-    const chat = normaliseChat(parsed.data);
+    const chat = normaliseChat(parsed.data, true);
     return {
       kind: "openrouter_free_probe",
       model: chat.model ?? this.config.model,

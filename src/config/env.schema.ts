@@ -64,11 +64,11 @@ export type EngineSpendCeilings = z.infer<typeof engineSpendCeilingsSchema>;
  * engines with a real adapter (gemini, and the two SerpApi Google surfaces of STORY-029) are the
  * ones that spend real money, so each gets a placeholder (USD/month): gemini 100 pending owner
  * decision O9; google_aio / google_ai_mode 5 each pending the owner's figure (250 Free-plan
- * searches at the metered $0.015 is $3.75 across both); chatgpt / claude / perplexity 5 each (owner decision 42, placeholders: one native-search
+ * searches at the metered $0.015 is $3.75 across both); chatgpt 4 / claude 4 / perplexity 1 (placeholders PENDING the owner, like gemini's O9: decision 42 sets only the 10 USD OpenRouter key limit, and these total 9 so they fit inside it; one native-search
  * capture costs about $0.07 / $0.11 / $0.006 through OpenRouter). A configured entry always wins; an engine
  * with no default has NO alerts and NO hard stop (spend-meter.ts computes both only when a ceiling exists).
  */
-export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100, google_aio: 5, google_ai_mode: 5, chatgpt: 5, claude: 5, perplexity: 5 };
+export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100, google_aio: 5, google_ai_mode: 5, chatgpt: 4, claude: 4, perplexity: 1 };
 
 /** The effective ceilings: defaults, overridden per engine by the configured JSON (already validated at boot). */
 export function resolveEngineSpendCeilings(configuredJson: string | undefined): EngineSpendCeilings {
@@ -447,6 +447,8 @@ export const envSchema = z
     OPENROUTER_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
     // Owner decision 43 - DEVELOPMENT ONLY. `openrouter-free` backs the chatgpt / claude / perplexity slots with free OpenRouter models
     // (results flagged `simulated`). Refused at boot under NODE_ENV=production (superRefine below), and again by the registry and adapter.
+    // Decision 44: the PAID OpenRouter path for chatgpt / claude / perplexity is an explicit opt-in. Default off: the key alone binds nothing.
+    ENGINE_OPENROUTER: z.enum(["off", "paid"]).optional(),
     ENGINE_SIMULATION: z.enum(["off", "openrouter-free"]).optional(),
     OPENROUTER_SIMULATED_MODEL_CHATGPT: requiredString.optional(),
     OPENROUTER_SIMULATED_MODEL_CLAUDE: requiredString.optional(),
