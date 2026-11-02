@@ -251,7 +251,7 @@ export function createMaintenanceIntegrityHandler(
         { blocking: blocking.length, graceDays: PURGE_FAILURE_GRACE_DAYS },
         {
           failures: blocking.map(
-            (failure) => `${failure.scope}/${failure.scopeId}`,
+            (failure) => `scope=${failure.scope} id=${failure.scopeId}`,
           ),
         },
       );
