@@ -2,6 +2,8 @@ import type { CaptureAdapter, EngineKey } from "./contract.js";
 import { engineKeySchema } from "./contract.js";
 import { FIXTURE_ADAPTERS } from "./fixtures/index.js";
 import { GeminiApiAdapter } from "./gemini/gemini-api-adapter.js";
+import { isFreeModel, OPENROUTER_DEFAULT_MODELS, OPENROUTER_ENGINE_KEYS, OpenRouterAdapter, type OpenRouterEngineKey } from "./openrouter/openrouter-adapter.js";
+import { assertSimulatedModel, assertSimulationAllowed, SIMULATED_DEFAULT_MODELS, simulationEnabled } from "./openrouter/openrouter-simulated.js";
 import { LicensedSerpAdapter, SERP_CAPTURE_TIMEOUT_MS, type LicensedSurface } from "./serp/licensed-serp.js";
 import { SerpApiProvider } from "./serp/serpapi-provider.js";
 
@@ -100,6 +102,42 @@ function serpAdapterFor(surface: LicensedSurface, key: string): LicensedSerpAdap
   return adapter;
 }
 
+// STORY-028 / owner decision 42 - chatgpt, claude and perplexity are real through ONE OpenRouter key. Hard per-capture timeout: the slowest
+// profile is claude at p95 16 s (tracking-engine.md section 3); OpenRouter's native search adds routing, and a reasoning model can think
+// for a while, so 60 s.
+const OPENROUTER_CAPTURE_TIMEOUT_MS = 60_000;
+const openRouterAdapterCache = new Map<OpenRouterEngineKey, { readonly cacheKey: string; readonly adapter: OpenRouterAdapter }>();
+
+/**
+ * The OpenRouter adapter for a tracked engine, or undefined when its configured model is a ':free' one. A free model NEVER serves a
+ * tracked engine: the engine is then left fixture-backed and not capture-ready, rather than silently measuring with a free model.
+ */
+function openRouterAdapterFor(engineKey: OpenRouterEngineKey, apiKey: string): OpenRouterAdapter | undefined {
+  // Owner decision 43 - DEVELOPMENT ONLY free-model slots. Checked FIRST and fail closed: with the flag set outside development this
+  // throws (it never falls through to the paid path or to a free model), and a non-free model id is refused, not sent.
+  if (simulationEnabled(process.env)) {
+    assertSimulationAllowed(process.env);
+    const configured = process.env[`OPENROUTER_SIMULATED_MODEL_${engineKey.toUpperCase()}`]?.trim();
+    const simModel = configured !== undefined && configured.length > 0 ? configured : SIMULATED_DEFAULT_MODELS[engineKey];
+    assertSimulatedModel(simModel);
+    const simKey = `sim|${apiKey}|${simModel}`;
+    const hit = openRouterAdapterCache.get(engineKey);
+    if (hit?.cacheKey === simKey) return hit.adapter;
+    const simulated = new OpenRouterAdapter({ engineKey, apiKey, model: simModel, timeoutMs: OPENROUTER_CAPTURE_TIMEOUT_MS, simulated: { nodeEnv: process.env.NODE_ENV } });
+    openRouterAdapterCache.set(engineKey, { cacheKey: simKey, adapter: simulated });
+    return simulated;
+  }
+  const override = process.env[`OPENROUTER_MODEL_${engineKey.toUpperCase()}`]?.trim();
+  const model = override !== undefined && override.length > 0 ? override : OPENROUTER_DEFAULT_MODELS[engineKey];
+  if (isFreeModel(model)) return undefined;
+  const cacheKey = `${apiKey}|${model}`;
+  const cached = openRouterAdapterCache.get(engineKey);
+  if (cached?.cacheKey === cacheKey) return cached.adapter;
+  const adapter = new OpenRouterAdapter({ engineKey, apiKey, model, timeoutMs: OPENROUTER_CAPTURE_TIMEOUT_MS });
+  openRouterAdapterCache.set(engineKey, { cacheKey, adapter });
+  return adapter;
+}
+
 /** The real registration when a key is configured; otherwise the honest keyless fallback. */
 function registrationFor(engineKey: EngineKey): EngineRegistration {
   if (engineKey === "google_aio" || engineKey === "google_ai_mode") {
@@ -115,6 +153,13 @@ function registrationFor(engineKey: EngineKey): EngineRegistration {
         geminiAdapterCache = { key, adapter: new GeminiApiAdapter({ apiKey: key, timeoutMs: GEMINI_CAPTURE_TIMEOUT_MS }) };
       }
       return { status: "active", adapter: geminiAdapterCache.adapter, captureReady: true };
+    }
+  }
+  if ((OPENROUTER_ENGINE_KEYS as readonly string[]).includes(engineKey)) {
+    const key = process.env.OPENROUTER_API_KEY;
+    if (key !== undefined && key.trim().length > 0) {
+      const adapter = openRouterAdapterFor(engineKey as OpenRouterEngineKey, key);
+      if (adapter !== undefined) return { status: "active", adapter, captureReady: true };
     }
   }
   return REGISTRY[engineKey];

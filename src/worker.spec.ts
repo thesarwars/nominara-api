@@ -3,6 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bootstrapWorker, WorkerGroupError } from "./worker.js";
 import { setAlertEmailerForTests } from "./lib/alerts/alerts.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../test/support/test-valkey.js";
+import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
+
+// Owner decision 42 gave chatgpt / claude / perplexity placeholder ceilings, so EVERY active engine now has a default and the boot
+// warning has nothing to name. The real function is kept (delegating wrapper) and its call is observed, so the wiring stays tested.
+vi.mock("./lib/engines/spend-meter.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/engines/spend-meter.js")>();
+  return { ...actual, warnMissingSpendCeilings: vi.fn(actual.warnMissingSpendCeilings) };
+});
 
 // STORY-022 — NFR-ARCH-06 cold start (<=8s) plus the worker's own
 // acceptance criterion: refuses to boot without a valid WORKER_GROUP.
@@ -57,15 +65,20 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
   // (src/lib/engines/spend-meter.ts's warnMissingSpendCeilings) had no
   // production caller anywhere. The capture group is where every other
   // engine-scoped boot concern (the canary) is already wired.
-  it("D13: logs a boot warning per active engine missing an ENGINE_SPEND_CEILINGS_USD entry, for the capture group", async () => {
+  it("D13: the capture group checks every active engine against the resolved ceilings at boot (the warning itself: spend-meter.spec.ts)", async () => {
     process.env.WORKER_GROUP = "capture";
     delete process.env.ENGINE_SPEND_CEILINGS_USD;
+    vi.mocked(warnMissingSpendCeilings).mockClear();
     const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
 
     const app = await bootstrapWorker();
     try {
-      const messages = warnSpy.mock.calls.map((call) => String(call[0]));
-      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(true);
+      expect(warnMissingSpendCeilings).toHaveBeenCalledTimes(1);
+      const [ceilings, active] = vi.mocked(warnMissingSpendCeilings).mock.calls[0]!;
+      expect(active).toEqual(expect.arrayContaining(["chatgpt", "claude", "perplexity", "gemini", "google_aio", "google_ai_mode"]));
+      expect(ceilings).toMatchObject({ chatgpt: 5, claude: 5, perplexity: 5 });
+      // Every active engine has a default, so nothing is missing and nothing is named.
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("no ENGINE_SPEND_CEILINGS_USD entry"))).toBe(false);
     } finally {
       await app.close();
       warnSpy.mockRestore();
@@ -89,7 +102,7 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     }
   }, 15_000);
 
-  it("E2E-B6d: gemini has a safe default spend ceiling, so no boot warning names it; other engines still warn", async () => {
+  it("E2E-B6d: gemini, and the OpenRouter engines, have a safe default spend ceiling, so no boot warning names them", async () => {
     process.env.WORKER_GROUP = "capture";
     delete process.env.ENGINE_SPEND_CEILINGS_USD;
     const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
@@ -97,8 +110,9 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     const app = await bootstrapWorker();
     try {
       const messages = warnSpy.mock.calls.map((call) => String(call[0]));
-      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'gemini'"))).toBe(false);
-      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(true);
+      for (const engine of ["gemini", "chatgpt", "claude", "perplexity"]) {
+        expect(messages.some((message) => message.includes(`no ENGINE_SPEND_CEILINGS_USD entry for engine '${engine}'`))).toBe(false);
+      }
     } finally {
       await app.close();
       warnSpy.mockRestore();
