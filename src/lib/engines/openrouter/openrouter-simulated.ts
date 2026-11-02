@@ -16,7 +16,7 @@ export const ENGINE_SIMULATION_MODE = "openrouter-free";
 export const SIMULATED_DEFAULT_MODELS: Readonly<Record<OpenRouterEngineKey, string>> = {
   chatgpt: "nvidia/nemotron-3-ultra-550b-a55b:free",
   claude: "google/gemma-4-31b-it:free",
-  perplexity: "thinkingmachines/inkling:free",
+  perplexity: "nvidia/nemotron-3.5-super-vl:free",
 };
 
 export class SimulationRefusedError extends Error {
@@ -44,6 +44,7 @@ export function assertSimulationAllowed(env: SimulationEnv): void {
   }
 }
 
+/** Any ':free' id fits a simulated slot, perplexity included: the result is labelled simulated and carries no grounding claim. */
 export function assertSimulatedModel(model: string): void {
   if (!model.endsWith(":free")) {
     throw new SimulationRefusedError("a simulated engine slot accepts only a ':free' OpenRouter model id");

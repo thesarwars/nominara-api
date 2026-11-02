@@ -33,7 +33,7 @@ export const OPENROUTER_ENGINE_KEYS: readonly OpenRouterEngineKey[] = ["chatgpt"
  * Model ids from GET /api/v1/models (2026-10-30). PLACEHOLDERS pending the owner's fidelity decision: model tier is a fidelity decision
  * (tracking-engine.md section 3), so a change here is a methodology event. Override per engine with OPENROUTER_MODEL_<ENGINE>.
  * Cost observed live, one capture each, web search included: gpt-5.4 ~$0.07, claude-sonnet-5.5 ~$0.11 (44k prompt tokens of search
- * context), perplexity/sonar ~$0.006. Mind the 5 USD placeholder ceilings.
+ * context), perplexity/sonar ~$0.006. Mind DEFAULT_ENGINE_SPEND_CEILINGS_USD (4/4/1 placeholders).
  */
 export const OPENROUTER_DEFAULT_MODELS: Readonly<Record<OpenRouterEngineKey, string>> = {
   chatgpt: "openai/gpt-5.4",

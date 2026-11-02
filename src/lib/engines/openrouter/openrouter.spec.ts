@@ -248,13 +248,17 @@ describe("failure taxonomy mapping", () => {
       expect((await failureOf(adapterFor(engine, fetchReturning(body, status)).capture(input, makeCtx().ctx))).code).toBe(code);
     }
   });
-  it.each(ENGINES)("%s: a moderation 403 is a stored refusal (data, NFR-SIM-07), not a failure and not auth_failed", async (engine) => {
-    const { ctx } = makeCtx();
-    const result = await adapterFor(engine, fetchReturning(moderation403, 403)).capture(input, ctx);
-    expect(rawCaptureSchema.safeParse(result).success).toBe(true);
-    expect(result.flags).toContain("engine_refused_to_answer");
-    expect(result.text).toBe("");
-    expect(JSON.stringify(result)).not.toContain("(redacted)");
+  it.each(ENGINES)("D50-C1 %s: an HTTP 403 moderation refusal is blocked (OpenRouter's pre-filter, not the engine), and the flagged input is never copied", async (engine) => {
+    const error = await failureOf(adapterFor(engine, fetchReturning(moderation403, 403)).capture(input, makeCtx().ctx));
+    expect(error.code).toBe("blocked");
+    expect(error.message).not.toContain("(redacted)");
+    expect(error.message).not.toContain("harassment");
+  });
+  it.each(ENGINES)("D50-C2 %s: a moderation 403 envelope inside a 200 is blocked too", async (engine) => {
+    const error = await failureOf(adapterFor(engine, fetchReturning(moderation403, 200)).capture(input, makeCtx().ctx));
+    expect(error.code).toBe("blocked");
+    expect(error.message).not.toContain("(redacted)");
+    expect(error.message).not.toContain("harassment");
   });
   it("a 200 carrying an error envelope is mapped by its code, not read as an answer", async () => {
     expect((await failureOf(adapterFor("chatgpt", fetchReturning(insufficientCredits402, 200)).capture(input, makeCtx().ctx))).code).toBe("quota_exhausted");

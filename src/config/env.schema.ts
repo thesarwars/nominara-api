@@ -553,6 +553,13 @@ export const envSchema = z
         message: "ENGINE_SIMULATION backs tracked engines with free simulated models and is a development-only mode; it cannot be set under NODE_ENV=production.",
       });
     }
+    if (env.ENGINE_SIMULATION === "openrouter-free" && env.ENGINE_OPENROUTER === "paid") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ENGINE_OPENROUTER"],
+        message: "ENGINE_SIMULATION=openrouter-free and ENGINE_OPENROUTER=paid are mutually exclusive: a slot is either simulated by a free model or paid, never both.",
+      });
+    }
     if (env.NODE_ENV === "production" && env.RESEND_TO_EMAIL !== undefined) {
       ctx.addIssue({
         code: "custom",

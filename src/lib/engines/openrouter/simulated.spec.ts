@@ -56,6 +56,22 @@ describe("decision 43 · the guard", () => {
     expect(() => simulated("chatgpt", fetchReturning(freeGemma), "production")).toThrow(SimulationRefusedError);
     expect(() => simulated("chatgpt", fetchReturning(freeGemma), "development", "openai/gpt-5.4")).toThrow(SimulationRefusedError);
   });
+  it("D50-A1 a non-sonar model in the perplexity SIMULATED slot is allowed (labelled simulated, no grounding claim); the paid path still refuses it", async () => {
+    const fetchImpl = fetchReturning(freeGemma);
+    const adapter = simulated("perplexity", fetchImpl, "development", "nvidia/nemotron-3.5-super-vl:free");
+    const result = await adapter.capture(input, makeCtx().ctx);
+    expect(result.flags).toContain("simulated");
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]![1]?.body)).model).toBe("nvidia/nemotron-3.5-super-vl:free");
+    expect(() => new OpenRouterAdapter({ engineKey: "perplexity", apiKey: FAKE_KEY, timeoutMs: 1000, fetchImpl, model: "nvidia/nemotron-3.5-super-vl:free" })).toThrow();
+    expect(() => new OpenRouterAdapter({ engineKey: "perplexity", apiKey: FAKE_KEY, timeoutMs: 1000, fetchImpl, model: "openai/gpt-5.4" })).toThrow();
+  });
+  it("D50-E1 boot refuses ENGINE_SIMULATION=openrouter-free together with ENGINE_OPENROUTER=paid, naming both", () => {
+    applyFakeApiEnv();
+    const base = { ...process.env, NODE_ENV: "development" };
+    expect(() => loadEnv({ ...base, ENGINE_SIMULATION: "openrouter-free", ENGINE_OPENROUTER: "paid" })).toThrow(/ENGINE_SIMULATION.*ENGINE_OPENROUTER|ENGINE_OPENROUTER.*ENGINE_SIMULATION/s);
+    expect(() => loadEnv({ ...base, ENGINE_SIMULATION: "openrouter-free", ENGINE_OPENROUTER: "off" })).not.toThrow();
+    expect(() => loadEnv({ ...base, ENGINE_SIMULATION: "off", ENGINE_OPENROUTER: "paid" })).not.toThrow();
+  });
   it("D43-G5 boot refuses ENGINE_SIMULATION under NODE_ENV=production (loadEnv), and allows it in development", () => {
     applyFakeApiEnv();
     expect(() => loadEnv({ ...process.env, NODE_ENV: "production", ENGINE_SIMULATION: "openrouter-free" })).toThrow(EnvValidationError);
@@ -124,7 +140,7 @@ describe("decision 43 · the registry", () => {
     expect(SIMULATED_DEFAULT_MODELS).toEqual({
       chatgpt: "nvidia/nemotron-3-ultra-550b-a55b:free",
       claude: "google/gemma-4-31b-it:free",
-      perplexity: "thinkingmachines/inkling:free",
+      perplexity: "nvidia/nemotron-3.5-super-vl:free",
     });
   });
   it("D43-R2 with the flag in development, each slot is a simulated adapter, capture-ready, on its default model", async () => {

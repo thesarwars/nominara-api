@@ -1,3 +1,4 @@
+// Approved exception (owner decision 50b): these 2026-10-30 fixtures came from paid calls; no further paid calls are made.
 // Recorded OpenRouter /chat/completions responses (2026-10-30, STORY-028 / owner decision 42). REAL responses, ids replaced and
 // reasoning text/signatures removed; nothing account-identifying and no credential appears (the key travels in the Authorization header).
 //
@@ -417,5 +418,5 @@ export const noNativeSearch404 = { error: { code: 404, message: "The requested m
 
 /** DOCUMENTED shape (OpenRouter errors page, 403), not a recorded call: the chosen model requires moderation and the input was flagged. */
 export const moderation403 = { error: { code: 403, message: "Your chosen model requires moderation and your input was flagged", metadata: { reasons: ["harassment"], flagged_input: "(redacted)", provider_name: "OpenAI", model_slug: "openai/gpt-5.4" } } } as const;
-/** A 403 with no moderation metadata: not a refusal, and not a credential fault either. */
+/** A 403 with no moderation metadata: blocked as well (decision 50c), and not a credential fault. */
 export const forbidden403 = { error: { code: 403, message: "Forbidden" } } as const;

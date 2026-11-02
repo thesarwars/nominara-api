@@ -45,8 +45,9 @@ export class OpenRouterCallError extends Error {
  * 401 -> auth_failed · 402 -> quota_exhausted (no credit, terminal) · 403 and 404 -> blocked · 408 -> timeout · 429 -> rate_limited ·
  * 5xx -> upstream_5xx · other 4xx -> malformed_response.
  *
- * 403 is NOT a credential signal on this vendor: it means the model requires moderation and the input was flagged (a flagged one is a
- * stored refusal, see moderationRefusalBody) or, for a free model, that the route is closed. 404 is "no endpoints found" for a delisted or
+ * 403 is NOT a credential signal on this vendor: it means the model requires moderation and the input was flagged (OpenRouter's own
+ * pre-filter, decision 50c: `blocked`, never `engine_refused_to_answer`, so it stays out of visibility numbers; the flagged input is never
+ * copied into the result or the error) or, for a free model, that the route is closed. The same mapping applies to an in-body 403 envelope. 404 is "no endpoints found" for a delisted or
  * renamed model, or a model without native web search: a CONFIGURATION fault, terminal, and not a vendor-payload (parser) fault. Both
  * are `blocked`: the engine could not be used as configured.
  */
@@ -58,20 +59,6 @@ export function failureCodeForStatus(status: number): CaptureFailureCode {
   if (status === 429) return "rate_limited";
   if (status >= 500) return "upstream_5xx";
   return "malformed_response";
-}
-
-/**
- * OpenRouter's documented 403: "your chosen model requires moderation and your input was flagged". The envelope carries
- * `error.metadata.reasons` / `flagged_input`. That is the engine declining to answer: data (tracking-engine.md section 2, NFR-SIM-07),
- * so it becomes the same shape as a `content_filter` completion. The flagged input is never read into the result.
- */
-function moderationRefusalBody(status: number, body: unknown, model: string): unknown {
-  if (status !== 403) return undefined;
-  const parsed = z.looseObject({ error: z.looseObject({ metadata: z.looseObject({ reasons: z.array(z.string()).optional(), flagged_input: z.unknown().optional() }) }) }).safeParse(body);
-  if (!parsed.success) return undefined;
-  const { reasons, flagged_input } = parsed.data.error.metadata;
-  if (reasons === undefined && flagged_input === undefined) return undefined;
-  return { model, choices: [{ finish_reason: "content_filter", message: { role: "assistant", content: "" } }] };
 }
 
 function envelopeCode(body: unknown): number | undefined | null {
@@ -114,16 +101,12 @@ export async function postChat(options: {
       body = undefined;
     }
     if (!response.ok) {
-      const refusal = moderationRefusalBody(response.status, body, options.request.model);
-      if (refusal !== undefined) return refusal;
       const code = failureCodeForStatus(response.status);
       throw new OpenRouterCallError(code, code === "rate_limited" ? retryAfterMsOf(response.headers, body) : undefined);
     }
     if (body === undefined) throw new OpenRouterCallError("malformed_response");
     const inBody = envelopeCode(body);
     if (inBody !== null) {
-      const refusal = inBody === undefined ? undefined : moderationRefusalBody(inBody, body, options.request.model);
-      if (refusal !== undefined) return refusal;
       throw new OpenRouterCallError(inBody === undefined ? "malformed_response" : failureCodeForStatus(inBody));
     }
     return body;
