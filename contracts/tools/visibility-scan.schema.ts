@@ -64,6 +64,12 @@ export const scanStreamEngineResultSchema = scanEngineResultEventSchema
     /** How old the answer is when it came from cache; 0 for a live capture. `captured_at` is the engine answer's own time, never the run's. */
     age_ms: z.number().int().nonnegative(),
     estimated: z.literal(true),
+    /**
+     * A citation the engine returned as a redirect wrapper (Gemini's grounding redirect) is not fetched on the interactive path, so its real host is only
+     * a HINT (the engine's own title for the source) or unknown: `domain` / `is_owned` are `null` - not a foreign source, and not an owned one - when
+     * the hint is missing. The wrapper's own host is never reported as a source.
+     */
+    citations: z.array(z.object({ slot: z.number().int().positive(), domain: z.string().min(1).nullable(), is_owned: z.boolean().nullable() }).strict()),
   })
   .strict();
 
@@ -108,11 +114,17 @@ const scanConvertCtaSchema = z
 export const scanStreamCompletedSchema = z
   .object({
     tool_run_id: z.uuid(),
-    status: z.enum(["completed", "partial", "failed"]),
+    /** `running` only when `settled` is false (the stream's deadline ended it before the worker settled the run). */
+    status: z.enum(["completed", "partial", "failed", "running"]),
     duration_ms: z.number().int().nonnegative(),
     aggregate: scanAggregateSchema,
     engine_failures: z.array(scanEngineFailureSchema),
-    credits: z.object({ charged: z.number().int().nonnegative(), refunded: z.number().int().nonnegative() }).strict(),
+    /**
+     * `false` only on the terminal event the STREAM synthesises when its own deadline (or a fault) ends it before the worker has settled the run: the
+     * money is then not yet final, so `credits.charged` / `credits.refunded` are `null` (unknown, not 0) and the run resource holds the final figure.
+     */
+    settled: z.boolean(),
+    credits: z.object({ charged: z.number().int().nonnegative().nullable(), refunded: z.number().int().nonnegative().nullable() }).strict(),
     /** True when the latency deadline ended the run with engines still outstanding: what landed is returned (a partial), not nothing. */
     deadline_reached: z.boolean(),
     not_tracked: z.literal(true),
@@ -144,6 +156,8 @@ export const lookupExecuteJobPayloadSchema = z
     queryText: z.string().min(1),
     competitors: z.array(z.string()),
     engines: z.array(z.string().min(1)).min(1),
+    /** False when the workspace's plan carries `no_shared_cache`: no read from, and no seed of, the cross-tenant L1. Absent (an older job) means false: fail closed. */
+    sharedCacheEnabled: z.boolean().default(false),
     locale: z.string().min(1),
     startedAt: z.iso.datetime(),
   })
