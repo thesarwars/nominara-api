@@ -1,16 +1,20 @@
 import type { Job } from "bullmq";
 import type { ClientBase, Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
+import { guardedFetch } from "../../../src/lib/net/guarded-fetch.js";
+import { NOMINARA_USER_AGENT } from "../../../src/lib/net/user-agent.js";
 import { nameUuid } from "../../../src/lib/ids/name-uuid.js";
 import type { GuardedResponse } from "../../../src/lib/net/guarded-fetch.js";
 import { signQueueJobPayload } from "../../../src/lib/queue/envelope.js";
 import { handlerFor, type QueueHandlerContext } from "../../../src/lib/queue/handlers.js";
-import { createSourceVerifyPresenceHandler } from "../../../src/lib/queue/handlers/source-verify-presence.handler.js";
+import { createSourceVerifyPresenceHandler, identifiedFetcher } from "../../../src/lib/queue/handlers/source-verify-presence.handler.js";
 import type { RotatingSigningKeys } from "../../../src/lib/queue/signing.js";
 import { topologyFor } from "../../../src/lib/queue/topology.js";
 import { createJobProcessor, phasesOf } from "../../../src/lib/queue/worker-factory.js";
 import { projectQueueLockKey } from "../../../src/lib/queue/locks.js";
 import { seededTargetUrl, seededVerificationUrl } from "../../../src/lib/sources/verify-presence.js";
+
+vi.mock("../../../src/lib/net/guarded-fetch.js", async (importOriginal) => ({ ...(await importOriginal<object>()), guardedFetch: vi.fn() }));
 
 // STORY-066 AC8 — `source_seeded` (`scoring-models.md` §13: "completion of an
 // authority task with a verified target URL"; `aux-and-geo-analysis.md`
@@ -260,5 +264,35 @@ describe("STORY-066 AC8 · both presence commits serialise with rollup.metric_da
     expect(lock, "the rollup's per-project lock is taken").toBeGreaterThanOrEqual(0);
     expect(lock).toBeLessThan(indexOf(h, /FROM projects WHERE id = \$1 AND deleted_at IS NULL FOR NO KEY UPDATE/u));
     expect(lock).toBeLessThan(indexOf(h, /UPDATE project_source_index SET brand_present_on_domain/u));
+  });
+});
+
+// STORY-055 review round 7 / STORY-049 AC7 - Wikipedia and Reddit answered 403 to a fetch that did not identify itself.
+describe("STORY-055 / STORY-049 AC7 - the seeding fetches identify themselves", () => {
+  const headers = { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" };
+
+  it("the identified fetcher sends the Nominara User-Agent and Accept on the page and on the canary, keeping the redirect rule", async () => {
+    const guarded = vi.fn(async () => page("x"));
+    const followRedirect = () => true;
+    const fetch = identifiedFetcher(guarded);
+    await fetch("https://en.wikipedia.org/wiki/Acme", { followRedirect });
+    await fetch("https://en.wikipedia.org/wiki/Acme-canary-nonce");
+    expect(guarded).toHaveBeenNthCalledWith(1, "https://en.wikipedia.org/wiki/Acme", { followRedirect, headers });
+    expect(guarded).toHaveBeenNthCalledWith(2, "https://en.wikipedia.org/wiki/Acme-canary-nonce", { headers });
+  });
+
+  it("the handler's default fetcher (periodic verify-presence path) is that identified fetcher", async () => {
+    const mocked = vi.mocked(guardedFetch);
+    mocked.mockReset();
+    mocked.mockResolvedValue(page("Acme Analytics"));
+    const h = harness();
+    await createJobProcessor(topologyFor("source.verify_presence"), {
+      keys: KEYS,
+      getClient: h.getClient,
+      releaseClient: h.releaseClient,
+      process: createSourceVerifyPresenceHandler(h.context, { now: () => JOB_NOW }),
+    })(job({}));
+    expect(mocked).toHaveBeenCalledTimes(1);
+    expect(mocked.mock.calls[0]![1]).toMatchObject({ headers });
   });
 });

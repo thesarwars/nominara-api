@@ -3,6 +3,7 @@ import { gzipSync } from "node:zlib";
 import type { CrawlPageFetch } from "../../../contracts/aux/index.js";
 import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../net/guarded-fetch.js";
 import { toRegistrableDomain } from "../net/registrable-domain.js";
+import { NOMINARA_USER_AGENT } from "../net/user-agent.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "./politeness.js";
 import { createRenderRequestGuard, RendererUnavailable, type Renderer } from "./renderer.js";
 import { CRAWL_AGENT, isAllowed, type ParsedRobots } from "./robots.js";
@@ -21,7 +22,7 @@ import { sanitiseText } from "./sanitise.js";
 // (STORY-131's rule, kept here).
 
 /** aux-and-geo-analysis.md §1 step 4(a). */
-export const NOMINARA_USER_AGENT = "NominaraBot/1.0 (+https://nominara.com/bot)";
+export { NOMINARA_USER_AGENT };
 /** aux-and-geo-analysis.md §1 step 4(b): "networkidle + 2 s". An adapter applies it; the cut-off here is the backstop. */
 export const RENDER_TIMEOUT_MS = 30_000;
 const MAX_URL_CHARS = 2048;

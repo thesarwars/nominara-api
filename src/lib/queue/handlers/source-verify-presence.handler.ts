@@ -3,7 +3,8 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
-import { guardedFetch } from "../../net/guarded-fetch.js";
+import { guardedFetch, type GuardedResponse } from "../../net/guarded-fetch.js";
+import { NOMINARA_USER_AGENT } from "../../net/user-agent.js";
 import {
   commitPresenceRun,
   commitSeededVerification,
@@ -104,9 +105,17 @@ function fetchSubmissionTraced(plan: SubmissionPlan, fetch: SubmissionFetcher): 
   });
 }
 
+/**
+ * STORY-055 (review r7) / STORY-049 AC7 - every fetch this job makes (the submission's page and canary, the seeded target, the periodic
+ * presence page) identifies itself. Wikipedia and Reddit answered 403 to an anonymous request and 200 to this one.
+ */
+export function identifiedFetcher(guarded: (url: string, init: Parameters<typeof guardedFetch>[1]) => Promise<GuardedResponse> = guardedFetch): SubmissionFetcher {
+  return (url, init) => guarded(url, { ...init, headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" } });
+}
+
 export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {
   const logger = new Logger("source.verify_presence");
-  const fetch: SubmissionFetcher = deps.fetch ?? ((url, init) => guardedFetch(url, init));
+  const fetch: SubmissionFetcher = deps.fetch ?? identifiedFetcher((url, init) => guardedFetch(url, init));
   const clock = deps.now ?? (() => new Date());
   // Built on the first submission job, not at boot: a worker group without a reachable cache must still boot (as task.generate's).
   let publisher: RealtimePublisher | undefined;
