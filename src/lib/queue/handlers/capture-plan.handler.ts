@@ -111,20 +111,20 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
    * project. Asked for once the project has been claimed as due, whether or not an engine was capturable (the audit needs none), and only while
    * the project has no audit at all. The enqueue is after COMMIT and its failure never fails the scan: the audit is retried by the next call
    * that finds the project still without one (a manual audit, or the next scheduled scan).
+   *
+   * OWNER DECISION 47 - a plan WITHOUT the page audit (Free: `aux.scheduled_audits` is off) still gets the free SITE-FILES-ONLY check (robots.txt, llms.txt,
+   * sitemap), which plans-and-entitlements.md makes "free and unlimited": the job carries `siteFilesOnly`, so `crawl.audit` fetches no page. A plan that
+   * includes the page audit gets the full one. Neither is charged.
    */
   const requestOnboardingAudit = async (tx: ClientBase, workspaceId: string, projectId: string, auxIncluded: boolean): Promise<void> => {
-    // A plan without AUX audits (Free) gets none: the audit is free of CREDITS, not free to the tier, and it would cost real crawl egress.
-    if (!auxIncluded) {
-      incrementCounter("nominara_aux_onboarding_audit_skipped_total", { reason: "not_in_plan" });
-      return;
-    }
+    const siteFilesOnly = !auxIncluded;
     if (!(await onboardingAuditWanted(tx, projectId))) return;
     const auditId = onboardingAuditId(projectId);
     afterCommit(() => {
-      void enqueueCrawlAudit(workspaceId, { projectId, auditId, trigger: "onboarding" }, crawlAuditIdempotencyKey(projectId, auditId))
+      void enqueueCrawlAudit(workspaceId, { projectId, auditId, trigger: "onboarding", ...(siteFilesOnly ? { siteFilesOnly: true as const } : {}) }, crawlAuditIdempotencyKey(projectId, auditId))
         .then(() => {
-          incrementCounter("nominara_aux_onboarding_audit_requested_total", {});
-          logger.log({ event: "aux.onboarding_audit.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId });
+          incrementCounter("nominara_aux_onboarding_audit_requested_total", { kind: siteFilesOnly ? "site_files_only" : "full" });
+          logger.log({ event: "aux.onboarding_audit.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, kind: siteFilesOnly ? "site_files_only" : "full" });
         })
         .catch((error: unknown) => {
           incrementCounter("nominara_aux_onboarding_audit_request_failed_total", {});

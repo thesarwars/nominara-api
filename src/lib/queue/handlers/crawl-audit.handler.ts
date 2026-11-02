@@ -283,6 +283,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     readonly origin: string;
     readonly verified: boolean;
     readonly scope: SelectionScope;
+    /** Owner decision 47: no page at all. */
+    readonly siteFilesOnly: boolean;
     readonly pageCap: number;
     readonly startedAt: Date;
     readonly startedMs: number;
@@ -383,7 +385,10 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       [payload.projectId, rootDomain],
     );
     const verified = verifiedRow.rows.length > 0;
-    const scope: SelectionScope = verified ? (payload.scope ?? "key_pages") : "public_surface";
+    // OWNER DECISION 47: a site-files-only job (a Free project's onboarding check) is held to the site files whatever the verification state says: public_surface,
+    // and no page is chosen, fetched or judged (see fetchPhase). The flag is on a signed job; a manual job cannot carry it (the payload contract refuses that).
+    const siteFilesOnly = payload.siteFilesOnly === true;
+    const scope: SelectionScope = verified && !siteFilesOnly ? (payload.scope ?? "key_pages") : "public_surface";
     const startedAt = now();
 
     // What a key_pages audit must look at: owned citations and open-task URLs. Read HERE because `run` has no client.
@@ -409,6 +414,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       origin: `https://${rootDomain}`,
       verified,
       scope,
+      siteFilesOnly,
       pageCap: deps.pageCap ?? pageCapForPlan(planKey),
       startedAt,
       startedMs,
@@ -539,15 +545,18 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     if (failed === siteFiles.length) return { kind: "unreachable", failed, finishedAt: now() };
 
     // SELECT PAGES (step 3) and FETCH TWICE (step 4).
-    const selection = selectPages({
-      scope,
-      rootUrl,
-      cap: pageCap,
-      sitemap: sitemapResult.urls,
-      ownedCitationUrls: evidence.citations,
-      openTaskUrls: evidence.tasks,
-      targetUrls: payload.targetUrls ?? [],
-    });
+    // A site-files-only audit (owner decision 47) selects nothing: the sitemap was READ for its facts, but no page is fetched, rendered or judged.
+    const selection = prepared.siteFilesOnly
+      ? { urls: [] as string[], overCap: 0, skipped: [] as { url: string; reason: string }[] }
+      : selectPages({
+          scope,
+          rootUrl,
+          cap: pageCap,
+          sitemap: sitemapResult.urls,
+          ownedCitationUrls: evidence.citations,
+          openTaskUrls: evidence.tasks,
+          targetUrls: payload.targetUrls ?? [],
+        });
 
     // THE WALL-CLOCK BUDGET, UP FRONT. Each page costs two requests (plain and rendered; one with no renderer installed) at the interval now in force, which a
     // declared Crawl-delay has already stretched. Shrink the list to what fits, and record what was not attempted.

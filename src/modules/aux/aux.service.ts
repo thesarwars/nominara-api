@@ -24,7 +24,7 @@ import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoun
 import { PG_POOL } from "../../db/pg-pool.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../lib/aux/audit-constants.js";
 import { AUX_AUDIT_BASE_CREDITS, AUX_AUDIT_BASE_PAGES, AUX_AUDIT_EXTRA_PAGE_CREDITS, auxAuditPrice, auxAuditPricing } from "../../lib/aux/audit-price.js";
-import { manualAuditIdentity } from "../../lib/aux/manual-audit-id.js";
+import { IDEMPOTENCY_REPLAY_WINDOW_HOURS, manualAuditIdentity } from "../../lib/aux/manual-audit-id.js";
 import { AUX_AUDITS_ENTITLEMENT, auxAuditsIncluded, crawlAuditIdempotencyKey } from "../../lib/aux/onboarding-audit.js";
 import { pageCapForPlan } from "../../lib/aux/page-selection.js";
 import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
@@ -367,15 +367,24 @@ export class AuxService {
     return tracer.startActiveSpan("aux.audit.trigger", async (span) => {
       try {
         await this.assertProjectVisible(projectId);
-        const { auditId, ledgerKey } = manualAuditIdentity(workspaceId, clientKey);
-        // Serialise attempts that share an identity: the second waits for the first to commit, then finds its audit below.
-        await acquireAdvisoryXactLock(tx, [AUX_AUDIT_REFERENCE, auditId].join(":"));
-        const replay = await this.replayOf(tx, auditId, clientKey, projectId, body);
-        if (replay !== null) {
-          incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "replayed" });
-          span.setAttribute("nominara.aux.replayed", true);
-          return replay;
+        // Serialise attempts that share a client key (every generation of it): the second waits for the first to commit, then finds its audit below.
+        await acquireAdvisoryXactLock(tx, [AUX_AUDIT_REFERENCE, manualAuditIdentity(workspaceId, clientKey).auditId].join(":"));
+        // OWNER DECISION 48: walk the key's generations. One whose audit is inside the 24-hour window is REPLAYED; one past it is skipped (the key has outlived
+        // it); the first with no audit is where a new one is made. Each skipped generation is a full window old, so the walk is as long as the key's age in days.
+        let generation = 0;
+        let identity = manualAuditIdentity(workspaceId, clientKey, generation);
+        for (;;) {
+          const replay = await this.replayOf(tx, identity.auditId, clientKey, projectId, body);
+          if (replay === null) break;
+          if (replay !== "expired") {
+            incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "replayed" });
+            span.setAttribute("nominara.aux.replayed", true);
+            return replay;
+          }
+          generation += 1;
+          identity = manualAuditIdentity(workspaceId, clientKey, generation);
         }
+        const { auditId, ledgerKey } = identity;
 
         const quote = await this.quoteFor(tx, workspaceId, projectId, body);
         const shown = requireConfirmedCredits(confirmed);
@@ -485,20 +494,23 @@ export class AuxService {
 
   /**
    * The answer to a request whose identity already has an audit: the audit that was made, with the figure the ledger actually took. `null` when there is none
-   * (a first attempt). The same identity asked for something else (another project, scope or URL list) is a conflict, never a quiet return of the wrong audit.
+   * (a first attempt), and `"expired"` when there is one but it was requested more than 24 hours ago (owner decision 48): the key has outlived its window, so
+   * the caller moves to the key's next generation. Inside the window, the same identity asked for something else (another project, scope or URL list) is a conflict, never a quiet return of the wrong audit.
    */
-  private async replayOf(tx: ClientBase, auditId: string, clientKey: string, projectId: string, body: TriggerAuxAuditRequest): Promise<TriggerAuxAuditResponse | null> {
+  private async replayOf(tx: ClientBase, auditId: string, clientKey: string, projectId: string, body: TriggerAuxAuditRequest): Promise<TriggerAuxAuditResponse | "expired" | null> {
     // The request is compared with request_hash, written once at insert: scope and target_urls are REWRITTEN by crawl.audit (verification decides the scope; the
     // crawled pages replace the hints), so they cannot say what was asked. The status and the refunds are read live: a replay reports where the audit has got to.
-    const found = await tx.query<{ request_hash: string | null; scope: NonNullable<TriggerAuxAuditRequest["scope"]>; status: TriggerAuxAuditResponse["status"]; created_at: Date; charged: string | null; refunded: string }>(
-      `SELECT a.request_hash, a.scope, a.status, a.created_at,
+    const found = await tx.query<{ request_hash: string | null; scope: NonNullable<TriggerAuxAuditRequest["scope"]>; status: TriggerAuxAuditResponse["status"]; created_at: Date; expired: boolean; charged: string | null; refunded: string }>(
+      `SELECT a.request_hash, a.scope, a.status, a.created_at, (a.created_at <= now() - make_interval(hours => $3)) AS expired,
               (SELECT l.credits::text FROM credit_ledger l WHERE l.entry_type = 'commit' AND l.reference_type = $2 AND l.reference_id = a.id ORDER BY l.seq DESC LIMIT 1) AS charged,
               (SELECT COALESCE(SUM(l.credits), 0)::text FROM credit_ledger l WHERE l.entry_type = 'refund' AND l.reference_type = $2 AND l.reference_id = a.id) AS refunded
          FROM aux_audits a WHERE a.id = $1`,
-      [auditId, AUX_AUDIT_REFERENCE],
+      [auditId, AUX_AUDIT_REFERENCE, IDEMPOTENCY_REPLAY_WINDOW_HOURS],
     );
     const row = found.rows[0];
     if (row === undefined) return null;
+    // Past the window the key means nothing for this audit: not a replay and not a conflict (a different body is a new request, as on every paid action).
+    if (row.expired) return "expired";
     if (row.request_hash !== requestHashOf(projectId, body)) {
       throw new IdempotencyConflictError({
         message: "this Idempotency-Key was already used for a different AUX audit request",
