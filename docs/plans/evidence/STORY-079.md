@@ -68,3 +68,13 @@ New tests: unit `visibility-scan.spec.ts` (sentiment band, Gemini recorded paylo
 shipped defaults - its own file, because the main spec installs a widened document and the guard memoises its config for 15 s).
 Red runs: `s079-r1-red-unit.log` (11 failing), `s079-r1-red-int.log` (4 failing on the pre-fix source; the same-key concurrency and the rate-limit test passed on the old code - they pin behaviour that already held).
 Not done, raised for the owner (see docs-carry 9, 10, 12, 14): a DB-level idempotency key, the reconnect-at-daily-cap case, the scoring constants, the streaming audit exemption.
+
+Also found by the new concurrency test (it hung on the pre-fix source, `s079-r1-red-int.log`): **pool starvation.** `start` resolved entitlements, and `ToolsService.startRun` resolved them again, each
+opening a second pooled connection while the request's transaction held the first; 19 simultaneous scans needed 2x19 connections from a pool of 20 and every request waited forever. Entitlements are now
+resolved before a connection is taken and passed to `startRun` (`StartToolRunInput.entitlements`); the worker reads the shared-cache flag from the signed payload instead of resolving it.
+Also found: the integration spec's worker held its OWN Valkey connection while the app (under the test runner) uses a per-process in-memory cache, so per-engine events never reached the stream and the
+stream was only ever fed by the final snapshot; the spec now shares one cache between app and worker, which is what makes the mid-run reconnect test meaningful.
+
+Final gates on head after this round (logs `plans-7day/logs/s079-r1-*.log`): lint EXIT=0, typecheck EXIT=0, contracts:check EXIT=0, test:unit 6364 passed (one unrelated 5 s timeout in
+`contracts-worked-example` under load, rerun alone EXIT=0), visibility-scan + rate-limit + tool-runs-core + queue-interactive-pool integration 78/78, test:isolation 55/55, imagebuild EXIT=0, full
+test:integration 4719 passed / 1 failed: `seed-demo.spec.ts` (date-dependent default-partition constraint in `src/workers/rollup/maintenance.ts`; fixed by b9a0c265 on `fix/partition-default-rows`, not on main; no file in this diff touches it).
