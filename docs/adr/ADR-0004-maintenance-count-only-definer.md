@@ -75,13 +75,28 @@ following ADR-0002.
   `pg_class.relpartbound` and apply each partition's range as a predicate on `captured_at` through the parent; the DEFAULT
   partition is "outside every sibling's range", which is its partition constraint. An unreadable bound raises. Partition pruning
   keeps each per-partition count to its own partition. The default-partition count scans the parent once per fact table at each
-  run (the orphan scan already does that nightly); it is bounded by the caller's transaction-local `statement_timeout`.
+  run (the orphan scan already does that nightly). Two bounds, neither of them a function-level `SET statement_timeout`, which would
+  bound nothing: the timer is armed when the top-level statement starts, and a `SET` on a function applies after that. The bound is on
+  the CALL: `detectDefaultPartitionRows` runs the count in its own short transaction under `SET LOCAL statement_timeout`
+  (`DEFAULT_PARTITION_COUNT_TIMEOUT_MS`, 60 s; MD-12 shows a blocked count failing with `57014` and the setting not leaking). And the
+  scan is shown to read only the `*_default` partitions (MD-11, via `pg_stat_xact_user_tables`), not every month.
 - Seven more policies exist on tenant tables, all for one NOLOGIN role that nobody can assume. Any further definer-owner needs its
   own ADR; this one does not generalise.
 - The migration identity must be a SUPERUSER, as for `0005` and `0112` (`ALTER FUNCTION ... OWNER TO` and `ALTER ROLE ... NOSUPERUSER`
   need it). A failed apply aborts and fails closed.
-- `EXECUTE` is granted to the role name `nominara_owner`. A production maintenance login must be a member of it with `INHERIT`
-  (or be that role); this is the part of README G-4 that remains an operator decision.
+- `EXECUTE` is granted to the role name `nominara_owner`. **Go-live item G-4:** the production maintenance login must be a member of
+  `nominara_owner` `WITH INHERIT TRUE` (PG16+ decides INHERIT per grant), or the code must `SET ROLE nominara_owner` first. Until
+  that is settled the nightly checks fail closed (`check="definer_function"`), they never read a false 0. README G-4 remains an
+  operator decision.
+- **The down revokes `USAGE ON SCHEMA app` from `nominara_owner` only if the up granted it.** The owner already holds it in production
+  and `createPartition` calls `app.apply_tenant_rls()` through it; a blanket revoke would break partition creation. The up grants only
+  when the owner lacks USAGE and leaves a marker in the comment of `app.maintenance_default_partition_rows()`; the down reads that
+  marker before it drops the function (MD-9b; `db:roundtrip-check` covers the case where the up did grant).
+- **The function ACL is asserted directly** (ISO-27, MD-5: `aclexplode(proacl)` is exactly the function owner and `nominara_owner`, no
+  PUBLIC grantee), not through a role-name filter. `TimeZone` and `DateStyle` are pinned on the functions, because the partition
+  bounds are read back through `pg_get_expr`, whose text depends on both.
+- **The definer-owner role holds no role** (ISO-28, the converse of ISO-24), and the migration strips any membership it finds on
+  re-run (MD-10), because PG16 decides INHERIT per grant and the `NOINHERIT` attribute alone does not cover it.
 - A vector-recall result below `VECTOR_RECALL_THRESHOLD` raises an alert only. The `REINDEX CONCURRENTLY` stays operator-run
   (`pnpm db:maintenance:run`); the nightly tick never rebuilds (owner decision 58(b)).
 - `DATABASE_ROLES` does not list the role (the roles spec migrates 0001-0005 only); `DEFINER_OWNER_ROLES` does, and `ISO-24` /

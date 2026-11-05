@@ -2,6 +2,15 @@
 -- left in place, as 0005's and 0112's downs do for cluster-scoped roles: CREATE ROLE is shared across databases, and an unprivileged
 -- NOLOGIN role with no grants and no objects is inert.
 -- @contract-phase
+-- USAGE on schema app for nominara_owner is revoked ONLY IF the up granted it (its marker is in the comment of the first function, so this
+-- runs before that function is dropped). nominara_owner already holds USAGE in production and createPartition's call to
+-- app.apply_tenant_rls() depends on it; a blanket revoke would break partition creation.
+DO $$
+BEGIN
+  IF coalesce(position('[0160 granted USAGE on schema app to nominara_owner]' in obj_description(to_regprocedure('app.maintenance_default_partition_rows()'), 'pg_proc')) > 0, false) THEN
+    REVOKE USAGE ON SCHEMA app FROM nominara_owner;
+  END IF;
+END $$;
 DROP FUNCTION IF EXISTS app.maintenance_recall_overlap(text, halfvec, integer);
 DROP FUNCTION IF EXISTS app.maintenance_orphan_counts();
 DROP FUNCTION IF EXISTS app.maintenance_default_partition_rows();
@@ -20,4 +29,3 @@ REVOKE SELECT (id, centroid)                         ON topic_clusters  FROM nom
 REVOKE SELECT (id, embedding)                        ON content_chunks  FROM nominara_maintenance;
 REVOKE SELECT (id, embedding)                        ON corpus_passages FROM nominara_maintenance;
 REVOKE USAGE ON SCHEMA public FROM nominara_maintenance;
-REVOKE USAGE ON SCHEMA app FROM nominara_owner;

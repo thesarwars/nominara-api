@@ -651,7 +651,7 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     await expect(runOrphanScan(client)).rejects.toThrow(/orphan fact row/);
   });
 
-  it("privilege proof (qa-reviewer blocking #4) · nominara_worker sees ZERO rows from scanForOrphans's cross-tenant query where the privileged connection sees the real orphan — proving why this discovery function needs privileged access, not asserting it", async () => {
+  it("privilege proof (qa-reviewer blocking #4) · nominara_worker reads ZERO rows directly where the privileged connection's scanForOrphans sees the real orphan, and scanForOrphans itself is REFUSED (42501) for the worker", async () => {
     const workspaceId = await createWorkspace();
     const projectId = await createProject(workspaceId);
     await insertMentionFactOrphan(workspaceId, projectId, new Date());

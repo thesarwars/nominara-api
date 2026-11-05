@@ -337,10 +337,28 @@ export async function assertMaintenanceDefinerAvailable(client: ClientBase): Pro
   }
 }
 
-export async function detectDefaultPartitionRows(client: ClientBase): Promise<DefaultPartitionAlert[]> {
-  const result = await client.query<{ parent_table: PartitionedFactTable; default_partition: string; row_count: string }>(
-    "SELECT parent_table, default_partition, row_count::text AS row_count FROM app.maintenance_default_partition_rows()",
-  );
+/** Upper bound on the default-partition count. It runs in autocommit on the maintenance connection, so nothing else would stop it. */
+export const DEFAULT_PARTITION_COUNT_TIMEOUT_MS = 60_000;
+
+export async function detectDefaultPartitionRows(
+  client: ClientBase,
+  timeoutMs: number = DEFAULT_PARTITION_COUNT_TIMEOUT_MS,
+): Promise<DefaultPartitionAlert[]> {
+  // ⚠ The bound is set HERE, on the call, in its own short transaction: a statement_timeout in the function's own SET clause is not
+  // re-armed for the statement already running, so it would bound nothing (ADR-0004). SET LOCAL ends with the transaction.
+  // The callers are autocommit (runMonthlyMaintenance holds a session advisory lock, not a transaction).
+  let result: { rows: { parent_table: PartitionedFactTable; default_partition: string; row_count: string }[] };
+  await client.query("BEGIN");
+  try {
+    await client.query(`SET LOCAL statement_timeout = '${String(Math.trunc(timeoutMs))}ms'`);
+    result = await client.query<{ parent_table: PartitionedFactTable; default_partition: string; row_count: string }>(
+      "SELECT parent_table, default_partition, row_count::text AS row_count FROM app.maintenance_default_partition_rows()",
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
   const alerts: DefaultPartitionAlert[] = [];
   for (const table of PARTITIONED_FACT_TABLES) {
     const row = result.rows.find((r) => r.parent_table === table);

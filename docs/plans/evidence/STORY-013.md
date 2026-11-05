@@ -84,6 +84,17 @@ Spans: `maintenance.integrity` with outcome and finding-count attributes; not as
   The retention-cascade "privilege proof" now asserts the worker is refused (42501) and reads 0 directly.
 * Evidence: red `013r2-red-unit.log`, `013r2-red-int.log`; green `013r2-*.log`.
 
+## Review round 3 — dangerous-area audit of round 2
+
+* 0160 down revokes `USAGE ON SCHEMA app` from `nominara_owner` only if the up granted it (marker in a function comment); a blanket revoke would break `createPartition`'s `app.apply_tenant_rls()`. MD-9b holds it, `db:roundtrip-check` covers the granted case.
+* ISO-27 and MD-5 assert the function ACL via `aclexplode(proacl)` (owner + `nominara_owner`, no PUBLIC); the ISO-27 breaker grants EXECUTE to a
+  role without the `nominara_` prefix. New ISO-28 (a definer-owner role is a member of no role) with its own breaker; 0160 strips memberships on re-run (MD-10).
+* The runway is shown to be extended when the count fails (partition-handler spec). MD-9 rolls back through 0160 by name, not "the last migration".
+* The default-partition count runs under a call-side `SET LOCAL statement_timeout` (MD-12) and is shown to scan only `*_default` (MD-11); ADR-0004 corrected.
+* `TimeZone` / `DateStyle` pinned on the functions; MD-2 filters `proallargtypes` by output mode; the retention-cascade "privilege proof" title matches its assertion.
+* **Go-live item G-4:** the production maintenance login needs `nominara_owner` `WITH INHERIT TRUE` (PG16 per-grant INHERIT), or the code needs a `SET ROLE nominara_owner`.
+  Until then the checks fail closed with `check="definer_function"`.
+
 ### Doc changes needed (docs repo; not edited here)
 
 * security-and-tenancy.md section 2: add `nominara_maintenance` (NOLOGIN, NOBYPASSRLS, definer-owner) next to `nominara_share_lookup`; section 3: seven

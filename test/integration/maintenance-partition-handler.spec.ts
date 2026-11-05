@@ -337,6 +337,22 @@ describe("STORY-142 · maintenance.partition handler", () => {
     expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "definer_function")).toBe(true);
   }, 60_000);
 
+  it("STORY-013 r3 · the runway is extended EVEN WHEN the default-partition count fails, and the job then rejects with check=definer_function", async () => {
+    const inWindow = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + PARTITION_LEAD_MONTHS, 15));
+    const suffix = `${String(inWindow.getUTCFullYear())}_${String(inWindow.getUTCMonth() + 1).padStart(2, "0")}`;
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    await db.query(`DROP TABLE IF EXISTS answer_captures_${suffix}`);
+    await db.query("ALTER FUNCTION app.maintenance_default_partition_rows() RENAME TO maintenance_default_partition_rows_off");
+    counters.length = 0;
+    try {
+      await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).rejects.toThrow(/definer/);
+      expect((await monthsFor("answer_captures")).some((n) => n.endsWith(suffix)), "the runway was not extended").toBe(true);
+      expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "definer_function")).toBe(true);
+    } finally {
+      await db.query("ALTER FUNCTION app.maintenance_default_partition_rows_off() RENAME TO maintenance_default_partition_rows");
+    }
+  }, 60_000);
+
   it("STORY-013 · partition DDL behind a long reader of the parent FAILS FAST (lock_timeout) instead of queueing writers behind it", async () => {
     const inWindow = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + PARTITION_LEAD_MONTHS, 15));
     const suffix = `${String(inWindow.getUTCFullYear())}_${String(inWindow.getUTCMonth() + 1).padStart(2, "0")}`;

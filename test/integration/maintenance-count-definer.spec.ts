@@ -146,7 +146,7 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
   it("MD-2 · the functions return COUNTS ONLY: every output column is text/bigint/integer, and no function takes a predicate or an arbitrary relation", async () => {
     const r = await admin.query<{ proname: string; args: string; outs: string[] | null; outtypes: string[] | null; rettype: string }>(
       `SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, p.proargnames::text[] AS outs,
-              (SELECT array_agg(format_type(t, NULL) ORDER BY ord) FROM unnest(p.proallargtypes) WITH ORDINALITY AS u(t, ord)) AS outtypes,
+              (SELECT array_agg(format_type(t, NULL) ORDER BY ord) FROM unnest(p.proallargtypes, p.proargmodes) WITH ORDINALITY AS u(t, m, ord) WHERE m IN ('t', 'o')) AS outtypes,
               format_type(p.prorettype, NULL) AS rettype
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'app' AND p.proname LIKE 'maintenance\\_%' ORDER BY p.proname`,
@@ -224,9 +224,13 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     expect(Object.values(role.rows[0]!)).toEqual([false, false, false, false, false, false, false]);
     const members = await admin.query("SELECT 1 FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid WHERE r.rolname = $1", [OWNER]);
     expect(members.rowCount).toBe(0);
-    const fns = await admin.query<{ proname: string; owner: string; secdef: boolean; config: string[] | null; holders: string[] | null }>(
+    // And it is a member of NO role (it must not inherit anything), including the PG16 per-grant INHERIT case.
+    const memberOf = await admin.query("SELECT 1 FROM pg_auth_members am JOIN pg_roles m ON m.oid = am.member WHERE m.rolname = $1", [OWNER]);
+    expect(memberOf.rowCount).toBe(0);
+    const fns = await admin.query<{ proname: string; owner: string; secdef: boolean; config: string[] | null; grantees: string[] }>(
       `SELECT p.proname, o.rolname::text AS owner, p.prosecdef AS secdef, p.proconfig AS config,
-              (SELECT array_agg(x.rolname::text ORDER BY x.rolname) FROM pg_roles x WHERE has_function_privilege(x.oid, p.oid, 'EXECUTE') AND x.rolname LIKE 'nominara\\_%' AND NOT x.rolsuper AND x.oid <> p.proowner) AS holders
+              coalesce((SELECT array_agg(DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END ORDER BY CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END)
+                          FROM aclexplode(p.proacl) a WHERE a.privilege_type = 'EXECUTE'), ARRAY['PUBLIC (null acl)']) AS grantees
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles o ON o.oid = p.proowner
         WHERE n.nspname = 'app' AND p.proname LIKE 'maintenance\\_%'`,
     );
@@ -235,7 +239,26 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
       expect(f.owner).toBe(OWNER);
       expect(f.secdef).toBe(true);
       expect(f.config).toContain("search_path=pg_catalog, pg_temp");
-      expect(f.holders).toEqual(["nominara_owner"]);
+      expect(f.config).toContain("TimeZone=UTC");
+      expect(f.config).toContain("DateStyle=ISO, MDY");
+      // The ACL itself, not a filtered view of roles: exactly the owner and nominara_owner, and nobody (PUBLIC = grantee 0) else.
+      expect(new Set(f.grantees), f.proname).toEqual(new Set(["nominara_maintenance", "nominara_owner"]));
+      expect(f.grantees.length, f.proname).toBe(2);
+    }
+    // The same query sees a grant to PUBLIC and to a role without the nominara_ prefix.
+    await admin.query("CREATE ROLE md5_plain_reader NOLOGIN");
+    try {
+      await admin.query("GRANT USAGE ON SCHEMA app TO md5_plain_reader");
+      await admin.query("GRANT EXECUTE ON FUNCTION app.maintenance_orphan_counts() TO md5_plain_reader, PUBLIC");
+      const dirty = await admin.query<{ grantees: string[] }>(
+        `SELECT array_agg(DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END ORDER BY CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END) AS grantees
+           FROM pg_proc p, aclexplode(p.proacl) a WHERE p.oid = 'app.maintenance_orphan_counts()'::regprocedure`,
+      );
+      expect(new Set(dirty.rows[0]!.grantees)).toEqual(new Set(["PUBLIC", "md5_plain_reader", "nominara_maintenance", "nominara_owner"]));
+    } finally {
+      await admin.query("REVOKE EXECUTE ON FUNCTION app.maintenance_orphan_counts() FROM md5_plain_reader, PUBLIC");
+      await admin.query("REVOKE USAGE ON SCHEMA app FROM md5_plain_reader");
+      await admin.query("DROP ROLE md5_plain_reader");
     }
   });
 
@@ -271,8 +294,62 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     }
   }, 60_000);
 
+  it("MD-11 · the default-partition count scans ONLY the *_default partitions (no monthly partition is read)", async () => {
+    await admin.query("BEGIN");
+    try {
+      const scans = async (): Promise<Map<string, number>> => {
+        const r = await admin.query<{ relname: string; n: string }>(
+          `SELECT c.relname::text AS relname, (coalesce(x.seq_scan, 0) + coalesce(x.idx_scan, 0))::text AS n
+             FROM pg_class c LEFT JOIN pg_stat_xact_user_tables x ON x.relid = c.oid
+            WHERE c.relkind = 'r' AND c.relname ~ '^(answer_captures|mention_facts|citation_facts)_'`,
+        );
+        return new Map(r.rows.map((row) => [row.relname, Number(row.n)]));
+      };
+      const before = await scans();
+      await admin.query("SELECT * FROM app.maintenance_default_partition_rows()");
+      const after = await scans();
+      const touched = [...after].filter(([name, n]) => n > (before.get(name) ?? 0)).map(([name]) => name).sort();
+      expect(touched).toEqual(["answer_captures_default", "citation_facts_default", "mention_facts_default"]);
+    } finally {
+      await admin.query("ROLLBACK");
+    }
+  }, 60_000);
+
+  it("MD-12 · the default-partition count runs under a transaction-local statement_timeout: a blocked count fails with 57014 and nothing leaks into the session", async () => {
+    const blocker = new Client({ connectionString: container.getConnectionUri() });
+    await blocker.connect();
+    const client = await connectAs(PROD_LIKE, "pl");
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query("LOCK TABLE answer_captures_default IN ACCESS EXCLUSIVE MODE");
+      const started = Date.now();
+      await expect(detectDefaultPartitionRows(client, 400)).rejects.toMatchObject({ code: "57014" });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      // The failed transaction was rolled back and the timeout was LOCAL: the session is usable and unbounded again.
+      const after = await client.query<{ t: string }>("SELECT current_setting('statement_timeout') AS t");
+      expect(after.rows[0]!.t).toBe("0");
+    } finally {
+      await blocker.query("ROLLBACK");
+      await blocker.end();
+      await client.end();
+    }
+  }, 60_000);
+
+  // Roll back until 0160 itself is rolled back, so the case survives a later migration merging after it.
+  async function rollbackThrough0160(): Promise<string[]> {
+    const undone: string[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      const name = await rollbackLast(admin, MIGRATIONS_DIR);
+      if (name === null) throw new Error("0160 was never rolled back");
+      undone.push(name);
+      if (name.startsWith("0160_")) return undone;
+    }
+    throw new Error("0160 was not reached");
+  }
+
   it("MD-9 · 0160 rolls back cleanly (functions, policies and grants gone, rows untouched) and re-applies", async () => {
-    await rollbackLast(admin, MIGRATIONS_DIR);
+    const undone = await rollbackThrough0160();
+    expect(undone[undone.length - 1]).toMatch(/^0160_/);
     const gone = await admin.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'app' AND p.proname LIKE 'maintenance\\_%'");
     expect(gone.rowCount).toBe(0);
     const pol = await admin.query("SELECT 1 FROM pg_policies WHERE $1 = ANY(roles)", [OWNER]);
@@ -281,4 +358,26 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     const back = await admin.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'app' AND p.proname LIKE 'maintenance\\_%'");
     expect(back.rowCount).toBe(3);
   }, 120_000);
+
+  it("MD-9b · rolling 0160 back leaves nominara_owner's USAGE on schema app exactly as it was (createPartition calls app.apply_tenant_rls)", async () => {
+    const usage = async (): Promise<boolean> =>
+      (await admin.query<{ x: boolean }>("SELECT has_schema_privilege('nominara_owner', 'app', 'USAGE') AS x")).rows[0]!.x;
+    await rollbackThrough0160();
+    // The owner already holds USAGE in production, before 0160 ever runs.
+    await admin.query("GRANT USAGE ON SCHEMA app TO nominara_owner");
+    expect(await usage()).toBe(true);
+    await migrateUp(admin, MIGRATIONS_DIR);
+    expect(await usage()).toBe(true);
+    await rollbackThrough0160();
+    expect(await usage(), "the down must not revoke a USAGE it did not own").toBe(true);
+    await migrateUp(admin, MIGRATIONS_DIR);
+  }, 180_000);
+
+  it("MD-10 · re-running 0160 strips every role the maintenance owner is a member of", async () => {
+    await rollbackThrough0160();
+    await admin.query("GRANT nominara_worker TO nominara_maintenance");
+    await migrateUp(admin, MIGRATIONS_DIR);
+    const memberOf = await admin.query("SELECT 1 FROM pg_auth_members am JOIN pg_roles m ON m.oid = am.member WHERE m.rolname = $1", [OWNER]);
+    expect(memberOf.rowCount).toBe(0);
+  }, 180_000);
 });

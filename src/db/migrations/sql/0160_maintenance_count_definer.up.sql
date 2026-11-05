@@ -11,7 +11,8 @@
 --   * ONE FOR SELECT policy per table it reads, TO nominara_maintenance only, USING (true). The functions read the PARENT tables, so
 --     no per-partition policy is needed as months are added. Declared to rls-check via computeDefinerOwnerPolicies.
 --   * app.maintenance_default_partition_rows(), app.maintenance_orphan_counts(), app.maintenance_recall_overlap(text, halfvec, int):
---     every output column is text (a table or partition NAME), bigint or integer. SET search_path = pg_catalog, pg_temp.
+--     every output column is text (a table or partition NAME), bigint or integer. SET search_path = pg_catalog, pg_temp, and TimeZone / DateStyle
+--     pinned (the partition bounds are read back from pg_get_expr, whose text depends on both).
 --     EXECUTE revoked from PUBLIC and granted to nominara_owner only: the maintenance connection, never a runtime role.
 --
 -- OPERATOR NOTE: as 0005 / 0112, the migration identity must be a SUPERUSER (ALTER ROLE ... NOSUPERUSER and ALTER FUNCTION ... OWNER
@@ -25,6 +26,24 @@ END $$;
 -- Converging, as 0005 / 0112: re-state every attribute so a pre-existing role (e.g. one hand-given BYPASSRLS) cannot keep it.
 ALTER ROLE nominara_maintenance NOLOGIN NOINHERIT CONNECTION LIMIT -1
   NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+
+-- A role that is a MEMBER of another role could inherit its rights (PG16+ decides INHERIT per grant, so the NOINHERIT attribute above is not
+-- enough on its own). On a re-run, strip every membership it holds, whoever granted it (ISO-28 holds the same property).
+DO $$
+DECLARE
+  g record;
+BEGIN
+  FOR g IN
+    SELECT r.rolname::text AS role_name, gr.rolname::text AS grantor_name
+      FROM pg_auth_members am
+      JOIN pg_roles m ON m.oid = am.member
+      JOIN pg_roles r ON r.oid = am.roleid
+      JOIN pg_roles gr ON gr.oid = am.grantor
+     WHERE m.rolname = 'nominara_maintenance'
+  LOOP
+    EXECUTE format('REVOKE %I FROM nominara_maintenance GRANTED BY %I', g.role_name, g.grantor_name);
+  END LOOP;
+END $$;
 
 GRANT USAGE ON SCHEMA public TO nominara_maintenance;
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM nominara_maintenance;
@@ -61,6 +80,8 @@ LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET TimeZone = 'UTC'
+SET DateStyle = 'ISO, MDY'
 AS $$
 DECLARE
   v_parent     text;
@@ -106,6 +127,8 @@ LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET TimeZone = 'UTC'
+SET DateStyle = 'ISO, MDY'
 AS $$
 DECLARE
   v_parent     text;
@@ -167,6 +190,8 @@ LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET TimeZone = 'UTC'
+SET DateStyle = 'ISO, MDY'
 AS $$
 DECLARE
   v_col      text;
@@ -227,13 +252,27 @@ REVOKE ALL ON FUNCTION app.maintenance_default_partition_rows() FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.maintenance_orphan_counts() FROM PUBLIC;
 REVOKE ALL ON FUNCTION app.maintenance_recall_overlap(text, halfvec, integer) FROM PUBLIC;
 -- nominara_owner owns schema app in production; elsewhere (a superuser-owned schema) it needs USAGE to resolve app.maintenance_*.
-GRANT USAGE ON SCHEMA app TO nominara_owner;
+-- The grant is made ONLY IF the owner does not already hold USAGE, and when 0160 made it, it leaves a marker in the comment of
+-- app.maintenance_default_partition_rows(); the down revokes USAGE only if that marker is there. Revoking a USAGE that was already held
+-- (production) would break createPartition's call to app.apply_tenant_rls(). A re-run keeps the marker (owner holds USAGE because of us).
+DO $$
+DECLARE
+  v_marker constant text := ' [0160 granted USAGE on schema app to nominara_owner]';
+  v_prev    text := obj_description(to_regprocedure('app.maintenance_default_partition_rows()'), 'pg_proc');
+  v_added   boolean;
+BEGIN
+  v_added := NOT has_schema_privilege('nominara_owner', 'app', 'USAGE') OR coalesce(position(v_marker in v_prev) > 0, false);
+  IF v_added AND NOT has_schema_privilege('nominara_owner', 'app', 'USAGE') THEN
+    GRANT USAGE ON SCHEMA app TO nominara_owner;
+  END IF;
+  EXECUTE format('COMMENT ON FUNCTION app.maintenance_default_partition_rows() IS %L',
+    'Row count of each fact table''s DEFAULT partition (0 included; raises if it is missing). COUNT-ONLY SECURITY DEFINER owned by nominara_maintenance; EXECUTE for nominara_owner only. ADR-0004.'
+    || CASE WHEN v_added THEN v_marker ELSE '' END);
+END $$;
 GRANT EXECUTE ON FUNCTION app.maintenance_default_partition_rows() TO nominara_owner;
 GRANT EXECUTE ON FUNCTION app.maintenance_orphan_counts() TO nominara_owner;
 GRANT EXECUTE ON FUNCTION app.maintenance_recall_overlap(text, halfvec, integer) TO nominara_owner;
 
-COMMENT ON FUNCTION app.maintenance_default_partition_rows() IS
-  'Row count of each fact table''s DEFAULT partition (0 included; raises if it is missing). COUNT-ONLY SECURITY DEFINER owned by nominara_maintenance; EXECUTE for nominara_owner only. ADR-0004.';
 COMMENT ON FUNCTION app.maintenance_orphan_counts() IS
   'Per-partition count of mention_facts / citation_facts rows with no parent answer_captures row in the same workspace. COUNT-ONLY SECURITY DEFINER owned by nominara_maintenance; EXECUTE for nominara_owner only. ADR-0004.';
 COMMENT ON FUNCTION app.maintenance_recall_overlap(text, halfvec, integer) IS
