@@ -646,8 +646,9 @@ describe("STORY-079 · Visibility Scan", () => {
   it("round 3 - a capture cancelled by the scan's own abort is not recorded as an engine failure on the breaker; a real failure still is", async () => {
     const a = await owner("starter");
     const recorded: { key: string; code?: string }[] = [];
+    // perplexity fails on its own, BEFORE the deadline: that is the vendor's failure and the breaker must hear it. chatgpt is only cancelled by the scan's abort.
     adapters = {
-      perplexity: async () => raw(),
+      perplexity: async () => { throw new CaptureFailureError("rate_limited", "perplexity" as never); },
       chatgpt: (ctx) => new Promise<RawCapture>((_resolve, reject) => ctx.signal.addEventListener("abort", () => reject(new CaptureFailureError("timeout", "chatgpt" as never)), { once: true })),
     };
     workerDeps = {
@@ -658,6 +659,7 @@ describe("STORY-079 · Visibility Scan", () => {
     expect(res.statusCode, res.body).toBe(200);
     await Promise.allSettled(workers);
     expect(recorded.filter((r) => r.key === "chatgpt")).toEqual([]);
+    expect(recorded.filter((r) => r.key === "perplexity")).toEqual([{ key: "perplexity", code: "rate_limited" }]);
   }, 60_000);
 
   it("the job is enqueued on the dedicated interactive pool, keyed by the run", async () => {

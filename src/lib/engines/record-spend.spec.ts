@@ -46,4 +46,13 @@ describe("STORY-079 · recordEngineSpend", () => {
     await recordEngineSpend({ recordCost } as unknown as SpendMeter, { warn: vi.fn(), error: vi.fn() }, "nope", 1, "lookup");
     expect(recordCost).not.toHaveBeenCalled();
   });
+
+  it("the scheduled capture path labels its spend counters { engine_key, source: \"capture\" }", async () => {
+    const counter = vi.spyOn(metrics, "incrementCounter").mockImplementation(() => undefined);
+    await recordEngineSpend(meterReturning({ totalUsd: 1, ceilingUsd: 100, newAlerts: [], hardStopped: false }), { warn: vi.fn(), error: vi.fn() }, "gemini", 1, "capture");
+    expect(counter).toHaveBeenCalledWith("nominara_capture_cost_recorded_total", { engine_key: "gemini", source: "capture" });
+    const failing = { recordCost: async () => { throw new Error("valkey down"); } } as unknown as SpendMeter;
+    await recordEngineSpend(failing, { warn: vi.fn(), error: vi.fn() }, "gemini", 1, "capture");
+    expect(counter).toHaveBeenCalledWith("nominara_capture_cost_record_failed_total", { engine_key: "gemini", source: "capture" });
+  });
 });

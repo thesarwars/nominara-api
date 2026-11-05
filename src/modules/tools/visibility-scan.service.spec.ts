@@ -165,4 +165,29 @@ describe("STORY-079 review round 2", () => {
     await service.accept(TENANT, BODY, headers("k11"), META);
     expect(start).toHaveBeenCalledTimes(2);
   });
+
+  it("round 4 - a COMMIT not yet visible to the first probe is found by a retry: the claim is kept and the run attaches", async () => {
+    const cache = new InMemoryCacheAdapter();
+    const { service, start } = build(cache);
+    start.mockRejectedValueOnce(new Error("connection terminated during COMMIT"));
+    const probe = vi.fn().mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockResolvedValueOnce(RUN_ID);
+    (service as unknown as { committedRunFor: unknown }).committedRunFor = probe;
+    await expect(service.accept(TENANT, BODY, headers("k12"), META)).rejects.toThrow("COMMIT");
+    expect(probe).toHaveBeenCalledTimes(3);
+    const again = await service.accept(TENANT, BODY, headers("k12"), META);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(again).toMatchObject({ runId: RUN_ID, resumed: true });
+  });
+
+  it("round 4 - a probe that finds nothing on all 3 attempts releases the claim, so the retry starts a run", async () => {
+    const cache = new InMemoryCacheAdapter();
+    const { service, start } = build(cache);
+    start.mockRejectedValueOnce(new Error("connection reset"));
+    const probe = vi.fn(async () => undefined);
+    (service as unknown as { committedRunFor: unknown }).committedRunFor = probe;
+    await expect(service.accept(TENANT, BODY, headers("k13"), META)).rejects.toThrow("reset");
+    expect(probe).toHaveBeenCalledTimes(3);
+    await service.accept(TENANT, BODY, headers("k13"), META);
+    expect(start).toHaveBeenCalledTimes(2);
+  });
 });

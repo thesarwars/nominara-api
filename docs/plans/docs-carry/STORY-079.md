@@ -35,11 +35,12 @@
     daily scan whose connection drops is refused (429) on reconnect, although the reconnect charges nothing. The documented route for that case is `GET /tools/runs/{id}`
     (free). Detecting the claim before the cap guard would move logic into a guard: not done without a decision.
 11. **Shared cache.** `no_shared_cache` is honoured: a flagged workspace neither reads nor seeds the cross-tenant L1 (integration test `no_shared_cache`).
-12. **Sentiment and share constants.** The scan's headline AND per-engine sentiment labels now use the parser's `labelFor` (the row label is the band of the row's mean score, not a majority of mention labels; owner to ratify) (band 0.15, exclusive). The headline `sov_estimate` is the mean of the
+12. **Sentiment and share constants.** The scan's headline AND per-engine sentiment labels now use the parser's `labelFor` (the row label is the band of the row's mean score, not a majority of mention labels; ratified by decision 59) (band 0.15, exclusive). The headline `sov_estimate` is the mean of the
     engines' shares and the headline sentiment score is a plain mean of scored engines; scoring-models.md section 3 (pooled ratio) and section 6 (prominence weighting) do not
-    cover a single-sample estimate. The owner should ratify these two choices in scoring-models.md or direct the section 6 weighting (they are labelled estimates, and `scoring_version` is not stored for a scan).
+    cover a single-sample estimate. These choices are ratified by decision 59 (record them in scoring-models.md); they are labelled estimates, and `scoring_version` is not stored for a scan.
 13. **AC wording.** STORY-079's "report-only ... asserted by the isolation suite": the isolation suite (`test/isolation`) asserts RLS structure per table, not behaviour; the behavioural
     assertion (zero rows in the fact tables after a scan) is integration scenario 11. Reword the AC to "asserted by the integration suite". Scenario 15 (interactive latency under a scheduled
     batch) is evidenced by `test/integration/queue-interactive-pool-isolation.spec.ts` plus the enqueue-option assertion in `visibility-scan.spec.ts`; no end-to-end latency test was written.
 14. **Audit.** `@Streaming()` still exempts a route from the AuditInterceptor and the audit-coverage sweep wholesale. A per-route "self-audited" marker would be a new pattern (decorator +
     sweep rule): raised for the owner (see also the `billing-subscription.service.ts` note that streaming is a pattern decision).
+15. **Gemini ceiling overshoot (Tools path).** `isCeilingReached()` is checked before the vendor call, not atomically with it, so concurrent scans and scheduled capture can each pass just below the ceiling. The overshoot is bounded by (interactive pool concurrency x cost of one capture) in flight at the crossing. Accepted and documented: ratified by decision 59.

@@ -59,6 +59,9 @@ const SETTLE_CHECK_MS = 1_000;
 export const SCAN_STREAM_PARTIAL_MS = 55_000;
 /** api-specification.md section 1: a billable POST replays for 24 hours. A shorter claim lets a late retry of the same key start (and charge) a second scan. */
 export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+/** The ambiguous-commit probe: 3 attempts, 500 ms apart (about 1 s in all). */
+const COMMIT_PROBE_ATTEMPTS = 3;
+const COMMIT_PROBE_GAP_MS = 500;
 const CLAIM_WAIT_MS = 3_000;
 
 export interface ScanAccepted {
@@ -232,7 +235,7 @@ export class VisibilityScanService {
           // A `start` that threw releases the claim - UNLESS the failure was the COMMIT itself (the connection dropped while Postgres committed): then the run and
           // its debit exist, and releasing the claim would let a retry charge a second scan. A typed domain error (402, 412, 409, 403...) is raised BEFORE any
           // COMMIT and is a definitive refusal, so it is never probed; only an unclassified (connection / driver) error asks the database, by this exact key.
-          const committed = error instanceof DomainError ? undefined : await this.committedRunFor(tenant, keyTag(key), claimedAt);
+          const committed = error instanceof DomainError ? undefined : await this.committedRunWithRetry(tenant, keyTag(key), claimedAt);
           if (committed === undefined) {
             await this.cache.delete(claimKey).catch(() => undefined);
             throw error;
@@ -265,6 +268,16 @@ export class VisibilityScanService {
         span.end();
       }
     });
+  }
+
+  /** A COMMIT that has not become visible yet can be missed by a single probe: ask up to 3 times over about 1 s before concluding nothing was committed. */
+  private async committedRunWithRetry(tenant: TenantContext, keyTag: string, claimedAt: string): Promise<string | undefined> {
+    for (let attempt = 1; attempt <= COMMIT_PROBE_ATTEMPTS; attempt += 1) {
+      const found = await this.committedRunFor(tenant, keyTag, claimedAt);
+      if (found !== undefined) return found;
+      if (attempt < COMMIT_PROBE_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, COMMIT_PROBE_GAP_MS));
+    }
+    return undefined;
   }
 
   /** The id of the scan THIS Idempotency-Key started, or undefined (also when the database cannot be asked). Exact: the key's tag is in the run's audit row, written in the run's own transaction. */
