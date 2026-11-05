@@ -31,6 +31,8 @@ export interface ProbeRunContext {
   readonly projectId: string;
   /** `all` for a scheduled run, or the priority subset. */
   readonly scope: PromptScope;
+  /** STORY-067: the prompt cluster a `cluster` scope covers. */
+  readonly clusterId?: string;
   /** Narrows the engine set; can never widen it past the entitlement. */
   readonly engineKeys?: readonly string[];
   /** Test seam — production leaves it undefined. See PlanRunContext. */
@@ -67,10 +69,10 @@ export interface ProbedRun {
  */
 export async function resolveRunCells(
   tx: ClientBase,
-  context: Pick<ProbeRunContext, "projectId" | "scope" | "engineKeys" | "captureReadyEngineKeys">,
+  context: Pick<ProbeRunContext, "projectId" | "scope" | "clusterId" | "engineKeys" | "captureReadyEngineKeys">,
 ): Promise<{ readonly engines: readonly ResolvedEngine[]; readonly cells: readonly PlannedCell[] }> {
   const engines = await resolveEnabledEngines(tx, context.projectId, context.engineKeys, context.captureReadyEngineKeys);
-  const prompts = await selectPrompts(tx, context.projectId, context.scope);
+  const prompts = await selectPrompts(tx, context.projectId, context.scope, context.clusterId ?? null);
   return { engines, cells: fanOutCells(prompts, engines) };
 }
 

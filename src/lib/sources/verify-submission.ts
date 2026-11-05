@@ -1,4 +1,5 @@
 import { randomInt } from "node:crypto";
+import { scheduleTaskVerifications } from "../impact/verification-schedule.js";
 import { isIP } from "node:net";
 import { Logger } from "@nestjs/common";
 import { trace } from "@opentelemetry/api";
@@ -680,6 +681,9 @@ async function commitLocked(tx: ClientBase, plan: SubmissionPlan, outcome: Submi
      VALUES (app.current_workspace(), $1, 'system', 'completed', 'in_review', 'done', $2::jsonb, clock_timestamp())`,
     [plan.taskId, JSON.stringify({ submission_id: plan.submissionId })],
   );
+
+  // STORY-067 - the same two re-measurements a directly completed task gets, in this transaction.
+  await scheduleTaskVerifications(tx, { taskId: plan.taskId, milestoneId: completed.rows[0]!.id, completedAt });
 
   if (plan.sourceDomainId !== null) {
     await tx.query(`UPDATE project_source_index SET brand_present_on_domain = true, verified_at = $3 WHERE project_id = $1 AND source_domain_id = $2 AND workspace_id = app.current_workspace()`, [

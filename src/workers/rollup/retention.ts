@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { cancelTaskVerifications } from "../../lib/impact/verification-schedule.js";
 import { Logger } from "@nestjs/common";
 import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
@@ -165,6 +166,8 @@ export async function softDeleteProject(
     ]);
     await tx.query("UPDATE tracked_prompts SET status = 'paused' WHERE project_id = $1 AND status = 'active'", [projectId]);
     await tx.query("UPDATE capture_runs SET status = 'canceled' WHERE project_id = $1 AND status = 'queued'", [projectId]);
+    // STORY-067 AC10 - a deleted project is not re-measured: its pending verifications are cancelled, not orphaned.
+    await cancelTaskVerifications(tx, { projectId }, "project_deleted");
   });
 }
 

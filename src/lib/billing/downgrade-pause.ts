@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { cancelTaskVerifications } from "../impact/verification-schedule.js";
 import { MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { structuralLimitFrom } from "../entitlements/classification.js";
@@ -368,6 +369,8 @@ export async function reconcileDowngradePause(tx: ClientBase, workspaceId: strin
         WHERE id = ANY($1::uuid[]) AND status IN ('active', 'initializing') AND paused_by_downgrade_at IS NULL AND deleted_at IS NULL`,
       [plan.pauseProjects],
     );
+    // STORY-067 AC10 - a paused project's pending re-measurements are cancelled with the pause, not left to be found by the sweep.
+    for (const projectId of plan.pauseProjects) await cancelTaskVerifications(tx, { projectId }, "project_paused");
   }
   if (plan.resumeProjects.length > 0) {
     await tx.query(

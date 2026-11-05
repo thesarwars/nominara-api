@@ -466,6 +466,15 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
           { idempotencyKey: job.idempotencyKey },
         );
       },
+      // STORY-067 - a due task verification is planned by `capture.plan` (the payload names the row, nothing else).
+      enqueueVerification: async (job) => {
+        await sweepProducer.enqueueTenantJob(
+          "capture.plan",
+          job.workspaceId,
+          { projectId: job.projectId, trigger: "verification", verificationId: job.verificationId },
+          { idempotencyKey: job.idempotencyKey },
+        );
+      },
       // SCANFIX D4 - the stuck-run reaper asks for the rollup of a run it finishes.
       enqueueRollup: (queue, workspaceId, payload, idempotencyKey) =>
         sweepProducer.enqueueTenantJob(queue, workspaceId, payload, { idempotencyKey }),

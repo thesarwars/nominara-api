@@ -8,6 +8,7 @@ import { cacheKeyNamespace } from "../../cache/key-namespace.js";
 import { auxAuditsIncluded, crawlAuditIdempotencyKey, onboardingAuditId, onboardingAuditWanted, type EnqueueCrawlAudit } from "../../aux/onboarding-audit.js";
 import { releaseFairUseCapacity } from "../../capture/fair-use.js";
 import { claimDueProject, planScheduledRun, priorityVariantFor, type ScheduledRun } from "../../capture/scheduler.js";
+import { planVerificationRun } from "../../capture/verification-run.js";
 import { resolveEntitlements } from "../../entitlements/resolution.js";
 import { uuidV7 } from "../../ids/uuidv7.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
@@ -69,7 +70,7 @@ export interface CapturePlanDeps {
   readonly enqueueCrawlAudit?: EnqueueCrawlAudit;
 }
 
-type Outcome = "planned" | "skipped" | "no_capturable_engine" | "dispatch_failed";
+type Outcome = "planned" | "skipped" | "no_capturable_engine" | "dispatch_failed" | "verification_planned" | "verification_canceled" | "verification_no_capture";
 
 export function createCapturePlanHandler(context: QueueHandlerContext, deps?: CapturePlanDeps): JobProcessor {
   const logger = new Logger("capture.plan");
@@ -185,6 +186,47 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = capturePlanJobSchema.parse((job.data as { payload: unknown }).payload);
     const now = (deps?.now ?? (() => new Date()))();
+
+    if (payload.trigger === "verification") {
+      // STORY-067 - a verification run for ONE completed task. It is not a scheduled run: no project claim, no schedule advance,
+      // nothing charged. The job names a verification row and the rest is re-derived from it (verification-run.ts).
+      cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
+      const resolved = await resolveEntitlements(tx, payload.workspaceId);
+      const runId = uuidV7();
+      const periodStart = (await resolveBillingPeriod(tx, payload.workspaceId, now)).start;
+      const outcome = await planVerificationRun(
+        tx,
+        cache,
+        { verificationId: payload.verificationId, workspaceId: payload.workspaceId, runId, now },
+        {
+          periodStart,
+          normalizerVersion: NORMALIZER_VERSION,
+          captureMode: "api",
+          env: cacheKeyNamespace(),
+          sharedCacheEnabled: resolved.entitlements["no_shared_cache"]?.value !== true,
+        },
+      );
+      if (outcome.kind === "planned") {
+        record("verification_planned", payload.workspaceId, payload.projectId, runId);
+        const scheduled = outcome.scheduled;
+        afterCommit(() => {
+          void dispatch(scheduled).catch((error: unknown) => {
+            record("dispatch_failed", payload.workspaceId, payload.projectId, runId);
+            logger.error({ event: "capture.plan.dispatch_error", run_id: runId, error: error instanceof Error ? error.name : "unknown" });
+            return failUndispatchedRun(payload.workspaceId, runId, periodStart, scheduled.plan.live).catch((compensationError: unknown) => {
+              logger.error({ event: "capture.plan.compensation_error", workspace_id: payload.workspaceId, run_id: runId, error: compensationError instanceof Error ? compensationError.name : "unknown" });
+            });
+          });
+        });
+      } else if (outcome.kind === "canceled") {
+        record("verification_canceled", payload.workspaceId, payload.projectId);
+      } else if (outcome.kind === "no_capture") {
+        record("verification_no_capture", payload.workspaceId, payload.projectId);
+      } else {
+        record("skipped", payload.workspaceId, payload.projectId);
+      }
+      return;
+    }
 
     const project = await claimDueProject(tx, payload.projectId, now);
     if (project === null || project.workspaceId !== payload.workspaceId) {

@@ -440,6 +440,9 @@ export const envSchema = z
     // Which embedding provider this process runs. `auto` (default) = OPENAI_API_KEY ? OpenAI : stand-in (refusing in production). `openrouter`
     // = the free nvidia/nemotron-3.5-embed-1b:free at 1536 dimensions, DEVELOPMENT ONLY. Having an OPENROUTER_API_KEY never selects it by itself.
     EMBEDDING_PROVIDER: z.enum(["auto", "stand-in", "openrouter", "openai"]).default("auto"),
+    // STORY-067 - the two verification horizons after a task completes. UNSET = the documented defaults (+48 h, +14 d).
+    TASK_VERIFICATION_SHORT_HOURS: z.coerce.number().int().positive().optional(),
+    TASK_VERIFICATION_LONG_DAYS: z.coerce.number().int().positive().optional(),
     // Conservative pace for the OpenRouter free embedding tier (the vendor allows 20 a minute, and a daily cap on an account with no credit).
     OPENROUTER_EMBED_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
     // Owner decision 42 - the pace the capture dispatcher holds EACH of chatgpt / claude / perplexity to (a one-token bucket per engine,
