@@ -128,7 +128,7 @@ describe("STORY-032 AC7 · the re-match parse is enqueued at plan time", () => {
   async function seedL1(text: string): Promise<void> {
     await cache.set(
       captureL1Key({ env: "test", engineKey: "perplexity", adapterMajor: adapterMajorOf("1.0.0"), promptText: text, locale: "en-US", personaHint: null, ttlSeconds: TTL_SECONDS, nowMs: NOW_MS }),
-      JSON.stringify({ v: 1, contentHash: "a".repeat(64), payload: { format: "markdown", text: "HubSpot is great" }, excerpt: "HubSpot is great" }),
+      JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: { format: "markdown", text: "HubSpot is great" }, excerpt: "HubSpot is great" }),
       { ttlMs: 600_000 },
     );
   }
