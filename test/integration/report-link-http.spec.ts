@@ -65,7 +65,10 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
   }
 
   const click = (workspaceId: string, token: string) => harness.app().inject({ method: "GET", url: apiUrl(`/report-links/${workspaceId}/${token}`) });
-  const refusal = (res: { statusCode: number; json(): unknown }) => ({ status: res.statusCode, error: (res.json() as { error: { code: string; message: string } }).error });
+  const refusal = (res: { statusCode: number; json(): unknown }) => {
+    const { code, message } = (res.json() as { error: { code: string; message: string } }).error;
+    return { status: res.statusCode, code, message }; // request_id differs per request by design
+  };
 
   it("STORY-180 AC3 · a valid token is a 302 to a 15-minute presign of the stored file, with no cookie, uncached", async () => {
     const ws = await workspace();
