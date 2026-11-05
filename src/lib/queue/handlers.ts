@@ -5,6 +5,7 @@ import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-e
 import { createBillingDowngradeNoticeHandler } from "./handlers/billing-downgrade-notice.handler.js";
 import { createEmbedBatchHandler } from "./handlers/embed-batch.handler.js";
 import { createTopicClusterHandler } from "./handlers/topic-cluster.handler.js";
+import { createLookupExecuteHandler } from "./handlers/lookup-execute.handler.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
 import type { DirtyEntry } from "../rollup/dirty-dates.js";
@@ -118,6 +119,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "capture.plan": (context) => createCapturePlanHandler(context),
   "crawl.audit": (context) => createCrawlAuditHandler(context),
   "capture.execute": (context) => createCaptureExecuteHandler(context),
+  "lookup.execute": (context) => createLookupExecuteHandler(context),
   "capture.parse": (context) => createCaptureParseHandler(context),
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
   "credit.reconcile": (context) => createCreditReconcileHandler(context),

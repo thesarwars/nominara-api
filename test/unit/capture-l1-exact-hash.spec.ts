@@ -220,6 +220,35 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
     expect(parsed?.payload).toEqual({ answer: "the shared answer" });
   });
 
+  // STORY-079 AC "a cached engine result is labelled with its TRUE capture age": the envelope may carry when the answer was captured.
+  // Additive and optional: an entry written before this field existed still reads, and carries no time.
+  it("STORY-079 - an envelope may carry the answer's capture time; one written without it still reads, with none", () => {
+    const withTime = parseL1Envelope(JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", capturedAt: "2026-11-02T08:00:00.000Z" }));
+    expect(withTime?.capturedAt).toBe("2026-11-02T08:00:00.000Z");
+    expect(parseL1Envelope(envelope(HASH_A))?.capturedAt).toBeUndefined();
+    // A time that is not a time is dropped, never trusted - the entry itself stays a readable hit for the scheduled path.
+    const junk = parseL1Envelope(JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", capturedAt: "yesterday" }));
+    expect(junk).toBeDefined();
+    expect(junk?.capturedAt).toBeUndefined();
+  });
+
+  it("STORY-079 - a probe hit exposes the capture time when the entry has one, and null when it does not", async () => {
+    const { cache } = countingCache();
+    const withTime = candidate({ promptId: "p-time", promptText: "timed question" });
+    const withoutTime = candidate({ promptId: "p-none", promptText: "untimed question" });
+    for (const [c, extra] of [[withTime, { capturedAt: "2026-11-02T08:00:00.000Z" }], [withoutTime, {}]] as const) {
+      await cache.set(
+        captureL1Key({ env: CONTEXT.env, engineKey: c.engineKey, adapterMajor: adapterMajorOf(c.adapterVersion), promptText: c.promptText, locale: CONTEXT.locale, personaHint: CONTEXT.personaHint, ttlSeconds: c.ttlSeconds, nowMs: CONTEXT.nowMs }),
+        JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", ...extra }),
+        { ttlMs: 60_000 },
+      );
+    }
+    const hits = await probeExactHash(cache, CONTEXT, [withTime, withoutTime]);
+    const byPrompt = new Map([...hits.values()].map((h) => [h.promptId, h]));
+    expect(byPrompt.get("p-time")?.capturedAt).toBe("2026-11-02T08:00:00.000Z");
+    expect(byPrompt.get("p-none")?.capturedAt).toBeNull();
+  });
+
   describe("adapterMajorOf", () => {
     it("reads the major and ignores the rest", () => {
       expect(adapterMajorOf("3.1.0")).toBe(3);

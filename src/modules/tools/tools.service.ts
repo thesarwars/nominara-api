@@ -27,6 +27,7 @@ import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { toolConversionPlan } from "../../lib/tools/conversion.js";
 import { toolInputHash } from "../../lib/tools/input-hash.js";
 import { toolPresentation } from "../../lib/tools/presentation.js";
+import type { ResolvedEntitlementsResponse } from "../../lib/entitlements/resolution.js";
 import { toolSnapshotExpiresAt } from "../../lib/tools/retention-window.js";
 import { deriveToolRunOutcome } from "../../lib/tools/run-outcome.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -70,6 +71,12 @@ export interface StartToolRunInput {
   readonly resultJson?: ToolRunResult | null;
   /** The flat price, debited from the wallet now and returned in full by `finishRun` if the run captured nothing. 0 for a free tool. */
   readonly credits: number;
+  /**
+   * The workspace's entitlements, when the caller has ALREADY resolved them. `startRun` otherwise resolves them itself, which opens a second pooled connection
+   * while the caller's transaction holds the first: N concurrent starts then need 2N connections, and a burst as large as the pool deadlocks. A caller that
+   * resolved them before taking its connection passes them here.
+   */
+  readonly entitlements?: ResolvedEntitlementsResponse["entitlements"];
 }
 
 export interface StartedToolRun {
@@ -238,7 +245,7 @@ export class ToolsService {
         if (input.credits > 0 && (FREE_TOOL_KEYS as readonly string[]).includes(input.toolKey)) {
           throw new Error(`${input.toolKey} is a free tool and can never be charged`);
         }
-        const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
+        const resolved = input.entitlements !== undefined ? { entitlements: input.entitlements } : await this.entitlements.resolveForWorkspace(workspaceId);
         const id = uuidV7();
         const expiresAt = toolSnapshotExpiresAt(resolved.entitlements, new Date());
         const engineKeys = [...(input.engineKeys ?? [])];
@@ -384,6 +391,15 @@ export class ToolsService {
     const row = found.rows[0];
     if (row === undefined) throw new NotFoundError({ message: "no such tool run" });
     incrementCounter("nominara_tools_run_reopens_total", { tool_key: row.tool_key });
+    return toDetail(row);
+  }
+
+  /** A read of one run for a caller that is not a person re-opening it (the scan's stream): the same row as `get`, without counting a re-open. */
+  async peek(id: string): Promise<ToolRunDetail> {
+    const { client } = this.store();
+    const found = await client.query<RunRow>(`SELECT ${COLUMNS} FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1`, [id]);
+    const row = found.rows[0];
+    if (row === undefined) throw new NotFoundError({ message: "no such tool run" });
     return toDetail(row);
   }
 

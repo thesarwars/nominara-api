@@ -1,6 +1,10 @@
+import "reflect-metadata";
 import { Test } from "@nestjs/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
+import { RATE_LIMIT_CLASS_KEY } from "../../api/rate-limit/route-class.js";
+import { DAILY_CAP_KEY } from "../../api/decorators/daily-cap.decorator.js";
+import { STREAMING_KEY } from "../../api/decorators/streaming.decorator.js";
 import { ToolsController } from "./tools.controller.js";
 import { ToolsModule } from "./tools.module.js";
 import { ToolsService } from "./tools.service.js";
@@ -25,5 +29,22 @@ describe("STORY-022 · ToolsModule compiles", () => {
     expect(moduleRef.get(ToolsController)).toBeInstanceOf(ToolsController);
     expect(moduleRef.get(ToolsService)).toBeInstanceOf(ToolsService);
     await moduleRef.close();
+  });
+});
+
+// STORY-079 - the scan route's guard declarations (api-specification.md section 12, security-and-tenancy.md section 5). A guard that is never
+// declared never runs, and nothing fails when it does not, so the declarations are asserted on the handler itself.
+describe("STORY-079 · the scan route declares its guards", () => {
+  const handler = (name: keyof ToolsController): unknown => (ToolsController.prototype as unknown as Record<string, unknown>)[name];
+
+  it("is a capture-backed tool (5/min per user), shares the one daily counter, and streams", () => {
+    expect(Reflect.getMetadata(RATE_LIMIT_CLASS_KEY, handler("scan") as object)).toBe("capture_backed_tools");
+    expect(Reflect.getMetadata(DAILY_CAP_KEY, handler("scan") as object)).toBe("lookup");
+    expect(Reflect.getMetadata(STREAMING_KEY, handler("scan") as object)).toBe(true);
+  });
+
+  it("the free estimate is neither daily-capped nor streaming: it costs nothing and starts nothing", () => {
+    expect(Reflect.getMetadata(DAILY_CAP_KEY, handler("estimateScan") as object)).toBeUndefined();
+    expect(Reflect.getMetadata(STREAMING_KEY, handler("estimateScan") as object)).toBeUndefined();
   });
 });

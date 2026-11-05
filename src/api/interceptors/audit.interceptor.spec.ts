@@ -8,6 +8,7 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { AuditMetadataMissingError, AuditResourceIdUnresolvedError } from "../../tenancy/errors.js";
 import type { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { Audit } from "../decorators/audit.decorator.js";
+import { Streaming } from "../decorators/streaming.decorator.js";
 import { Public } from "../decorators/public.decorator.js";
 import { SkipTenantContext } from "../decorators/skip-tenant-context.decorator.js";
 import { AuditInterceptor, type AuditableRequest } from "./audit.interceptor.js";
@@ -41,6 +42,9 @@ class ProjectController {
   actionFromResponse(): void {}
 
   unannotatedMutation(): void {}
+
+  @Streaming()
+  streamingMutation(): void {}
 
   @Audit({ action: "project.read_ignored", resourceType: "project" })
   read(): void {}
@@ -222,6 +226,20 @@ describe("STORY-020 · AuditInterceptor", () => {
       AuditMetadataMissingError,
     );
     expect(handle).not.toHaveBeenCalled();
+    expect(auditChain.append).not.toHaveBeenCalled();
+  });
+
+  // STORY-079 - a streaming route holds no ambient transaction (see streaming.decorator.ts), so there is no store to append to and no response body to name
+  // a resource from. Like the three interceptors the marker already exempts, this one steps aside; the route's own service writes its audit row in the
+  // transaction it opens (visibility-scan.service.ts).
+  it("STORY-079 - a @Streaming() mutating route is not run through the interceptor: no throw, no row", async () => {
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const handle = vi.fn(() => of("streamed"));
+    const req: Partial<AuditableRequest> = { method: "POST", id: "req-1", headers: {} };
+    const result$ = interceptor.intercept(makeContext("streamingMutation", req), { handle });
+    await expect(firstValueFrom(result$)).resolves.toBe("streamed");
+    expect(handle).toHaveBeenCalledTimes(1);
     expect(auditChain.append).not.toHaveBeenCalled();
   });
 

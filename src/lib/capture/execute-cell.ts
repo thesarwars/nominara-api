@@ -502,7 +502,7 @@ function isSeedable(raw: RawCapture): boolean {
 }
 
 /** The L1 entry a later run's `probeExactHash` reads. Same envelope, same key. */
-async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw: RawCapture, now: Date): Promise<void> {
+export async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw: RawCapture, now: Date): Promise<void> {
   if (!isSeedable(raw)) return; // belt and braces: the caller already withholds the seed
   const key = captureL1Key({
     env: cacheKeyNamespace(),
@@ -521,6 +521,8 @@ async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw: RawCa
       contentHash: contentHash(raw.text).toString("hex"),
       payload: rawPayload(raw),
       excerpt: raw.text.slice(0, EXCERPT_CHARS),
+      // STORY-079 - the answer's own capture time, so a Tools scan serving it can state its true age.
+      capturedAt: now.toISOString(),
     }),
     { ttlMs: input.ttlSeconds * 1000 },
   );

@@ -74,6 +74,11 @@ export interface L1Envelope {
   readonly payload: Record<string, unknown>;
   /** The short human-readable excerpt shown in the UI. */
   readonly excerpt: string | null;
+  /**
+   * STORY-079 - WHEN THE ANSWER WAS CAPTURED (ISO), so a reader that shows the answer can label its TRUE age rather than the time it was served.
+   * Optional and additive (the envelope version is unchanged by it): an entry written before this field existed reads as before, with no time.
+   */
+  readonly capturedAt?: string;
 }
 
 export interface L1Hit {
@@ -84,6 +89,8 @@ export interface L1Hit {
   /** The answer, so the suppressed row is a row the parser can actually read. */
   readonly payload: Record<string, unknown>;
   readonly excerpt: string | null;
+  /** STORY-079 - when the shared answer was captured, or null for an entry written without a time. */
+  readonly capturedAt: string | null;
 }
 
 /**
@@ -110,7 +117,9 @@ export function parseL1Envelope(raw: string): L1Envelope | undefined {
   }
   const excerpt = candidate.excerpt;
   if (excerpt !== null && typeof excerpt !== "string") return undefined;
-  return { v: L1_ENVELOPE_VERSION, contentHash: candidate.contentHash, payload: candidate.payload, excerpt: excerpt ?? null };
+  // A time that is not a time is dropped, never trusted: the entry stays a readable hit for the scheduled path.
+  const capturedAt = typeof candidate.capturedAt === "string" && !Number.isNaN(Date.parse(candidate.capturedAt)) ? candidate.capturedAt : undefined;
+  return { v: L1_ENVELOPE_VERSION, contentHash: candidate.contentHash, payload: candidate.payload, excerpt: excerpt ?? null, ...(capturedAt !== undefined ? { capturedAt } : {}) };
 }
 
 export interface L1ProbeContext {
@@ -213,6 +222,7 @@ export async function probeExactHash(
         contentHash,
         payload: envelope.payload,
         excerpt: envelope.excerpt,
+        capturedAt: envelope.capturedAt ?? null,
       });
     }
   });

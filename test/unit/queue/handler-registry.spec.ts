@@ -74,6 +74,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "domain.reverify",
       "embed.batch",
       "identity.sweep_unverified",
+      // STORY-079 - the Visibility Scan, on the dedicated interactive pool.
+      "lookup.execute",
       "maintenance.partition",
       "notify.dispatch",
       "report.build",
@@ -91,6 +93,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "capture.plan",
       "capture.execute",
       "capture.parse",
+      // STORY-079 - declared after capture.arbitrate (inert) and before crawl.discover in topology.ts.
+      "lookup.execute",
       "crawl.discover",
       // NEW-C-9 — after crawl.fingerprint (inert), before the embed group.
       "crawl.audit",
@@ -169,9 +173,11 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   });
 
   it("a group with SOME handlers reports both halves", () => {
-    const capture = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "capture").map((entry) => entry.name);
-    expect(liveQueueNames(capture)).toEqual(["capture.plan", "capture.execute"]);
-    expect(inertQueueNames(capture).length).toBeGreaterThan(0);
+    // The capture group had one inert queue until STORY-079 gave `lookup.execute` its handler, so the property moves to the parse group, where
+    // `capture.parse` is live and `capture.arbitrate` is still inert (it has no bound model).
+    const parse = QUEUE_TOPOLOGY.filter((entry) => entry.workerGroup === "parse").map((entry) => entry.name);
+    expect(liveQueueNames(parse)).toEqual(["capture.parse"]);
+    expect(inertQueueNames(parse)).toEqual(["capture.arbitrate"]);
   });
 
   it("a factory is called once per queue at boot, not once per job", () => {
