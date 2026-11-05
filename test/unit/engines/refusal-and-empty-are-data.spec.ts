@@ -98,8 +98,11 @@ describe("STORY-027 · scenarios 3-4 · NFR-SIM-07 · a refusal and an empty ans
   // [audit r4] FORCES A DECISION. `isSeedable` (execute-cell.ts) keeps any flagged answer out of the shared L1 cache, and
   // `observedAnswerSql` (refresh-project-displacements.ts) decides which flags make a row "no observation". A new flag must be
   // classified in both, then added here.
-  it("[audit r4] captureFlagSchema holds exactly the three flags whose seeding and displacement behaviour was decided", () => {
-    expect([...captureFlagSchema.options].sort()).toEqual(["empty_answer", "engine_refused_to_answer", "no_ai_overview_for_query"]);
+  // `simulated` (owner decision 43, development-only OpenRouter slots) was classified when batch 2 combined the two branches:
+  // `isSeedable` keeps it out of the shared L1 cache (any flag does), so simulated text never reaches a real capture; it is NOT a
+  // "no observation" flag for displacement, because a simulated answer is still an answer within the development data it lives in.
+  it("[audit r4] captureFlagSchema holds exactly the four flags whose seeding and displacement behaviour was decided", () => {
+    expect([...captureFlagSchema.options].sort()).toEqual(["empty_answer", "engine_refused_to_answer", "no_ai_overview_for_query", "simulated"]);
   });
 
   it("flags on rawCaptureSchema is a string[] matching answer_captures.flags' text[] shape, and round-trips an empty array", () => {
