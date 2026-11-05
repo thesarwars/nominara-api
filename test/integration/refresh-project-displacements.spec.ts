@@ -308,6 +308,20 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(await events()).toHaveLength(0);
   });
 
+  it.each([["a BOM", "\uFEFF"], ["a space", " "], ["a no-break space", "\u00A0"]])(
+    "[audit r4 AC2] STORY-056: %s-only answer is no observation by its FLAG (the parse stamps empty_answer), and by the text for a legacy unflagged row",
+    async (_label, text) => {
+      for (const flags of [["empty_answer"], []]) {
+        await db.query("DELETE FROM answer_captures WHERE project_id = $1", [projectId]);
+        await db.query("DELETE FROM displacement_events WHERE project_id = $1", [projectId]);
+        await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+        await capture({ at: `${D2}T10:00:00Z`, present: false, text, flags });
+        await run(D2);
+        expect(await events(), JSON.stringify({ text, flags })).toHaveLength(0);
+      }
+    },
+  );
+
   it("STORY-056 · decision 57a: a WHITESPACE-only answer is an empty answer - no observation, no baseline", async () => {
     await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
     await capture({ at: `${D2}T10:00:00Z`, present: false, text: "\n  " });

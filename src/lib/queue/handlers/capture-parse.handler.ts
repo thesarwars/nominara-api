@@ -16,6 +16,7 @@ import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
 import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
+import { captureFlagSchema } from "../../engines/contract.js";
 import { decodeRawObject, type RawObjectBody } from "../../capture/raw-object.js";
 import { rawObjectStores, type BoundRawObjects, type RawObjectStores } from "../../capture/raw-object-store.js";
 import { StorageTenancyError } from "../../storage/storage-keys.js";
@@ -277,9 +278,9 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     // row only: `blocked` and `failed` returned above ("we could not ask" is not data), and a reused row whose source is gone returned
     // above too. A row with NO text at all (payload expired, no object) is not an empty answer and keeps the NULL below.
     //
-    // A REUSED row whose source answered with nothing (`kind: "empty"`) is the same observation: it parses "" and carries the source's refusal
-    // flag. A TRUNCATED empty answer (Gemini MAX_TOKENS, text "", truncated: true) is a token-budget failure, not an answer, so it is NOT an
-    // empty answer and keeps NULL (the capture stage should classify it `failed`; recorded as a follow-up).
+    // A REUSED row whose source answered with nothing (`kind: "empty"`) is the same observation: it parses "" and carries the source's own
+    // flags. A TRUNCATED empty answer (Gemini MAX_TOKENS, text "", truncated: true) is a token-budget failure, not an answer, so it is NOT
+    // an empty answer: the capture stage records it `failed` (malformed_response) and never reaches here; a legacy row that does keeps NULL.
     const emptyAnswer =
       resolved !== null
         ? resolved.kind === "empty"
@@ -309,12 +310,12 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       text: parseText,
       flags: [
         ...record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
-        // The source's refusal travels onto the reused row, so the row reads as the refusal it reuses.
-        ...(resolved?.kind === "empty" && resolved.refused && !record.flags.includes(ENGINE_REFUSED_FLAG) ? [ENGINE_REFUSED_FLAG] : []),
-        // DENORMALISED (decision 57a): the displacement detector tests the row's OWN flags, never a cross-partition read of the source
-        // (which also flips meaning once retention drops it). Added for every reused row that resolved to nothing, refused or not.
-        ...(resolved?.kind === "empty" && !record.flags.includes(EMPTY_ANSWER_FLAG) ? [EMPTY_ANSWER_FLAG] : []),
-      ],
+        // DENORMALISED (decision 57a): every row resolved as an empty answer, live or reused, carries `empty_answer` on its OWN flags;
+        // the displacement detector tests the row's flags, never a cross-partition read of a source (which flips meaning once retention
+        // drops it). A reused row also carries its source's own flags (a refusal, no_ai_overview_for_query). UNIONED with the row's
+        // existing flags, never overwriting them.
+        ...(emptyAnswer ? [EMPTY_ANSWER_FLAG, ...(resolved?.kind === "empty" ? resolved.flags.filter((flag) => CARRIED_FLAGS.has(flag)) : [])] : []),
+      ].filter((flag, index, all) => all.indexOf(flag) === index),
       ...structuredOf(record, rawObject),
     };
 
@@ -356,6 +357,8 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
 const ENGINE_REFUSED_FLAG = "engine_refused_to_answer";
 const EMPTY_ANSWER_FLAG = "empty_answer";
+/** The source flags a reused empty row inherits: exactly the contract's capture flags (captureFlagSchema), nothing internal. */
+const CARRIED_FLAGS: ReadonlySet<string> = new Set(captureFlagSchema.options);
 
 /** The row carries a text field and it is the empty string - an answer of nothing, as opposed to no text field at all. */
 function answeredWithNothing(record: CaptureRecord, rawObject: RawObjectBody | null): boolean {
@@ -392,7 +395,7 @@ function textOf(record: CaptureRecord, rawObject: RawObjectBody | null): string 
 }
 
 /** What a reused row's answer resolved to: text, an answer of nothing (a refusal or an empty answer - a measurement), or nothing recoverable. */
-type ReusedText = { kind: "text"; text: string } | { kind: "empty"; refused: boolean } | { kind: "missing" };
+type ReusedText = { kind: "text"; text: string } | { kind: "empty"; flags: readonly string[] } | { kind: "missing" };
 
 /**
  * STORY-032 AC7 — the answer text of a REUSED row.
@@ -411,7 +414,7 @@ async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: 
   if (typeof own === "string") {
     if (own.trim().length > 0) return { kind: "text", text: own };
     // A truncated empty answer is a failure, not an answer; a reused row cannot be marked parsed, so it is unavailable.
-    return record.truncated ? { kind: "missing" } : { kind: "empty", refused: record.flags.includes(ENGINE_REFUSED_FLAG) };
+    return record.truncated ? { kind: "missing" } : { kind: "empty", flags: record.flags };
   }
   if (record.source_result_id === null) return { kind: "missing" };
   const source = await tx.query<{ payload: CaptureRecord["payload"]; flags: string[]; truncated: boolean }>(
@@ -422,7 +425,7 @@ async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: 
   const text = row?.payload?.text;
   if (row === undefined || typeof text !== "string") return { kind: "missing" };
   if (text.trim().length > 0) return { kind: "text", text };
-  return row.truncated ? { kind: "missing" } : { kind: "empty", refused: row.flags.includes(ENGINE_REFUSED_FLAG) };
+  return row.truncated ? { kind: "missing" } : { kind: "empty", flags: row.flags };
 }
 
 function structuredOf(record: CaptureRecord, rawObject: RawObjectBody | null): Partial<Pick<CaptureRow, "structuredCitations" | "structuredElements">> {

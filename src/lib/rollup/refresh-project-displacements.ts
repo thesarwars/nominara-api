@@ -97,11 +97,13 @@ const CLASS_ORDER = ["recommendation", "ranked", "neutral_list", "also_consider"
  * flags) and rows whose own payload text is empty after trim. No subquery. `table` is a fixed identifier, never user input.
  */
 function observedAnswerSql(table: string): string {
-  // Only the row's OWN columns: a reused row carries the resolution of its source in its flags (`empty_answer`, `engine_refused_to_answer`,
-  // written by capture.parse), so there is no cross-partition probe of the source and no change of meaning when retention drops it.
-  // Whitespace-only text is empty, like "". A row with no text at all (an L2 row, whose payload is {}) is not excluded by its text.
+  // THE FLAGS DECIDE. capture.parse stamps `empty_answer` on every row it resolves as an empty answer (live or reused, and by the same
+  // JS definition of blank as the parser: String.trim, which includes U+FEFF and U+00A0), so the detector reads only the row's OWN columns:
+  // no subquery, no change of meaning when retention drops a source. The text test is a FALLBACK for legacy rows written before the stamp
+  // existed; it spells out JS's blank set because Postgres `\s` does not match U+FEFF. A row with no text (an L2 row, payload {}) is
+  // not excluded by its text.
   return `NOT (${table}.flags && ARRAY['engine_refused_to_answer', 'empty_answer']::text[])
-          AND (${table}.payload->>'text' IS NULL OR ${table}.payload->>'text' !~ '^\\s*$')`;
+          AND (${table}.payload->>'text' IS NULL OR ${table}.payload->>'text' !~ '^[\\s\\u00a0\\ufeff\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$')`;
 }
 
 export async function refreshProjectDisplacements(

@@ -60,7 +60,7 @@ const HASH_B = "b".repeat(64);
 
 /** One shared entry: the engine's public answer, exactly as §6 describes it. */
 function envelope(hash: string, answer = "the shared answer"): string {
-  return JSON.stringify({ v: 1, contentHash: hash, payload: { answer }, excerpt: answer });
+  return JSON.stringify({ v: 2, contentHash: hash, payload: { answer }, excerpt: answer });
 }
 
 async function seed(cache: Cache, c: L1Candidate, hash: string, answer?: string): Promise<void> {
@@ -186,10 +186,11 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
   it.each([
     ["not JSON at all", "not-a-digest"],
     ["a bare hash, which is the shape this module shipped with", "a".repeat(64)],
-    ["an envelope from a future build", JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: {} })],
-    ["an envelope whose hash is not a digest", JSON.stringify({ v: 1, contentHash: "nope", payload: {} })],
-    ["an envelope with no payload", JSON.stringify({ v: 1, contentHash: "a".repeat(64) })],
-    ["an envelope whose payload is an array", JSON.stringify({ v: 1, contentHash: "a".repeat(64), payload: [] })],
+    ["an envelope from a future build", JSON.stringify({ v: 3, contentHash: "a".repeat(64), payload: {} })],
+    ["[audit r4 AC4] a v1 envelope, cached before empty/truncated answers were withheld from L1", JSON.stringify({ v: 1, contentHash: "a".repeat(64), payload: { answer: "x" }, excerpt: "x" })],
+    ["an envelope whose hash is not a digest", JSON.stringify({ v: 2, contentHash: "nope", payload: {} })],
+    ["an envelope with no payload", JSON.stringify({ v: 2, contentHash: "a".repeat(64) })],
+    ["an envelope whose payload is an array", JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: [] })],
   ])("treats %s as a MISS rather than a hit", async (_label, stored) => {
     const { cache } = countingCache();
     const only = candidate();

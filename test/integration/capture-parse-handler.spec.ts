@@ -549,6 +549,38 @@ describe("STORY-135 · capture.parse", () => {
     expect((await presenceOf(real)).flags).not.toContain("empty_answer");
   });
 
+  it("[audit r4 AC2] every LIVE row resolved as an empty answer is stamped empty_answer, UNIONED with its existing flags", async () => {
+    const plain = await seedEmpty("captured", []);
+    const blank = await seedEmpty("captured", [], "\uFEFF");
+    const space = await seedEmpty("captured", [], " ");
+    const refused = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const noOverview = await seedEmpty("captured", ["no_ai_overview_for_query"]);
+    for (const id of [plain, blank, space, refused, noOverview]) await run(handler(), job(id));
+    for (const id of [plain, blank, space]) expect((await presenceOf(id)).flags, id).toContain("empty_answer");
+    expect((await presenceOf(refused)).flags).toEqual(expect.arrayContaining(["empty_answer", "engine_refused_to_answer"]));
+    expect((await presenceOf(noOverview)).flags).toEqual(expect.arrayContaining(["empty_answer", "no_ai_overview_for_query"]));
+    expect(await presenceOf(blank)).toMatchObject({ status: "parsed", brand_present: false });
+  });
+
+  it("[audit r4 AC2] a live row with a real answer is not stamped, and a truncated empty is not stamped", async () => {
+    const real = await seedCapture(ANSWER);
+    const truncated = await seedEmpty("captured", []);
+    await db.query("UPDATE answer_captures SET truncated = true WHERE id = $1", [truncated]);
+    for (const id of [real, truncated]) await run(handler(), job(id));
+    expect((await presenceOf(real)).flags).not.toContain("empty_answer");
+    expect((await presenceOf(truncated)).flags).not.toContain("empty_answer");
+  });
+
+  it("[audit r4 nit] a reused row carries its SOURCE's actual flags, unioned with empty_answer", async () => {
+    const source = await seedEmpty("captured", ["no_ai_overview_for_query"]);
+    const l2 = await seedReused("l2", { source });
+    const refusedSource = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const l2Refused = await seedReused("l2", { source: refusedSource });
+    for (const id of [l2, l2Refused]) await run(handler(), job(id));
+    expect((await presenceOf(l2)).flags).toEqual(expect.arrayContaining(["empty_answer", "no_ai_overview_for_query"]));
+    expect((await presenceOf(l2Refused)).flags).toEqual(expect.arrayContaining(["empty_answer", "engine_refused_to_answer"]));
+  });
+
   it("[s2.5 blocked/failed] blocked and failed cells stay NULL and are out of the denominator", async () => {
     const blocked = await seedEmpty("blocked", []);
     const failed = await seedEmpty("failed", []);

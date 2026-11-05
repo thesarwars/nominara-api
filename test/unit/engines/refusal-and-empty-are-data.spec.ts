@@ -95,6 +95,13 @@ describe("STORY-027 · scenarios 3-4 · NFR-SIM-07 · a refusal and an empty ans
     expect(captureFlagSchema.safeParse("made_up_flag").success).toBe(false);
   });
 
+  // [audit r4] FORCES A DECISION. `isSeedable` (execute-cell.ts) keeps any flagged answer out of the shared L1 cache, and
+  // `observedAnswerSql` (refresh-project-displacements.ts) decides which flags make a row "no observation". A new flag must be
+  // classified in both, then added here.
+  it("[audit r4] captureFlagSchema holds exactly the three flags whose seeding and displacement behaviour was decided", () => {
+    expect([...captureFlagSchema.options].sort()).toEqual(["empty_answer", "engine_refused_to_answer", "no_ai_overview_for_query"]);
+  });
+
   it("flags on rawCaptureSchema is a string[] matching answer_captures.flags' text[] shape, and round-trips an empty array", () => {
     expect(
       rawCaptureSchema.safeParse({
