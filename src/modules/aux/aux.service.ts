@@ -20,7 +20,7 @@ import type { AuxPatch } from "../../../contracts/aux/index.js";
 import { guidanceFor } from "../../lib/aux/patches/guidance.js";
 import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
 import { failManualAudit } from "../../lib/aux/fail-manual-audit.js";
-import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, PriceChangedError, UnauthenticatedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../lib/aux/audit-constants.js";
 import { AUX_AUDIT_BASE_CREDITS, AUX_AUDIT_BASE_PAGES, AUX_AUDIT_EXTRA_PAGE_CREDITS, auxAuditPrice, auxAuditPricing } from "../../lib/aux/audit-price.js";
@@ -364,7 +364,7 @@ export class AuxService {
     // The identity is scoped by the actor (review round 5), as the Idempotency interceptor's record is by the user; without one there is nothing to scope by, so fail
     // closed rather than let every actor-less caller share one identity.
     const actorId = actor.id;
-    if (actorId === null) throw new Error("AuxService.triggerAudit requires an authenticated actor to scope the Idempotency-Key");
+    if (actorId === null) throw new UnauthenticatedError({ message: "An authenticated user is required to start an audit" });
     const clientKey = options.idempotencyKey;
     if (clientKey === undefined || clientKey.length === 0 || clientKey.length > 255) {
       throw new ValidationFailedError({
@@ -527,7 +527,7 @@ export class AuxService {
     );
     const row = found.rows[0];
     if (row === undefined) {
-      // No audit row, but the generation's ledger entry may outlive it: a project hard delete cascades `aux_audits`, and the append-only ledger keeps the charge. Taking
+      // No audit row, but the generation's ledger entry may outlive it: only a direct delete of the audit row reaches this (a project is soft-deleted, so it no longer cascades `aux_audits`), and the append-only ledger keeps the charge. Taking
       // this generation again would run into its ledger key (500), so an entry older than the window means the generation is spent - expired, the walk moves on.
       // The age is the ledger entry's own (the first one this identity wrote), on the database clock.
       const spent = await tx.query<{ expired: boolean }>(

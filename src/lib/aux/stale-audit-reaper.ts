@@ -25,8 +25,8 @@ const logger = new Logger("aux.stale-audit-reaper");
 /** Owner decision 40: 60 minutes. */
 export const MANUAL_AUDIT_STALE_AFTER_MINUTES = 60;
 
-/** `now` stamps `finished_at` only; which audits are stale is decided by the database's clock. */
-export async function reapStaleManualAudits(client: ClientBase, now: Date, staleAfterMinutes: number = MANUAL_AUDIT_STALE_AFTER_MINUTES): Promise<{ readonly reaped: number }> {
+/** Both which audits are stale and `finished_at` come from the database's clock; `_now` is kept for the sweep's signature and is not used. */
+export async function reapStaleManualAudits(client: ClientBase, _now: Date, staleAfterMinutes: number = MANUAL_AUDIT_STALE_AFTER_MINUTES): Promise<{ readonly reaped: number }> {
   // IDs only: no tenant content is read.
   const stale = await client.query<{ id: string; workspace_id: string }>(
     `SELECT id, workspace_id FROM aux_audits
@@ -38,7 +38,7 @@ export async function reapStaleManualAudits(client: ClientBase, now: Date, stale
   for (const row of stale.rows) {
     try {
       const done = await withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, (tx) =>
-        failManualAudit(tx, { workspaceId: row.workspace_id, auditId: row.id, reason: "stale", at: now, olderThanMinutes: staleAfterMinutes }),
+        failManualAudit(tx, { workspaceId: row.workspace_id, auditId: row.id, reason: "stale", olderThanMinutes: staleAfterMinutes }),
       );
       if (!done) continue;
       reaped += 1;

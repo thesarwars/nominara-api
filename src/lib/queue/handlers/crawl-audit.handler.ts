@@ -45,7 +45,7 @@ import { collectSitemap, MAX_SITEMAP_FILES, SitemapFetchSkipped, type SitemapRes
 import { guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
 import { uuidV7 } from "../../ids/uuidv7.js";
 import { toRegistrableDomain } from "../../net/registrable-domain.js";
-import { auxDecidedBasis, auxScore, type AuxCategory, type AuxCountedFinding } from "../../scoring/aux.js";
+import { AUX_HARD_CAP, auxDecidedBasis, auxScore, type AuxCategory, type AuxCountedFinding } from "../../scoring/aux.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
 import type { ObjectStoragePort } from "../../storage/storage.port.js";
@@ -82,9 +82,9 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // edge rules) CANNOT be evaluated at all: OWNER DECISION 2026-10-22, Nominara sends every request as NominaraBot and never under
 // another crawler's name, so a firewall or CDN rule that blocks by user agent is not observable here. AI-bot access is judged
 // from what robots.txt publishes for each AI crawler token (`ai_bot_access` in the manifest; AUX-R-001/002 as findings).
-// `excluded_rules` names all of this. THE HEADLINE (owner decisions 38 and 52): when pages were judged, `aux_score` is computed over the RULES that were decided: a category is
+// `excluded_rules` names all of this. THE HEADLINE (owner decisions 38, 52 and 55): when pages were judged, `aux_score` is computed over the RULES that were decided: a category is
 // scored on the decided rules only (its max_penalty is their weights' sum, so an unmeasured rule does not count as passed), a category with no decided rule is
-// dropped, and the sum is renormalised to 100 and capped at 72 by a critical crawler_access finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
+// dropped, a finding whose rule was not decided in this audit (stale / not re-checked) costs nothing and weighs nothing (decision 55), and the sum is renormalised to 100 and capped at 72 by a critical crawler_access finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
 // (site files only) it stays null: one category's subscore is published, but that is not a headline. `score_capped` is set whenever a critical
 // crawler_access finding is open.
 //
@@ -992,9 +992,21 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // re-observe, and stale ones: stale is not fixed. A site-file finding is domain-wide, so it affects every page crawled (scope 1). A page finding
     // affects the distinct pages it is open on (STORY-052 AC9), never more than the pages this audit crawled; the scope factor is floored at 0.25.
     const open = await tx.query<{ rule_code: string; severity: AuxSeverityBand; url: string | null }>(
-      "SELECT rule_code, severity, url FROM aux_findings WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[])",
+      "SELECT rule_code, severity, url FROM aux_findings WHERE project_id = $1 AND status = ANY($2::text[]) AND rule_code = ANY($3::text[]) ORDER BY rule_code, url NULLS FIRST, id",
       [payload.projectId, SCORED_STATUSES, [...FINDING_RULE_CODES]],
     );
+    // OWNER DECISIONS 52 and 55. The rules that were DECIDED in this audit: the site-file rules whose file answered, and the page rules that ran on at least one page.
+    // This one set is BOTH the score basis and the penalty set. A category is scored ONLY on those rules: max_penalty(cat) is the sum of the decided rules' weights, so a
+    // rule nobody could judge (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, the held AUX-R-013, ...) is out of the denominator instead of counting as passed.
+    // A category with no decided rule is dropped. An open or stale finding whose rule was NOT decided in this audit (not re-checked) contributes NOTHING - not to the
+    // penalty, not to the denominator; it stays in the findings list as stale / not re-checked (the lifecycle, STORY-052, is untouched). Its rule is named in
+    // `excluded_rules`, so the headline is partial.
+    const decidedAnywhere = new Set<string>();
+    for (const rules of pageEvaluated.values()) for (const code of rules) decidedAnywhere.add(code);
+    const decidedRules = new Set<string>(covered);
+    if (pageEvaluated.size > 0) {
+      for (const code of decidedAnywhere) decidedRules.add(code);
+    }
     const pagesForScore = Math.max(1, pageEvaluated.size);
     // scoring-models.md section 7 counts a FINDING with the pages it affects: scope(f) = affected_pages(f) / pages_crawled. The page rules open one row per
     // page (and per place on it), so those rows are folded back to one counted finding per rule - its worst severity, over the distinct pages it is open on -
@@ -1003,7 +1015,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     const perRule = new Map<string, { severity: AuxSeverityBand; urls: Set<string> }>();
     const counted: AuxCountedFinding[] = [];
     const asCategory = (code: string): AuxCategory => (catalog.byCode.get(code)?.category ?? "crawler_access") as AuxCategory;
+    // `capped` (the flag, and the 72 cap) follows every open critical crawler_access finding, decided or not: the cap is a policy on what is open, not penalty arithmetic.
+    let capped = false;
     for (const r of open.rows) {
+      if (asCategory(r.rule_code) === "crawler_access" && r.severity === "critical") capped = true;
+      if (!decidedRules.has(r.rule_code)) continue; // decision 55: not decided in this audit, so it neither costs nor weighs
       if (!pageRuleCodes.has(r.rule_code)) {
         counted.push({ category: asCategory(r.rule_code), severity: r.severity, ruleWeight: catalog.byCode.get(r.rule_code)?.weight ?? 0, affectedPages: pagesForScore });
         continue;
@@ -1019,25 +1035,14 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       const lookedAt = [...urls].filter((u) => pageEvaluated.has(u)).length;
       counted.push({ category: asCategory(code), severity, ruleWeight: catalog.byCode.get(code)?.weight ?? 0, affectedPages: Math.min(pagesForScore, lookedAt) });
     }
-    // OWNER DECISION 52 (extending decision 38 to rule level). The rules that were DECIDED in this audit: the site-file rules whose file answered, and the page rules
-    // that ran on at least one page. A category is scored ONLY on those: max_penalty(cat) is the sum of the decided rules' weights, so a rule nobody could judge
-    // (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, the held AUX-R-013, ...) is out of the denominator instead of counting as passed. A category with no
-    // decided rule is dropped. A rule that still has an open finding from an earlier audit (stale is not fixed) is in the basis too, or its penalty would be
-    // weighed against a denominator that left it out; it stays listed in `excluded_rules` when this audit did not run it, so the headline is still partial.
-    const decidedAnywhere = new Set<string>();
-    for (const rules of pageEvaluated.values()) for (const code of rules) decidedAnywhere.add(code);
-    const decidedRules = new Set<string>(covered);
-    if (pageEvaluated.size > 0) {
-      for (const code of decidedAnywhere) decidedRules.add(code);
+
+    // Summed in CATALOG order (and as integer basis points inside auxDecidedBasis), so identical inputs give a bit-identical breakdown whatever order the sets were built in.
+    const basis = auxDecidedBasis(catalog.rules.filter((rule) => decidedRules.has(rule.code)).map((rule) => ({ category: rule.category as AuxCategory, weight: rule.weight })));
+    // A category whose every catalog rule was decided has a max penalty of exactly 1 (the catalog tolerates 1 +- 0.001).
+    const categoryMaxPenalty: Partial<Record<AuxCategory, number>> = { ...basis.categoryMaxPenalty };
+    for (const category of basis.categories) {
+      if (catalog.rules.filter((rule) => rule.category === category).every((rule) => decidedRules.has(rule.code))) categoryMaxPenalty[category] = 1;
     }
-    for (const r of open.rows) if (pageEvaluated.size > 0 || (RAN_RULES as readonly string[]).includes(r.rule_code)) decidedRules.add(r.rule_code);
-    const basis = auxDecidedBasis(
-      [...decidedRules].flatMap((code) => {
-        const entry = catalog.byCode.get(code);
-        return entry === undefined ? [] : [{ category: entry.category as AuxCategory, weight: entry.weight }];
-      }),
-    );
-    const capped = counted.some((c) => c.category === "crawler_access" && c.severity === "critical");
 
     const status = outcome.siteFilesFailed + outcome.pagesFailed + outcome.partialPages + outcome.unmodelledPages + skippedSiteFileCount(outcome) > 0 || outcome.manifestStored === false ? "partial" : "completed";
     // Every rule that could not run is named: the ones outside this crawl, and any whose input file got no answer
@@ -1061,11 +1066,11 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         findings: counted,
         pagesCrawled: pagesForScore,
         evaluatedCategories: basis.categories,
-        categoryMaxPenalty: basis.categoryMaxPenalty,
+        categoryMaxPenalty,
         unmeasuredRules: excluded.filter((code) => catalog.byCode.has(code)),
       });
       for (const category of basis.categories) breakdown[category] = scored.subscores[category];
-      if (pageEvaluated.size > 0) headline = scored.score;
+      if (pageEvaluated.size > 0) headline = capped && basis.categories.includes("crawler_access") ? Math.min(scored.score, AUX_HARD_CAP) : scored.score;
     }
 
     await tx.query(

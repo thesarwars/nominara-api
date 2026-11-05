@@ -147,10 +147,18 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   };
   // Rows are asserted by column name; a per-column interface would restate the schema.
   /* eslint-disable @typescript-eslint/no-explicit-any */
-  // OWNER DECISION 52: a category's max_penalty is the sum of the DECIDED rules' weights - the catalog's rules for the category that the audit did not list in excluded_rules.
-  const decidedWeight = async (category: string, excluded: readonly string[]): Promise<number> =>
-    Number((await db.query("SELECT COALESCE(SUM(weight), 0) AS w FROM aux_rule_catalog WHERE category = $1 AND NOT (code = ANY($2::text[]))", [category, excluded])).rows[0].w);
-  const weightOfRule = async (code: string): Promise<number> => Number((await db.query("SELECT weight FROM aux_rule_catalog WHERE code = $1", [code])).rows[0].weight);
+  // OWNER DECISIONS 52 and 55: a category's max_penalty is the sum of the DECIDED rules' weights. These are worked by hand from the catalog (0070 and 0148), NOT read
+  // back from the audit's own `excluded_rules`, so a wrongly excluded rule cannot make the expectation agree with the bug.
+  //   crawler_access: 001 .30 + 002 .08 + 003 .12 + 004 .06 + 005 .24 + 006 .12 + 007 .08 = 1.00; 005 is never decided; 006 is a page rule
+  //   structured_data: 008 .14 + 009 .10 + 010 .12 + 011 .07 + 012 .09 + 013 .11 + 014 .09 + 015 .06 + 016 .06 + 017 .08 + 018 .08 = 1.00; 013 is held
+  //   render_mode: 026 .34 + 027 .28 + 028 .22 + 029 .16 = 1.00
+  const DECIDED = {
+    crawlerAccessWithPages: 0.76, // 001 .30 + 002 .08 + 003 .12 + 004 .06 + 006 .12 + 007 .08
+    crawlerAccessSiteFilesOnly: 0.64, // the same without the page rule 006
+    structuredData: 0.89, // 1.00 - 013 (.11, held)
+    renderMode029Only: 0.16, // 026, 027 and 028 undecided with no renderer
+    contextFitness: 1,
+  } as const;
   const audits = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_audits ORDER BY created_at")).rows;
   const findings = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_findings ORDER BY created_at")).rows;
   /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -228,8 +236,9 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(Number(a.aux_score)).toBe(72);
     expect(a.score_capped).toBe(true);
     expect(a.findings_critical).toBe(1);
-    // Decision 52 changes the denominator: the critical AUX-R-001 takes its weight off crawler_access's DECIDED rules (AUX-R-005 is never decided), not off 1.000.
-    expect(Number(a.score_breakdown.crawler_access)).toBeCloseTo(1 - (await weightOfRule("AUX-R-001")) / (await decidedWeight("crawler_access", a.excluded_rules)), 5);
+    // Decision 52: the critical AUX-R-001 (weight 0.30) takes its weight off crawler_access's DECIDED rules (AUX-R-005, 0.24, is never decided): 1 - 0.30/0.76. Decision 55
+    // does not move this figure: every decided rule here ran in this audit.
+    expect(Number(a.score_breakdown.crawler_access)).toBeCloseTo(0.6052631578947368, 12);
   });
 
   it("NEW-C-9 AC5.2 · a clean site: subscore 1, not capped, a partial headline of 100 (renormalised over the five measured categories)", async () => {
@@ -890,13 +899,11 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(await statusOf()).toEqual(["stale"]);
       const a = (await audits()).at(-1);
       expect(a.score_capped).toBe(true);
-      // Decision 52 changes this: robots.txt being down leaves AUX-R-001/002/003 undecided, so crawler_access is now scored on FEWER decided rules and the same
-      // figure cannot be expected. What must still hold is the point of the test: the stale finding keeps costing its weight - against a denominator that still
-      // contains its rule - so it never scores like a fix.
-      const w001 = await weightOfRule("AUX-R-001");
-      const decided = (await decidedWeight("crawler_access", a.excluded_rules)) + w001;
-      expect(Number(a.score_breakdown.crawler_access)).toBeCloseTo(1 - w001 / decided, 5);
-      expect(Number(a.score_breakdown.crawler_access)).toBeLessThan(1);
+      // Decision 55 changes this (it refines 52): robots.txt being down leaves AUX-R-001/002/003 undecided in this audit, so the stale AUX-R-001 is neither in the penalty
+      // nor in the denominator. crawler_access is scored on the decided rules alone (004, 006 and 007: no finding), i.e. 1; the finding stays listed as stale, and the
+      // cap and the flag still follow the open critical finding. (Under decision 52 this was 1 - w001/(decided + w001), < 1.)
+      expect(Number(a.score_breakdown.crawler_access)).toBe(1);
+      expect(a.aux_score).toBeNull(); // robots.txt down: no page was judged, so no headline (the subscore is published)
       expect(Number(before.score_breakdown.crawler_access)).toBeLessThan(1);
     });
 
@@ -1282,7 +1289,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const [a] = await audits();
       const w = await weightOf("AUX-R-008");
       // decision 52: over structured_data's DECIDED rules (AUX-R-013 is held, so out of the denominator)
-      const decided = await decidedWeight("structured_data", a.excluded_rules);
+      const decided = DECIDED.structuredData;
       expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - w / decided, 5);
       for (const c of ["crawler_access", "context_fitness", "freshness", "render_mode"]) expect(Number(a.score_breakdown[c]), c).toBe(1);
       expect(a.score_capped).toBe(false); // the cap is for a critical crawler_access finding only
@@ -1294,7 +1301,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await run(job(), depsServing(withPages({ "/": BROKEN_PAGE, "/pricing": HEALTHY_PAGE, "/about": HEALTHY_PAGE })));
       let [a] = await audits();
       expect(a.pages_crawled).toBe(3);
-      const decided = await decidedWeight("structured_data", a.excluded_rules); // decision 52
+      const decided = DECIDED.structuredData; // decision 52
       expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (w * (1 / 3)) / decided, 5);
 
       await db.query("TRUNCATE aux_audits CASCADE");
@@ -1312,7 +1319,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await run(job(), depsServing(withPages(pages), [], 10_000, { pageCap: 25 }));
       const [a] = await audits();
       expect(a.pages_crawled).toBe(10);
-      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (w * 0.25) / (await decidedWeight("structured_data", a.excluded_rules)), 5); // decision 52
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (w * 0.25) / DECIDED.structuredData, 5); // decision 52
     });
 
     it("STORY-052 AC4 · the same page defect in two audits is ONE finding with occurrence_count 2; fixing the page resolves it (with a milestone), and it regresses if it returns", async () => {
@@ -1599,7 +1606,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await run(job(), depsServing(withPages({ "/": HEALTHY_PAGE, "/pricing": BROKEN_PAGE })));
       await run(job(), depsServing(withPages({ "/": HEALTHY_PAGE })));
       const last = (await audits()).at(-1);
-      expect(Number(last.score_breakdown.structured_data)).toBeCloseTo(1 - (w * 0.25) / (await decidedWeight("structured_data", last.excluded_rules)), 5); // decision 52
+      expect(Number(last.score_breakdown.structured_data)).toBeCloseTo(1 - (w * 0.25) / DECIDED.structuredData, 5); // decision 52
     });
 
     it("AUXLIVE-5 · decisions 38 and 52: the headline is renormalised over the measured categories, each scored on its decided rules - one broken page of one: (0.28 + 0.22*sub + 0.20 + 0.15 + 0.06) / 0.91 * 100", async () => {
@@ -1607,7 +1614,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
       const [a] = await audits();
       // decision 52: each category is scored on its decided rules; only structured_data has a finding here
-      const sub = 1 - w / (await decidedWeight("structured_data", a.excluded_rules));
+      const sub = 1 - w / DECIDED.structuredData;
       const expected = Number((((0.28 + 0.22 * sub + 0.2 + 0.15 + 0.06) / 0.91) * 100).toFixed(1));
       expect(Number(a.aux_score)).toBe(expected);
       expect(Object.keys(a.score_breakdown).sort()).toEqual(["context_fitness", "crawler_access", "freshness", "render_mode", "structured_data"]);
@@ -1657,7 +1664,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const f = (await findings()).filter((x) => x.rule_code === "AUX-R-029");
       expect(f).toHaveLength(1);
       const w029 = await weightOf("AUX-R-029");
-      const decided = await decidedWeight("render_mode", a.excluded_rules);
+      const decided = DECIDED.renderMode029Only;
       expect(decided).toBeCloseTo(w029, 9); // 026, 027 and 028 are excluded, so 029 is the only decided rule
       const expected = 1 - (w029 * SEVERITY_FACTOR[f[0].severity]!) / decided;
       expect(Number(a.score_breakdown.render_mode)).toBeCloseTo(expected, 5);
@@ -1683,9 +1690,8 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
       const [a] = await audits();
       expect(a.excluded_rules).toContain("AUX-R-013");
-      const total = await decidedWeight("structured_data", []);
-      const decided = await decidedWeight("structured_data", a.excluded_rules);
-      expect(decided).toBeCloseTo(total - (await weightOf("AUX-R-013")), 9);
+      const decided = DECIDED.structuredData;
+      expect(decided).toBeCloseTo(1 - (await weightOf("AUX-R-013")), 9);
       expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (await weightOf("AUX-R-008")) / decided, 5);
       expect(Number(a.score_breakdown.structured_data)).toBeLessThan(1 - (await weightOf("AUX-R-008")) - 0.01);
     });
@@ -1693,7 +1699,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     it("D52 · a fully measured category scores as before: context_fitness lists no unmeasured rule, its decided weights sum to 1, and a clean page is 1", async () => {
       await run(job(), depsServing(healthy(OPEN)));
       const [a] = await audits();
-      expect(await decidedWeight("context_fitness", a.excluded_rules)).toBeCloseTo(1, 9);
+      expect(DECIDED.contextFitness).toBe(1);
       expect(Number(a.score_breakdown.context_fitness)).toBe(1);
       const audit = await asTenantAudit();
       expect(audit.categories.find((c) => c.category === "context_fitness")?.rules_not_evaluated).toEqual([]);
@@ -1706,6 +1712,58 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const audit = await asTenantAudit();
       expect(audit.score_partial).toBe(true);
       expect(audit.unmeasured_categories).toEqual(expect.arrayContaining(["render_mode", "entity_clarity"]));
+    });
+
+    // OWNER DECISION 55 (refines 52): a finding whose rule was NOT decided in this audit costs nothing and weighs nothing. It stays listed (stale / open, not re-checked).
+    const seedFinding = async (rule: string, status: string, url: string): Promise<void> => {
+      await db.query(
+        `INSERT INTO aux_findings (workspace_id, project_id, audit_id, rule_code, url, severity, status, fingerprint, title, evidence, rule_version, first_detected_at, last_detected_at)
+         SELECT workspace_id, project_id, id, $1, $2, 'high', $3, sha256(($1 || $2)::bytea), 't', '{"reason":"seed","snippet":null,"locator":"x"}'::jsonb, '2026.10.2', now(), now() FROM aux_audits ORDER BY created_at LIMIT 1`,
+        [rule, url, status],
+      );
+    };
+    const NOAI_PAGE = pageWith('<meta name="robots" content="noai">');
+
+    it("D55 (a) · an audit where every page fetch fails decides only the site-file rules: an open AUX-R-006 page finding is not in the crawler_access penalty or its denominator", async () => {
+      await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: NOAI_PAGE } }));
+      expect((await findings()).filter((x) => x.rule_code === "AUX-R-006")).toHaveLength(1);
+      await run(job(), depsServing({ ...healthy(OPEN), "/llms.txt": { status: 404 }, "/.well-known/llms.txt": { status: 404 }, "/": { status: 500, body: "" } }));
+      const a = (await audits()).at(-1);
+      const f006 = (await findings()).find((x) => x.rule_code === "AUX-R-006")!;
+      expect(f006.status).toBe("open"); // still listed, not re-checked
+      expect(a.aux_score).toBeNull(); // no page was judged
+      // decided: 001 .30 + 002 .08 + 003 .12 + 004 .06 + 007 .08 = 0.64 (hand-worked). The only penalty: 004 absent, low (0.1) x 0.06, over the whole crawl (scope 1).
+      expect(Number(a.score_breakdown.crawler_access)).toBeCloseTo(1 - (0.06 * 0.1) / DECIDED.crawlerAccessSiteFilesOnly, 12);
+      // had the open 006 (high, .12 x .6) counted, the figure would be far lower
+      expect(Number(a.score_breakdown.crawler_access)).toBeGreaterThan(0.99);
+    });
+
+    it("D55 (b) · no renderer, a stale AUX-R-026 on 1 of 4 pages and AUX-R-029 decided with a medium finding: render_mode = 1 - 0.048/0.16 = 0.70 (the stale rule is out of both the penalty and the basis)", async () => {
+      await verifyDomain();
+      const four = withPages({ "/": HEALTHY_PAGE, "/a": HEALTHY_PAGE, "/b": HEALTHY_PAGE, "/c": HEALTHY_PAGE });
+      await run(job(), depsServing(four));
+      await seedFinding("AUX-R-026", "stale", "https://acme.com/a");
+      await run(job(), slow(depsServing(four, [], 10_000, { renderer: unavailableRenderer })));
+      const a = (await audits()).at(-1);
+      const f029 = (await findings()).filter((x) => x.rule_code === "AUX-R-029");
+      expect(f029.length).toBeGreaterThan(0);
+      expect(f029[0].severity).toBe("medium");
+      expect((await findings()).find((x) => x.rule_code === "AUX-R-026")!.status).toBe("stale");
+      // 029 weight 0.16, medium 0.3, all 4 pages slow (scope 1): penalty 0.048 over the decided 0.16 - 029 alone
+      expect(Number(a.score_breakdown.render_mode)).toBeCloseTo(1 - 0.048 / DECIDED.renderMode029Only, 12);
+      expect(Number(a.score_breakdown.render_mode)).toBeCloseTo(0.7, 12);
+    });
+
+    it("D55 (c) · no renderer and no timing, with only a stale AUX-R-026: render_mode is dropped and the headline is partial", async () => {
+      await run(job(), depsServing(healthy(OPEN)));
+      await seedFinding("AUX-R-026", "stale", "https://acme.com/");
+      await run(job(), depsServing(healthy(OPEN), [], 10_000, { renderer: unavailableRenderer }));
+      const [, a] = await audits();
+      expect(Object.keys(a.score_breakdown)).not.toContain("render_mode");
+      expect((await findings()).find((x) => x.rule_code === "AUX-R-026")!.status).toBe("stale");
+      const audit = await asTenantAudit(a.id);
+      expect(audit.score_partial).toBe(true);
+      expect(audit.unmeasured_categories).toEqual(expect.arrayContaining(["render_mode"]));
     });
 
     it("D52 · the audit's rule_version is the bumped one (the formula changed)", async () => {

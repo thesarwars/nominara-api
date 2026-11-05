@@ -75,6 +75,20 @@ describe("AUXLIVE-5 round 5 · owner decision 52: the score is over decided rule
     expect(basis.categoryMaxPenalty.freshness).toBeUndefined();
   });
 
+  it("round 6 · auxDecidedBasis is order-independent to the bit: the same rules in any order give an identical basis (0.1 + 0.2 + 0.3 is not 0.3 + 0.2 + 0.1 in floating point)", () => {
+    const rules = [rule("structured_data", 0.1), rule("structured_data", 0.2), rule("structured_data", 0.3)];
+    const forward = auxDecidedBasis(rules);
+    const backward = auxDecidedBasis([...rules].reverse());
+    expect(0.1 + 0.2 + 0.3).not.toBe(0.3 + 0.2 + 0.1); // the hazard is real
+    expect(backward).toEqual(forward);
+    expect(forward.categoryMaxPenalty.structured_data).toBe(0.6);
+  });
+
+  it("round 6 · a fully decided category's max penalty is exactly 1", () => {
+    const basis = auxDecidedBasis([rule("render_mode", 0.34), rule("render_mode", 0.28), rule("render_mode", 0.22), rule("render_mode", 0.16)]);
+    expect(basis.categoryMaxPenalty.render_mode).toBe(1);
+  });
+
   it("D52 · auxDecidedBasis of nothing decided is empty (the caller drops every category)", () => {
     expect(auxDecidedBasis([])).toEqual({ categories: [], categoryMaxPenalty: {} });
   });

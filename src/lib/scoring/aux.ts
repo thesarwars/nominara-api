@@ -122,8 +122,11 @@ export interface AuxDecidedRule {
  * dropped, as decision 38 already did for a whole category). The result feeds `auxScore` as `evaluatedCategories` and `categoryMaxPenalty`.
  */
 export function auxDecidedBasis(rules: readonly AuxDecidedRule[]): { readonly categories: readonly AuxCategory[]; readonly categoryMaxPenalty: Partial<Record<AuxCategory, number>> } {
+  // Integer basis points (weights carry four decimals at most): the sum is exact and independent of the order of `rules`, so identical inputs give identical output.
+  const basisPoints: Partial<Record<AuxCategory, number>> = {};
+  for (const rule of rules) basisPoints[rule.category] = (basisPoints[rule.category] ?? 0) + Math.round(rule.weight * 10_000);
   const categoryMaxPenalty: Partial<Record<AuxCategory, number>> = {};
-  for (const rule of rules) categoryMaxPenalty[rule.category] = (categoryMaxPenalty[rule.category] ?? 0) + rule.weight;
+  for (const c of AUX_CATEGORIES) if ((basisPoints[c] ?? 0) > 0) categoryMaxPenalty[c] = basisPoints[c]! / 10_000;
   return { categories: AUX_CATEGORIES.filter((c) => (categoryMaxPenalty[c] ?? 0) > 0), categoryMaxPenalty };
 }
 

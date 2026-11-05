@@ -20,7 +20,8 @@ export interface FailManualAuditInput {
   readonly workspaceId: string;
   readonly auditId: string;
   readonly reason: ManualAuditFailure;
-  readonly at: Date;
+  /** Omitted: `finished_at` is stamped from the database clock (`now()`), the clock that stamped `created_at`. */
+  readonly at?: Date;
   /**
    * When set, only an audit created more than this many minutes ago is failed (the reaper's bound, re-checked under the row lock the UPDATE takes). The cutoff is
    * computed IN SQL, on the database clock that stamped `created_at`, never from an application clock that may drift from it.
@@ -38,10 +39,10 @@ export interface FailManualAuditInput {
 export async function failManualAudit(tx: ClientBase, input: FailManualAuditInput): Promise<boolean> {
   const moved = await tx.query(
     `UPDATE aux_audits
-        SET status = 'failed', error_summary = jsonb_build_object('reason', $2::text), finished_at = $3
+        SET status = 'failed', error_summary = jsonb_build_object('reason', $2::text), finished_at = COALESCE($3::timestamptz, now())
       WHERE id = $1 AND workspace_id = app.current_workspace() AND trigger = 'manual' AND status IN ('queued', 'running')
         AND ($4::int IS NULL OR created_at < now() - make_interval(mins => $4::int))`,
-    [input.auditId, input.reason, input.at, input.olderThanMinutes ?? null],
+    [input.auditId, input.reason, input.at ?? null, input.olderThanMinutes ?? null],
   );
   if ((moved.rowCount ?? 0) !== 1) return false;
   await refundAuxAuditCharge(tx, { workspaceId: input.workspaceId, auditId: input.auditId, reason: input.reason });

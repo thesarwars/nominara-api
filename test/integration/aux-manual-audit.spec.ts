@@ -115,6 +115,13 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
         confirmedCredits: "confirmedCredits" in options ? options.confirmedCredits : "10",
       }),
     );
+  it("AUXLIVE-3 round 6 · a request with no authenticated actor is a typed 401 (unauthenticated), and nothing is charged", async () => {
+    const err = await asTenant(() => service().triggerAudit(projectId, {}, { id: null, type: "system" }, { idempotencyKey: randomUUID(), confirmedCredits: "10" })).then(() => null, (e: unknown) => e);
+    expect(codeOf(err)).toBe("unauthenticated");
+    expect((err as { getStatus(): number }).getStatus()).toBe(401);
+    expect(await audits()).toHaveLength(0);
+  });
+
   const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 60));
   const codeOf = (e: unknown): string | undefined => (e as { code?: string }).code;
 
@@ -503,6 +510,14 @@ describe("AUXLIVE-3 · the manual AUX audit: priced, queued after commit, refund
       expect(a.finished_at).not.toBeNull();
       expect(await wallet()).toMatchObject({ included: 100, reserved: 0 });
       expect(await refunds()).toHaveLength(1);
+    });
+
+    it("AUXLIVE-3 AC16 round 6 · the reaper stamps finished_at from the DATABASE clock, not from the application clock it was handed", async () => {
+      const res = await trigger();
+      await age(res.audit_id, 61);
+      await reapStaleManualAudits(db, new Date("2001-01-01T00:00:00Z")); // a skewed application clock
+      const near = await db.query("SELECT abs(extract(epoch FROM (finished_at - now()))) < 60 AS near FROM aux_audits WHERE id = $1", [res.audit_id]);
+      expect(near.rows[0].near).toBe(true);
     });
 
     it("AUXLIVE-3 AC16 · a manual audit still RUNNING after 61 minutes is reaped too", async () => {
