@@ -14,6 +14,8 @@ import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
+import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
+import { reportStorageEnv } from "../support/report-storage-env.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // NEW-E-100c — /v1/scheduled-reports through the REAL ApiModule.
@@ -24,17 +26,18 @@ const cookieOf = (t: Cookie): string => `${ACCESS_COOKIE_NAME}=${t.accessToken};
 describe("STORY-100 part C · scheduled reports over HTTP", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
+  let localstack: LocalstackFixture;
   const harness = useApiHarness({
-    env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString }),
+    env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString, ...reportStorageEnv(localstack.endpoint) }),
   });
   let pool: Pool;
   let sessions: SessionService;
 
   beforeAll(async () => {
-    [cacheValkey, queueValkey] = await Promise.all([startValkey(), startValkeyFixture()]);
+    [cacheValkey, queueValkey, localstack] = await Promise.all([startValkey(), startValkeyFixture(), startLocalstack()]);
   }, 180_000);
   afterAll(async () => {
-    await Promise.all([cacheValkey.stop(), queueValkey.stop()]);
+    await Promise.all([cacheValkey.stop(), queueValkey.stop(), localstack.stop()]);
   });
   beforeEach(() => {
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -178,7 +181,7 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
   it("AC2 · under SET ROLE nominara_app a project of another workspace is refused as unreadable (400) and another workspace's report is invisible (404)", async () => {
     const one = await seeded();
     const two = await seeded();
-    const service = new ScheduledReportsService(null as never, null as never, null as never, null as never, null as never);
+    const service = new ScheduledReportsService(null as never, null as never, null as never, null as never, null as never, null as never);
     const client = await pool.connect();
     try {
       await expect(
@@ -230,6 +233,33 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     expect((await used(a.workspaceId))?.used).toBe(1);
     const listed = data<Array<{ deliveries: unknown[] }>>(await call(a, "GET", "/scheduled-reports"));
     expect(listed[0]!.deliveries).toEqual([{ ...delivery, status: "logged", recipients: 1 }]);
+  }, 180_000);
+
+  it("STORY-180 AC1/AC3/AC6 · send-now attaches each file (8 MiB or less) read back from the reports bucket, with no link, and the artifact rows hold the real keys", async () => {
+    const { a, p } = await seeded();
+    const p2 = await project(a.workspaceId, "Second");
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p, p2]))));
+    const sent: Array<{ to: string; textBody: string; attachments?: Array<{ filename: string; content: Buffer; contentType?: string }> }> = [];
+    const restore = withSender({ delivers: true, send: async (m) => void sent.push(m as never) });
+    try {
+      expect((await call(a, "POST", `/scheduled-reports/${made.id}/send-now`)).statusCode).toBe(200);
+      await settleDeliveries();
+    } finally {
+      restore();
+    }
+    expect(sent).toHaveLength(1);
+    const files = sent[0]!.attachments ?? [];
+    expect(files).toHaveLength(2);
+    for (const f of files) {
+      expect(f.contentType).toBe("application/pdf");
+      expect(f.content.subarray(0, 5).toString()).toBe("%PDF-");
+    }
+    expect(new Set(files.map((f) => f.filename)).size).toBe(2);
+    expect(sent[0]!.textBody).not.toContain("report-links");
+    const keys = (await harness.db().query(`SELECT object_key, bytes FROM report_artifacts WHERE workspace_id = $1 ORDER BY created_at`, [a.workspaceId])).rows as Array<{ object_key: string; bytes: number }>;
+    expect(keys).toHaveLength(2);
+    for (const k of keys) expect(k.object_key).toMatch(new RegExp(`^inttest/${a.workspaceId}/[0-9a-f-]{36}\\.pdf$`));
+    expect(keys.map((k) => k.bytes).sort()).toEqual(files.map((f) => f.content.length).sort());
   }, 180_000);
 
   it("STORY-100 s9 · send-now on a tier with ZERO allowance is 403 feature_not_in_plan, with no delivery and no unit", async () => {

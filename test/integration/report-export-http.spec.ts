@@ -13,6 +13,8 @@ import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
+import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
+import { fetchStored, reportStorageEnv } from "../support/report-storage-env.js";
 import { pdfRaw, pdfText } from "../support/pdf-text.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
@@ -26,17 +28,18 @@ const cookieOf = (t: Cookie): string => `${ACCESS_COOKIE_NAME}=${t.accessToken};
 describe("STORY-100 · on-demand export over HTTP", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
+  let localstack: LocalstackFixture;
   const harness = useApiHarness({
-    env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString }),
+    env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString, ...reportStorageEnv(localstack.endpoint) }),
   });
   let pool: Pool;
   let sessions: SessionService;
 
   beforeAll(async () => {
-    [cacheValkey, queueValkey] = await Promise.all([startValkey(), startValkeyFixture()]);
+    [cacheValkey, queueValkey, localstack] = await Promise.all([startValkey(), startValkeyFixture(), startLocalstack()]);
   }, 180_000);
   afterAll(async () => {
-    await Promise.all([cacheValkey.stop(), queueValkey.stop()]);
+    await Promise.all([cacheValkey.stop(), queueValkey.stop(), localstack.stop()]);
   });
   beforeEach(() => {
     pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -140,13 +143,21 @@ describe("STORY-100 · on-demand export over HTTP", () => {
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
   const errorOf = (res: { json(): unknown }) => (res.json() as { error: { code: string; details?: Record<string, unknown> } }).error;
   type Exported = ReturnType<typeof exportResponseSchema.parse>;
-  const fileOf = (e: Exported): Buffer => Buffer.from(e.download_url.slice(e.download_url.indexOf(",") + 1), "base64");
+  const fileOf = (e: Exported): Promise<Buffer> => fetchStored(e.download_url);
   const usage = async (workspaceId: string) =>
     (await harness.db().query(`SELECT used_value::int AS used, reserved_value::int AS reserved FROM usage_counters WHERE workspace_id = $1 AND metric = 'pdf_exports'`, [workspaceId])).rows[0] as
       | { used: number; reserved: number }
       | undefined;
   const credits = async (workspaceId: string) =>
     ((await harness.db().query(`SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1`, [workspaceId])).rows[0] as { n: number }).n;
+
+  async function waitFor(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await check())) {
+      if (Date.now() > deadline) throw new Error("condition not met in time");
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
 
   async function seeded(plan: "starter" | "growth" | "business" = "growth") {
     const a = await owner(plan);
@@ -164,10 +175,14 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const exported = exportResponseSchema.parse(data(res));
     expect(exported.format).toBe("pdf");
     expect(exported.filename).toMatch(/\.pdf$/);
-    expect(exported.download_url).toMatch(/^data:application\/pdf;base64,/);
+    // STORY-180 AC1/AC2: a presigned object-storage URL (http here only because LocalStack is), never a data: URL.
+    expect(exported.download_url).toMatch(/^https?:\/\//);
+    expect(exported.download_url).not.toMatch(/^data:/);
+    expect(exported.download_url).toContain(`/nominara-reports/inttest/${a.workspaceId}/${exported.export_id}.pdf`);
+    expect(new URL(exported.download_url).searchParams.get("X-Amz-Expires")).toBe("900");
     expect(exported.footer.note).toBe(METHODOLOGY_NOTE);
     expect(exported.footer.engines).toEqual(["chatgpt", "gemini"]);
-    const file = fileOf(exported);
+    const file = (await fileOf(exported));
     expect(file.subarray(0, 5).toString()).toBe("%PDF-");
     expect(pdfRaw(file)).toContain(METHODOLOGY_NOTE);
 
@@ -176,7 +191,10 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(row.workspace_id).toBe(a.workspaceId);
     expect(row.project_ids).toEqual([p]);
     expect(row.format).toBe("pdf");
-    expect(row.object_key).toBe(`inline:${exported.export_id}`);
+    // The upload ran after the commit and a second transaction recorded the REAL key (the file was fetched above, so it has landed).
+    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    const stored = (await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string };
+    expect(stored.object_key).toBe(`inttest/${a.workspaceId}/${exported.export_id}.pdf`);
     expect(row.bytes).toBe(file.length);
     expect(row.methodology_footer).toEqual(exported.footer);
     expect(row.scheduled_report_id).toBeNull();
@@ -190,9 +208,9 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const res = await exportReport(a, p, body({ format: "csv" }));
     expect(res.statusCode, res.body).toBe(201);
     const exported = exportResponseSchema.parse(data(res));
-    expect(exported.download_url).toMatch(/^data:text\/csv;base64,/);
+    expect(exported.download_url).toMatch(/^https?:\/\/.*\.csv\?/);
     expect(exported.filename).toMatch(/\.csv$/);
-    const csv = fileOf(exported).toString("utf8");
+    const csv = (await fileOf(exported)).toString("utf8");
     expect(csv).toContain("methodology,,,,scoring_version,");
     expect(csv).toContain(METHODOLOGY_NOTE);
     expect(csv).toContain("overview,,brand,all,visibility_score,60,");
@@ -212,7 +230,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
       const res = await exportReport(a, p, body({ sections }));
       expect(res.statusCode, res.body).toBe(201);
       const exported = exportResponseSchema.parse(data(res));
-      expect(pdfRaw(fileOf(exported))).toContain(METHODOLOGY_NOTE);
+      expect(pdfRaw((await fileOf(exported)))).toContain(METHODOLOGY_NOTE);
       expect(exported.footer.note).toBe(METHODOLOGY_NOTE);
     }
   }, 120_000);
@@ -226,7 +244,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     await hideBrandTheme(a.workspaceId);
     const res = await exportReport(a, p, body());
     expect(res.statusCode, res.body).toBe(201);
-    const text = pdfText(fileOf(exportResponseSchema.parse(data(res))));
+    const text = pdfText((await fileOf(exportResponseSchema.parse(data(res)))));
     expect(text).not.toContain("Powered by Nominara");
     expect(text).toContain("Methodology");
   }, 120_000);
@@ -236,7 +254,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     await hideBrandTheme(a.workspaceId);
     const res = await exportReport(a, p, body());
     expect(res.statusCode, res.body).toBe(201);
-    const text = pdfText(fileOf(exportResponseSchema.parse(data(res))));
+    const text = pdfText((await fileOf(exportResponseSchema.parse(data(res)))));
     expect(text).toContain("Powered by Nominara");
     expect(text).toContain("Methodology");
   }, 120_000);
@@ -361,7 +379,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const exported = exportResponseSchema.parse(data(res));
     expect(exported.footer.data_through).toBeNull();
     expect(exported.footer.live_capture_ratio).toBeNull();
-    const csv = fileOf(exported).toString("utf8");
+    const csv = (await fileOf(exported)).toString("utf8");
     expect(csv).toContain("methodology,,,,data_through,,");
     expect(csv).not.toMatch(/visibility_score,0,/);
   }, 120_000);
@@ -372,9 +390,9 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     await harness.db().query(`INSERT INTO competitors (id, workspace_id, project_id, name) VALUES ($1,$2,$3,'Rival Roofing')`, [competitorId, a.workspaceId, p]);
     await metric(a.workspaceId, p, "gemini", 2, { entity: "competitor", entityId: competitorId, score: "30.000" });
     await metric(a.workspaceId, p, "all", 2, { entity: "competitor", entityId: competitorId, score: "30.000" });
-    const shown = fileOf(data<Exported>(await exportReport(a, p, body({ format: "csv" }))));
+    const shown = (await fileOf(data<Exported>(await exportReport(a, p, body({ format: "csv" })))));
     expect(shown.toString()).toContain("Rival Roofing");
-    const hidden = fileOf(data<Exported>(await exportReport(a, p, body({ format: "csv", hide_competitors: true }))));
+    const hidden = (await fileOf(data<Exported>(await exportReport(a, p, body({ format: "csv", hide_competitors: true })))));
     expect(hidden.toString()).not.toContain("Rival Roofing");
   }, 120_000);
   // STORY-100 AC2 / scenario 3 — the third suppression route (a section selection) and the second format (CSV).
@@ -392,12 +410,12 @@ describe("STORY-100 · on-demand export over HTTP", () => {
       const pdf = await exportReport(a, p, body({ sections: [section] }));
       expect(pdf.statusCode, `${section} pdf: ${pdf.body}`).toBe(201);
       const stored = exportResponseSchema.parse(data(pdf));
-      expect(pdfRaw(fileOf(stored)), `${section} pdf`).toContain(METHODOLOGY_NOTE);
+      expect(pdfRaw((await fileOf(stored))), `${section} pdf`).toContain(METHODOLOGY_NOTE);
       expect(stored.footer.note).toBe(METHODOLOGY_NOTE);
 
       const csv = await exportReport(a, p, body({ format: "csv", sections: [section] }));
       expect(csv.statusCode, `${section} csv: ${csv.body}`).toBe(201);
-      const text = fileOf(exportResponseSchema.parse(data(csv))).toString("utf8");
+      const text = (await fileOf(exportResponseSchema.parse(data(csv)))).toString("utf8");
       expect(text, `${section} csv`).toContain("methodology,,,,scoring_version,");
       expect(text, `${section} csv`).toContain(METHODOLOGY_NOTE);
     }
@@ -412,7 +430,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const res = await exportReport(a, p, body({ format: "csv", sections: ["tasks"] }));
     expect(res.statusCode, res.body).toBe(201);
     const exported = exportResponseSchema.parse(data(res));
-    const text = fileOf(exported).toString("utf8");
+    const text = (await fileOf(exported)).toString("utf8");
     expect(text).toContain("methodology,,,,scoring_version,");
     expect(text).toContain("methodology,,,,note,");
     expect(text).toContain(METHODOLOGY_NOTE);
@@ -429,13 +447,13 @@ describe("STORY-100 · on-demand export over HTTP", () => {
 
     const pdf = await exportReport(a, p, body({ sections: ["overview"] }));
     expect(pdf.statusCode, pdf.body).toBe(201);
-    const text = pdfText(fileOf(exportResponseSchema.parse(data(pdf))));
+    const text = pdfText((await fileOf(exportResponseSchema.parse(data(pdf)))));
     expect(text).toContain("low confidence");
     expect(text).toContain("high");
 
     const csv = await exportReport(a, p, body({ format: "csv", sections: ["overview"] }));
     expect(csv.statusCode, csv.body).toBe(201);
-    const rows = fileOf(exportResponseSchema.parse(data(csv))).toString("utf8");
+    const rows = (await fileOf(exportResponseSchema.parse(data(csv)))).toString("utf8");
     expect(rows).toMatch(/overview,,brand,gemini,visibility_score,70,low,3,/);
     expect(rows).toMatch(/overview,,brand,all,visibility_score,60,low,3,/);
     expect(rows).toMatch(/overview,,brand,chatgpt,visibility_score,50,high,200,/);

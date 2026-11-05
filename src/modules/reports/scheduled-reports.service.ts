@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, type OnModuleDestroy } from "@nestjs/common";
 import type { ClientBase, Pool, PoolClient } from "pg";
 import { SCHEDULED_REPORT_MAX_RECIPIENTS } from "../../../contracts/reports/index.js";
+import { loadEnv } from "../../config/env.js";
 import { PG_POOL, isConnectionClassFailure } from "../../db/pg-pool.js";
 import { RESEND_WORST_CASE_SEND_MS } from "../identity/adapters/resend-email-sender.adapter.js";
 import type {
@@ -34,6 +35,8 @@ import {
   type ReportSender,
   type ScheduledReportRow,
 } from "../../lib/reports/run-scheduled-report.js";
+import { mailDepsFromEnv, planArtifactMail, type ArtifactMailPlan } from "../../lib/reports/report-artifact-mail.js";
+import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { commitTierCap, provisionUsageCounters, releaseTierCap, reserveTierCap } from "../../lib/usage/tier-caps.js";
@@ -137,6 +140,7 @@ export class ScheduledReportsService implements OnModuleDestroy {
     private readonly exports: ExportService,
     @Inject(EMAIL_SENDER) private readonly email: EmailSender,
     @Inject(PG_POOL) private readonly pool: Pool,
+    private readonly objects: TenantObjectStore,
   ) {}
 
   /** Set at the start of shutdown: deliveries that have not yet begun sending do not begin (see `deliver`). */
@@ -288,18 +292,21 @@ export class ScheduledReportsService implements OnModuleDestroy {
     // STORY-100 AC10: the agency's display name and Reply-To, read from the theme row in THIS transaction (the send itself
     // holds none) and carried to the post-commit send.
     const sender = await resolveReportSender(client, report.theme_id);
+    // STORY-180 AC3: attach or link, decided and (for a link) the token's hash stored, in THIS transaction. The bytes are read
+    // after the commit, by the delivery.
+    const mail = await planArtifactMail(client, { ...mailDepsFromEnv(this.objects, loadEnv()), uploaded: (ids) => this.exports.uploaded(ids) }, workspaceId, artifacts);
     // The request's WHOLE tenant context (project scope included) carries to the second transaction.
     const context = currentTenantStore()!.context;
-    afterCommit(() => this.startDelivery(context, report, deliveryId, artifacts, sender));
+    afterCommit(() => this.startDelivery(context, report, deliveryId, mail, sender));
     return recorded;
   }
 
   /** Runs after the request transaction has committed. Never throws; a failure to record leaves the row `sending` (read as stale `failed`). */
-  private startDelivery(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[], sender: ReportSender): void {
+  private startDelivery(context: TenantContext, report: ReportRow, deliveryId: string, mail: ArtifactMailPlan, sender: ReportSender): void {
     // setImmediate: the request's own connection is released right after its afterCommit tasks run, so the work (and the pooled
     // connection it takes for the second transaction) starts on the next turn, never while the request still holds its own.
     const work = new Promise<void>((resolve) => setImmediate(resolve))
-      .then(() => this.deliver(context, report, deliveryId, artifacts, sender))
+      .then(() => this.deliver(context, report, deliveryId, mail, sender))
       .catch((error: unknown) => {
         logger.error({ message: "scheduled report delivery could not be finalised; the row stays sending", workspace_id: context.workspaceId, scheduled_report_id: report.id, error: error instanceof Error ? error.name : "unknown" });
       })
@@ -307,7 +314,7 @@ export class ScheduledReportsService implements OnModuleDestroy {
     this.inflight.add(work);
   }
 
-  private async deliver(context: TenantContext, report: ReportRow, deliveryId: string, artifacts: string[], sender: ReportSender): Promise<void> {
+  private async deliver(context: TenantContext, report: ReportRow, deliveryId: string, mail: ArtifactMailPlan, sender: ReportSender): Promise<void> {
     if (this.stopping) {
       // Shutdown began before this delivery's turn: send NOTHING (the drain has already stopped waiting) and record it as
       // failed, best effort. If recording fails too, the row stays `sending`, reads `failed` after STALE_SENDING_MS, and no
@@ -316,7 +323,7 @@ export class ScheduledReportsService implements OnModuleDestroy {
       return;
     }
     // NOTE: `report.recipients` is the list captured at REQUEST time: edits made while the send runs do not change who is mailed.
-    const result = await sendReportEmails(this.email, report, artifacts, sender);
+    const result = await sendReportEmails(this.email, report, mail, sender);
     // `delivered` only when the sender really delivers mail; the logging/dev senders keep the owner's honesty rule (`logged`).
     const { status, reason } = deliveryOutcome(result, report.recipients.length, this.email.delivers === true);
     await this.recordOutcome(context, deliveryId, report.id, status, reason, result.sent);

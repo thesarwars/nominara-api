@@ -13,6 +13,8 @@ import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
+import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
+import { reportStorageEnv } from "../support/report-storage-env.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // Group C review round 5 — the post-commit finalisation of a scheduled-report delivery runs as the real `nominara_app` role
@@ -25,19 +27,20 @@ const cookieOf = (t: Cookie): string => `${ACCESS_COOKIE_NAME}=${t.accessToken};
 describe("Group C · scheduled-report delivery finalise under the app role (RLS)", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
+  let localstack: LocalstackFixture;
   const harness = useApiHarness({
     runAsAppRole: true,
-    env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString }),
+    env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString, ...reportStorageEnv(localstack.endpoint) }),
   });
   /** Superuser pool for fixtures only: the application under test runs as nominara_app. */
   let admin: Pool;
   let sessions: SessionService;
 
   beforeAll(async () => {
-    [cacheValkey, queueValkey] = await Promise.all([startValkey(), startValkeyFixture()]);
+    [cacheValkey, queueValkey, localstack] = await Promise.all([startValkey(), startValkeyFixture(), startLocalstack()]);
   }, 180_000);
   afterAll(async () => {
-    await Promise.all([cacheValkey.stop(), queueValkey.stop()]);
+    await Promise.all([cacheValkey.stop(), queueValkey.stop(), localstack.stop()]);
   });
   beforeEach(() => {
     const c = harness.db();

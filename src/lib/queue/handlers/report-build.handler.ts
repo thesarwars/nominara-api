@@ -19,6 +19,11 @@ import {
   type ReportRunDeps,
   type RunOutcome,
 } from "../../reports/run-scheduled-report.js";
+import { mailDepsFromEnv } from "../../reports/report-artifact-mail.js";
+import { S3Adapter } from "../../storage/s3.adapter.js";
+import { resolveStorageConfig } from "../../storage/storage-config.js";
+import { unconfiguredStoragePort } from "../../storage/unconfigured-port.js";
+import { TenantObjectStore } from "../../storage/tenant-object-store.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
@@ -70,7 +75,10 @@ export function createReportBuildHandler(context: QueueHandlerContext, deps: Rep
     if (run === undefined) {
       const resolver = new EntitlementResolver(new InMemoryCacheAdapter(), context.pool);
       const usage = new StructuralUsage(context.pool);
-      run = { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, context.pool) };
+      const config = resolveStorageConfig(context.env);
+      // Unconfigured storage fails closed, as in the API: every export refuses with 503 and the period retries then settles failed.
+      const objects = new TenantObjectStore(config === null ? unconfiguredStoragePort() : new S3Adapter(config), config?.keyEnv ?? context.env.NODE_ENV);
+      run = { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, context.pool, objects), mail: mailDepsFromEnv(objects, context.env) };
     }
     return run;
   };

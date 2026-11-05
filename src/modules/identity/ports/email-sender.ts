@@ -8,12 +8,21 @@
 
 export const EMAIL_SENDER = Symbol("EMAIL_SENDER");
 
+/** STORY-180 AC3: a file carried on the message. Bytes, never a path or a URL; never logged. */
+export interface EmailAttachment {
+  readonly filename: string;
+  readonly content: Buffer;
+  readonly contentType?: string;
+}
+
 export interface EmailMessage {
   readonly to: string;
   readonly subject: string;
   readonly textBody: string;
   /** Optional HTML alternative. Nothing renders one today (no email template/branding exists); the Resend adapter passes it through when present. */
   readonly htmlBody?: string;
+  /** STORY-180 AC3: files to attach (a scheduled report up to 8 MiB). Absent for every other mail. */
+  readonly attachments?: readonly EmailAttachment[];
   /**
    * STORY-077 (owner 2026-10-23): a key the provider de-duplicates on, stable across RETRIES of the same logical email (a
    * queue job's attempts). Absent, the Resend adapter mints one per send() call, which only protects its own in-call

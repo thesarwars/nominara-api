@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import type { DataSource } from "../../../contracts/analytics/index.js";
-import type { ExportRequest, ExportResponse, ReportSection } from "../../../contracts/reports/index.js";
+import { EXPORT_DOWNLOAD_URL_SECONDS, type ExportRequest, type ExportResponse, type ReportSection } from "../../../contracts/reports/index.js";
 import { FeatureNotInPlanError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { combineDataSources, engineDataSourcesForDates } from "../../lib/analytics/data-source.js";
@@ -21,20 +21,32 @@ import {
 import { renderPdf } from "../../lib/reports/export-pdf.js";
 import { CROSS_ENGINE_KEY } from "../../lib/rollup/roll-up-day.js";
 import { confidenceFor } from "../../lib/scoring/index.js";
+import type { BoundObjectStore } from "../../lib/storage/tenant-object-store.js";
+import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { commitTierCap, limitValueFor, readCounter, releaseTierCap, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
 import { exportPaletteFrom, type ExportPalette, type StoredThemeValues } from "../../lib/theme/export-palette.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
-import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
+import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 
 // NEW-E-100b — POST /v1/projects/{id}/reports/export (STORY-100, NFR-AGY-05).
 //
 // OWNER DECISION (E-0): the synchronous per-project path. The file is built in
-// the request, stored as a `report_artifacts` row (object_key `inline:<id>`),
-// and returned as a `data:` URL. Rendering is pure computation over rollup
-// rows: no network call, so KAD-06 holds.
+// the request. Rendering is pure computation over rollup rows: no network call,
+// so KAD-06 holds.
+//
+// STORY-180 (owner decision 54): THE FILE LIVES IN OBJECT STORAGE. The row is
+// recorded in the request transaction with `object_key = 'pending:<id>'`; the
+// upload to `nominara-reports` happens AFTER that transaction commits (never
+// inside it), and a second short transaction records the real key. The response
+// carries a presigned URL (15 minutes, minted locally - no network call) for the
+// key the upload will use, and a `data:` URL is gone. With storage not
+// configured the presign refuses and the export answers 503 `degraded`; there
+// is no inline fallback. A failed upload is logged and counted and leaves the
+// row `pending:`: nothing downloads a file that is not there (the link route
+// answers 404 for it, the cadence path rebuilds it).
 //
 // WHAT COMES FROM WHERE
 //   figures   `metric_daily` only (the rollups), cells-weighted over the window
@@ -94,7 +106,16 @@ export class ExportService {
     private readonly resolver: EntitlementResolver,
     private readonly usage: StructuralUsage,
     @Inject(PG_POOL) private readonly pool: Pool,
+    private readonly objects: TenantObjectStore,
   ) {}
+
+  /** Post-commit uploads still running, by artifact id. Tests and the mail step wait on them. */
+  private readonly uploads = new Map<string, Promise<void>>();
+
+  /** Resolves when the named artifacts' uploads (started by THIS process) have finished, successfully or not. Unknown ids resolve at once. */
+  async uploaded(ids: readonly string[]): Promise<void> {
+    await Promise.all(ids.map((id) => this.uploads.get(id)));
+  }
 
   async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined): Promise<ExportResponse> {
     const started = Date.now();
@@ -102,8 +123,15 @@ export class ExportService {
     if (store === undefined) throw new Error("ExportService requires an active tenant context");
     const tx = store.client;
     const workspaceId = store.context.workspaceId;
+    const exportId = uuidV7();
+    const relativeKey = `${exportId}.${body.format}`;
 
     try {
+      // BEFORE any work: with storage unconfigured the presign refuses with 503 and nothing has been rendered or written.
+      // Minting is a local signature (ObjectStoragePort.presignGet), so a request handler may (KAD-06).
+      const bound = this.objects.bind();
+      const downloadUrl = await bound.presignGet("reports", relativeKey, { expiresInSeconds: EXPORT_DOWNLOAD_URL_SECONDS });
+
       const entitlements = await this.resolver.resolveForWorkspace(workspaceId);
 
       // CSV is a feature gate, not a metered one (the PDF cap was already
@@ -172,13 +200,14 @@ export class ExportService {
       });
 
       const file = body.format === "pdf" ? await renderPdf(doc) : Buffer.from(renderCsv(doc), "utf8");
-      const exportId = uuidV7();
       await tx.query(
         `INSERT INTO report_artifacts
            (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at)
          VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9::jsonb, now() + make_interval(days => $10::int))`,
-        [exportId, workspaceId, [projectId], window.from, window.to, body.format, `inline:${exportId}`, file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS],
+        [exportId, workspaceId, [projectId], window.from, window.to, body.format, `pending:${exportId}`, file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS],
       );
+
+      this.scheduleUpload(bound, store.context, { id: exportId, relativeKey, file, contentType: body.format === "pdf" ? "application/pdf" : "text/csv" });
 
       if (body.format === "pdf" && idempotencyKey !== undefined) {
         await commitTierCap(tx, workspaceId, "pdf_exports", idempotencyKey);
@@ -203,7 +232,7 @@ export class ExportService {
         export_id: exportId,
         format: body.format,
         filename: `nominara-report-${stamp}.${body.format}`,
-        download_url: `data:${body.format === "pdf" ? "application/pdf" : "text/csv"};base64,${file.toString("base64")}`,
+        download_url: downloadUrl,
         footer,
         pdf,
       };
@@ -214,6 +243,61 @@ export class ExportService {
       }
       throw error;
     }
+  }
+
+  /**
+   * STORY-180 AC1. Registers the upload to run AFTER this request's transaction commits (a rolled-back export uploads nothing).
+   * Public so the ordering is testable; call it only from `export`.
+   *
+   * The work: put the object (no transaction open), then ONE short tenant transaction records the real key. If the row is gone
+   * by then (the build was rolled back to a savepoint after the upload was registered) the orphan object is deleted. Never throws:
+   * a failure is logged and counted and leaves the row `pending:` (see the header).
+   */
+  scheduleUpload(bound: BoundObjectStore, context: TenantContext, artifact: { id: string; relativeKey: string; file: Buffer; contentType: string }): void {
+    afterCommit(() => {
+      const work = new Promise<void>((resolve) => setImmediate(resolve))
+        .then(() => this.upload(bound, context, artifact))
+        .catch((error: unknown) => {
+          logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+        })
+        .finally(() => this.uploads.delete(artifact.id));
+      this.uploads.set(artifact.id, work);
+    });
+  }
+
+  private async upload(bound: BoundObjectStore, context: TenantContext, artifact: { id: string; relativeKey: string; file: Buffer; contentType: string }): Promise<void> {
+    const started = Date.now();
+    let key: string;
+    try {
+      key = await bound.put("reports", artifact.relativeKey, artifact.file, { contentType: artifact.contentType });
+    } catch (error) {
+      incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "put_failed" });
+      logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "put_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
+      return;
+    }
+    try {
+      const client = await this.pool.connect();
+      try {
+        const recorded = await withTenantContext(client, context, (tx) =>
+          tx.query("UPDATE report_artifacts SET object_key = $2 WHERE id = $1 AND object_key = $3", [artifact.id, key, `pending:${artifact.id}`]),
+        );
+        if ((recorded.rowCount ?? 0) === 0) {
+          await bound.delete("reports", artifact.relativeKey);
+          incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "orphan_removed" });
+          logger.warn({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "orphan_removed", duration_ms: Date.now() - started });
+          return;
+        }
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "record_failed" });
+      logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "record_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
+      return;
+    }
+    incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "ok" });
+    // Workspace ID and sizes only: no key, no URL, no figures.
+    logger.log({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "ok", bytes: artifact.file.length, duration_ms: Date.now() - started });
   }
 
   /**
