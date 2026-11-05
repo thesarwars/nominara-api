@@ -240,6 +240,12 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
           await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
         }
         await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
+        // A TRUNCATED EMPTY ANSWER is a token-budget failure, not a refusal (the scheduled path's rule): the cell failed as `malformed_response`, the breaker above
+        // already heard a success (the engine was reachable), and nothing is seeded. Cost was recorded above.
+        if (raw.text.trim() === "" && raw.truncated) {
+          incrementCounter("nominara_capture_truncated_empty_total", { engine_key: key.data });
+          throw new ScanCaptureError("malformed_response");
+        }
         if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
         if (window !== undefined && sharedCacheEnabled) {
           await seedSharedCache(

@@ -223,11 +223,11 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
   // STORY-079 AC "a cached engine result is labelled with its TRUE capture age": the envelope may carry when the answer was captured.
   // Additive and optional: an entry written before this field existed still reads, and carries no time.
   it("STORY-079 - an envelope may carry the answer's capture time; one written without it still reads, with none", () => {
-    const withTime = parseL1Envelope(JSON.stringify({ v: 1, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", capturedAt: "2026-11-02T08:00:00.000Z" }));
+    const withTime = parseL1Envelope(JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", capturedAt: "2026-11-02T08:00:00.000Z" }));
     expect(withTime?.capturedAt).toBe("2026-11-02T08:00:00.000Z");
     expect(parseL1Envelope(envelope(HASH_A))?.capturedAt).toBeUndefined();
     // A time that is not a time is dropped, never trusted - the entry itself stays a readable hit for the scheduled path.
-    const junk = parseL1Envelope(JSON.stringify({ v: 1, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", capturedAt: "yesterday" }));
+    const junk = parseL1Envelope(JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", capturedAt: "yesterday" }));
     expect(junk).toBeDefined();
     expect(junk?.capturedAt).toBeUndefined();
   });
@@ -239,7 +239,7 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
     for (const [c, extra] of [[withTime, { capturedAt: "2026-11-02T08:00:00.000Z" }], [withoutTime, {}]] as const) {
       await cache.set(
         captureL1Key({ env: CONTEXT.env, engineKey: c.engineKey, adapterMajor: adapterMajorOf(c.adapterVersion), promptText: c.promptText, locale: CONTEXT.locale, personaHint: CONTEXT.personaHint, ttlSeconds: c.ttlSeconds, nowMs: CONTEXT.nowMs }),
-        JSON.stringify({ v: 1, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", ...extra }),
+        JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", ...extra }),
         { ttlMs: 60_000 },
       );
     }

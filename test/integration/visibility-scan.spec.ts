@@ -326,7 +326,7 @@ describe("STORY-079 · Visibility Scan", () => {
     const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
     await workerCache.set(
       captureL1Key({ env: cacheKeyNamespace(), engineKey: "perplexity", adapterMajor: adapterMajorOf(engine.adapter_version), promptText: seeded.query_text, locale: "en-US", personaHint: null, ttlSeconds: engine.cache_ttl_seconds, nowMs: Date.now() }),
-      JSON.stringify({ v: 1, contentHash: "a".repeat(64), payload: { format: "markdown", text: ANSWER }, excerpt: "x", capturedAt: twoHoursAgo }),
+      JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: { format: "markdown", text: ANSWER }, excerpt: "x", capturedAt: twoHoursAgo }),
       { ttlMs: 60_000 },
     );
     let liveCalls = 0;
@@ -486,7 +486,7 @@ describe("STORY-079 · Visibility Scan", () => {
     const seeded = body();
     await workerCache.set(
       await l1KeyFor("perplexity", seeded.query_text),
-      JSON.stringify({ v: 1, contentHash: "b".repeat(64), payload: { format: "markdown", text: "ANOTHER TENANT'S ANSWER about Acme" }, excerpt: "x", capturedAt: new Date(Date.now() - 3_600_000).toISOString() }),
+      JSON.stringify({ v: 2, contentHash: "b".repeat(64), payload: { format: "markdown", text: "ANOTHER TENANT'S ANSWER about Acme" }, excerpt: "x", capturedAt: new Date(Date.now() - 3_600_000).toISOString() }),
       { ttlMs: 60_000 },
     );
     let liveCalls = 0;
@@ -660,6 +660,25 @@ describe("STORY-079 · Visibility Scan", () => {
     await Promise.allSettled(workers);
     expect(recorded.filter((r) => r.key === "chatgpt")).toEqual([]);
     expect(recorded.filter((r) => r.key === "perplexity")).toEqual([{ key: "perplexity", code: "rate_limited" }]);
+  }, 60_000);
+
+  it("fix/result-document-text rules on the Tools path - a truncated EMPTY answer fails as malformed_response (breaker hears a success); a truncated, a flagged or an empty answer is never seeded into the shared cache", async () => {
+    const a = await owner("starter");
+    const q = body();
+    const recorded: { key: string; outcome: string }[] = [];
+    adapters = {
+      perplexity: async () => ({ ...raw(""), truncated: true }),
+      chatgpt: async () => ({ ...raw("HubSpot is a partial answer cut off"), truncated: true }),
+    };
+    workerDeps = { engineGate: { admit: async () => ({ kind: "admit" as const }), record: async (key: string, o: { outcome: string }) => { recorded.push({ key, outcome: o.outcome }); } } } as Partial<LookupExecuteDeps>;
+    const res = await post(a, { body: q });
+    expect(res.statusCode, res.body).toBe(200);
+    await Promise.allSettled(workers);
+    const done = frames(res.body).find((f) => f.event === "scan.completed")!;
+    expect(done.data["engine_failures"]).toEqual([expect.objectContaining({ engine: "perplexity", code: "malformed_response" })]);
+    expect(recorded.filter((r) => r.key === "perplexity")).toEqual([{ key: "perplexity", outcome: "success" }]);
+    expect(await workerCache.get(await l1KeyFor("perplexity", q.query_text))).toBeUndefined();
+    expect(await workerCache.get(await l1KeyFor("chatgpt", q.query_text))).toBeUndefined();
   }, 60_000);
 
   it("the job is enqueued on the dedicated interactive pool, keyed by the run", async () => {
