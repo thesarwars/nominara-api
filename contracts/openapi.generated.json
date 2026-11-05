@@ -40980,7 +40980,7 @@
                         },
                         "download_url": {
                           "type": "string",
-                          "minLength": 1
+                          "format": "uri"
                         },
                         "footer": {
                           "type": "object",
