@@ -143,6 +143,9 @@ export class ScheduledReportsService implements OnModuleDestroy {
     private readonly objects: TenantObjectStore,
   ) {}
 
+  /** Built once, on the first send-now (validated: a bad signing key fails closed there, not at boot). */
+  private mailDeps: ReturnType<typeof mailDepsFromEnv> | undefined;
+
   /** Set at the start of shutdown: deliveries that have not yet begun sending do not begin (see `deliver`). */
   private stopping = false;
 
@@ -294,7 +297,7 @@ export class ScheduledReportsService implements OnModuleDestroy {
     const sender = await resolveReportSender(client, report.theme_id);
     // STORY-180 AC3: attach or link, decided and (for a link) the token's hash stored, in THIS transaction. The bytes are read
     // after the commit, by the delivery.
-    const mail = await planArtifactMail(client, { ...mailDepsFromEnv(this.objects, loadEnv()), uploaded: (ids) => this.exports.uploaded(ids) }, workspaceId, artifacts);
+    const mail = await planArtifactMail(client, { ...(this.mailDeps ??= mailDepsFromEnv(this.objects, loadEnv())), uploaded: (ids) => this.exports.uploaded(ids) }, workspaceId, artifacts);
     // The request's WHOLE tenant context (project scope included) carries to the second transaction.
     const context = currentTenantStore()!.context;
     afterCommit(() => this.startDelivery(context, report, deliveryId, mail, sender));

@@ -1,9 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, hkdfSync } from "node:crypto";
 import type { ClientBase } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { REPORT_ATTACHMENT_MAX_BYTES } from "../../../contracts/reports/index.js";
 import {
   hashReportLinkToken,
+  mailDepsFromEnv,
   planArtifactMail,
   reportLinkToken,
   reportLinkUrl,
@@ -58,6 +59,19 @@ describe("STORY-180 AC3 · the link token", () => {
     expect(reportLinkToken(Buffer.alloc(32, 8), A1)).not.toBe(t);
   });
 
+  it("is keyed by a SUBKEY derived for this purpose (HKDF, info 'nominara/report-link'), never the job-signing key itself", () => {
+    const sub = Buffer.from(hkdfSync("sha256", KEY, Buffer.alloc(0), "nominara/report-link", 32));
+    const expected = createHmac("sha256", sub).update(A1).digest("base64url");
+    expect(reportLinkToken(KEY, A1)).toBe(expected);
+  });
+
+  it("mailDepsFromEnv fails closed on a signing key that is not 32 bytes of base64", () => {
+    const env = (k: string) => ({ OAUTH_REDIRECT_BASE_URL: BASE, QUEUE_JOB_SIGNING_KEY: k });
+    expect(() => mailDepsFromEnv({} as never, env(""))).toThrow(/signing key/);
+    expect(() => mailDepsFromEnv({} as never, env(Buffer.alloc(8).toString("base64")))).toThrow(/signing key/);
+    expect(mailDepsFromEnv({} as never, env(Buffer.alloc(32, 1).toString("base64"))).signingKey).toHaveLength(32);
+  });
+
   it("is stored as its SHA-256, never itself", () => {
     const t = reportLinkToken(KEY, A1);
     expect(hashReportLinkToken(t).equals(createHash("sha256").update(t).digest())).toBe(true);
@@ -82,6 +96,55 @@ describe("STORY-180 AC3 · attach or link", () => {
     expect(plan.items[1]!.link).toBe(reportLinkUrl(BASE, WS, reportLinkToken(KEY, A2)));
   });
 
+  it("the email's attachments are budgeted IN TOTAL: a file that would take the running sum past 8 MiB is linked (the boundary)", async () => {
+    const half = REPORT_ATTACHMENT_MAX_BYTES / 2;
+    const exact = fixture([
+      { id: A1, format: "pdf", bytes: half, period_end: "2026-10-31" },
+      { id: A2, format: "csv", bytes: half, period_end: "2026-10-31" },
+    ]);
+    expect((await planArtifactMail(exact.tx, exact.deps, WS, [A1, A2])).items.map((i) => i.link)).toEqual([null, null]);
+    const over = fixture([
+      { id: A1, format: "pdf", bytes: half, period_end: "2026-10-31" },
+      { id: A2, format: "csv", bytes: half + 1, period_end: "2026-10-31" },
+    ]);
+    const plan = await planArtifactMail(over.tx, over.deps, WS, [A1, A2]);
+    expect(plan.items[0]!.link).toBeNull();
+    expect(plan.items[1]!.link).not.toBeNull();
+  });
+
+  it("many files each under the limit never attach more than 8 MiB between them; the rest are links", async () => {
+    const ids = Array.from({ length: 6 }, (_, n) => `0190bbbb-0000-7000-8000-0000000001${String(n).padStart(2, "0")}`);
+    const f = fixture(ids.map((id) => ({ id, format: "pdf" as const, bytes: 3_000_000, period_end: "2026-10-31" })));
+    const plan = await planArtifactMail(f.tx, f.deps, WS, ids);
+    const attached = plan.items.filter((i) => i.link === null);
+    expect(attached).toHaveLength(2);
+    expect(attached.reduce((n, i) => n + i.bytes, 0)).toBeLessThanOrEqual(REPORT_ATTACHMENT_MAX_BYTES);
+    expect(plan.items.filter((i) => i.link !== null)).toHaveLength(4);
+  });
+
+  it("an oversize file does not consume the budget: a small file after it is still attached", async () => {
+    const f = fixture([
+      { id: A1, format: "pdf", bytes: REPORT_ATTACHMENT_MAX_BYTES + 1, period_end: "2026-10-31" },
+      { id: A2, format: "csv", bytes: 1000, period_end: "2026-10-31" },
+    ]);
+    expect((await planArtifactMail(f.tx, f.deps, WS, [A1, A2])).items.map((i) => i.link === null)).toEqual([false, true]);
+  });
+
+  it("every statement carries the workspace predicate", async () => {
+    const f = fixture([{ id: A1, format: "pdf", bytes: 9_000_000, period_end: "2026-10-31" }]);
+    await planArtifactMail(f.tx, f.deps, WS, [A1]);
+    for (const s of f.sql) {
+      expect(s.text).toContain("workspace_id =");
+      expect(s.params).toContain(WS);
+    }
+  });
+
+  it("an artifact that already holds a DIFFERENT token hash (the signing key rotated between attempts) fails closed instead of overwriting a link already mailed", async () => {
+    const f = fixture([{ id: A1, format: "pdf", bytes: 9_000_000, period_end: "2026-10-31" }]);
+    (f.tx.query as ReturnType<typeof vi.fn>).mockImplementation(async (text: string) => (/FROM report_artifacts/.test(text) ? { rows: [{ id: A1, format: "pdf", bytes: 9_000_000, period_end: "2026-10-31" }] } : { rows: [], rowCount: 0 }));
+    await expect(planArtifactMail(f.tx, f.deps, WS, [A1])).rejects.toThrow(/link token/);
+  });
+
   it("a zero-byte file is attached, not linked", async () => {
     const f = fixture([{ id: A1, format: "csv", bytes: 0, period_end: "2026-10-31" }]);
     const plan = await planArtifactMail(f.tx, f.deps, WS, [A1]);
@@ -100,11 +163,6 @@ describe("STORY-180 AC3 · attach or link", () => {
     expect((writes[0]!.params[1] as Buffer).equals(hashReportLinkToken(reportLinkToken(KEY, A2)))).toBe(true);
     // The raw token is never written.
     expect(JSON.stringify(writes[0]!.params)).not.toContain(reportLinkToken(KEY, A2));
-  });
-
-  it("without a signing key an oversize file fails closed (no link without a token)", async () => {
-    const f = fixture([{ id: A1, format: "pdf", bytes: 9_000_000, period_end: "2026-10-31" }], { signingKey: undefined });
-    await expect(planArtifactMail(f.tx, f.deps, WS, [A1])).rejects.toThrow(/link/i);
   });
 
   it("an artifact that is not in the workspace's table fails rather than being skipped", async () => {

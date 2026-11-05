@@ -96,8 +96,9 @@ export class S3Adapter implements ObjectStoragePort {
     await this.send(() => this.client.send(new DeleteObjectCommand({ Bucket: this.bucketName(bucket), Key: key })));
   }
 
-  async presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number): Promise<string> {
-    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: key }), { expiresIn: expiresInSeconds });
+  async presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number, downloadFilename?: string): Promise<string> {
+    const disposition = downloadFilename === undefined ? undefined : `attachment; filename="${downloadFilename.replace(/[^A-Za-z0-9._-]/g, "_")}"`;
+    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: key, ResponseContentDisposition: disposition }), { expiresIn: expiresInSeconds });
   }
 
   private bucketName(bucket: StorageBucketName): string {

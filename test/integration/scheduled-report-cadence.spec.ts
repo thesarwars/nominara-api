@@ -177,7 +177,7 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
     const resolver = new EntitlementResolver(new InMemoryCacheAdapter(), appPool);
     const usage = new StructuralUsage(appPool);
     const objects = objectStore();
-    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool, objects), mail: mailDepsFromEnv(objects, workerEnv() as never) };
+    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool, objects, "http://localhost:3000"), mail: mailDepsFromEnv(objects, workerEnv() as never) };
   }
 
   /** Real services over the app pool, but a build that always throws (a stand-in for a renderer fault). */

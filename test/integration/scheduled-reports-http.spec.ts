@@ -15,7 +15,7 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
-import { reportStorageEnv } from "../support/report-storage-env.js";
+import { fetchStored, reportStorageEnv } from "../support/report-storage-env.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // NEW-E-100c — /v1/scheduled-reports through the REAL ApiModule.
@@ -260,6 +260,35 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     expect(keys).toHaveLength(2);
     for (const k of keys) expect(k.object_key).toMatch(new RegExp(`^inttest/${a.workspaceId}/[0-9a-f-]{36}\\.pdf$`));
     expect(keys.map((k) => k.bytes).sort()).toEqual(files.map((f) => f.content.length).sort());
+  }, 180_000);
+
+  it("STORY-180 AC3/AC6 · a file over 8 MiB is a link in the email, and clicking that very link redirects to the stored bytes", async () => {
+    const { a, p } = await seeded();
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p]))));
+    // The decision depends only on the `bytes` column, so no 8 MiB file is built: a trigger scoped to this workspace records a size
+    // above the limit for the artifact (the stored object stays the real, small file).
+    const suffix = a.workspaceId.replaceAll("-", "");
+    await harness.db().query(`CREATE OR REPLACE FUNCTION public.t180_oversize_${suffix}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.bytes := 9000000; RETURN NEW; END $$`);
+    await harness.db().query(
+      `CREATE TRIGGER t180_oversize_${suffix} BEFORE INSERT ON report_artifacts FOR EACH ROW WHEN (NEW.workspace_id = '${a.workspaceId}') EXECUTE FUNCTION public.t180_oversize_${suffix}()`,
+    );
+    const sent: Array<{ textBody: string; attachments?: unknown[] }> = [];
+    const restore = withSender({ delivers: true, send: async (m) => void sent.push(m as never) });
+    try {
+      expect((await call(a, "POST", `/scheduled-reports/${made.id}/send-now`)).statusCode).toBe(200);
+      await settleDeliveries();
+    } finally {
+      restore();
+      await harness.db().query(`DROP TRIGGER IF EXISTS t180_oversize_${suffix} ON report_artifacts`);
+      await harness.db().query(`DROP FUNCTION IF EXISTS public.t180_oversize_${suffix}()`);
+    }
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.attachments ?? []).toHaveLength(0);
+    const url = /https?:\/\/\S*\/v1\/report-links\/[0-9a-f-]{36}\/[A-Za-z0-9_-]{43}/.exec(sent[0]!.textBody)?.[0];
+    expect(url).toBeDefined();
+    const click = await harness.app().inject({ method: "GET", url: new URL(url!).pathname });
+    expect(click.statusCode, click.body).toBe(302);
+    expect((await fetchStored(String(click.headers.location))).subarray(0, 5).toString()).toBe("%PDF-");
   }, 180_000);
 
   it("STORY-100 s9 · send-now on a tier with ZERO allowance is 403 feature_not_in_plan, with no delivery and no unit", async () => {

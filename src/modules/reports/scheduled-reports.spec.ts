@@ -198,8 +198,8 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     expect(h.sent[0]!.textBody).toContain("7 days");
   });
 
-  it("STORY-180 AC3 · a file exactly 8 MiB is still attached", async () => {
-    const h = harness({ artifactBytes: 8_388_608 });
+  it("STORY-180 AC3 · files totalling exactly 8 MiB are still attached (two of 4 MiB)", async () => {
+    const h = harness({ artifactBytes: 4_194_304 });
     await h.service.sendNow(REPORT_ID);
     await h.commit();
     expect(h.sent[0]!.attachments).toHaveLength(2);

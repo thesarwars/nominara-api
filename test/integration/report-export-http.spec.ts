@@ -128,8 +128,9 @@ describe("STORY-100 · on-demand export over HTTP", () => {
   });
 
   let keyCounter = 0;
-  const exportReport = (a: Actor, projectId: string, payload: unknown, key: string | null = `key-${String(++keyCounter)}-${uuidV7()}`) =>
-    harness.app().inject({
+  const exportReport = (a: Actor, projectId: string, payload: unknown, key: string | null = `key-${String(++keyCounter)}-${uuidV7()}`) => {
+    lastActor = a;
+    return harness.app().inject({
       method: "POST",
       url: apiUrl(`/projects/${projectId}/reports/export`),
       headers: {
@@ -140,10 +141,23 @@ describe("STORY-100 · on-demand export over HTTP", () => {
       },
       payload: payload as object,
     });
+  };
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
   const errorOf = (res: { json(): unknown }) => (res.json() as { error: { code: string; details?: Record<string, unknown> } }).error;
   type Exported = ReturnType<typeof exportResponseSchema.parse>;
-  const fileOf = (e: Exported): Promise<Buffer> => fetchStored(e.download_url);
+  // STORY-180: download_url is the API's own route. The browser follows it with the session cookie of whoever exported (the latest
+  // exportReport call), gets 409 until the post-commit upload has landed, then a 302 to a fresh presign it fetches.
+  let lastActor: Actor | undefined;
+  const downloadRoute = (e: Exported, cookie: string) => harness.app().inject({ method: "GET", url: new URL(e.download_url).pathname, headers: { cookie } });
+  const fileOf = async (e: Exported): Promise<Buffer> => {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const res = await downloadRoute(e, lastActor!.cookie);
+      if (res.statusCode === 302) return fetchStored(String(res.headers.location));
+      if (res.statusCode !== 409 || Date.now() > deadline) throw new Error(`download route answered ${String(res.statusCode)}: ${res.body}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  };
   const usage = async (workspaceId: string) =>
     (await harness.db().query(`SELECT used_value::int AS used, reserved_value::int AS reserved FROM usage_counters WHERE workspace_id = $1 AND metric = 'pdf_exports'`, [workspaceId])).rows[0] as
       | { used: number; reserved: number }
@@ -175,11 +189,10 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const exported = exportResponseSchema.parse(data(res));
     expect(exported.format).toBe("pdf");
     expect(exported.filename).toMatch(/\.pdf$/);
-    // STORY-180 AC1/AC2: a presigned object-storage URL (http here only because LocalStack is), never a data: URL.
+    // STORY-180 AC2: the API's download route (an http(s) URL), never a data: URL and never a presign minted before the file exists.
     expect(exported.download_url).toMatch(/^https?:\/\//);
     expect(exported.download_url).not.toMatch(/^data:/);
-    expect(exported.download_url).toContain(`/nominara-reports/inttest/${a.workspaceId}/${exported.export_id}.pdf`);
-    expect(new URL(exported.download_url).searchParams.get("X-Amz-Expires")).toBe("900");
+    expect(new URL(exported.download_url).pathname).toBe(`/v1/exports/${exported.export_id}/download`);
     expect(exported.footer.note).toBe(METHODOLOGY_NOTE);
     expect(exported.footer.engines).toEqual(["chatgpt", "gemini"]);
     const file = (await fileOf(exported));
@@ -203,12 +216,74 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(audit).toEqual([{ action: "report.exported", resource_type: "report_artifact", resource_id: exported.export_id }]);
   }, 120_000);
 
+  it("STORY-180 AC2 · the download route 302s to a fresh 15-minute presign of the STORED key, named for the file, uncached", async () => {
+    const { a, p } = await seeded();
+    const exported = exportResponseSchema.parse(data(await exportReport(a, p, body())));
+    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    const res = await downloadRoute(exported, a.cookie);
+    expect(res.statusCode, res.body).toBe(302);
+    const location = String(res.headers.location);
+    expect(location).toContain(`/nominara-reports/inttest/${a.workspaceId}/${exported.export_id}.pdf`);
+    expect(new URL(location).searchParams.get("X-Amz-Expires")).toBe("900");
+    expect(res.headers["cache-control"]).toBe("no-store");
+    const fetched = await fetch(location);
+    expect(fetched.status).toBe(200);
+    expect(fetched.headers.get("content-disposition")).toBe(`attachment; filename="${exported.filename}"`);
+    await fetched.arrayBuffer();
+    // Re-fetched on every click: a replayed response (same Idempotency-Key) still downloads.
+    expect((await downloadRoute(exported, a.cookie)).statusCode).toBe(302);
+    const row = (await harness.db().query(`SELECT download_count FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { download_count: number };
+    expect(row.download_count).toBe(2);
+  }, 120_000);
+
+  it("STORY-180 AC2 · a manager scoped to the export's project may download it; one scoped to another project gets the neutral 404", async () => {
+    const { a, p } = await seeded();
+    const other = await project(a.workspaceId, "Other");
+    const exported = exportResponseSchema.parse(data(await exportReport(a, p, body({ format: "csv" }))));
+    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    const inScope = await member(a.workspaceId, "manager", [p]);
+    const outOfScope = await member(a.workspaceId, "manager", [other]);
+    expect((await downloadRoute(exported, inScope.cookie)).statusCode).toBe(302);
+    expect((await downloadRoute(exported, outOfScope.cookie)).statusCode).toBe(404);
+  }, 180_000);
+
+  it("STORY-180 AC2 · while the file has not landed (key still pending) the route is 409, with no redirect", async () => {
+    const { a, p } = await seeded();
+    const id = uuidV7();
+    await harness.db().query(
+      `INSERT INTO report_artifacts (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at)
+       VALUES ($1,$2,$3,'2026-10-01','2026-10-31','pdf',$4,10,'{}'::jsonb, now() + interval '7 days')`,
+      [id, a.workspaceId, [p], `pending:${id}`],
+    );
+    const res = await harness.app().inject({ method: "GET", url: apiUrl(`/exports/${id}/download`), headers: { cookie: a.cookie } });
+    expect(res.statusCode, res.body).toBe(409);
+    expect(res.headers.location).toBeUndefined();
+  }, 120_000);
+
+  it("STORY-180 AC2 · another workspace's export, an expired one and an unknown id are the same 404; no session is 401; a malformed id is 400", async () => {
+    const { a, p } = await seeded();
+    const other = await seeded();
+    const exported = exportResponseSchema.parse(data(await exportReport(other.a, other.p, body({ format: "csv" }))));
+    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    const foreign = await downloadRoute(exported, a.cookie);
+    await harness.db().query(`UPDATE report_artifacts SET expires_at = now() - interval '1 minute' WHERE id = $1`, [exported.export_id]);
+    const expired = await downloadRoute(exported, other.a.cookie);
+    const unknown = await harness.app().inject({ method: "GET", url: apiUrl(`/exports/${uuidV7()}/download`), headers: { cookie: a.cookie } });
+    for (const res of [foreign, expired, unknown]) {
+      expect(res.statusCode).toBe(404);
+      expect(res.headers.location).toBeUndefined();
+    }
+    expect((await harness.app().inject({ method: "GET", url: apiUrl(`/exports/${uuidV7()}/download`) })).statusCode).toBe(401);
+    expect((await harness.app().inject({ method: "GET", url: apiUrl(`/exports/not-a-uuid/download`), headers: { cookie: a.cookie } })).statusCode).toBe(400);
+    void p;
+  }, 180_000);
+
   it("STORY-100 s1 — a CSV export carries the footer rows and the per-engine rows beside the blend", async () => {
     const { a, p } = await seeded();
     const res = await exportReport(a, p, body({ format: "csv" }));
     expect(res.statusCode, res.body).toBe(201);
     const exported = exportResponseSchema.parse(data(res));
-    expect(exported.download_url).toMatch(/^https?:\/\/.*\.csv\?/);
+    expect(new URL(exported.download_url).pathname).toBe(`/v1/exports/${exported.export_id}/download`);
     expect(exported.filename).toMatch(/\.csv$/);
     const csv = (await fileOf(exported)).toString("utf8");
     expect(csv).toContain("methodology,,,,scoring_version,");

@@ -35,6 +35,8 @@ export const MAX_PRESIGN_SECONDS = 604_800;
 
 export interface PresignOptions {
   readonly expiresInSeconds?: number;
+  /** The store answers the GET with `Content-Disposition: attachment` under this name (letters, digits, `.`, `_`, `-` only survive). */
+  readonly downloadFilename?: string;
 }
 
 export interface PutOptions {
@@ -89,7 +91,11 @@ export class BoundObjectStore {
       throw new StorageKeyError("presign lifetime must be a whole number of seconds from 1 to 604800");
     }
     const location = buildObjectLocation(this.keyEnv, workspaceId, namespace, relative);
-    return this.observe("presign", workspaceId, namespace, () => this.port.presignGet(location.bucket, location.key, expiresInSeconds));
+    return this.observe("presign", workspaceId, namespace, () =>
+      options.downloadFilename === undefined
+        ? this.port.presignGet(location.bucket, location.key, expiresInSeconds)
+        : this.port.presignGet(location.bucket, location.key, expiresInSeconds, options.downloadFilename),
+    );
   }
 
   async getStored(namespace: StorageNamespace, stored: string): Promise<Buffer> {

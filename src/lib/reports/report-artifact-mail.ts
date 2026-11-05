@@ -1,4 +1,4 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, hkdfSync } from "node:crypto";
 import type { ClientBase } from "pg";
 import { REPORT_ATTACHMENT_MAX_BYTES } from "../../../contracts/reports/index.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
@@ -16,15 +16,23 @@ import type { BoundObjectStore, TenantObjectStore } from "../storage/tenant-obje
 // byte-identical (Resend refuses a changed body under the same idempotency key). A random token cannot be recovered from the SHA-256
 // the database keeps, so the token is HMAC-SHA256(job signing key, purpose || artifact id): the same artifact always yields the same
 // link, the key never leaves the process, and the table holds only the hash, so a database read cannot be replayed as a link.
-// Rotating the key does not break an issued link (the lookup is by the stored hash); it changes only links issued afterwards.
+// The HMAC key is a SUBKEY (HKDF, info "nominara/report-link") of the job-signing key, so the queue envelope's key is never used
+// directly for a second purpose. The stored hash is written once and never overwritten: if the signing key rotates between a
+// delivery's attempt and its retry, the recomputed token no longer matches the stored hash and the plan FAILS CLOSED (the delivery
+// is retried and finally settles failed with a notification) rather than silently killing the links already mailed to recipients
+// who succeeded on the earlier attempt. A dedicated non-rotating key would remove that window; it is an owner decision (evidence file).
+//
+// THE ATTACHMENT BUDGET IS PER EMAIL. One email carries a file per project per format, and a provider refuses a message over 40 MB, so
+// the files attached to one email add up to at most REPORT_ATTACHMENT_MAX_BYTES (in order); a file that would pass that sum is a link.
 //
 // Everything here that touches the database runs in the caller's TENANT TRANSACTION and makes no network call (KAD-06). The only
 // network read, the attachment bytes, happens in `resolveMailParts`, which the caller runs with no transaction open.
 
-const TOKEN_PURPOSE = "nominara/report-artifact-link/v1:";
+const HKDF_INFO = "nominara/report-link";
 
 export function reportLinkToken(signingKey: Uint8Array, artifactId: string): string {
-  return createHmac("sha256", signingKey).update(TOKEN_PURPOSE).update(artifactId).digest("base64url");
+  const subkey = Buffer.from(hkdfSync("sha256", signingKey, Buffer.alloc(0), HKDF_INFO, 32));
+  return createHmac("sha256", subkey).update(artifactId).digest("base64url");
 }
 
 /** What the database stores: the token itself is never written. */
@@ -40,8 +48,8 @@ export interface ArtifactMailDeps {
   readonly store: TenantObjectStore;
   /** The API's public origin (the same value OAuth redirects are built from). */
   readonly apiBaseUrl: string;
-  /** The queue job signing key; absent means no link can be issued. */
-  readonly signingKey: Uint8Array | undefined;
+  /** The queue job signing key (32 bytes, validated by `mailDepsFromEnv`). */
+  readonly signingKey: Uint8Array;
   /** Resolves when the named artifacts' post-commit uploads have finished (immediately for ones this process did not upload). */
   readonly uploaded: (ids: readonly string[]) => Promise<void>;
 }
@@ -85,8 +93,8 @@ const CONTENT_TYPE = { pdf: "application/pdf", csv: "text/csv" } as const;
 export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, workspaceId: string, artifactIds: readonly string[]): Promise<ArtifactMailPlan> {
   const store = deps.store.bind();
   const found = await tx.query<ArtifactRow>(
-    "SELECT id, format, bytes, period_end::text AS period_end FROM report_artifacts WHERE id = ANY($1::uuid[])",
-    [artifactIds],
+    "SELECT id, format, bytes, period_end::text AS period_end FROM report_artifacts WHERE id = ANY($1::uuid[]) AND workspace_id = $2",
+    [artifactIds, workspaceId],
   );
   const byId = new Map(found.rows.map((r) => [r.id, r]));
   const sameFormat = new Map<string, number>();
@@ -95,6 +103,7 @@ export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, w
     if (row !== undefined) sameFormat.set(row.format, (sameFormat.get(row.format) ?? 0) + 1);
   }
   const seen = new Map<string, number>();
+  let attachedBytes = 0;
   const items: MailArtifact[] = [];
   for (const id of artifactIds) {
     const row = byId.get(id);
@@ -105,11 +114,16 @@ export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, w
     const suffix = (sameFormat.get(row.format) ?? 1) > 1 ? `-${String(index)}` : "";
     const filename = `nominara-report-${row.period_end}${suffix}.${row.format}`;
     let link: string | null = null;
-    if (row.bytes > REPORT_ATTACHMENT_MAX_BYTES) {
-      if (deps.signingKey === undefined) throw new DegradedError({ message: "report download links are not available" });
+    if (row.bytes <= REPORT_ATTACHMENT_MAX_BYTES && attachedBytes + row.bytes <= REPORT_ATTACHMENT_MAX_BYTES) {
+      attachedBytes += row.bytes;
+    } else {
       const token = reportLinkToken(deps.signingKey, id);
-      // A revoked link stays revoked: the hash is only (re)written, never the revocation cleared.
-      await tx.query("UPDATE report_artifacts SET link_token_hash = $2 WHERE id = $1 AND link_token_hash IS DISTINCT FROM $2", [id, hashReportLinkToken(token)]);
+      // Written once. A row holding another hash (the key rotated since the first attempt) is left alone and the plan refuses.
+      const stored = await tx.query(
+        "UPDATE report_artifacts SET link_token_hash = $2 WHERE id = $1 AND workspace_id = $3 AND (link_token_hash IS NULL OR link_token_hash = $2)",
+        [id, hashReportLinkToken(token), workspaceId],
+      );
+      if ((stored.rowCount ?? 0) === 0) throw new DegradedError({ message: "report link token cannot be issued for this artifact" });
       link = reportLinkUrl(deps.apiBaseUrl, workspaceId, token);
     }
     items.push({ id, filename, contentType: CONTENT_TYPE[row.format], bytes: row.bytes, relativeKey: `${id}.${row.format}`, link });
@@ -131,5 +145,8 @@ export async function resolveMailParts(plan: ArtifactMailPlan): Promise<MailPart
 
 /** The environment-derived half of the dependencies (the part that does not depend on who exported). */
 export function mailDepsFromEnv(store: TenantObjectStore, env: { readonly OAUTH_REDIRECT_BASE_URL: string; readonly QUEUE_JOB_SIGNING_KEY: string }): Omit<ArtifactMailDeps, "uploaded"> {
-  return { store, apiBaseUrl: env.OAUTH_REDIRECT_BASE_URL, signingKey: Buffer.from(env.QUEUE_JOB_SIGNING_KEY, "base64") };
+  const signingKey = Buffer.from(env.QUEUE_JOB_SIGNING_KEY, "base64");
+  // Fail closed: an empty or short key would sign every link with a weak key without a word.
+  if (signingKey.length !== 32) throw new Error("report link signing key must decode to exactly 32 bytes");
+  return { store, apiBaseUrl: env.OAUTH_REDIRECT_BASE_URL, signingKey };
 }

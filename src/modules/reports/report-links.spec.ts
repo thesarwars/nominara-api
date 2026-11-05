@@ -46,7 +46,7 @@ describe("STORY-180 AC3 · GET /v1/report-links/{workspaceId}/{token}", () => {
     expect(h.presignGetStored).toHaveBeenCalledWith("reports", `unit/${WS}/a.pdf`, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });
     expect(REPORT_LINK_REDIRECT_SECONDS).toBe(900);
     expect(h.contexts[0]).toMatchObject({ workspaceId: WS });
-    expect(h.release).toHaveBeenCalledTimes(1);
+    expect(h.release).toHaveBeenCalledTimes(2); // the lookup, then the click count
   });
 
   it("looks the token up by its hash, never by the token, and checks revocation and expiry in the query", async () => {
@@ -58,6 +58,25 @@ describe("STORY-180 AC3 · GET /v1/report-links/{workspaceId}/{token}", () => {
     expect(q.params[1]).toBe(WS);
     expect(q.text).toContain("link_revoked_at IS NULL");
     expect(q.text).toContain("expires_at > now()");
+  });
+
+  it("refuses a workspace that is deleted or pending erasure, in the query itself", async () => {
+    const h = build({ rows: [{ object_key: `unit/${WS}/a.pdf` }] });
+    await h.service.resolve(params);
+    expect(h.queries[0]!.text).toContain("w.deleted_at IS NULL");
+    expect(h.queries[0]!.text).not.toContain("download_count");
+    expect(h.queries[1]!.text).toContain("download_count = download_count + 1");
+    expect(h.queries[0]!.text).toContain("w.deletion_execute_at IS NULL");
+  });
+
+  it("mints the presign only after the transaction has ended (no connection is held across it)", async () => {
+    const h = build({ rows: [{ object_key: `unit/${WS}/a.pdf` }] });
+    h.presignGetStored.mockImplementationOnce(async () => {
+      expect(h.release).toHaveBeenCalledTimes(1);
+      return "https://s3.example.test/x";
+    });
+    await h.service.resolve(params);
+    expect(h.presignGetStored).toHaveBeenCalledTimes(1);
   });
 
   it("an unknown, revoked, expired or other-workspace token (no row) is the one neutral 404 and presigns nothing", async () => {

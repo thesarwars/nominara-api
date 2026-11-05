@@ -85,7 +85,7 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
     expect(row.download_count).toBe(1);
   }, 120_000);
 
-  it("STORY-180 AC3 · every click re-checks the token: revoking it ends the link at once, even for a presign already issued", async () => {
+  it("STORY-180 AC3 · every click re-checks the token: after revocation the NEXT click is a 404 (a presign already issued stays valid for its 15 minutes)", async () => {
     const ws = await workspace();
     const a = await artifact(ws);
     expect((await click(ws, a.token)).statusCode).toBe(302);
@@ -109,6 +109,16 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
     ].map(refusal);
     for (const r of refusals) expect(r).toEqual(refusals[0]);
     expect(refusals[0]!.status).toBe(404);
+  }, 120_000);
+
+  it("STORY-180 AC3 · a workspace that is soft-deleted or pending erasure stops serving its emailed links", async () => {
+    const ws = await workspace();
+    const a = await artifact(ws);
+    expect((await click(ws, a.token)).statusCode).toBe(302);
+    await harness.db().query("UPDATE workspaces SET deletion_execute_at = now() + interval '1 day' WHERE id = $1", [ws]);
+    expect((await click(ws, a.token)).statusCode).toBe(404);
+    await harness.db().query("UPDATE workspaces SET deletion_execute_at = NULL, deleted_at = now() WHERE id = $1", [ws]);
+    expect((await click(ws, a.token)).statusCode).toBe(404);
   }, 120_000);
 
   it("STORY-180 AC3 · a token that is not 43 base64url characters is a 400 before any lookup", async () => {

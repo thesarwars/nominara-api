@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
 import type { DataSource } from "../../../contracts/analytics/index.js";
-import { EXPORT_DOWNLOAD_URL_SECONDS, type ExportRequest, type ExportResponse, type ReportSection } from "../../../contracts/reports/index.js";
+import { type ExportRequest, type ExportResponse, type ReportSection } from "../../../contracts/reports/index.js";
 import { FeatureNotInPlanError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { combineDataSources, engineDataSourcesForDates } from "../../lib/analytics/data-source.js";
@@ -29,6 +29,7 @@ import { commitTierCap, limitValueFor, readCounter, releaseTierCap, UNLIMITED_LI
 import { exportPaletteFrom, type ExportPalette, type StoredThemeValues } from "../../lib/theme/export-palette.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
+import { exportDownloadUrl, EXPORT_PUBLIC_BASE_URL } from "./export-download.service.js";
 import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 
 // NEW-E-100b — POST /v1/projects/{id}/reports/export (STORY-100, NFR-AGY-05).
@@ -42,8 +43,10 @@ import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 // upload to `nominara-reports` happens AFTER that transaction commits (never
 // inside it), and a second short transaction records the real key. The response
 // carries a presigned URL (15 minutes, minted locally - no network call) for the
-// key the upload will use, and a `data:` URL is gone. With storage not
-// configured the presign refuses and the export answers 503 `degraded`; there
+// key the upload will use, and a `data:` URL is gone. The response carries the URL of the API's download route
+// (export-download.service.ts), which presigns the STORED key afresh on each click and answers 409 while the key is
+// still `pending:`; no URL for a not-yet-uploaded object is ever handed out. With storage not configured a local
+// presign probe refuses and the export answers 503 `degraded`; there
 // is no inline fallback. A failed upload is logged and counted and leaves the
 // row `pending:`: nothing downloads a file that is not there (the link route
 // answers 404 for it, the cadence path rebuilds it).
@@ -107,6 +110,8 @@ export class ExportService {
     private readonly usage: StructuralUsage,
     @Inject(PG_POOL) private readonly pool: Pool,
     private readonly objects: TenantObjectStore,
+    /** The API's public origin the download route is addressed on (OAUTH_REDIRECT_BASE_URL). */
+    @Inject(EXPORT_PUBLIC_BASE_URL) private readonly publicBaseUrl: string,
   ) {}
 
   /** Post-commit uploads still running, by artifact id. Tests and the mail step wait on them. */
@@ -127,10 +132,11 @@ export class ExportService {
     const relativeKey = `${exportId}.${body.format}`;
 
     try {
-      // BEFORE any work: with storage unconfigured the presign refuses with 503 and nothing has been rendered or written.
-      // Minting is a local signature (ObjectStoragePort.presignGet), so a request handler may (KAD-06).
+      // BEFORE any work: with storage unconfigured the presign refuses with 503 and nothing has been rendered or written. The
+      // 1-second URL is a readiness probe and is discarded. Minting is a local signature (ObjectStoragePort.presignGet), so a
+      // request handler may (KAD-06); the caveat that the SDK may resolve role credentials is recorded in the evidence file.
       const bound = this.objects.bind();
-      const downloadUrl = await bound.presignGet("reports", relativeKey, { expiresInSeconds: EXPORT_DOWNLOAD_URL_SECONDS });
+      await bound.presignGet("reports", relativeKey, { expiresInSeconds: 1 });
 
       const entitlements = await this.resolver.resolveForWorkspace(workspaceId);
 
@@ -232,7 +238,7 @@ export class ExportService {
         export_id: exportId,
         format: body.format,
         filename: `nominara-report-${stamp}.${body.format}`,
-        download_url: downloadUrl,
+        download_url: exportDownloadUrl(this.publicBaseUrl, exportId),
         footer,
         pdf,
       };
@@ -279,7 +285,7 @@ export class ExportService {
       const client = await this.pool.connect();
       try {
         const recorded = await withTenantContext(client, context, (tx) =>
-          tx.query("UPDATE report_artifacts SET object_key = $2 WHERE id = $1 AND object_key = $3", [artifact.id, key, `pending:${artifact.id}`]),
+          tx.query("UPDATE report_artifacts SET object_key = $2 WHERE id = $1 AND object_key = $3 AND workspace_id = $4", [artifact.id, key, `pending:${artifact.id}`, context.workspaceId]),
         );
         if ((recorded.rowCount ?? 0) === 0) {
           await bound.delete("reports", artifact.relativeKey);

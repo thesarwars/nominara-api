@@ -5,7 +5,7 @@ import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { hashReportLinkToken } from "../../lib/reports/report-artifact-mail.js";
 import { StorageTenancyError } from "../../lib/storage/storage-keys.js";
-import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
+import { TenantObjectStore, type BoundObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -54,34 +54,57 @@ export class ReportLinksService {
     }
   }
 
+  /** A click is counted only once it is served (not when the presign was refused). A failed count is logged and counted; it never withholds the file. */
+  private async countClick(params: ReportLinkParams): Promise<void> {
+    try {
+      const client = await this.pool.connect();
+      try {
+        await withTenantContext(client, { workspaceId: params.workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+          tx.query("UPDATE report_artifacts SET download_count = download_count + 1 WHERE link_token_hash = $1 AND workspace_id = $2", [hashReportLinkToken(params.token), params.workspaceId]),
+        );
+      } finally {
+        client.release();
+      }
+    } catch {
+      incrementCounter("nominara_reports_link_clicks_total", { outcome: "count_failed" });
+      logger.error({ span: "reports.link.resolve", workspace_id: params.workspaceId, outcome: "count_failed" });
+    }
+  }
+
   private async lookup(params: ReportLinkParams): Promise<string> {
     const client = await this.pool.connect();
+    let found: { key: string | undefined; bound: BoundObjectStore };
     try {
-      return await withTenantContext(client, { workspaceId: params.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+      found = await withTenantContext(client, { workspaceId: params.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        // Revocation, expiry and the workspace's own state are decided in the WHERE clause, by the database clock. 
         const bound = this.objects.bind();
-        // Revocation and expiry are decided in the WHERE clause, by the database clock. A click is counted only when it is served.
-        const found = await tx.query<{ object_key: string }>(
-          `UPDATE report_artifacts SET download_count = download_count + 1
-            WHERE link_token_hash = $1 AND workspace_id = $2 AND link_revoked_at IS NULL AND expires_at > now()
-        RETURNING object_key`,
+        const hit = await tx.query<{ object_key: string }>(
+          `SELECT a.object_key FROM report_artifacts a
+            WHERE a.link_token_hash = $1 AND a.workspace_id = $2 AND a.link_revoked_at IS NULL AND a.expires_at > now()
+              AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = a.workspace_id AND w.deleted_at IS NULL AND w.deletion_execute_at IS NULL)
+`,
           [hashReportLinkToken(params.token), params.workspaceId],
         );
-        const key = found.rows[0]?.object_key;
-        if (key === undefined || key.startsWith("pending:")) throw refusal();
-        try {
-          return await bound.presignGetStored("reports", key, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });
-        } catch (error) {
-          if (error instanceof StorageTenancyError) {
-            // Corruption or an attack, never a lookup miss: refused, and loud in the log.
-            incrementCounter("nominara_reports_link_clicks_total", { outcome: "tenancy_refused" });
-            logger.warn({ event: "report_object_tenancy_refused", workspace_id: params.workspaceId });
-            throw refusal();
-          }
-          throw error;
-        }
+        return { key: hit.rows[0]?.object_key, bound };
       });
     } finally {
       client.release();
+    }
+    const { key, bound } = found;
+    if (key === undefined || key.startsWith("pending:")) throw refusal();
+    // Minted AFTER the transaction ended: no pooled connection is held while the SDK may resolve credentials.
+    try {
+      const url = await bound.presignGetStored("reports", key, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });
+      await this.countClick(params);
+      return url;
+    } catch (error) {
+      if (error instanceof StorageTenancyError) {
+        // Corruption or an attack, never a lookup miss: refused, and loud in the log.
+        incrementCounter("nominara_reports_link_clicks_total", { outcome: "tenancy_refused" });
+        logger.warn({ event: "report_object_tenancy_refused", workspace_id: params.workspaceId });
+        throw refusal();
+      }
+      throw error;
     }
   }
 }

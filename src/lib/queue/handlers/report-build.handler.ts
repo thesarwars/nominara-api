@@ -78,7 +78,7 @@ export function createReportBuildHandler(context: QueueHandlerContext, deps: Rep
       const config = resolveStorageConfig(context.env);
       // Unconfigured storage fails closed, as in the API: every export refuses with 503 and the period retries then settles failed.
       const objects = new TenantObjectStore(config === null ? unconfiguredStoragePort() : new S3Adapter(config), config?.keyEnv ?? context.env.NODE_ENV);
-      run = { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, context.pool, objects), mail: mailDepsFromEnv(objects, context.env) };
+      run = { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, context.pool, objects, context.env.OAUTH_REDIRECT_BASE_URL), mail: mailDepsFromEnv(objects, context.env) };
     }
     return run;
   };

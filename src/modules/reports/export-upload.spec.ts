@@ -35,7 +35,7 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
     }),
     delete: vi.fn(async () => void order.push("delete")),
   };
-  const service = new ExportService({} as never, {} as never, {} as never, pool as never, {} as never);
+  const service = new ExportService({} as never, {} as never, {} as never, pool as never, {} as never, "https://api.example.test");
   return { service, bound, tasks, recorded, release, pool, order };
 }
 
@@ -58,8 +58,8 @@ describe("STORY-180 AC1 · the artifact upload", () => {
     h.tasks[0]!();
     await h.service.uploaded([ID]);
     expect(h.recorded).toHaveLength(1);
-    expect(h.recorded[0]!.text).toMatch(/UPDATE report_artifacts SET object_key = \$2 WHERE id = \$1 AND object_key = \$3/);
-    expect(h.recorded[0]!.params).toEqual([ID, `unit/${WS}/${ID}.pdf`, `pending:${ID}`]);
+    expect(h.recorded[0]!.text).toMatch(/UPDATE report_artifacts SET object_key = \$2 WHERE id = \$1 AND object_key = \$3 AND workspace_id = \$4/);
+    expect(h.recorded[0]!.params).toEqual([ID, `unit/${WS}/${ID}.pdf`, `pending:${ID}`, WS]);
     // The put finished before any pooled connection was taken: no connection is held across the upload.
     expect(h.order).toEqual(["put"]);
     expect(h.release).toHaveBeenCalledTimes(1);

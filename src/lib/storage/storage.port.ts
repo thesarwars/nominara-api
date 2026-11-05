@@ -44,7 +44,8 @@ export interface ObjectStoragePort {
   delete(bucket: StorageBucketName, key: string): Promise<void>;
   /**
    * A GET URL that stops working after `expiresInSeconds`. Computed locally (no network call), so a request handler may
-   * mint one under KAD-06. It does NOT check that the object exists.
+   * mint one under KAD-06. It does NOT check that the object exists. `downloadFilename` makes the store answer with
+   * `Content-Disposition: attachment; filename="..."` (STORY-180: a cross-origin link ignores the `download` attribute).
    */
-  presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number): Promise<string>;
+  presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number, downloadFilename?: string): Promise<string>;
 }
