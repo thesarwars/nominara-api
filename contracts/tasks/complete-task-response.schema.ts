@@ -12,9 +12,9 @@ import { taskSchema } from "./task-response.schema.js";
 // `completed` event. The task's `baseline_metrics` were captured at CREATION
 // and are not touched here — the before must predate the work.
 //
-// `verification` is null until STORY-067 (the verification scheduler) exists.
-// The API never promises a +48h / +14d re-measurement it has not scheduled: null
-// is "not scheduled", never a fabricated timestamp.
+// `verification` carries the due times of the two re-measurements STORY-067 scheduled in the completing transaction (+48h and +14d by
+// default). It is null only while a seeding task is `in_review`: nothing is scheduled until its URL verifies and the milestone is
+// pinned. The API never promises a re-measurement it has not scheduled.
 export const completeTaskMilestoneSchema = z
   .object({
     id: z.string().uuid(),

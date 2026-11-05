@@ -61,6 +61,23 @@ export const taskGenerationRules = pgTable("task_generation_rules", {
   enabledSince: timestamp("enabled_since", { withTimezone: true }),
 });
 
+export const taskVerifications = pgTable("task_verifications", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  projectId: uuid("project_id").notNull(),
+  taskId: uuid("task_id").notNull(),
+  milestoneId: uuid("milestone_id").notNull(),
+  horizon: text("horizon").notNull(),
+  dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+  promptClusterId: uuid("prompt_cluster_id"),
+  status: text("status").notNull().default(sql`'pending'::text`),
+  outcome: text("outcome"),
+  cancelReason: text("cancel_reason"),
+  runId: uuid("run_id"),
+  settledAt: timestamp("settled_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
 export const tasks = pgTable("tasks", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),

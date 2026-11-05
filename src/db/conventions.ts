@@ -351,6 +351,8 @@ export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   // 0135_notifications_alerts_digests.up.sql — STORY-068; tenant-scoped, NOT portal-readable.
   "notification_reads",
   "notification_emails",
+  // 0163_task_verifications.up.sql — STORY-067; tenant-scoped, NOT portal-readable.
+  "task_verifications",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every
