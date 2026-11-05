@@ -11,22 +11,20 @@ import { reportFormatSchema, reportSectionSchema, reportTimeframeSchema } from "
 // `/exports` is a week-2 item; that divergence is recorded here, not silently
 // taken.
 //
-// STORY-180 (owner decision 54, 2026-11-02): the file is stored in the reports
-// bucket (uploaded after the request commits). `download_url` is the API route
-// GET /v1/exports/{id}/download (cookie-authenticated, export:data), which
-// answers 302 to a presigned URL that lives 15 minutes, minted afresh on EVERY
-// fetch from the STORED key (so an Idempotency-Key replay still downloads, and
-// a click never lands before the upload does: 409 until the file is stored).
-// It is no longer a `data:` URL; a client must open it (navigate or window.open,
-// so the session cookie travels), not decode it.
+// STORY-180 (owner decisions 54 and 60): the file is stored in the reports
+// bucket BEFORE this request answers. The export commits its row, uploads the
+// file outside any transaction, records the stored key, and only then returns,
+// so `download_url` works the moment the response arrives. `download_url` is the
+// API route GET /v1/exports/{id}/download (cookie-authenticated, export:data),
+// which answers 302 to a presigned URL that lives 15 minutes, minted afresh on
+// EVERY fetch from the STORED key (so an Idempotency-Key replay still
+// downloads). It is not a `data:` URL; a client opens it (navigates or
+// window.open, so the session cookie travels), it does not decode it. The
+// redirect target carries `Content-Disposition: attachment; filename="<filename>"`.
 //
-// The upload runs just after the export response, so the FIRST request can
-// still answer 409 `conflict` with `Retry-After: 1`. A plain navigation cannot
-// recover from that (the browser would show the problem document), so a client
-// MUST poll the URL with fetch (credentials: include, redirect: manual; an
-// opaque-redirect response means the file is ready) while it answers 409,
-// honouring Retry-After, and only then navigate. The redirect target carries
-// `Content-Disposition: attachment; filename="<filename>"`.
+// If the file cannot be stored the export answers 503 `degraded` (the row is
+// marked failed; retry the export). If a stored file is later unavailable the
+// download route answers 503 `degraded` too. There is no 409 and no polling.
 //
 // Permission export:data (step-up for owner/admin). 0 credits. One
 // `pdf_exports` usage unit for PDF via @Meter; CSV is gated by exports.csv.
@@ -51,7 +49,7 @@ export const exportResponseSchema = z
     export_id: z.uuid(),
     format: reportFormatSchema,
     filename: z.string().min(1),
-    /** The API download route for this export (an http(s) URL). Opening it redirects to a fresh EXPORT_DOWNLOAD_URL_SECONDS presign. Never a `data:` URL. */
+    /** The API download route for this export (an http(s) URL). Opening it redirects to a fresh EXPORT_DOWNLOAD_URL_SECONDS presign, and works as soon as the export response arrives. Never a `data:` URL. */
     download_url: z.url({ protocol: /^https?$/ }),
     /** Always present, in every format (NFR-AGY-05). */
     footer: methodologyFooterSchema,
