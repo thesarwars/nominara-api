@@ -51,6 +51,7 @@ export function assertCatalogWeights(
   for (const rule of rules) {
     if (seen.has(rule.code)) throw new AuxCatalogWeightError(rule.category, null, `lists rule ${rule.code} twice`);
     seen.add(rule.code);
+    if (!Number.isFinite(rule.weight)) throw new AuxCatalogWeightError(rule.category, null, `has a non-finite weight on rule ${rule.code}`);
     sums.set(rule.category, (sums.get(rule.category) ?? 0) + rule.weight);
   }
   for (const category of requiredCategories) {

@@ -85,8 +85,9 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // `excluded_rules` names all of this. THE HEADLINE (owner decisions 38, 52 and 55): when pages were judged, `aux_score` is computed over the RULES that were decided: a category is
 // scored on the decided rules only (its max_penalty is their weights' sum, so an unmeasured rule does not count as passed), a category with no decided rule is
 // dropped, a finding whose rule was not decided in this audit (stale / not re-checked) costs nothing and weighs nothing (decision 55), and the sum is renormalised to 100 and capped at 72 by a critical crawler_access finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
-// (site files only) it stays null: one category's subscore is published, but that is not a headline. `score_capped` is set whenever a critical
-// crawler_access finding is open.
+// (site files only) it stays null: one category's subscore is published, but that is not a headline. `score_capped` says whether the cap applies to the number
+// (decision 57): it is set when a critical crawler_access finding is open AND crawler_access is in this audit's basis, so a flag of true always accompanies a headline held at 72 or
+// below. An audit that decided nothing in crawler_access (every site file but llms.txt timed out) carries false, and no headline.
 //
 // A JOB THAT FAILS (review round 1). A rule that crashes on one page's markup is that page's problem (page-rules.ts: unmodelled, `rule_error:<code>`), so the audit
 // ends `partial` instead of never publishing. Anything else that throws walks the retry ladder; on the LAST attempt a MANUAL audit is failed and its charge
@@ -1015,7 +1016,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     const perRule = new Map<string, { severity: AuxSeverityBand; urls: Set<string> }>();
     const counted: AuxCountedFinding[] = [];
     const asCategory = (code: string): AuxCategory => (catalog.byCode.get(code)?.category ?? "crawler_access") as AuxCategory;
-    // `capped` (the flag, and the 72 cap) follows every open critical crawler_access finding, decided or not: the cap is a policy on what is open, not penalty arithmetic.
+    // `capped` follows every open critical crawler_access finding, decided or not: the cap is a policy on what is open, not penalty arithmetic. Whether it applies to THIS
+    // audit's number is settled below, once the basis is known (decision 57).
     let capped = false;
     for (const r of open.rows) {
       if (asCategory(r.rule_code) === "crawler_access" && r.severity === "critical") capped = true;
@@ -1060,6 +1062,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     // The headline (decision 52): over the categories with a decided rule, each scored against its decided rules' weights, and PARTIAL whenever any rule went unmeasured
     // (`excluded` names them). With no category decided there is nothing to score; with no page judged the site files alone are not a headline (it stays null).
     const breakdown: Partial<Record<AuxCategory, number>> = {};
+    const capAppliesToBasis = basis.categories.includes("crawler_access");
+    const scoreCapped = capped && capAppliesToBasis;
     let headline: number | null = null;
     if (basis.categories.length > 0) {
       const scored = auxScore({
@@ -1070,7 +1074,9 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         unmeasuredRules: excluded.filter((code) => catalog.byCode.has(code)),
       });
       for (const category of basis.categories) breakdown[category] = scored.subscores[category];
-      if (pageEvaluated.size > 0) headline = capped && basis.categories.includes("crawler_access") ? Math.min(scored.score, AUX_HARD_CAP) : scored.score;
+      // `basis.categories.includes("crawler_access")` is always true whenever a headline exists: a headline needs a judged page, and a judged page decides AUX-R-006
+      // (a crawler_access page rule). It is kept so the cap and the flag below stay one rule that cannot drift apart if that ever stops holding.
+      if (pageEvaluated.size > 0) headline = capped && capAppliesToBasis ? Math.min(scored.score, AUX_HARD_CAP) : scored.score;
     }
 
     await tx.query(
@@ -1085,7 +1091,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
         // The snapshot is stored verbatim except for what Postgres text cannot hold; the hash is of the bytes as fetched.
         outcome.robotsSnapshot,
         outcome.robotsHash,
-        outcome.llmsPresent, outcome.sitemapCount, capped, JSON.stringify(breakdown),
+        outcome.llmsPresent, outcome.sitemapCount, scoreCapped, JSON.stringify(breakdown),
         counts.critical, counts.high, counts.medium, counts.low, finishedAt,
         [...new Set(outcome.allSiteFileUrls)], excluded, outcome.domObjectPrefix, outcome.errorSummary,
         // null = no page was judged, so the site files alone are not a headline score; 0 would be a measured zero. With pages judged it is the partial score of
@@ -1156,7 +1162,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
    */
   async function failUnrunManualAudit(tx: ClientBase, payload: { auditId: string; workspaceId: string; trigger: string }, reason: "project_deleted"): Promise<void> {
     if (payload.trigger !== "manual") return;
-    await failManualAudit(tx, { workspaceId: payload.workspaceId, auditId: payload.auditId, reason, at: now() });
+    await failManualAudit(tx, { workspaceId: payload.workspaceId, auditId: payload.auditId, reason });
   }
 
   return phasedProcessor<Prepared, Outcome>({
@@ -1177,7 +1183,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       const parsed = crawlAuditJobPayloadSchema.safeParse(raw);
       const settleable = parsed.success ? parsed.data : refundFieldsSchema.safeParse(raw).data;
       if (settleable === undefined || settleable.trigger !== "manual") return false;
-      const settled = await failManualAudit(tx, { workspaceId: settleable.workspaceId, auditId: settleable.auditId, reason: "job_failed", at: now() });
+      const settled = await failManualAudit(tx, { workspaceId: settleable.workspaceId, auditId: settleable.auditId, reason: "job_failed" });
       if (settled) {
         incrementCounter("nominara_aux_audit_job_recovered_total", { phase: failure.phase });
         logger.warn({ event: "aux.audit.job_failed", workspace_id: settleable.workspaceId, audit_id: settleable.auditId, phase: failure.phase, error: failure.error instanceof Error ? failure.error.name : "unknown" });

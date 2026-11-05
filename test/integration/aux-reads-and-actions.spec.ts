@@ -106,8 +106,16 @@ describe("NEW-C-10 · AuxService — real SQL under RLS", () => {
     const a3 = await createAudit(ws, p, { score: 75, created: "2026-09-03T00:00:00Z", ruleVersion: "v2" });
     const a4 = await createAudit(ws, p, { score: 80, created: "2026-09-04T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
     const a5 = await createAudit(ws, p, { score: 82, created: "2026-09-05T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
-    const page = await inTenant(CTX(ws, actor), () => service.listProjectAudits(p, { limit: 10 }));
+    const a6 = await createAudit(ws, p, { score: null, status: "partial", created: "2026-09-06T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a7 = await createAudit(ws, p, { score: 90, created: "2026-09-07T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a8 = await createAudit(ws, p, { score: 0, created: "2026-09-08T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a9 = await createAudit(ws, p, { score: 5, created: "2026-09-09T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const page = await inTenant(CTX(ws, actor), () => service.listProjectAudits(p, { limit: 20 }));
     const delta = Object.fromEntries(page.items.map((a) => [a.audit_id, a.delta]));
+    expect(delta[a6]).toBeNull(); // no score of its own
+    expect(delta[a7]).toBe(8); // skips the unscored a6 and compares with a5 (82)
+    expect(delta[a8]).toBe(-90);
+    expect(delta[a9]).toBe(5); // a predecessor scored 0 is a score, not an absence: 5 - 0, never null
     expect(delta[a1]).toBeNull(); // no previous audit
     expect(delta[a2]).toBe(10); // control: same rule version, same excluded set
     expect(delta[a3]).toBeNull(); // rule version v1 -> v2

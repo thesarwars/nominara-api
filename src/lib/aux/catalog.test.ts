@@ -38,6 +38,13 @@ describe("NEW-C-8 AC3 · catalog weight assertion", () => {
     expect(() => assertCatalogWeights(withFirst(0.302), ["crawler_access"])).toThrow(AuxCatalogWeightError);
   });
 
+  it("round 7 · a non-finite weight is refused, not summed (NaN fails every comparison and would pass the tolerance check)", () => {
+    for (const weight of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const broken = CRAWLER.map((r) => (r.code === "AUX-R-001" ? { ...r, weight } : r));
+      expect(() => assertCatalogWeights(broken, ["crawler_access"]), String(weight)).toThrow(AuxCatalogWeightError);
+    }
+  });
+
   it("NEW-C-8 AC3.5 · an empty catalog, or a required category with no rules, is refused (not a vacuous pass)", () => {
     expect(() => loadAuxCatalog([], SUBSET)).toThrow(AuxCatalogWeightError);
     expect(() => loadAuxCatalog(CRAWLER, ["crawler_access", "structured_data"])).toThrow(AuxCatalogWeightError);

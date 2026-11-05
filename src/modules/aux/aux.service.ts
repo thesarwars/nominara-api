@@ -567,7 +567,7 @@ export class AuxService {
     try {
       await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
         // The one failure function (aux/fail-manual-audit.ts): only a still-queued or running manual audit moves, the refund follows the row, the counter moves.
-        await failManualAudit(tx, { workspaceId, auditId, reason: "dispatch_failed", at: new Date() });
+        await failManualAudit(tx, { workspaceId, auditId, reason: "dispatch_failed" });
       });
     } finally {
       client.release();

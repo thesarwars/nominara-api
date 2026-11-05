@@ -89,6 +89,13 @@ describe("AUXLIVE-5 round 5 · owner decision 52: the score is over decided rule
     expect(basis.categoryMaxPenalty.render_mode).toBe(1);
   });
 
+  it("round 7 · auxDecidedBasis refuses a non-finite, a negative, or a not-whole-basis-point weight instead of rounding it into a basis", () => {
+    for (const weight of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0.1, 0.12345, 0.00004]) {
+      expect(() => auxDecidedBasis([rule("render_mode", weight)]), String(weight)).toThrow(RangeError);
+    }
+    expect(() => auxDecidedBasis([rule("render_mode", 0.1235), rule("render_mode", 0)])).not.toThrow();
+  });
+
   it("D52 · auxDecidedBasis of nothing decided is empty (the caller drops every category)", () => {
     expect(auxDecidedBasis([])).toEqual({ categories: [], categoryMaxPenalty: {} });
   });

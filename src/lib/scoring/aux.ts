@@ -124,7 +124,13 @@ export interface AuxDecidedRule {
 export function auxDecidedBasis(rules: readonly AuxDecidedRule[]): { readonly categories: readonly AuxCategory[]; readonly categoryMaxPenalty: Partial<Record<AuxCategory, number>> } {
   // Integer basis points (weights carry four decimals at most): the sum is exact and independent of the order of `rules`, so identical inputs give identical output.
   const basisPoints: Partial<Record<AuxCategory, number>> = {};
-  for (const rule of rules) basisPoints[rule.category] = (basisPoints[rule.category] ?? 0) + Math.round(rule.weight * 10_000);
+  for (const rule of rules) {
+    const points = rule.weight * 10_000;
+    if (!Number.isFinite(rule.weight) || rule.weight < 0 || Math.abs(points - Math.round(points)) > 1e-6) {
+      throw new RangeError(`auxDecidedBasis needs a finite, non-negative weight in whole basis points; got ${String(rule.weight)}`);
+    }
+    basisPoints[rule.category] = (basisPoints[rule.category] ?? 0) + Math.round(points);
+  }
   const categoryMaxPenalty: Partial<Record<AuxCategory, number>> = {};
   for (const c of AUX_CATEGORIES) if ((basisPoints[c] ?? 0) > 0) categoryMaxPenalty[c] = basisPoints[c]! / 10_000;
   return { categories: AUX_CATEGORIES.filter((c) => (categoryMaxPenalty[c] ?? 0) > 0), categoryMaxPenalty };

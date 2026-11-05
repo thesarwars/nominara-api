@@ -157,7 +157,6 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     crawlerAccessSiteFilesOnly: 0.64, // the same without the page rule 006
     structuredData: 0.89, // 1.00 - 013 (.11, held)
     renderMode029Only: 0.16, // 026, 027 and 028 undecided with no renderer
-    contextFitness: 1,
   } as const;
   const audits = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_audits ORDER BY created_at")).rows;
   const findings = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_findings ORDER BY created_at")).rows;
@@ -900,7 +899,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const a = (await audits()).at(-1);
       expect(a.score_capped).toBe(true);
       // Decision 55 changes this (it refines 52): robots.txt being down leaves AUX-R-001/002/003 undecided in this audit, so the stale AUX-R-001 is neither in the penalty
-      // nor in the denominator. crawler_access is scored on the decided rules alone (004, 006 and 007: no finding), i.e. 1; the finding stays listed as stale, and the
+      // nor in the denominator. crawler_access is scored on the decided rules alone (004 and 007: no finding), i.e. 1; the finding stays listed as stale, and the
       // cap and the flag still follow the open critical finding. (Under decision 52 this was 1 - w001/(decided + w001), < 1.)
       expect(Number(a.score_breakdown.crawler_access)).toBe(1);
       expect(a.aux_score).toBeNull(); // robots.txt down: no page was judged, so no headline (the subscore is published)
@@ -924,6 +923,31 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(await r001Status()).toEqual(["stale"]);
       expect(await milestones()).toHaveLength(0);
       expect((await audits()).at(-1).score_capped).toBe(true);
+    });
+
+    it("round 7 (decision 56) · the 72 cap holds on its only live path: AUX-R-001 undecided (robots.txt 403) while its critical finding is open, pages judged -> headline 72, flag true, finding not resolved, crawler_access scored without 001", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      expect((await r001Status())).toEqual(["open"]);
+      await runAsTenant({ ...healthy(OPEN), "/robots.txt": { status: 403, body: "" } });
+      const a = (await audits()).at(-1);
+      expect(a.pages_crawled).toBeGreaterThan(0); // a 403 is a 4xx: RFC 9309 treats it as no robots file, so the page was crawled and judged
+      expect(await r001Status()).toEqual(["open"]);
+      expect(Number(a.aux_score)).toBe(72);
+      expect(a.score_capped).toBe(true);
+      // Worked by hand (decision 55): 001 (.30) and 002 (.08) are undecided, 005 is never decided, so the decided rules are 003 .12 + 004 .06 + 006 .12 + 007 .08 = .38. The only
+      // penalty is the high AUX-R-003 (a 403 robots.txt, severity factor .6): 1 - .12 * .6 / .38. The open critical 001 weighs nothing, so it is neither in the penalty nor the denominator.
+      expect(Number(a.score_breakdown.crawler_access)).toBeCloseTo(1 - (0.12 * 0.6) / 0.38, 12);
+    });
+
+    it("round 7 (decision 57) · every site file but llms.txt timing out: nothing in crawler_access was decided, so the flag is false and the headline null though a critical AUX-R-001 is still open", async () => {
+      await runAsTenant(healthy(BLOCKED));
+      const hung: Served = { ...healthy(OPEN), "/robots.txt": "hang", "/sitemap.xml": "hang", "/.well-known/llms.txt": "hang" };
+      await runAsTenant(hung, { timeoutMs: 50 });
+      const a = (await audits()).at(-1);
+      expect(await r001Status()).toEqual(["open"]);
+      expect(a.score_capped).toBe(false);
+      expect(a.aux_score).toBeNull();
+      expect(a.score_breakdown.crawler_access).toBeUndefined();
     });
 
     it("STORY-052 AC8 · a robots.txt that is definitively absent (404) still lets an open AUX-R-001 resolve", async () => {
@@ -1665,7 +1689,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(f).toHaveLength(1);
       const w029 = await weightOf("AUX-R-029");
       const decided = DECIDED.renderMode029Only;
-      expect(decided).toBeCloseTo(w029, 9); // 026, 027 and 028 are excluded, so 029 is the only decided rule
+      expect(decided).toBeCloseTo(w029, 12); // 026, 027 and 028 are excluded, so 029 is the only decided rule
       const expected = 1 - (w029 * SEVERITY_FACTOR[f[0].severity]!) / decided;
       expect(Number(a.score_breakdown.render_mode)).toBeCloseTo(expected, 5);
       // the old denominator (1.000) would have said 1 - w029 * factor, i.e. nearly 1
@@ -1691,7 +1715,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       const [a] = await audits();
       expect(a.excluded_rules).toContain("AUX-R-013");
       const decided = DECIDED.structuredData;
-      expect(decided).toBeCloseTo(1 - (await weightOf("AUX-R-013")), 9);
+      expect(decided).toBeCloseTo(1 - (await weightOf("AUX-R-013")), 12);
       expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (await weightOf("AUX-R-008")) / decided, 5);
       expect(Number(a.score_breakdown.structured_data)).toBeLessThan(1 - (await weightOf("AUX-R-008")) - 0.01);
     });
@@ -1699,7 +1723,6 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     it("D52 · a fully measured category scores as before: context_fitness lists no unmeasured rule, its decided weights sum to 1, and a clean page is 1", async () => {
       await run(job(), depsServing(healthy(OPEN)));
       const [a] = await audits();
-      expect(DECIDED.contextFitness).toBe(1);
       expect(Number(a.score_breakdown.context_fitness)).toBe(1);
       const audit = await asTenantAudit();
       expect(audit.categories.find((c) => c.category === "context_fitness")?.rules_not_evaluated).toEqual([]);
