@@ -64,7 +64,7 @@ export async function verifyAllWallets(
   const ids = workspaceIds ?? (await listReconcilableWorkspaceIds(client));
   let checked = 0;
   for (const workspaceId of ids) {
-    const mismatch = await verifyWorkspaceWallet(client, workspaceId);
+    const mismatch = await inSnapshot(client, () => verifyWorkspaceWallet(client, workspaceId));
     checked += 1;
     if (mismatch !== null) {
       await notifier.page(mismatch);
@@ -72,6 +72,25 @@ export async function verifyAllWallets(
     }
   }
   return { checked, mismatch: null };
+}
+
+/**
+ * ONE REPEATABLE READ snapshot per workspace (not per run, so xmin is not pinned across the estate).
+ *
+ * `verifyWorkspaceWallet` makes three separate reads (wallet, ledger, lifetime counters). On a plain READ COMMITTED
+ * connection a reserve, settle or debit committing between them replays one entry past the wallet that was read, and the
+ * nightly job pages falsely on a healthy wallet. Same guard as `audit-verify.ts`. Read-only, so nothing to roll forward.
+ */
+async function inSnapshot<T>(client: ClientBase, fn: () => Promise<T>): Promise<T> {
+  await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    const result = await fn();
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
 }
 
 async function main(): Promise<void> {

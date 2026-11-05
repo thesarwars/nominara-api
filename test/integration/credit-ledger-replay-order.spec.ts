@@ -6,6 +6,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { adjustCredits, provisionWalletWithGrant } from "../../src/lib/credits/balance.js";
 import { readLedgerForReplay, replayLedger, verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
+import { verifyAllWallets } from "../../src/workers/rollup/credit-verify.js";
 
 // STORY-073 AC4 — the nightly replay orders the ledger by `seq`. `readLedgerForReplay` selected `seq::text` and then
 // wrote `ORDER BY seq`; Postgres resolves an ORDER BY name against the OUTPUT columns first, so it sorted the TEXT
@@ -96,5 +97,43 @@ describe("STORY-073 · readLedgerForReplay orders by the NUMERIC seq", () => {
     }
     expect((await readLedgerForReplay(db, workspaceId)).map((row) => row.seq)).toEqual(["98", "99", "100", "101"]);
     expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+  });
+
+  // Review round 1 (major): the nightly walk runs unattended against live traffic. verifyWorkspaceWallet makes three READ
+  // COMMITTED reads; a movement committing between the wallet read and the ledger read replays one entry past the wallet and
+  // pages falsely. One REPEATABLE READ snapshot per workspace closes it.
+  it("[STORY-073 AC4] a movement committing between the wallet read and the ledger read raises NO false mismatch", async () => {
+    await inTx((tx) => provisionWalletWithGrant(tx, workspaceId, 100, { start: "2026-09-01", end: "2026-10-01" }));
+    const other = new Client({ connectionString: container.getConnectionUri() });
+    await other.connect();
+    try {
+      let injected = false;
+      const racing = {
+        query: async (...args: unknown[]) => {
+          const result = await (db.query as (...a: unknown[]) => Promise<unknown>)(...args);
+          if (!injected && typeof args[0] === "string" && args[0].includes("FROM credit_wallets")) {
+            injected = true;
+            await other.query("BEGIN");
+            await adjustCredits(
+              other,
+              { workspaceId, idempotencyKey: "race-adj", actorId: humanId, actorType: "user", reason: "support credit" },
+              "purchased",
+              10,
+            );
+            await other.query("COMMIT");
+          }
+          return result;
+        },
+      } as unknown as ClientBase;
+      const paged: unknown[] = [];
+      const outcome = await verifyAllWallets(racing, { page: (m) => { paged.push(m); return Promise.resolve(); } }, [workspaceId]);
+      expect(injected).toBe(true);
+      expect(outcome.mismatch).toBeNull();
+      expect(paged).toEqual([]);
+      // The movement did land: the next night's snapshot sees it, and still agrees.
+      expect(await verifyWorkspaceWallet(db, workspaceId)).toBeNull();
+    } finally {
+      await other.end();
+    }
   });
 });
