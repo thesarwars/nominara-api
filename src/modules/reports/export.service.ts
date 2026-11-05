@@ -3,6 +3,7 @@ import type { ClientBase, Pool } from "pg";
 import type { DataSource } from "../../../contracts/analytics/index.js";
 import { type ExportRequest, type ExportResponse, type ReportSection } from "../../../contracts/reports/index.js";
 import { afterTransaction } from "../../api/after-transaction.js";
+import type { RequestAuditActor } from "../../api/interceptors/audit.interceptor.js";
 import { DegradedError, FeatureNotInPlanError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { combineDataSources, engineDataSourcesForDates } from "../../lib/analytics/data-source.js";
@@ -27,6 +28,7 @@ import type { BoundObjectStore } from "../../lib/storage/tenant-object-store.js"
 import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
+import { httpReservationJobId } from "../../lib/usage/reservation-job-id.js";
 import { commitTierCap, limitValueFor, readCounter, releaseTierCap, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
 import { exportPaletteFrom, type ExportPalette, type StoredThemeValues } from "../../lib/theme/export-palette.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
@@ -61,8 +63,15 @@ import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 // If the release itself cannot be written, the reservation stands until the cycle rolls: the safe direction for a ceiling.
 //
 // AUDIT. The interceptor's row is `report.export_attempted` (written in the request transaction, before the file is stored). The outcome
-// follows from here: `report.exported` in the record transaction, or `report.export_failed` (carrying the outcome) in its own short
-// transaction. The scheduled path has no requesting actor and appends neither.
+// follows from here: `report.exported` in the record transaction, or `report.export_failed` (carrying the outcome) in the same short
+// transaction that releases the unit. Both name the REAL actor (user, api_key or support, the grant, request id, ip and user agent), taken
+// from the request by the interceptor's own mapping (requestAuditActorOf) and carried on the artifact. The scheduled path has no
+// requesting actor and appends neither.
+//
+// EVERY NON-OK END RELEASES THE UNIT (round 7): the three named failure paths, an unexpected exception inside the upload, and any error
+// the export handler itself throws. The unit is reserved under `http:<actorId>:<Idempotency-Key>` (reservation-job-id.ts). An ambiguous
+// COMMIT (the record threw, but the row may be stored) is settled by re-reading the row: if it is stored the export succeeds and the
+// object is NOT deleted; if the row cannot be read at all nothing is deleted or marked, and the nightly cleanup decides.
 //
 // WHAT COMES FROM WHERE
 //   figures   `metric_daily` only (the rollups), cells-weighted over the window
@@ -95,6 +104,8 @@ interface UploadArtifact {
   readonly file: Buffer;
   readonly contentType: string;
   readonly pdfUnitKey?: string;
+  /** Who asked (the HTTP path only; the scheduled path has no requesting actor and audits nothing). Carried from the request so the outcome row names the same actor as the interceptor's. */
+  readonly audit?: RequestAuditActor;
 }
 
 /** How a post-commit upload ended. Only `ok` leaves a stored file and a row that says so. */
@@ -156,7 +167,7 @@ export class ExportService {
    * `options.awaitUpload` (the HTTP export route only): the request does not answer until the file is stored, and fails if it could not
    * be. Without it (the scheduled path, whose delivery waits through `uploaded()`) the upload runs after commit and nothing holds a response.
    */
-  async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options: { readonly awaitUpload?: boolean } = {}): Promise<ExportResponse> {
+  async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options: { readonly awaitUpload?: boolean; readonly audit?: RequestAuditActor } = {}): Promise<ExportResponse> {
     const started = Date.now();
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ExportService requires an active tenant context");
@@ -164,6 +175,8 @@ export class ExportService {
     const workspaceId = store.context.workspaceId;
     const exportId = uuidV7();
     const relativeKey = `${exportId}.${body.format}`;
+    // The job id QuotaGuard reserved this PDF's unit under (same function, same actor); absent for a CSV or a request with no key.
+    const pdfUnitKey = body.format === "pdf" && idempotencyKey !== undefined ? httpReservationJobId(store.context.actorId, idempotencyKey) : undefined;
 
     try {
       const bound = this.objects.bind();
@@ -243,11 +256,17 @@ export class ExportService {
         [exportId, workspaceId, [projectId], window.from, window.to, body.format, pendingKey(exportId), file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS],
       );
 
-      const pdfUnitKey = body.format === "pdf" ? idempotencyKey : undefined;
       this.scheduleUpload(
         bound,
         store.context,
-        { id: exportId, relativeKey, file, contentType: body.format === "pdf" ? "application/pdf" : "text/csv", ...(pdfUnitKey === undefined ? {} : { pdfUnitKey }) },
+        {
+          id: exportId,
+          relativeKey,
+          file,
+          contentType: body.format === "pdf" ? "application/pdf" : "text/csv",
+          ...(pdfUnitKey === undefined ? {} : { pdfUnitKey }),
+          ...(options.audit === undefined ? {} : { audit: options.audit }),
+        },
         options.awaitUpload === true,
       );
 
@@ -277,9 +296,9 @@ export class ExportService {
       };
     } catch (error) {
       incrementCounter("nominara_reports_exports_total", { format: body.format, outcome: "error" });
-      if (error instanceof NotFoundError && body.format === "pdf" && idempotencyKey !== undefined) {
-        await this.releaseIfUnserved(workspaceId, idempotencyKey);
-      }
+      // Any error the handler throws means no file will be stored for this unit (the request transaction rolls back and the registered
+      // upload is discarded), so the unit goes back, on its own connection. A retry under the same key re-takes it (reserveTierCap).
+      await this.releaseUnit(workspaceId, pdfUnitKey);
       throw error;
     }
   }
@@ -316,8 +335,10 @@ export class ExportService {
   private runUpload(bound: BoundObjectStore, context: TenantContext, artifact: UploadArtifact, audited: boolean, start: Promise<void> = Promise.resolve()): Promise<UploadOutcome> {
     const work: Promise<UploadOutcome> = start
       .then(() => this.upload(bound, context, artifact, audited))
-      .catch((error: unknown): UploadOutcome => {
+      .catch(async (error: unknown): Promise<UploadOutcome> => {
         logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+        // An exception nothing above named is still a non-ok end: the unit goes back and the failure is audited. Never throws.
+        await this.settleFailure(context, artifact, "error", audited);
         return "error";
       })
       .then((result) => {
@@ -335,8 +356,7 @@ export class ExportService {
     const started = Date.now();
     // Every non-ok end releases the PDF's unit and (HTTP path) audits the failure, whatever the cause.
     const fail = async (outcome: Exclude<UploadOutcome, "ok" | "error">): Promise<UploadOutcome> => {
-      await this.releaseUnit(context.workspaceId, artifact.pdfUnitKey);
-      if (audited) await this.auditFailure(context, artifact, outcome);
+      await this.settleFailure(context, artifact, outcome, audited);
       return outcome;
     };
     let key: string;
@@ -368,12 +388,23 @@ export class ExportService {
         client.release();
       }
     } catch (error) {
-      incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "record_failed" });
-      logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "record_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
-      // The object is there and the row does not say so. Delete the object FIRST (no connection held), then mark the row: if the delete
-      // fails the row stays pending, and the nightly cleanup deletes the object (idempotently) and marks the row.
-      if (await this.deleteQuietly(bound, artifact.relativeKey, context)) await this.markFailed(context, artifact.id);
-      return fail("record_failed");
+      // AMBIGUOUS COMMIT: the record threw, but a COMMIT whose acknowledgement was lost may have been applied. Deleting the object now
+      // could leave a row that says "stored" over nothing, so the row is re-read first (by id, on a fresh connection).
+      const stored = await this.rowIsStored(context, artifact.id, key);
+      if (stored === true) {
+        // The key, the unit and the audit row all committed together: the export succeeded, the acknowledgement was merely lost.
+        incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "record_ack_lost" });
+        logger.warn({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "record_ack_lost", error: error instanceof Error ? error.name : "unknown" });
+        recorded = true;
+      } else {
+        incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "record_failed" });
+        logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "record_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
+        // The row is NOT stored (or cannot be read: `undefined`, in which case nothing is deleted or marked and the nightly cleanup decides).
+        // Delete the object FIRST (no connection held), then mark the row: if the delete fails the row stays pending, and the nightly
+        // cleanup deletes the object (idempotently) and marks the row.
+        if (stored === false && (await this.deleteQuietly(bound, artifact.relativeKey, context))) await this.markFailed(context, artifact.id);
+        return fail("record_failed");
+      }
     }
     if (!recorded) {
       // The row is gone (rolled back to a savepoint after the upload was registered): remove the orphan with NO connection held.
@@ -388,36 +419,78 @@ export class ExportService {
     return "ok";
   }
 
-  /** Appends the outcome audit row on the hash chain, inside the caller's tenant transaction. The actor is the one who asked for the export. */
+  /** Appends the outcome audit row on the hash chain, inside the caller's tenant transaction. The actor is the one who asked for the export (type, grant, request id, ip and user agent as the interceptor's row has them). */
   private auditOutcome(tx: ClientBase, context: TenantContext, artifact: UploadArtifact, action: "report.exported" | "report.export_failed", afterState: Record<string, string>): Promise<void> {
+    const actor = artifact.audit;
     return new AuditChainService().append(tx, {
       workspaceId: context.workspaceId,
-      actorType: "user",
+      actorType: actor?.actorType ?? "user",
       actorId: context.actorId,
-      actorIp: null,
-      actorUa: null,
+      actorIp: actor?.ip ?? null,
+      actorUa: actor?.ua ?? null,
       action,
       resourceType: "report_artifact",
       resourceId: artifact.id,
       beforeState: null,
       afterState,
-      requestId: "",
-      supportGrantId: null,
+      requestId: actor?.requestId ?? "",
+      supportGrantId: actor?.supportGrantId ?? null,
       severity: "info",
     });
   }
 
-  /** `report.export_failed` in its own short tenant transaction. Best effort: a failure to audit is logged and never changes the 503. */
-  private async auditFailure(context: TenantContext, artifact: UploadArtifact, outcome: string): Promise<void> {
+  /**
+   * A non-ok end, settled in ONE short tenant transaction: the PDF's unit goes back (if it holds one) and, on the HTTP path, the
+   * `report.export_failed` row is appended. Each is its own savepoint, so a failing release cannot cost the audit row and a failing audit
+   * cannot cost the release. Best effort: nothing here changes the 503, and nothing throws. If the whole transaction cannot be had, the
+   * reservation stands until the cycle rolls (the safe direction for a ceiling) and the audit row is lost, loudly.
+   */
+  private async settleFailure(context: TenantContext, artifact: UploadArtifact, outcome: string, audited: boolean): Promise<void> {
+    const unitKey = artifact.pdfUnitKey;
+    if (unitKey === undefined && !audited) return;
     try {
       const client = await this.pool.connect();
       try {
-        await withTenantContext(client, context, (tx) => this.auditOutcome(tx, context, artifact, "report.export_failed", { outcome }));
+        await withTenantContext(client, context, async (tx) => {
+          const step = async (name: "release" | "audit", work: () => Promise<unknown>): Promise<void> => {
+            await tx.query(`SAVEPOINT settle_${name}`);
+            try {
+              await work();
+              await tx.query(`RELEASE SAVEPOINT settle_${name}`);
+            } catch (error) {
+              await tx.query(`ROLLBACK TO SAVEPOINT settle_${name}`);
+              logger.error({ span: "reports.artifact.settle", workspace_id: context.workspaceId, outcome: `${name}_failed`, error: error instanceof Error ? error.name : "unknown" });
+            }
+          };
+          if (unitKey !== undefined) await step("release", () => releaseTierCap(tx, context.workspaceId, "pdf_exports", unitKey));
+          if (audited) await step("audit", () => this.auditOutcome(tx, context, artifact, "report.export_failed", { outcome }));
+        });
       } finally {
         client.release();
       }
     } catch (error) {
-      logger.error({ span: "reports.artifact.audit", workspace_id: context.workspaceId, outcome: "audit_failed", error: error instanceof Error ? error.name : "unknown" });
+      // The reservation stands until the period rolls - the safe direction for a ceiling.
+      logger.error({ span: "reports.artifact.settle", workspace_id: context.workspaceId, outcome: "settle_failed", error: error instanceof Error ? error.name : "unknown" });
+    }
+  }
+
+  /**
+   * Does the row NOW hold exactly this stored key? `true`/`false` from a fresh read; `undefined` when the row cannot be read at all
+   * (the database is the thing that is down), which the caller must treat as "unknown", never as "not stored".
+   */
+  private async rowIsStored(context: TenantContext, id: string, key: string): Promise<boolean | undefined> {
+    try {
+      const client = await this.pool.connect();
+      try {
+        return await withTenantContext(client, context, async (tx) => {
+          const found = await tx.query<{ object_key: string }>("SELECT object_key FROM report_artifacts WHERE id = $1 AND workspace_id = app.current_workspace()", [id]);
+          return found.rows[0]?.object_key === key;
+        });
+      } finally {
+        client.release();
+      }
+    } catch {
+      return undefined;
     }
   }
 
@@ -545,19 +618,6 @@ export class ExportService {
       [workspaceId, unitKey],
     );
     return Number(held.rows[0]?.quantity ?? 0);
-  }
-
-  /**
-   * A PDF whose project does not exist can never succeed under this
-   * Idempotency-Key, so the unit QuotaGuard reserved for it is given back (on
-   * its own connection - this request's transaction is about to roll back).
-   * Any OTHER failure keeps the reservation on purpose: a retry under the same
-   * key finds it already held and commits it, so a transient failure followed
-   * by a successful retry costs exactly one unit; releasing here would make
-   * that retry free.
-   */
-  private async releaseIfUnserved(workspaceId: string, idempotencyKey: string): Promise<void> {
-    await this.releaseUnit(workspaceId, idempotencyKey);
   }
 
   /** Gives a PDF's reserved unit back on its own connection (no request transaction is open). Never throws; `undefined` is nothing to release. */

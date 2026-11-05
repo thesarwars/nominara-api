@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Param, Post, Query, Req } from "@nestjs/common";
 import {
   exportRequestSchema,
   exportResponseSchema,
@@ -16,6 +16,7 @@ import { Meter } from "../../api/decorators/meter.decorator.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { RequireStorage } from "../../api/decorators/require-storage.decorator.js";
+import { requestAuditActorOf, type AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { isMeteredPdfExport } from "./export-metering.js";
 import { ExportService } from "./export.service.js";
@@ -59,7 +60,10 @@ export class ReportsController {
     @Param("id") projectId: string,
     @Body(new ZodValidationPipe(exportRequestSchema)) body: ExportRequest,
     @Headers("idempotency-key") idempotencyKey: string | undefined,
+    @Req() request: AuditableRequest,
   ): Promise<ExportResponse> {
-    return this.exports.export(projectId, body, idempotencyKey, { awaitUpload: true });
+    // The outcome audit row (report.exported / report.export_failed) is written after the response's transaction, so it needs the same
+    // actor the interceptor's report.export_attempted row names: taken from the request here, by the interceptor's own mapping.
+    return this.exports.export(projectId, body, idempotencyKey, { awaitUpload: true, audit: requestAuditActorOf(request) });
   }
 }

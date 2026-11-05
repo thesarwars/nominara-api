@@ -16,8 +16,11 @@ const artifact = { id: ID, relativeKey: `${ID}.pdf`, file: Buffer.from("%PDF"), 
 const UNIT_KEY = "idem-key-1";
 const pdfArtifact = { ...artifact, pdfUnitKey: UNIT_KEY };
 
-function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?: boolean; deleteFails?: boolean; markFails?: boolean } = {}) {
+function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?: boolean; deleteFails?: boolean; markFails?: boolean; reread?: "stored" | "absent" | "throws" } = {}) {
   const order: string[] = [];
+  const rereads: number[] = [];
+  const unitTx: number[] = [];
+  const auditTx: number[] = [];
   const tasks: Array<() => void> = [];
   vi.spyOn(tenantContext, "afterCommit").mockImplementation((t) => void tasks.push(t));
   const recorded: Array<{ text: string; params: unknown[] }> = [];
@@ -29,10 +32,21 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
   };
   const requestTasks: Array<() => Promise<void>> = [];
   vi.spyOn(afterTx, "afterTransaction").mockImplementation((t) => (requestTasks.push(t), true));
+  let transactions = 0;
   vi.spyOn(tenantContext, "withTenantContext").mockImplementation(async (_c, _ctx, fn) => {
+    transactions += 1;
+    const txNo = transactions;
     // The record (UPDATE ... SET object_key = $2 ...) may fail; the mark-failed statement has its own switch.
     return fn({
-      query: async (text: string, params: unknown[]) => {
+      query: async (text: string, params: unknown[] = []) => {
+        if (text.startsWith("SAVEPOINT") || text.startsWith("ROLLBACK TO") || text.startsWith("RELEASE")) return { rows: [], rowCount: 0 };
+        if (text.includes("SELECT object_key FROM report_artifacts")) {
+          // r7: the ambiguous-COMMIT re-read (a read, so the record's failure switch does not apply to it).
+          if (opts.reread === "throws") throw new Error("db down");
+          rereads.push(txNo);
+          return { rows: [{ object_key: opts.reread === "stored" ? `unit/${WS}/${ID}.pdf` : `pending:${ID}` }], rowCount: 1 };
+        }
+        if (text.includes("SET state = 'released'")) unitTx.push(txNo);
         if (text.includes("SET state = 'committed'")) order.push("commit_unit");
         if (text.includes("SET state = 'released'")) order.push("release_unit");
         const isMark = typeof params[1] === "string" && (params[1] as string).startsWith("failed:");
@@ -46,10 +60,11 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
       },
     } as never);
   });
-  const audits: Array<{ action: string; afterState: unknown }> = [];
+  const audits: Array<{ action: string; afterState: unknown; input: Record<string, unknown> }> = [];
   vi.spyOn(AuditChainService.prototype, "append").mockImplementation(async (_c, input) => {
     order.push(`audit:${input.action}`);
-    audits.push({ action: input.action, afterState: input.afterState });
+    audits.push({ action: input.action, afterState: input.afterState, input: input as unknown as Record<string, unknown> });
+    auditTx.push(transactions);
   });
   const release = vi.fn();
   const pool = { connect: vi.fn(async () => ({ release })) };
@@ -65,7 +80,7 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
     }),
   };
   const service = new ExportService({} as never, {} as never, {} as never, pool as never, {} as never, "https://api.example.test");
-  return { service, bound, tasks, recorded, release, pool, order, requestTasks, audits, txClient };
+  return { service, bound, tasks, recorded, release, pool, order, requestTasks, audits, txClient, rereads, unitTx, auditTx, transactionCount: () => transactions };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -267,5 +282,83 @@ describe("STORY-180 r6 · the audit trail tells the truth about the outcome", ()
     h.tasks[0]!();
     await h.service.uploaded([ID]);
     expect(h.audits).toEqual([]);
+  });
+});
+
+describe("STORY-180 r7 · the outcome audit row names the real actor", () => {
+  const request = { actorType: "api_key", supportGrantId: null, requestId: "req-7", ip: "203.0.113.9", ua: "curl/8" } as const;
+
+  it("an API-key export is audited as api_key, with the request id, ip and user agent the interceptor row carries", async () => {
+    const h = build();
+    h.service.scheduleUpload(h.bound as never, context, { ...artifact, audit: request }, true);
+    await h.requestTasks[0]!();
+    expect(h.audits[0]!.input).toMatchObject({ action: "report.exported", actorType: "api_key", actorId: "actor", actorIp: "203.0.113.9", actorUa: "curl/8", requestId: "req-7", supportGrantId: null });
+  });
+
+  it("a support-grant export is audited as support, naming the grant, on the failure row too", async () => {
+    const h = build({ putFails: true });
+    h.service.scheduleUpload(h.bound as never, context, { ...artifact, audit: { ...request, actorType: "support", supportGrantId: "0190cccc-0000-7000-8000-0000000000g1" } }, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.audits[0]!.input).toMatchObject({ action: "report.export_failed", actorType: "support", supportGrantId: "0190cccc-0000-7000-8000-0000000000g1", requestId: "req-7", actorIp: "203.0.113.9" });
+  });
+});
+
+describe("STORY-180 r7 · an ambiguous COMMIT is settled by re-reading the row, not by deleting a possibly stored file", () => {
+  it("the record failed to ACKNOWLEDGE but the row IS stored: the object is NOT deleted, the row is not marked, the unit is not released, and the export succeeds", async () => {
+    const h = build({ recordThrows: true, reread: "stored" });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).resolves.toBeUndefined();
+    expect(h.rereads).toHaveLength(1);
+    expect(h.bound.delete).not.toHaveBeenCalled();
+    expect(h.order).not.toContain("mark_failed");
+    expect(h.order).not.toContain("release_unit");
+  });
+
+  it("the re-read says the row is NOT stored: the old path (delete the object, mark failed, release the unit)", async () => {
+    const h = build({ recordThrows: true, reread: "absent" });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.bound.delete).toHaveBeenCalledWith("reports", `${ID}.pdf`);
+    expect(h.order).toContain("mark_failed");
+    expect(h.order).toContain("release_unit");
+  });
+
+  it("the re-read cannot be made either: nothing is deleted or marked (the nightly sweep decides), the request still fails", async () => {
+    const h = build({ recordThrows: true, reread: "throws" });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.bound.delete).not.toHaveBeenCalled();
+    expect(h.order).not.toContain("mark_failed");
+  });
+});
+
+describe("STORY-180 r7 · every non-ok end gives the unit back, and the release and the failure audit share one transaction", () => {
+  it("an unexpected exception inside the upload (outcome 'error') still releases the unit and audits the failure", async () => {
+    const h = build({ putFails: true });
+    // The put fails, and then counting that failure throws: nothing named by the three failure paths ran to its end.
+    vi.spyOn(metrics, "incrementCounter").mockImplementation(() => {
+      throw new Error("metrics down");
+    });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.order).toContain("release_unit");
+    expect(h.audits.map((a) => [a.action, a.afterState])).toEqual([["report.export_failed", { outcome: "error" }]]);
+  });
+
+  it("put_failed on an audited PDF: the release and the export_failed row are written in ONE transaction (the mark is the other)", async () => {
+    const h = build({ putFails: true });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.transactionCount()).toBe(2);
+    expect(h.unitTx).toHaveLength(1);
+    expect(h.auditTx).toHaveLength(1);
+    expect(h.unitTx[0]).toBe(h.auditTx[0]);
+  });
+
+  it("a release that throws does not lose the failure audit row (and vice versa)", async () => {
+    const h = build({ recordThrows: true, reread: "absent" });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.audits.map((a) => a.action)).toEqual(["report.export_failed"]);
   });
 });

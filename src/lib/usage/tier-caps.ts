@@ -179,6 +179,16 @@ export async function reserveTierCap(tx: ClientBase, request: ReservationRequest
     return row === undefined ? { ok: false } : { ok: true, remaining: numberOrNull(row.remaining), alreadyHeld: false };
   }
 
+  // THE LOCK IS TAKEN HERE, as its own statement, and the CTE below starts only after it is held (STORY-180 r7). Without it the CTE's
+  // `NOT EXISTS` reads the reservation row from the snapshot taken when the statement STARTED; a caller that waited on the counter row's
+  // lock still sees the row as `released`, so N concurrent callers re-taking one released job id would all bump the counter. A second
+  // statement in READ COMMITTED takes a fresh snapshot after the lock is granted, so it sees what the previous holder committed.
+  // The lock lasts to the end of the CALLER'S transaction: call this inside one (a request's, a job's), never in autocommit.
+  await tx.query(
+    "SELECT 1 FROM usage_counters WHERE workspace_id = $1 AND metric = $2 AND period_start = $3 FOR UPDATE",
+    [workspaceId, metric, periodStart],
+  );
+
   const result = await tx.query<{ remaining: string | null; already_held: boolean }>(
     `WITH bumped AS (
        UPDATE usage_counters
@@ -194,6 +204,7 @@ export async function reserveTierCap(tx: ClientBase, request: ReservationRequest
        SELECT $1, $2, $6, $3, $4 FROM bumped
        ON CONFLICT (workspace_id, metric, job_id)
        DO UPDATE SET state = 'reserved', settled_at = NULL, period_start = EXCLUDED.period_start, quantity = EXCLUDED.quantity, created_at = now()
+       WHERE usage_reservations.state = 'released'
        RETURNING job_id
      )
      SELECT (SELECT remaining FROM bumped) AS remaining,

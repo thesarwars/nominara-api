@@ -27,7 +27,11 @@ import { isStoredObjectKey } from "./artifact-key.js";
 //     phase 2   NO transaction, no connection: delete each object (a delete of an absent object succeeds)
 //     phase 3   ONE short transaction: mark the rows whose object is gone `purged:<id>`
 //
-// A TENANCY REFUSAL (StorageTenancyError: the row's key is outside the workspace prefix) is quarantined, not retried: `refused:<id>`.
+// A TENANCY REFUSAL (StorageTenancyError: the row's key is outside the workspace prefix) is quarantined, not retried: `quarantined_at` is
+// stamped and `object_key` is LEFT UNTOUCHED (round 7: the key is the evidence, and rewriting it destroyed it). A quarantined row is not due.
+// EXCEPT when a workspace has refusals and not one object was deleted: that pattern is a configuration mismatch (a wrong environment
+// prefix refuses every legitimate row), not forged rows, and quarantining would hide those rows for ever. Nothing is quarantined, the rows
+// stay due for when the configuration is fixed, and the run FAILS (counted `all_refused`, the job throws, the retry ladder and alert fire).
 // A crash between phases 2 and 3 leaves a row that is still due: the next run deletes again (harmless) and marks it. An object that
 // cannot be deleted leaves its row unmarked, so it is retried the next night, counted and logged.
 //
@@ -51,7 +55,7 @@ export interface CleanupResult {
   readonly workspaces: number;
   /** Objects that could not be deleted, plus workspaces whose marking failed. */
   readonly failed: number;
-  /** Rows quarantined as `refused:` (a stored key outside the workspace prefix). Not failures: they are permanent and are not retried. */
+  /** Rows quarantined with `quarantined_at` (a stored key outside the workspace prefix). Not failures: they are permanent and are not retried. */
   readonly refused: number;
 }
 
@@ -68,8 +72,8 @@ interface DueRow {
 
 // The one definition of "due", shared by discovery, the in-workspace re-read and the mark. $1 = the stale cutoff in seconds. "Now" is the
 // DATABASE clock (`now()`), the same clock that stamped `expires_at` and `created_at`, so a worker host's skewed clock cannot purge a live
-// link early or hold an expired one. A `refused:` row is quarantined and never due again.
-const DUE = `object_key !~ '^(purged|refused):' AND (expires_at < now() OR (object_key ~ '^(pending|failed):' AND created_at < now() - make_interval(secs => $1)))`;
+// link early or hold an expired one. A quarantined row (`quarantined_at` set, key untouched) and a purged one are never due again.
+const DUE = `quarantined_at IS NULL AND object_key !~ '^purged:' AND (expires_at < now() OR (object_key ~ '^(pending|failed):' AND created_at < now() - make_interval(secs => $1)))`;
 const STALE_SECONDS = STALE_UPLOAD_MS / 1000;
 
 export async function runReportArtifactCleanup(owner: ClientBase, pool: Pool, store: TenantObjectStore, deps: CleanupDeps): Promise<CleanupResult> {
@@ -136,13 +140,19 @@ async function cleanWorkspace(pool: Pool, store: TenantObjectStore, workspaceId:
     else failed += 1;
   }
   if (gone.length === 0 && refusedIds.length === 0) return { purged: 0, failed, refused: 0 };
+  if (gone.length === 0) {
+    // Refusals with nothing deleted beside them: no proof the configuration is sound, so no quarantine (see the header). The run fails.
+    incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "all_refused" });
+    logger.error({ span: "reports.cleanup.workspace", workspace_id: workspaceId, outcome: "all_refused", refused: refusedIds.length, failed });
+    return { purged: 0, failed: failed + refusedIds.length, refused: 0 };
+  }
 
   // Phase 3 - mark exactly the rows whose object is gone. Re-checking DUE keeps a row that became live in between.
-  // A tenancy refusal is permanent (the key will never lie inside the prefix), so the row is QUARANTINED in the same short transaction: it
-  // would otherwise fail the job every night and, being oldest first, eventually fill the batch and starve every legitimate row behind it.
+  // A tenancy refusal is permanent (the key will never lie inside the prefix), so the row is QUARANTINED in the same short transaction
+  // (key untouched): it would otherwise fail the job every night and, being oldest first, eventually fill the batch and starve every legitimate row behind it.
   await inWorkspace(pool, workspaceId, async (tx) => {
     if (gone.length > 0) await tx.query(`UPDATE report_artifacts SET object_key = 'purged:' || id::text WHERE workspace_id = app.current_workspace() AND id = ANY($2::uuid[]) AND ${DUE}`, [STALE_SECONDS, gone]);
-    if (refusedIds.length > 0) await tx.query(`UPDATE report_artifacts SET object_key = 'refused:' || id::text WHERE workspace_id = app.current_workspace() AND id = ANY($2::uuid[]) AND ${DUE}`, [STALE_SECONDS, refusedIds]);
+    if (refusedIds.length > 0) await tx.query(`UPDATE report_artifacts SET quarantined_at = now() WHERE workspace_id = app.current_workspace() AND id = ANY($2::uuid[]) AND ${DUE}`, [STALE_SECONDS, refusedIds]);
   });
   for (let i = 0; i < gone.length; i += 1) incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "purged" });
   for (let i = 0; i < refusedIds.length; i += 1) incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "refused" });

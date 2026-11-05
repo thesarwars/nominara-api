@@ -1,6 +1,9 @@
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportResponseSchema } from "../../contracts/reports/index.js";
+import { collectAfterTransactionTasks, type AfterTransactionTask } from "../../src/api/after-transaction.js";
+import { RateLimitBuckets } from "../../src/api/rate-limit/buckets.js";
+import { ReportsController } from "../../src/modules/reports/reports.controller.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -708,4 +711,90 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect((await harness.app().inject({ method: "POST", url: apiUrl(`/exports/${l.id}/revoke-link`) })).statusCode).toBe(401);
     expect((await revoke(a, "not-a-uuid")).statusCode).toBe(400);
   }, 180_000);
+  it("STORY-180 r7 · the PDF unit is reserved under http:<actor>:<Idempotency-Key>, so another user's key (or scheduled-report:<id>) can never collide with it", async () => {
+    const { a, p } = await seeded();
+    const key = `ns-${uuidV7()}`;
+    expect((await exportReport(a, p, body(), key)).statusCode).toBe(201);
+    const held = (await harness.db().query(`SELECT job_id, state FROM usage_reservations WHERE workspace_id = $1`, [a.workspaceId])).rows;
+    expect(held).toEqual([{ job_id: `http:${a.userId}:${key}`, state: "committed" }]);
+    // A second user presenting the SAME key reserves (and consumes) a unit of their own: no replay across actors.
+    const other = await member(a.workspaceId, "manager", [p]);
+    expect((await exportReport(other, p, body(), key)).statusCode).toBe(201);
+    expect(await usage(a.workspaceId)).toEqual({ used: 2, reserved: 0 });
+  }, 180_000);
+
+  it("STORY-180 r7 · a rate-limited export (429) leaves reserved_value at 0: RateLimitGuard runs before QuotaGuard", async () => {
+    const { a, p } = await seeded();
+    const limiter = harness.app().get(RateLimitBuckets, { strict: false });
+    vi.spyOn(limiter, "check").mockResolvedValue({ allowed: false, applied: false, limit: 0, remaining: 0, resetAfterMs: 1000 });
+    const res = await exportReport(a, p, body());
+    expect(res.statusCode, res.body).toBe(429);
+    expect(errorOf(res).code).toBe("rate_limited");
+    const counter = await usage(a.workspaceId);
+    expect(counter?.reserved ?? 0).toBe(0);
+    expect(counter?.used ?? 0).toBe(0);
+    expect(((await harness.db().query(`SELECT count(*)::int AS n FROM usage_reservations WHERE workspace_id = $1`, [a.workspaceId])).rows[0] as { n: number }).n).toBe(0);
+  }, 120_000);
+
+  const auditRows = async (workspaceId: string, exportId: string) =>
+    (
+      await harness.db().query(
+        `SELECT action, actor_type, actor_id::text, support_grant_id::text, request_id, host(actor_ip) AS ip, actor_ua FROM audit_log WHERE workspace_id = $1 AND resource_id = $2 ORDER BY seq`,
+        [workspaceId, exportId],
+      )
+    ).rows as Array<{ action: string; actor_type: string; actor_id: string; support_grant_id: string | null; request_id: string; ip: string | null; actor_ua: string | null }>;
+
+  it("STORY-180 r7 · over HTTP the outcome row (report.exported) names the same actor, request id and user agent as the interceptor's report.export_attempted row", async () => {
+    const { a, p } = await seeded();
+    const res = await harness.app().inject({
+      method: "POST",
+      url: apiUrl(`/projects/${p}/reports/export`),
+      headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json", "idempotency-key": `ua-${uuidV7()}`, "user-agent": "nominara-test/7" },
+      payload: body({ format: "csv" }),
+    });
+    expect(res.statusCode, res.body).toBe(201);
+    const rows = await auditRows(a.workspaceId, data<Exported>(res).export_id);
+    expect(rows.map((r) => r.action)).toEqual(["report.export_attempted", "report.exported"]);
+    expect(rows[1]).toEqual(rows[0] === undefined ? undefined : { ...rows[0], action: "report.exported" });
+    expect(rows[1]!.actor_type).toBe("user");
+    expect(rows[1]!.request_id).not.toBe("");
+    expect(rows[1]!.actor_ua).toBe("nominara-test/7");
+    expect(rows[1]!.ip).not.toBeNull();
+  }, 120_000);
+
+  // No production route sets `req.supportGrant` or `authMethod: "apiKey"` on this route yet, so these two drive the controller the way the
+  // global chain would (TenantContextInterceptor's order: transaction, COMMIT, release, then the afterTransaction tasks), with the request
+  // shape AuditInterceptor.writeAuditRow reads.
+  async function exportAs(a: Actor, p: string, req: Record<string, unknown>): Promise<string> {
+    const controller = harness.app().get(ReportsController, { strict: false });
+    const tasks: AfterTransactionTask[] = [];
+    const client = await pool.connect();
+    let result: Exported;
+    try {
+      result = await collectAfterTransactionTasks(tasks, () =>
+        withTenantContext(client, { workspaceId: a.workspaceId, actorId: a.userId }, () => controller.export(p, body({ format: "csv" }) as never, undefined, req as never)),
+      );
+    } finally {
+      client.release();
+    }
+    for (const task of tasks) await task();
+    return result.export_id;
+  }
+
+  it("STORY-180 r7 · an API-key export's outcome row is audited as api_key with the request's id, ip and user agent", async () => {
+    const { a, p } = await seeded();
+    const id = await exportAs(a, p, { authMethod: "apiKey", id: "req-apikey-1", ip: "203.0.113.7", headers: { "user-agent": "sdk/1.0" } });
+    const rows = await auditRows(a.workspaceId, id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ action: "report.exported", actor_type: "api_key", actor_id: a.userId, support_grant_id: null, request_id: "req-apikey-1", ip: "203.0.113.7", actor_ua: "sdk/1.0" });
+  }, 120_000);
+
+  it("STORY-180 r7 · a support-grant export's outcome row is audited as support, naming the grant", async () => {
+    const { a, p } = await seeded();
+    const grant = uuidV7();
+    const id = await exportAs(a, p, { authMethod: "session", supportGrant: { id: grant }, id: "req-support-1", ip: "198.51.100.4", headers: { "user-agent": "support-console/2" } });
+    const rows = await auditRows(a.workspaceId, id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ action: "report.exported", actor_type: "support", support_grant_id: grant, request_id: "req-support-1", ip: "198.51.100.4", actor_ua: "support-console/2" });
+  }, 120_000);
 });

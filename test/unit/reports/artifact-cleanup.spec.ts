@@ -40,7 +40,7 @@ function build(opts: { discovered: Due[]; rows: Record<string, Row[]>; deleteFai
             order.push(`select:${current}`);
             return { rows: opts.rows[current!] ?? [] };
           }
-          const refuse = text.includes("'refused:'");
+          const refuse = text.includes("SET quarantined_at");
           order.push(`${refuse ? "refuse" : "mark"}:${current}`);
           if (opts.markFails) throw new Error("db down");
           return { rows: [], rowCount: (params[1] as string[]).length };
@@ -84,7 +84,9 @@ describe("STORY-180 r5 (b) · runReportArtifactCleanup", () => {
     expect(q.text).toContain("expires_at < now()");
     expect(q.text).toContain("object_key ~ '^(pending|failed):'");
     expect(q.text).toContain("created_at < now() - make_interval(secs => $1)");
-    expect(q.text).toContain("object_key !~ '^(purged|refused):'");
+    expect(q.text).toContain("object_key !~ '^purged:'");
+    // r7: a quarantined row is excluded by its own column, never by rewriting the key.
+    expect(q.text).toContain("quarantined_at IS NULL");
     expect(q.params[0]).toBe(STALE_UPLOAD_MS / 1000);
     expect(q.params.some((p) => p instanceof Date)).toBe(false);
     expect(q.text).not.toContain("methodology_footer");
@@ -159,7 +161,7 @@ describe("STORY-180 r5 (b) · runReportArtifactCleanup", () => {
     expect(count).toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "purged" });
   });
 
-  it("STORY-180 r6 · a row refused for TENANCY reasons is quarantined as refused:<id> (not retried nightly), counted, logged, and does not fail the job or starve the batch", async () => {
+  it("STORY-180 r7 · a row refused for TENANCY reasons is quarantined with quarantined_at (its object_key is LEFT ALONE), counted, logged, and does not fail the job or starve the batch", async () => {
     const count = vi.spyOn(metrics, "incrementCounter");
     const foreign = `inttest/${WS_B}/${ID1}.pdf`;
     const good = `inttest/${WS_A}/${ID2}.pdf`;
@@ -171,17 +173,39 @@ describe("STORY-180 r5 (b) · runReportArtifactCleanup", () => {
     const result = await h.run();
     expect(result).toMatchObject({ status: "complete", purged: 1, failed: 0 });
     expect(h.deleted).toEqual([good]);
-    const refuse = h.queries.find((q) => q.text.includes("'refused:'"))!;
-    expect(refuse.text).toContain("object_key = 'refused:' || id::text");
+    const refuse = h.queries.find((q) => q.text.includes("SET quarantined_at"))!;
+    expect(refuse.text).toContain("SET quarantined_at = now()");
+    expect(refuse.text).not.toMatch(/object_key\s*=/);
     expect(refuse.text).toContain("workspace_id = app.current_workspace()");
     expect(refuse.params[1]).toEqual([ID1]);
     expect(count).toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "refused" });
     expect(count).not.toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "delete_failed" });
   });
 
+  it("STORY-180 r7 · when EVERY candidate row of a workspace is refused the run FAILS (a config mismatch, not forged rows) and nothing is quarantined, so the rows are retried once the config is fixed", async () => {
+    const count = vi.spyOn(metrics, "incrementCounter");
+    const h = build({
+      discovered: [{ id: ID1, workspace_id: WS_A }, { id: ID2, workspace_id: WS_A }],
+      rows: { [WS_A]: [{ id: ID1, format: "pdf", object_key: `wrongenv/${WS_A}/${ID1}.pdf` }, { id: ID2, format: "pdf", object_key: `wrongenv/${WS_A}/${ID2}.pdf` }] },
+      refused: () => true,
+    });
+    const result = await h.run();
+    expect(result.status).toBe("partial");
+    expect(result.failed).toBeGreaterThan(0);
+    expect(result.purged).toBe(0);
+    expect(h.queries.some((q) => q.text.includes("SET quarantined_at") && !q.text.startsWith("SELECT"))).toBe(false);
+    expect(count).toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "all_refused" });
+  });
+
   it("STORY-180 r6 · a quarantine that cannot be written fails the workspace (reported), never silently", async () => {
     const foreign = `inttest/${WS_B}/${ID1}.pdf`;
-    const h = build({ discovered: [{ id: ID1, workspace_id: WS_A }], rows: { [WS_A]: [{ id: ID1, format: "pdf", object_key: foreign }] }, refused: () => true, markFails: true });
+    const good = `inttest/${WS_A}/${ID2}.pdf`;
+    const h = build({
+      discovered: [{ id: ID1, workspace_id: WS_A }, { id: ID2, workspace_id: WS_A }],
+      rows: { [WS_A]: [{ id: ID1, format: "pdf", object_key: foreign }, { id: ID2, format: "pdf", object_key: good }] },
+      refused: (k) => k === foreign,
+      markFails: true,
+    });
     const result = await h.run();
     expect(result.status).toBe("partial");
   });

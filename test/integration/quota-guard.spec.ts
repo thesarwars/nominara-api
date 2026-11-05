@@ -326,6 +326,17 @@ describe("STORY-070 · QuotaGuard: a zero cap is never an exhausted counter", ()
     expect((await readCounter(db, workspaceId, "pdf_exports", currentPeriod().start))!.reservedValue).toBe(1);
   });
 
+  it("STORY-180 r7 · the reservation is namespaced http:<actor>:<key>, so two actors presenting the SAME key hold two reservations (and can never collide with scheduled-report:<id>)", async () => {
+    const one = { ...request(), headers: { "idempotency-key": "shared-key" } };
+    const two = { ...request(), headers: { "idempotency-key": "shared-key" } };
+    await guard.canActivate(makeContext(one, ExportPdfRoute));
+    await guard.canActivate(makeContext(two, ExportPdfRoute));
+
+    expect((await readCounter(db, workspaceId, "pdf_exports", currentPeriod().start))!.reservedValue).toBe(2);
+    const ids = (await db.query("SELECT job_id FROM usage_reservations WHERE workspace_id = $1 ORDER BY job_id", [workspaceId])).rows.map((r) => (r as { job_id: string }).job_id);
+    expect(ids).toEqual([`http:${one.tenant!.actorId}:shared-key`, `http:${two.tenant!.actorId}:shared-key`].sort());
+  });
+
   it("two different keys are two reservations", async () => {
     for (const key of ["req-1", "req-2"]) {
       await guard.canActivate(makeContext({ ...request(), headers: { "idempotency-key": key } }, ExportPdfRoute));
@@ -349,7 +360,7 @@ describe("STORY-070 · QuotaGuard: a zero cap is never an exhausted counter", ()
   // -------------------------------------------------------------------------
   // Scenario 12 — the slot
   // -------------------------------------------------------------------------
-  it("sits after EntitlementGuard and before DailyCapGuard and CreditGuard in the composition root", async () => {
+  it("sits after EntitlementGuard and RateLimitGuard (r7: a 429 reserves nothing) and before DailyCapGuard and CreditGuard in the composition root", async () => {
     // security-and-tenancy.md §5's chain. Asserted here against the real
     // registration array as well as in api.module.spec.ts's live-invocation
     // test, because the order is what keeps the five refusals distinct: a
@@ -357,7 +368,7 @@ describe("STORY-070 · QuotaGuard: a zero cap is never an exhausted counter", ()
     const source = await import("node:fs/promises").then(async (fs) =>
       fs.readFile(new URL("../../src/api/api.module.ts", import.meta.url), "utf8"),
     );
-    const order = ["EntitlementGuard", "QuotaGuard", "DailyCapGuard", "RateLimitGuard", "CreditGuard"].map((name) =>
+    const order = ["EntitlementGuard", "RateLimitGuard", "QuotaGuard", "DailyCapGuard", "CreditGuard"].map((name) =>
       source.indexOf(`useClass: ${name}`),
     );
     expect(order.every((index) => index > 0)).toBe(true);

@@ -151,10 +151,12 @@ describe("STORY-180 r5 (b) · report.cleanup and workspace erasure of report obj
     expect(await keyOf(bLive.id)).toBe(bLive.key);
   }, 120_000);
 
-  it("a row whose stored key points into ANOTHER workspace's prefix is refused: the foreign object survives and the row is quarantined as refused:<id>, once, without failing the job", async () => {
+  it("STORY-180 r7 · a row whose stored key points into ANOTHER workspace's prefix is refused: the foreign object survives and the row is quarantined with quarantined_at (object_key untouched), once, without failing the job", async () => {
     const a = await workspace();
     const b = await workspace();
     const victim = await artifact(b, { expiresIn: 5 * DAY });
+    // A legitimate expired row beside the forged one shows the configuration is sound (so the refusal is about the row).
+    const legit = await artifact(a, { expiresIn: -HOUR });
     // A's row (expired) carries B's object key: a corrupted or forged row must not delete B's file.
     const id = randomUUID();
     await db.query(
@@ -162,12 +164,33 @@ describe("STORY-180 r5 (b) · report.cleanup and workspace erasure of report obj
        VALUES ($1,$2,'{}','2026-10-01','2026-10-31','pdf',$3,10,'{}'::jsonb, now() - interval '1 hour')`,
       [id, a, victim.key],
     );
-    // STORY-180 r6: a tenancy refusal is permanent, so it is quarantined (not retried nightly, not failing the job, not starving the batch).
-    expect(await run()).toMatchObject({ status: "complete", purged: 0, failed: 0 });
+    expect(await run()).toMatchObject({ status: "complete", purged: 1, failed: 0, refused: 1 });
     expect(await exists(victim.key)).toBe(true);
-    expect(await keyOf(id)).toBe(`refused:${id}`);
+    expect(await exists(legit.key)).toBe(false);
+    // The key is evidence and is never rewritten; the row is excluded by its own column.
+    expect(await keyOf(id)).toBe(victim.key);
+    const q = (await db.query("SELECT quarantined_at FROM report_artifacts WHERE id = $1", [id])).rows[0] as { quarantined_at: Date | null };
+    expect(q.quarantined_at).not.toBeNull();
     expect(await run()).toMatchObject({ status: "complete", purged: 0, workspaces: 0 });
     expect(await keyOf(victim.id)).toBe(victim.key);
+  }, 120_000);
+
+  it("STORY-180 r7 · a workspace whose ONLY due row is refused fails the run (the job throws, not complete) and is NOT quarantined: the rows stay due for when the configuration is fixed", async () => {
+    const a = await workspace();
+    const b = await workspace();
+    const victim = await artifact(b, { expiresIn: 5 * DAY });
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO report_artifacts (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at)
+       VALUES ($1,$2,'{}','2026-10-01','2026-10-31','pdf',$3,10,'{}'::jsonb, now() - interval '1 hour')`,
+      [id, a, victim.key],
+    );
+    // The handler turns a failed count into a thrown job failure, so the retry ladder and the alert both fire.
+    await expect(run()).rejects.toThrow(/report cleanup/);
+    expect(await exists(victim.key)).toBe(true);
+    expect(await keyOf(id)).toBe(victim.key);
+    const q = (await db.query("SELECT quarantined_at FROM report_artifacts WHERE id = $1", [id])).rows[0] as { quarantined_at: Date | null };
+    expect(q.quarantined_at).toBeNull();
   }, 120_000);
 
   it("stale half-uploaded rows: a pending or failed row older than 24 h loses the object at its deterministic key; a younger one is kept", async () => {

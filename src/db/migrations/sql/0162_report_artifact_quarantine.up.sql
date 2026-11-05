@@ -1,0 +1,11 @@
+-- STORY-180 round 7 - quarantine a report artifact WITHOUT rewriting its key.
+--
+-- The nightly cleanup refuses a row whose stored object_key lies outside its workspace's prefix (a tenancy event). Round 6 quarantined it by
+-- overwriting object_key with 'refused:<id>', which destroyed the very evidence needed to investigate (and to repair a row that was only
+-- mis-keyed). The key is now left untouched and the row is excluded from "due" by this column instead.
+--
+--   quarantined_at  set by the cleanup when it refuses the row's key. NULL = not quarantined. The row keeps its figures, footer and key.
+--
+-- Expand-only: one nullable column on an existing tenant table. No new table, so no RLS change (the existing ws_isolation policy on
+-- report_artifacts covers it). Round 6 is unmerged, so no row carries a 'refused:' key.
+ALTER TABLE report_artifacts ADD COLUMN quarantined_at timestamptz;

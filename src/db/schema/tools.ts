@@ -166,6 +166,7 @@ export const reportArtifacts = pgTable("report_artifacts", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   linkTokenHash: bytea("link_token_hash"),
   linkRevokedAt: timestamp("link_revoked_at", { withTimezone: true }),
+  quarantinedAt: timestamp("quarantined_at", { withTimezone: true }),
 });
 
 export const scheduledReportDeliveries = pgTable("scheduled_report_deliveries", {

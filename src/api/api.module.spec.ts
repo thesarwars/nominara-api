@@ -49,11 +49,13 @@ const GUARD_ORDER = [
   WorkspaceGuard,
   RbacGuard,
   EntitlementGuard,
+  // STORY-180 r7 - BEFORE every guard that RESERVES something (QuotaGuard's tier-cap unit, DailyCapGuard's counter, CreditGuard's
+  // credits): a rate-limited request must not leave a reservation that no handler will ever settle.
+  RateLimitGuard,
   // STORY-180 r6 - BEFORE QuotaGuard: a refusal for unconfigured storage must come before a pdf_exports unit is reserved.
   StorageReadyGuard,
   QuotaGuard,
   DailyCapGuard,
-  RateLimitGuard,
   CreditGuard,
 ] as const;
 
@@ -194,7 +196,7 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
   // the wallet would otherwise be reserved against on every request that the
   // rate limiter was about to refuse — reservations that nothing settles,
   // because no handler ever runs.
-  it("a rate-limit refusal short-circuits before CreditGuard can reserve anything", async () => {
+  it("a rate-limit refusal short-circuits before QuotaGuard, DailyCapGuard and CreditGuard can reserve anything", async () => {
     const calls: string[] = [];
     for (const Guard of GUARD_ORDER) {
       const proto = Guard.prototype as unknown as { canActivate: (...args: unknown[]) => boolean | Promise<boolean> };
@@ -221,9 +223,9 @@ describe("STORY-022 · composition root guard/interceptor order", () => {
     const response = await app.inject({ method: "GET", url: "/health/live" });
 
     expect(response.statusCode).toBe(429);
-    // CreditGuard is absent from the list, which is the assertion: it was
-    // never invoked, so it cannot have reserved.
-    expect(calls).not.toContain(CreditGuard.name);
+    // r7: EVERY guard that reserves (QuotaGuard's tier-cap unit, DailyCapGuard, CreditGuard) is absent from the list, which is the
+    // assertion: none was invoked, so none can have reserved.
+    for (const reserving of [StorageReadyGuard, QuotaGuard, DailyCapGuard, CreditGuard]) expect(calls).not.toContain(reserving.name);
     expect(calls[calls.length - 1]).toBe(RateLimitGuard.name);
 
     await app.close();

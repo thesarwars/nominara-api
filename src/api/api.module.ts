@@ -114,11 +114,13 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     { provide: APP_GUARD, useClass: WorkspaceGuard },
     { provide: APP_GUARD, useClass: RbacGuard },
     { provide: APP_GUARD, useClass: EntitlementGuard },
+    // STORY-180 r7 - BEFORE every guard that reserves (QuotaGuard, DailyCapGuard, CreditGuard): a 429 must leave nothing reserved.
+    // This moves RateLimitGuard ahead of QuotaGuard/DailyCapGuard, which security-and-tenancy.md section 5 draws the other way round.
+    { provide: APP_GUARD, useClass: RateLimitGuard },
     // STORY-180 r6 - BEFORE QuotaGuard: storage unconfigured is refused before a tier-cap unit is reserved (acts only on @RequireStorage()).
     { provide: APP_GUARD, useClass: StorageReadyGuard },
     { provide: APP_GUARD, useClass: QuotaGuard },
     { provide: APP_GUARD, useClass: DailyCapGuard },
-    { provide: APP_GUARD, useClass: RateLimitGuard },
     { provide: APP_GUARD, useClass: CreditGuard },
     // Registered in THIS array order — NOT the documented linear chain's
     // order — because NestJS runs APP_INTERCEPTOR "before" logic in

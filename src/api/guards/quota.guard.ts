@@ -8,6 +8,7 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { StructuralUsage } from "../../lib/entitlements/structural-usage.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { METRIC_SPECS } from "../../lib/usage/metrics.js";
+import { httpReservationJobId } from "../../lib/usage/reservation-job-id.js";
 import { notifyQuotaThresholds } from "../../lib/notifications/thresholds.js";
 import { crossedWarningThresholds, provisionUsageCounters, reserveTierCap } from "../../lib/usage/tier-caps.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
@@ -53,6 +54,9 @@ function metricSpecFor(spec: MeterSpec) {
  * `IdempotencyInterceptor` gives the handler, one layer earlier, because the
  * reservation happens before the interceptor runs.
  *
+ * NAMESPACED (STORY-180 r7): the job id is `http:<actorId>:<key>` (reservation-job-id.ts), so the same key from another user is another
+ * reservation and no client-chosen key can equal a `scheduled-report:<id>` job.
+ *
  * WITHOUT ONE, NOTHING CAN SETTLE THE RESERVATION. It still counts against the
  * ceiling, so the cap binds correctly, but it stays `reserved` rather than
  * becoming `used` and is only cleared when the period rolls. That is the safe
@@ -67,10 +71,10 @@ function metricSpecFor(spec: MeterSpec) {
  * `@Meter` yet, so nothing is wrong today; the first one to do so must land
  * the settlement with it.
  */
-function idempotencyJobId(request: WorkspaceScopedRequest & { headers?: Record<string, unknown> }): string | undefined {
+function idempotencyJobId(request: WorkspaceScopedRequest & { headers?: Record<string, unknown> }, actorId: string): string | undefined {
   const raw = request.headers?.["idempotency-key"];
   const value = Array.isArray(raw) ? raw[0] : raw;
-  return typeof value === "string" && value.length > 0 && value.length <= 255 ? value : undefined;
+  return typeof value === "string" && value.length > 0 && value.length <= 255 ? httpReservationJobId(actorId, value) : undefined;
 }
 
 @Injectable()
@@ -149,7 +153,10 @@ export class QuotaGuard implements CanActivate {
       });
     }
 
-    await this.reserve(workspaceId, spec, resolved.entitlements, idempotencyJobId(request));
+    // The actor is the tenant context's own (WorkspaceGuard set it with the workspace); without one there is no namespace to
+    // reserve under, so the request reserves with no job id (counted, unsettleable) rather than under a shared bare key.
+    const actorId = request.tenant?.actorId;
+    await this.reserve(workspaceId, spec, resolved.entitlements, actorId === undefined ? undefined : idempotencyJobId(request, actorId));
     return true;
   }
 
