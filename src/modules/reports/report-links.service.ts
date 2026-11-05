@@ -71,27 +71,45 @@ export class ReportLinksService {
     }
   }
 
+  /**
+   * The row still says `pending:` but a link was mailed, which happens only when the put landed and recording the key then failed
+   * (the mail step confirms the object exists before it sends). The object sits at the deterministic key `{id}.{format}`: serve it if
+   * it is really there, no transaction open. Absent (or unreadable) stays the neutral 404.
+   */
+  private async servePending(params: ReportLinkParams, bound: BoundObjectStore, relative: string): Promise<string> {
+    try {
+      await bound.head("reports", relative);
+    } catch {
+      throw refusal();
+    }
+    const url = await bound.presignGet("reports", relative, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });
+    await this.countClick(params);
+    incrementCounter("nominara_reports_link_clicks_total", { outcome: "served_unrecorded" });
+    return url;
+  }
+
   private async lookup(params: ReportLinkParams): Promise<string> {
     const client = await this.pool.connect();
-    let found: { key: string | undefined; bound: BoundObjectStore };
+    let found: { key: string | undefined; id: string | undefined; format: string | undefined; bound: BoundObjectStore };
     try {
       found = await withTenantContext(client, { workspaceId: params.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
         // Revocation, expiry and the workspace's own state are decided in the WHERE clause, by the database clock. 
         const bound = this.objects.bind();
-        const hit = await tx.query<{ object_key: string }>(
-          `SELECT a.object_key FROM report_artifacts a
+        const hit = await tx.query<{ object_key: string; id: string; format: string }>(
+          `SELECT a.object_key, a.id, a.format FROM report_artifacts a
             WHERE a.link_token_hash = $1 AND a.workspace_id = $2 AND a.link_revoked_at IS NULL AND a.expires_at > now()
               AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = a.workspace_id AND w.deleted_at IS NULL AND w.deletion_execute_at IS NULL)
 `,
           [hashReportLinkToken(params.token), params.workspaceId],
         );
-        return { key: hit.rows[0]?.object_key, bound };
+        return { key: hit.rows[0]?.object_key, id: hit.rows[0]?.id, format: hit.rows[0]?.format, bound };
       });
     } finally {
       client.release();
     }
-    const { key, bound } = found;
-    if (key === undefined || key.startsWith("pending:")) throw refusal();
+    const { key, id, format, bound } = found;
+    if (key === undefined || id === undefined || format === undefined) throw refusal();
+    if (key.startsWith("pending:")) return this.servePending(params, bound, `${id}.${format}`);
     // Minted AFTER the transaction ended: no pooled connection is held while the SDK may resolve credentials.
     try {
       const url = await bound.presignGetStored("reports", key, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });

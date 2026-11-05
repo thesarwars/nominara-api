@@ -269,6 +269,8 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const res = await harness.app().inject({ method: "GET", url: apiUrl(`/exports/${id}/download`), headers: { cookie: a.cookie } });
     expect(res.statusCode, res.body).toBe(409);
     expect(res.headers.location).toBeUndefined();
+    // A plain navigation cannot recover from a 409 by itself: the contract tells the client to poll, and Retry-After says how soon.
+    expect(res.headers["retry-after"]).toBe("1");
   }, 120_000);
 
   it("STORY-180 AC2 · another workspace's export, an expired one and an unknown id are the same 404; no session is 401; a malformed id is 400", async () => {

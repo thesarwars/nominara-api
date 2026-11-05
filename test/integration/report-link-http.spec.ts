@@ -44,11 +44,11 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
   }
 
   /** An artifact row in `workspaceId`, its file in the bucket under `objectWorkspaceId`'s prefix, and a link token hash. */
-  async function artifact(workspaceId: string, over: { bytes?: Buffer; objectWorkspaceId?: string; pending?: boolean; expired?: boolean; revoked?: boolean; noLink?: boolean } = {}): Promise<Artifact> {
+  async function artifact(workspaceId: string, over: { bytes?: Buffer; objectWorkspaceId?: string; pending?: boolean; expired?: boolean; revoked?: boolean; noLink?: boolean; noObject?: boolean } = {}): Promise<Artifact> {
     const id = randomUUID();
     const bytes = over.bytes ?? Buffer.from("%PDF-1.4 report bytes");
     const key = `${REPORT_STORAGE_KEY_ENV}/${over.objectWorkspaceId ?? workspaceId}/${id}.pdf`;
-    await s3.put({ bucket: "reports", key, body: bytes, contentType: "application/pdf" });
+    if (over.noObject !== true) await s3.put({ bucket: "reports", key, body: bytes, contentType: "application/pdf" });
     const token = reportLinkToken(Buffer.alloc(32, 9), id);
     await harness.db().query(
       `INSERT INTO report_artifacts (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer,
@@ -140,9 +140,17 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
 
   it("STORY-180 AC1 · an artifact whose upload never landed (key still pending) is not linkable", async () => {
     const ws = await workspace();
-    const a = await artifact(ws, { pending: true });
+    const a = await artifact(ws, { pending: true, noObject: true });
     const res = await click(ws, a.token);
     expect(res.statusCode).toBe(404);
     expect(res.headers.location).toBeUndefined();
+  }, 120_000);
+
+  it("STORY-180 AC1 · a row still pending whose object IS stored (put landed, recording the key failed) is served from the deterministic key", async () => {
+    const ws = await workspace();
+    const a = await artifact(ws, { pending: true });
+    const res = await click(ws, a.token);
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toContain(`${a.id}.pdf`);
   }, 120_000);
 });

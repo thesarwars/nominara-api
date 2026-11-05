@@ -1,6 +1,7 @@
 import { Controller, Get, Header, HttpCode, Param, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import { exportDownloadParamsSchema, type ExportDownloadParams } from "../../../contracts/reports/index.js";
+import { ConflictError } from "../../api/errors/domain-errors.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
 import { ScopedByQuery } from "../../api/decorators/scoped-by-query.decorator.js";
@@ -21,7 +22,14 @@ export class ExportDownloadController {
   @Header("Referrer-Policy", "no-referrer")
   @ApiContract({ operationId: "downloadExport", redirect: true })
   async download(@Param(new ZodValidationPipe(exportDownloadParamsSchema)) params: ExportDownloadParams, @Res({ passthrough: true }) reply: FastifyReply): Promise<void> {
-    const { url } = await this.downloads.resolve(params);
-    void reply.header("location", url);
+    try {
+      const { url } = await this.downloads.resolve(params);
+      void reply.header("location", url);
+    } catch (error) {
+      // The file is uploaded just after the export commits; a navigation that arrives first gets 409 and must be told when to come back.
+      // ProblemFilter keeps headers already on the reply, so this travels with the problem+json.
+      if (error instanceof ConflictError) void reply.header("retry-after", "1");
+      throw error;
+    }
   }
 }

@@ -17,12 +17,14 @@ const WS = "0190dddd-0000-7000-8000-000000000001";
 const TOKEN = reportLinkToken(Buffer.alloc(32, 3), "0190dddd-0000-7000-8000-0000000000a1");
 const params = { workspaceId: WS, token: TOKEN };
 
-function build(opts: { rows?: Array<{ object_key: string }>; presign?: (ns: string, key: string, o: unknown) => Promise<string> } = {}) {
+function build(opts: { rows?: Array<{ object_key: string; id?: string; format?: string }>; head?: () => Promise<unknown>; presign?: (ns: string, key: string, o: unknown) => Promise<string> } = {}) {
   const queries: Array<{ text: string; params: unknown[] }> = [];
+  // The lookup selects id and format with the key; fixtures that only care about the key get plausible ones.
+  const rows = (opts.rows ?? []).map((r) => ({ id: "0190dddd-0000-7000-8000-0000000000a1", format: "pdf", ...r }));
   const tx = {
     query: vi.fn(async (text: string, p: unknown[]) => {
       queries.push({ text, params: p });
-      return { rows: opts.rows ?? [], rowCount: (opts.rows ?? []).length };
+      return { rows, rowCount: rows.length };
     }),
   };
   const contexts: unknown[] = [];
@@ -32,8 +34,10 @@ function build(opts: { rows?: Array<{ object_key: string }>; presign?: (ns: stri
   });
   const release = vi.fn();
   const presignGetStored = vi.fn(opts.presign ?? (async (_ns: string, key: string) => `https://s3.example.test/${key}?sig=x`));
-  const service = new ReportLinksService({ connect: async () => ({ release }) } as never, { bind: () => ({ presignGetStored }) } as never);
-  return { service, queries, contexts, release, presignGetStored };
+  const head = vi.fn(opts.head ?? (async () => ({ bytes: 1 })));
+  const presignGet = vi.fn(async (_ns: string, relative: string) => `https://s3.example.test/relative/${relative}?sig=x`);
+  const service = new ReportLinksService({ connect: async () => ({ release }) } as never, { bind: () => ({ presignGetStored, head, presignGet }) } as never);
+  return { service, queries, contexts, release, presignGetStored, head, presignGet };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -86,8 +90,16 @@ describe("STORY-180 AC3 · GET /v1/report-links/{workspaceId}/{token}", () => {
   });
 
   it("an artifact whose file never landed (key still pending) is the same 404", async () => {
-    const h = build({ rows: [{ object_key: "pending:0190dddd-0000-7000-8000-0000000000a1" }] });
+    const h = build({ rows: [{ object_key: "pending:0190dddd-0000-7000-8000-0000000000a1", id: "0190dddd-0000-7000-8000-0000000000a1", format: "pdf" }], head: async () => Promise.reject(new Error("NotFound")) });
     await expect(h.service.resolve(params)).rejects.toBeInstanceOf(NotFoundError);
+    expect(h.presignGetStored).not.toHaveBeenCalled();
+  });
+
+  it("a key still pending whose object IS in storage (the put landed, recording the key failed) is served from the deterministic key", async () => {
+    const h = build({ rows: [{ object_key: "pending:x", id: "0190dddd-0000-7000-8000-0000000000a1", format: "pdf" }] });
+    const out = await h.service.resolve(params);
+    expect(h.head).toHaveBeenCalledWith("reports", "0190dddd-0000-7000-8000-0000000000a1.pdf");
+    expect(out.url).toContain("0190dddd-0000-7000-8000-0000000000a1.pdf");
     expect(h.presignGetStored).not.toHaveBeenCalled();
   });
 

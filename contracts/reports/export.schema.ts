@@ -18,7 +18,14 @@ import { reportFormatSchema, reportSectionSchema, reportTimeframeSchema } from "
 // fetch from the STORED key (so an Idempotency-Key replay still downloads, and
 // a click never lands before the upload does: 409 until the file is stored).
 // It is no longer a `data:` URL; a client must open it (navigate or window.open,
-// so the session cookie travels), not decode it. The redirect target carries
+// so the session cookie travels), not decode it.
+//
+// The upload runs just after the export response, so the FIRST request can
+// still answer 409 `conflict` with `Retry-After: 1`. A plain navigation cannot
+// recover from that (the browser would show the problem document), so a client
+// MUST poll the URL with fetch (credentials: include, redirect: manual; an
+// opaque-redirect response means the file is ready) while it answers 409,
+// honouring Retry-After, and only then navigate. The redirect target carries
 // `Content-Disposition: attachment; filename="<filename>"`.
 //
 // Permission export:data (step-up for owner/admin). 0 credits. One

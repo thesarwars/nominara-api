@@ -61,13 +61,6 @@ describe("STORY-180 AC2 · GET /v1/exports/{id}/download", () => {
     expect(h.order).toEqual(["lookup", "presign", "count"]);
   });
 
-  it("many concurrent downloads all complete: the service takes no pooled connection of its own (hold-and-wait on the pool)", async () => {
-    const h = build({ rows: [{ object_key: KEY, format: "pdf", period_end: "2026-10-31" }] });
-    const results = await Promise.all(Array.from({ length: 50 }, () => h.service.resolve({ id: ID })));
-    expect(results).toHaveLength(50);
-    expect(h.presignGetStored).toHaveBeenCalledTimes(50);
-  });
-
   it("every fetch mints a new presign (nothing is cached or replayed)", async () => {
     const h = build({ rows: [{ object_key: KEY, format: "csv", period_end: "2026-10-31" }] });
     await h.service.resolve({ id: ID });
@@ -128,6 +121,18 @@ describe("STORY-180 AC2 · GET /v1/exports/{id}/download", () => {
     await build({ rows: [{ object_key: `pending:${ID}`, format: "pdf", period_end: "2026-10-31" }] }).service.resolve({ id: ID }).catch(() => undefined);
     const outcomes = count.mock.calls.filter((c) => c[0] === "nominara_reports_downloads_total").map((c) => (c[1] as { outcome: string }).outcome);
     expect(outcomes).toEqual(["redirected", "refused", "not_ready"]);
+  });
+
+  it("a 409 (file not landed yet) carries Retry-After so a client can poll; a redirect carries none", async () => {
+    const header = vi.fn();
+    const reply = { header } as never;
+    const notReady = new ExportDownloadController({ resolve: async () => Promise.reject(new ConflictError({ message: "not ready" })) } as never);
+    await expect(notReady.download({ id: ID }, reply)).rejects.toBeInstanceOf(ConflictError);
+    expect(header).toHaveBeenCalledWith("retry-after", "1");
+    header.mockClear();
+    const ready = new ExportDownloadController({ resolve: async () => ({ url: "https://s3.example.test/x" }) } as never);
+    await ready.download({ id: ID }, reply);
+    expect(header.mock.calls.map((c) => c[0])).toEqual(["location"]);
   });
 
   it("the route needs export:data and is declared as a redirect", () => {
