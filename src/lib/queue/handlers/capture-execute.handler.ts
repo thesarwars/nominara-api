@@ -361,7 +361,11 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       // EC-08) and `engine_health`. A `blocked` cell never reached the vendor (disabled engine, spend ceiling) and is not an attempt.
       if (engineKey.success) {
         if (cell.outcome.kind === "captured") await gate().record(engineKey.data, { outcome: "success", latencyMs: cell.outcome.latencyMs });
-        if (cell.outcome.kind === "failed") {
+        // A cell that failed with the engine REACHABLE (a truncated-empty answer: the token budget, not the vendor) is a SUCCESS for the
+        // breaker and health: counting it a failure would re-open a half-open breaker on one long prompt.
+        if (cell.outcome.kind === "failed" && cell.outcome.engineReachable !== undefined) {
+          await gate().record(engineKey.data, { outcome: "success", latencyMs: cell.outcome.engineReachable.latencyMs });
+        } else if (cell.outcome.kind === "failed") {
           const code = captureFailureCodeSchema.safeParse(cell.outcome.errorCode);
           if (code.success) await gate().record(engineKey.data, { outcome: "failure", code: code.data });
         }

@@ -66,6 +66,7 @@ vi.mock("../../src/lib/engines/registry.js", async (importOriginal) => {
         if (input.promptText === "quota") return Promise.reject(new Failure("quota_exhausted", engineKey as never));
         if (input.promptText === "walled") return Promise.reject(new Failure("blocked", engineKey as never));
         if (input.promptText === "slow") return Promise.reject(new Failure("rate_limited", engineKey as never));
+        if (input.promptText === "budget") return Promise.resolve({ text: "", format: "markdown", truncated: true, responseTokensEst: 0, latencyMs: 333, costUsd: 0 });
         return Promise.resolve({ text: "answer", format: "markdown", truncated: false, responseTokensEst: 1, latencyMs: 420, costUsd: 0 });
       },
     }),
@@ -258,6 +259,20 @@ describe("STORY-031 · engine limits in the live capture path", () => {
       await execute(job(p, "fine"));
       expect(await rows()).toEqual([{ engine_key: "gemini", status: "captured", error_code: null }]);
       expect((await breakers().for("gemini").detail()).state).toBe("closed");
+    });
+  });
+
+  describe("audit r4 AC3 · a truncated-empty answer is the CELL's failure, not the engine's", () => {
+    it("a half-open breaker probed by a truncated-empty cell CLOSES (the engine was reachable), while the cell is recorded failed/malformed_response", async () => {
+      await addRun(1);
+      await openOnRatio();
+      clock.now += ENGINE_BREAKER_OPEN_DURATION_MS + 1; // half-open
+      const p = await addPrompt("budget");
+      await execute(job(p, "budget"));
+      expect(await rows()).toEqual([{ engine_key: "gemini", status: "failed", error_code: "malformed_response" }]);
+      expect((await breakers().for("gemini").detail()).state).toBe("closed");
+      const health = await db.query<{ attempts: number; successes: number }>("SELECT attempts, successes FROM engine_health WHERE engine_key = 'gemini'");
+      expect(health.rows).toEqual([{ attempts: 1, successes: 1 }]);
     });
   });
 

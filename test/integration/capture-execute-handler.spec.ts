@@ -10,8 +10,14 @@ import type { Cache } from "../../src/lib/cache/cache.port.js";
 import type { RealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
 import { readRunProgress } from "../../src/lib/capture/run-progress.js";
+import { BaseCaptureAdapter } from "../../src/lib/engines/base-adapter.js";
+import type { RawCapture } from "../../src/lib/engines/contract.js";
 import { createCaptureExecuteHandler } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import * as metrics from "../../src/lib/telemetry/metrics.js";
+import type { SpendMeter } from "../../src/lib/engines/spend-meter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
@@ -147,7 +153,7 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     );
   });
 
-  function handler() {
+  function handler(extra: Partial<Parameters<typeof createCaptureExecuteHandler>[1]> = {}) {
     const context = { pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl(), QUEUE_REDIS_URL: testQueueRedisUrl() } } as unknown as QueueHandlerContext;
     // STORY-135 — the parse enqueue is stubbed and RECORDED. This suite is
     // about the capture handler, and the env above has no queue in it; what
@@ -156,6 +162,7 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     return createCaptureExecuteHandler(context, {
       cache,
       engineGate: OPEN_ENGINE_GATE,
+      ...extra,
       realtime: recordingPublisher(emissions),
       enqueueParse: (payload) => {
         parseJobs.push(payload);
@@ -332,6 +339,93 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     const second = await planRun();
     const progress = await readRunProgress(db, second.runId, NOW);
     expect(progress.skipped).toBe(1);
+    expect(progress.cachedByLayer.l1).toBe(1);
+  });
+
+  // ---- Audit round 3 - what may enter L1, and how a token-budget failure is recorded ---------------------------------------------
+  // `recordSuppressedCells` writes an L1 row with truncated = false and no flags, so an L1 copy of a truncated empty (brand_present
+  // false) or of a refusal (flag lost) would be wrong in the OTHER tenant. Such an answer must never be seeded. Driven through the real
+  // seed -> probe -> insert path: capture, plan again, read what the planner wrote.
+  const raw = (over: Partial<RawCapture>): RawCapture => ({
+    text: "", format: "markdown", truncated: false, responseTokensEst: 0, latencyMs: 10, costUsd: 0, ...over,
+  });
+
+  async function captureThenReplan(prompt: string, answer?: RawCapture, opts: { cost?: number; handlerExtra?: Parameters<typeof handler>[0] } = {}) {
+    if (answer !== undefined) {
+      vi.spyOn(BaseCaptureAdapter.prototype, "capture").mockImplementationOnce((_input, ctx) => {
+        if (opts.cost !== undefined) ctx.recordCost(opts.cost);
+        return Promise.resolve(answer);
+      });
+    }
+    await addPrompt(prompt);
+    const first = await planRun();
+    // In the job's tenant transaction: a run whose only cell FAILED requests its rollup, which defers the enqueue past COMMIT.
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => handler(opts.handlerExtra)(tx, first.jobs[0]!));
+    vi.restoreAllMocks();
+    const second = await planRun();
+    return { first, second, progress: await readRunProgress(db, second.runId, NOW) };
+  }
+
+  it("[audit r3 AC2] a truncated-empty answer (token budget) is recorded FAILED with malformed_response, never parsed; the vendor's cost is kept", async () => {
+    const recordCost = vi.fn().mockResolvedValue({ newAlerts: [], totalUsd: 0, ceilingUsd: 100, hardStopped: false });
+    const counterSpy = vi.spyOn(metrics, "incrementCounter");
+    const { first } = await captureThenReplan("normal", raw({ truncated: true, costUsd: 0.01 }), {
+      cost: 0.01,
+      handlerExtra: { spendMeter: { isCeilingReached: () => Promise.resolve(false), recordCost } as unknown as SpendMeter },
+    });
+    const row = await db.query<{ status: string; error_code: string | null }>("SELECT status, error_code FROM answer_captures WHERE run_id = $1", [first.runId]);
+    expect(row.rows[0]).toEqual({ status: "failed", error_code: "malformed_response" });
+    expect(parseJobs).toEqual([]);
+    expect(await readRunProgress(db, first.runId, NOW)).toMatchObject({ failed: 1, captured: 0 });
+    // [audit r4 AC5] the call was billed: one usage_ledger row for the failed cell, and the platform spend meter was charged.
+    const ledger = await db.query<{ unit_cost_usd: string; engine_key: string }>("SELECT unit_cost_usd::text, engine_key FROM usage_ledger WHERE reference_id = $1", [first.runId]);
+    expect(ledger.rows).toEqual([{ unit_cost_usd: "0.010000", engine_key: SEEDED_ENGINE_KEY }]);
+    expect(recordCost).toHaveBeenCalledWith(SEEDED_ENGINE_KEY, 0.01);
+    // [audit r4 nit] the metric label is `engine_key`, like every other capture metric.
+    expect(counterSpy).toHaveBeenCalledWith("nominara_capture_truncated_empty_total", { engine_key: SEEDED_ENGINE_KEY });
+  });
+
+  it("[audit r3 AC2/AC5] a whitespace-only truncated answer is the same token-budget failure", async () => {
+    const { first } = await captureThenReplan("normal", raw({ text: " \n ", truncated: true }));
+    const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE run_id = $1", [first.runId]);
+    expect(row.rows[0]!.status).toBe("failed");
+  });
+
+  it("[audit r3 AC1] a truncated-empty live answer is NOT seeded into L1: the next plan finds no hit", async () => {
+    const { progress } = await captureThenReplan("normal", raw({ truncated: true }));
+    expect(progress.cachedByLayer.l1).toBe(0);
+    expect(progress.skipped).toBe(0);
+  });
+
+  it("[audit r4 AC1] an unflagged but TRUNCATED non-empty answer is NOT seeded into L1 (isSeedable's truncated clause)", async () => {
+    const { progress } = await captureThenReplan("truncated");
+    expect(progress.cachedByLayer.l1).toBe(0);
+    expect(progress.skipped).toBe(0);
+  });
+
+  it("[audit r3 AC1] a flagged refusal is NOT seeded into L1 (an L1 copy would lose its flag)", async () => {
+    const { progress } = await captureThenReplan("refusal");
+    expect(progress.cachedByLayer.l1).toBe(0);
+    expect(progress.skipped).toBe(0);
+  });
+
+  it("[audit r3 AC1] a flagged empty answer is NOT seeded into L1", async () => {
+    const { progress } = await captureThenReplan("empty");
+    expect(progress.cachedByLayer.l1).toBe(0);
+  });
+
+  it("[audit r3 AC1/AC5] an unflagged empty or whitespace-only answer is NOT seeded into L1", async () => {
+    for (const text of ["", "\n", "   \t "]) {
+      await db.query("TRUNCATE answer_captures, capture_runs CASCADE");
+      cache = new InMemoryCacheAdapter();
+      await db.query("TRUNCATE tracked_prompts CASCADE");
+      const { progress } = await captureThenReplan("normal", raw({ text }));
+      expect(progress.cachedByLayer.l1, JSON.stringify(text)).toBe(0);
+    }
+  });
+
+  it("[audit r3 AC1] control: an unflagged, complete, non-empty answer is still seeded", async () => {
+    const { progress } = await captureThenReplan("normal", raw({ text: "HubSpot is a CRM." }));
     expect(progress.cachedByLayer.l1).toBe(1);
   });
 });

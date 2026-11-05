@@ -5,7 +5,7 @@ import type { ClientBase } from "pg";
 import type { Cache } from "../cache/cache.port.js";
 import { cacheKeyNamespace } from "../cache/key-namespace.js";
 import { captureL1Key } from "./l1-cache-key.js";
-import { adapterMajorOf } from "./l1-exact-hash.js";
+import { L1_ENVELOPE_VERSION, adapterMajorOf } from "./l1-exact-hash.js";
 import type { CaptureAdapter, CaptureContext, RawCapture } from "../engines/contract.js";
 import { CaptureFailureError, classifyCaptureFailure } from "../engines/failure-taxonomy.js";
 import { EngineRefusalError, resolveEngine } from "../engines/registry.js";
@@ -14,7 +14,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 import { encodeRawObject, rawObjectRelativeKey } from "./raw-object.js";
 import type { BoundRawObjects } from "./raw-object-store.js";
 
-const logger = new Logger("capture.raw-object");
+const logger = new Logger("capture.execute-cell");
 
 // STORY-034 — one cell, captured and recorded.
 //
@@ -76,7 +76,12 @@ export interface CaptureCellInput {
 export type CaptureCellOutcome =
   | { readonly kind: "captured"; readonly latencyMs: number; /** True when the cell already had a row and nothing was done: the caller must not count it again. */ readonly replayed?: true }
   | { readonly kind: "blocked"; readonly errorCode: string }
-  | { readonly kind: "failed"; readonly errorCode: string };
+  | {
+      readonly kind: "failed";
+      readonly errorCode: string;
+      /** Set when the cell failed but the engine was reachable (a token-budget truncation): the breaker and health record a SUCCESS, not a failure. */
+      readonly engineReachable?: { readonly latencyMs: number };
+    };
 
 /** The `error_code` of a cell refused because its engine's monthly spend ceiling is reached. */
 export const ENGINE_SPEND_CEILING_REACHED = "engine_spend_ceiling_reached";
@@ -269,8 +274,19 @@ export async function fetchCell(input: CaptureCellInput, ports: FetchCellPorts =
   }
 
   await meterSpend();
+  // A TRUNCATED EMPTY ANSWER IS A TOKEN-BUDGET FAILURE, NOT AN ANSWER (Gemini MAX_TOKENS, OpenRouter finish "length"). scoring-models
+  // s2.5: a failed cell is excluded from both numerator and denominator, so it is recorded `failed` (`malformed_response`: the engine
+  // returned no usable body) - not `captured` with a NULL presence the per-prompt view drops and the rollup counts. Terminal, not retried
+  // (the same prompt hits the same budget); the vendor billed the call, so its cost is kept. Nothing is stored or seeded. The engine
+  // breaker and health still record a SUCCESS (the engine was reachable), so one long prompt cannot re-open a half-open breaker.
+  if (isBlank(raw.text) && raw.truncated) {
+    incrementCounter("nominara_capture_truncated_empty_total", { engine_key: input.engineKey });
+    logger.warn({ event: "capture.truncated_empty", workspace_id: input.workspaceId, run_id: input.runId, engine_key: input.engineKey });
+    // The CELL failed; the ENGINE did not: it was reachable and answered within its latency, so the breaker and health hear a success.
+    return unansweredCell({ status: "failed", errorCode: "malformed_response" }, { kind: "failed", errorCode: "malformed_response", engineReachable: { latencyMs: raw.latencyMs } }, now, costs.usd);
+  }
   const stored = await storeRawObject(input, now, rawObjects, raw);
-  return { write: { status: "captured", adapter, raw }, ...stored, costUsd: costs.usd, seed: raw, now, outcome: { kind: "captured", latencyMs: raw.latencyMs } };
+  return { write: { status: "captured", adapter, raw }, ...stored, costUsd: costs.usd, seed: isSeedable(raw) ? raw : undefined, now, outcome: { kind: "captured", latencyMs: raw.latencyMs } };
 }
 
 /**
@@ -469,8 +485,25 @@ function contentHash(text: string): Buffer {
   return createHash("sha256").update(text, "utf8").digest();
 }
 
+/** Empty after trim: `""`, `"\n"` and spaces are all "the engine said nothing". */
+function isBlank(text: string): boolean {
+  return text.trim() === "";
+}
+
+/**
+ * ONLY A COMPLETE, UNFLAGGED, NON-EMPTY ANSWER MAY ENTER THE SHARED CACHE.
+ * Flags excluded (every `captureFlagSchema` value, pinned by a unit test so a new flag forces a decision here): `engine_refused_to_answer`,
+ * `empty_answer`, `no_ai_overview_for_query`. `recordSuppressedCells` writes an L1 row with
+ * `truncated = false` and no flags, so an L1 copy of a truncated answer, of a refusal (its flag would be lost) or of an empty answer
+ * (it would read as a measured `brand_present = false` in another tenant) would assert something the source never did.
+ */
+function isSeedable(raw: RawCapture): boolean {
+  return !raw.truncated && !isBlank(raw.text) && (raw.flags ?? []).length === 0;
+}
+
 /** The L1 entry a later run's `probeExactHash` reads. Same envelope, same key. */
 async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw: RawCapture, now: Date): Promise<void> {
+  if (!isSeedable(raw)) return; // belt and braces: the caller already withholds the seed
   const key = captureL1Key({
     env: cacheKeyNamespace(),
     engineKey: input.engineKey,
@@ -484,7 +517,7 @@ async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw: RawCa
   await cache.set(
     key,
     JSON.stringify({
-      v: 1,
+      v: L1_ENVELOPE_VERSION,
       contentHash: contentHash(raw.text).toString("hex"),
       payload: rawPayload(raw),
       excerpt: raw.text.slice(0, EXCERPT_CHARS),

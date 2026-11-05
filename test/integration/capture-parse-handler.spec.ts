@@ -6,6 +6,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createCaptureParseHandler, type CaptureParseDeps } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import { aggregateRange } from "../../src/lib/rollup/aggregate-day.js";
 import { ParseAlertMonitor } from "../../src/lib/parser/parse-alerts.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -470,5 +471,198 @@ describe("STORY-135 · capture.parse", () => {
     ).resolves.toBeUndefined();
     const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(row.rows[0]!.status).toBe("parsed");
+  });
+  // ---- STORY-091 audit B2 - scoring-models s2.5: a refusal is a measurement; a blocked or failed cell is not ----------
+  async function seedEmpty(status: string, flags: string[], text: string | null = ""): Promise<string> {
+    const id = await seedCapture("x", { status });
+    await db.query("UPDATE answer_captures SET payload = $2::jsonb, flags = $3, response_excerpt = NULL WHERE id = $1", [
+      id,
+      JSON.stringify(text === null ? { format: "markdown" } : { format: "markdown", text }),
+      flags,
+    ]);
+    return id;
+  }
+  const presenceOf = async (id: string) =>
+    (await db.query<{ status: string; brand_present: boolean | null; sov: string | null; flags: string[] }>(
+      "SELECT status, brand_present, sov, flags FROM answer_captures WHERE id = $1",
+      [id],
+    )).rows[0]!;
+
+  it("[s2.5 refusal] an engine refusal (empty text + engine_refused_to_answer) parses as brand_present = false, sov = 0, no mentions", async () => {
+    const id = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    await run(handler(), job(id));
+    const row = await presenceOf(id);
+    expect(row).toMatchObject({ status: "parsed", brand_present: false });
+    expect(Number(row.sov)).toBe(0);
+    expect(row.flags).toContain("engine_refused_to_answer");
+    expect((await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [id])).rowCount).toBe(0);
+  });
+
+  it("[s2.5 empty answer] an empty answer with no flag is also brand_present = false, not NULL", async () => {
+    const id = await seedEmpty("captured", []);
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ status: "parsed", brand_present: false });
+  });
+
+  it("[s2.5 truncated] an empty answer that was cut off (truncated) is a token-budget failure, not an answer: brand_present stays NULL", async () => {
+    const id = await seedEmpty("captured", []);
+    await db.query("UPDATE answer_captures SET truncated = true WHERE id = $1", [id]);
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ brand_present: null, sov: null });
+  });
+
+  it("[s2.5 missing source] an L2 cell whose source is gone stays rematch_unavailable with NULL, not an empty answer", async () => {
+    const id = await seedReused("l2", { source: randomUUID() });
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ status: "skipped", brand_present: null });
+    expect((await presenceOf(id)).flags).toContain("rematch_unavailable");
+  });
+
+  it("[s2.5 whitespace] a whitespace-only answer is an empty answer: brand_present = false, no mentions (audit round 3)", async () => {
+    const id = await seedEmpty("captured", [], "\n  \t");
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ status: "parsed", brand_present: false });
+    expect((await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [id])).rowCount).toBe(0);
+  });
+
+  it("[s2.5 whitespace] a whitespace-only truncated answer is a token-budget failure, like an empty one: NULL", async () => {
+    const id = await seedEmpty("captured", [], "  \n");
+    await db.query("UPDATE answer_captures SET truncated = true WHERE id = $1", [id]);
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ brand_present: null, sov: null });
+  });
+
+  it("[decision 57a denormalised] a reused row that resolves to an empty answer carries empty_answer on its OWN flags (L1, L1 whitespace, L2)", async () => {
+    const l1 = await seedReused("l1", { ownText: "" });
+    const l1Blank = await seedReused("l1", { ownText: " \n " });
+    const source = await seedEmpty("captured", []);
+    const l2 = await seedReused("l2", { source });
+    for (const id of [l1, l1Blank, l2]) await run(handler(), job(id));
+    for (const id of [l1, l1Blank, l2]) {
+      const row = await presenceOf(id);
+      expect(row, id).toMatchObject({ status: "skipped", brand_present: false });
+      expect(row.flags, id).toContain("empty_answer");
+    }
+    // A reused row with a real answer is not flagged.
+    const real = await seedReused("l1", { ownText: ANSWER });
+    await run(handler(), job(real));
+    expect((await presenceOf(real)).flags).not.toContain("empty_answer");
+  });
+
+  it("[audit r4 AC2] every LIVE row resolved as an empty answer is stamped empty_answer, UNIONED with its existing flags", async () => {
+    const plain = await seedEmpty("captured", []);
+    const blank = await seedEmpty("captured", [], "\uFEFF");
+    const space = await seedEmpty("captured", [], " ");
+    const refused = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const noOverview = await seedEmpty("captured", ["no_ai_overview_for_query"]);
+    for (const id of [plain, blank, space, refused, noOverview]) await run(handler(), job(id));
+    for (const id of [plain, blank, space]) expect((await presenceOf(id)).flags, id).toContain("empty_answer");
+    expect((await presenceOf(refused)).flags).toEqual(expect.arrayContaining(["empty_answer", "engine_refused_to_answer"]));
+    expect((await presenceOf(noOverview)).flags).toEqual(expect.arrayContaining(["empty_answer", "no_ai_overview_for_query"]));
+    expect(await presenceOf(blank)).toMatchObject({ status: "parsed", brand_present: false });
+  });
+
+  it("[audit r4 AC2] a live row with a real answer is not stamped, and a truncated empty is not stamped", async () => {
+    const real = await seedCapture(ANSWER);
+    const truncated = await seedEmpty("captured", []);
+    await db.query("UPDATE answer_captures SET truncated = true WHERE id = $1", [truncated]);
+    for (const id of [real, truncated]) await run(handler(), job(id));
+    expect((await presenceOf(real)).flags).not.toContain("empty_answer");
+    expect((await presenceOf(truncated)).flags).not.toContain("empty_answer");
+  });
+
+  it("[audit r4 nit] a reused row carries its SOURCE's actual flags, unioned with empty_answer", async () => {
+    const source = await seedEmpty("captured", ["no_ai_overview_for_query"]);
+    const l2 = await seedReused("l2", { source });
+    const refusedSource = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const l2Refused = await seedReused("l2", { source: refusedSource });
+    for (const id of [l2, l2Refused]) await run(handler(), job(id));
+    expect((await presenceOf(l2)).flags).toEqual(expect.arrayContaining(["empty_answer", "no_ai_overview_for_query"]));
+    expect((await presenceOf(l2Refused)).flags).toEqual(expect.arrayContaining(["empty_answer", "engine_refused_to_answer"]));
+  });
+
+  it("[s2.5 blocked/failed] blocked and failed cells stay NULL and are out of the denominator", async () => {
+    const blocked = await seedEmpty("blocked", []);
+    const failed = await seedEmpty("failed", []);
+    await run(handler(), job(blocked));
+    await run(handler(), job(failed));
+    expect(await presenceOf(blocked)).toMatchObject({ status: "blocked", brand_present: null });
+    expect(await presenceOf(failed)).toMatchObject({ status: "failed", brand_present: null });
+  });
+
+  /** A reused row as the planner writes it: `skipped`, a cache layer, and either its own payload (L1) or `{}` plus a source (L2). */
+  async function seedReused(layer: "l1" | "l2", over: { ownText?: string; source?: string }): Promise<string> {
+    const id = await seedCapture("x", { status: "skipped" });
+    await db.query("UPDATE answer_captures SET cache_layer = $2, source_result_id = $3, payload = $4::jsonb, response_excerpt = NULL WHERE id = $1", [
+      id,
+      layer,
+      over.source ?? null,
+      JSON.stringify(over.ownText === undefined ? {} : { format: "markdown", text: over.ownText }),
+    ]);
+    return id;
+  }
+
+  it("[s2.5 agreement] per-prompt presence and the rollup agree: the refusal is in the denominator and not present; blocked is out", async () => {
+    const present = await seedCapture(ANSWER);
+    const refused = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const blocked = await seedEmpty("blocked", []);
+    // Audit round 2 - reused cells whose source answered with nothing are measurements too, and stay `skipped`.
+    const l1Empty = await seedReused("l1", { ownText: "" });
+    const refusedSource = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const l2Refused = await seedReused("l2", { source: refusedSource });
+    // Audit round 3 - a truncated-empty live answer is classified `failed` at the capture stage (malformed_response), so it is out of
+    // the denominator here AND in the rollup; a whitespace-only answer is an empty answer and is in both.
+    const truncatedEmpty = await seedEmpty("failed", []);
+    await db.query("UPDATE answer_captures SET truncated = true, error_code = 'malformed_response' WHERE id = $1", [truncatedEmpty]);
+    const blank = await seedEmpty("captured", [], "\n  ");
+    for (const id of [present, refused, blocked, l1Empty, refusedSource, l2Refused, truncatedEmpty, blank]) await run(handler(), job(id));
+    expect(await presenceOf(truncatedEmpty)).toMatchObject({ status: "failed", brand_present: null });
+    expect(await presenceOf(blank)).toMatchObject({ status: "parsed", brand_present: false });
+    expect(await presenceOf(l1Empty)).toMatchObject({ status: "skipped", brand_present: false });
+    expect(Number((await presenceOf(l1Empty)).sov)).toBe(0);
+    expect((await presenceOf(l1Empty)).flags).not.toContain("rematch_unavailable");
+    expect(await presenceOf(l2Refused)).toMatchObject({ status: "skipped", brand_present: false });
+    expect(Number((await presenceOf(l2Refused)).sov)).toBe(0);
+    expect((await presenceOf(l2Refused)).flags).toContain("engine_refused_to_answer");
+    expect((await presenceOf(l2Refused)).flags).not.toContain("rematch_unavailable");
+
+    const rows = await db.query<{ id: string; brand_present: boolean | null }>(
+      "SELECT id, brand_present FROM answer_captures WHERE project_id = $1 AND status IN ('parsed','captured','skipped')",
+      [projectId],
+    );
+    const perPromptDenominator = rows.rows.filter((row) => row.brand_present !== null).length;
+    const perPromptPresent = rows.rows.filter((row) => row.brand_present === true).length;
+
+    const aggregates = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+      aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null),
+    );
+    const brand = aggregates.find((row) => row.entityType === "brand")!;
+    expect(perPromptDenominator).toBe(6); // present, refused, L1-empty, the refused source, the L2 row, the blank answer; blocked and truncated-empty are out
+    expect(brand.cellsTotal).toBe(perPromptDenominator);
+    expect(brand.cellsPresent).toBe(perPromptPresent);
+  });
+
+  // KNOWN DISAGREEMENT, PINNED (audit round 3). A reused row whose source is GONE parses to `rematch_unavailable`: status `skipped`,
+  // brand_present NULL. The per-prompt view reads NULL as "not measured" and drops it; `aggregateRange` keys on status only and counts a
+  // `skipped` row in the denominator. The delta is exactly the number of such rows. FOLLOW-UP (owner decision needed, not taken here):
+  // either exclude `rematch_unavailable` rows from aggregate-day's denominator or give them an explicit status. When that lands this
+  // test must flip to equality - it is expected to FAIL then, and the failure is the reminder.
+  it("[s2.5 agreement - KNOWN DISAGREEMENT] a rematch_unavailable reused row is out of the per-prompt denominator but in the rollup's, by exactly one", async () => {
+    const present = await seedCapture(ANSWER);
+    const gone = await seedReused("l2", { source: randomUUID() });
+    for (const id of [present, gone]) await run(handler(), job(id));
+    expect((await presenceOf(gone)).flags).toContain("rematch_unavailable");
+
+    const rows = await db.query<{ brand_present: boolean | null }>(
+      "SELECT brand_present FROM answer_captures WHERE project_id = $1 AND status IN ('parsed','captured','skipped')",
+      [projectId],
+    );
+    const perPromptDenominator = rows.rows.filter((row) => row.brand_present !== null).length;
+    const aggregates = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+      aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null),
+    );
+    const brand = aggregates.find((row) => row.entityType === "brand")!;
+    expect(perPromptDenominator).toBe(1);
+    expect(brand.cellsTotal - perPromptDenominator).toBe(1);
   });
 });

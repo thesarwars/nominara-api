@@ -217,7 +217,7 @@ describe("STORY-032 · planning a run end to end", () => {
         ttlSeconds: TTL_SECONDS,
         nowMs: NOW_MS,
       }),
-      JSON.stringify({ v: 1, contentHash, payload: { answer }, excerpt: answer }),
+      JSON.stringify({ v: 2, contentHash, payload: { answer }, excerpt: answer }),
       { ttlMs: 600_000 },
     );
   }

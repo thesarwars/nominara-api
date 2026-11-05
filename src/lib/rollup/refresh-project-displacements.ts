@@ -90,6 +90,22 @@ interface CellContext {
 
 const CLASS_ORDER = ["recommendation", "ranked", "neutral_list", "also_consider", "caveat"];
 
+/**
+ * Owner decision 57a - a refused or empty answer counts as "not mentioned" in presence, but it is NO OBSERVATION for displacement: it
+ * never opens an event, never closes one, and is never the baseline of the next comparison (the brand was not lost, the engine said
+ * nothing). Excludes rows flagged `engine_refused_to_answer` or `empty_answer` (a reused row carries its source's resolution on its own
+ * flags) and rows whose own payload text is empty after trim. No subquery. `table` is a fixed identifier, never user input.
+ */
+function observedAnswerSql(table: string): string {
+  // THE FLAGS DECIDE. capture.parse stamps `empty_answer` on every row it resolves as an empty answer (live or reused, and by the same
+  // JS definition of blank as the parser: String.trim, which includes U+FEFF and U+00A0), so the detector reads only the row's OWN columns:
+  // no subquery, no change of meaning when retention drops a source. The text test is a FALLBACK for legacy rows written before the stamp
+  // existed; it spells out JS's blank set because Postgres `\s` does not match U+FEFF. A row with no text (an L2 row, payload {}) is
+  // not excluded by its text.
+  return `NOT (${table}.flags && ARRAY['engine_refused_to_answer', 'empty_answer']::text[])
+          AND (${table}.payload->>'text' IS NULL OR ${table}.payload->>'text' !~ '^[\\s\\u00a0\\ufeff\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$')`;
+}
+
 export async function refreshProjectDisplacements(
   tx: ClientBase,
   projectId: string,
@@ -149,6 +165,7 @@ async function refreshProjectDisplacementsInner(
         WHERE project_id = $1 AND sample_index = 0 AND brand_present IS NOT NULL
           AND (captured_at AT TIME ZONE $2)::date = $3::date
           AND ${measurementStatusSql("status")}
+          AND ${observedAnswerSql("answer_captures")}
         ORDER BY captured_at, id`,
       [projectId, timezone, date],
     )
@@ -177,6 +194,7 @@ async function refreshProjectDisplacementsInner(
            FROM answer_captures
           WHERE project_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = 0 AND brand_present IS NOT NULL
             AND ${measurementStatusSql("status")}
+            AND ${observedAnswerSql("answer_captures")}
             AND (captured_at, id) < ($4::timestamptz, $5::uuid)
           ORDER BY captured_at DESC, id DESC LIMIT 1`,
         [projectId, after.prompt_id, after.engine_key, after.captured_at, after.id],

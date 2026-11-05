@@ -107,7 +107,7 @@ describe("STORY-034 · the manual run lifecycle", () => {
         ttlSeconds: TTL_SECONDS,
         nowMs: NOW.getTime(),
       }),
-      JSON.stringify({ v: 1, contentHash: "a".repeat(64), payload: { answer: "cached" }, excerpt: "cached" }),
+      JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: { answer: "cached" }, excerpt: "cached" }),
       { ttlMs: 600_000 },
     );
   }

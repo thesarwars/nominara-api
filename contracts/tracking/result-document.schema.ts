@@ -148,6 +148,7 @@ export const resultDocumentSchema = z
         sample_index: z.number().int().nonnegative(),
         latency_ms: z.number().int().nullable(),
         response_tokens_est: z.number().int().nullable(),
+        /** The length of the NORMALISED text served in `raw_response.text` (the string every offset indexes), not of the engine's raw bytes. */
         response_chars: z.number().int().nonnegative(),
         truncated: z.boolean(),
         content_hash: z.string(),

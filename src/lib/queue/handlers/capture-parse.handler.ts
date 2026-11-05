@@ -16,6 +16,7 @@ import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
 import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
+import { captureFlagSchema } from "../../engines/contract.js";
 import { decodeRawObject, type RawObjectBody } from "../../capture/raw-object.js";
 import { rawObjectStores, type BoundRawObjects, type RawObjectStores } from "../../capture/raw-object-store.js";
 import { StorageTenancyError } from "../../storage/storage-keys.js";
@@ -95,6 +96,7 @@ interface CaptureRecord {
   cache_layer: string;
   source_result_id: string | null;
   brand_present: boolean | null;
+  truncated: boolean;
 }
 
 /**
@@ -196,7 +198,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
     const found = await tx.query<CaptureRecord>(
       `SELECT id, project_id, run_id, prompt_id, engine_key, captured_at, status, content_hash,
               payload, response_excerpt, flags, normalizer_version, scoring_version, alias_fingerprint,
-              cache_layer, source_result_id, brand_present
+              cache_layer, source_result_id, brand_present, truncated
          FROM answer_captures
         WHERE id = $1
         FOR UPDATE`,
@@ -257,8 +259,9 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       return;
     }
 
-    const text = reused ? await reusedTextOf(tx, record, payload.workspaceId) : textOf(record, rawObject);
-    if (text === null && reused) {
+    const resolved = reused ? await reusedTextOf(tx, record, payload.workspaceId) : null;
+    const text = resolved !== null ? (resolved.kind === "text" ? resolved.text : null) : textOf(record, rawObject);
+    if (resolved?.kind === "missing") {
       // The answer cannot be recovered. NOT marked parsed (that would count the cell twice) and not left looking
       // pending (that would hold the run's rollup for ever): flagged, unscored, still skipped.
       await tx.query(
@@ -269,12 +272,25 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
-    if (text === null) {
-      // A suppressed (L1/L2) row carries an excerpt and no payload text, and a
-      // refusal carries neither. Marked parsed with no facts rather than left
-      // `captured` forever: there is genuinely nothing in it to match, and a
-      // cell stuck at `captured` would keep its run below 100% and keep this
-      // job coming back.
+    // scoring-models s2.5: "Engine refused to answer: sov = 0, flag engine_refused_to_answer, the cell counts in the denominator", and
+    // FR-SIM-01f makes an empty answer a valid observation too. The cell WAS asked and answered with nothing, so it is a measurement:
+    // brand_present = false, sov = 0, no mentions - not NULL, which the denominator reads as "not measured". This is a `captured`/`parsed`
+    // row only: `blocked` and `failed` returned above ("we could not ask" is not data), and a reused row whose source is gone returned
+    // above too. A row with NO text at all (payload expired, no object) is not an empty answer and keeps the NULL below.
+    //
+    // A REUSED row whose source answered with nothing (`kind: "empty"`) is the same observation: it parses "" and carries the source's own
+    // flags. A TRUNCATED empty answer (Gemini MAX_TOKENS, text "", truncated: true) is a token-budget failure, not an answer, so it is NOT
+    // an empty answer: the capture stage records it `failed` (malformed_response) and never reaches here; a legacy row that does keeps NULL.
+    const emptyAnswer =
+      resolved !== null
+        ? resolved.kind === "empty"
+        : text === null && !record.truncated && (record.flags.includes(ENGINE_REFUSED_FLAG) || answeredWithNothing(record, rawObject));
+    const parseText = emptyAnswer ? "" : text;
+    if (parseText === null) {
+      // Reaching here means a LIVE row (a reused row either has text, is an empty answer, or returned above as unavailable) with no
+      // text to parse: its payload expired or there is no object, or it is a truncated empty answer. Marked parsed with no facts rather
+      // than left `captured` forever: there is genuinely nothing in it to match, and a cell stuck at `captured` would keep its run below
+      // 100% and keep this job coming back.
       await tx.query("UPDATE answer_captures SET status = 'parsed', normalizer_version = $2, scoring_version = $3 WHERE id = $1", [
         record.id,
         NORMALIZER_VERSION,
@@ -291,8 +307,15 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       promptId: record.prompt_id,
       engineKey: record.engine_key,
       capturedAt: record.captured_at,
-      text,
-      flags: record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
+      text: parseText,
+      flags: [
+        ...record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
+        // DENORMALISED (decision 57a): every row resolved as an empty answer, live or reused, carries `empty_answer` on its OWN flags;
+        // the displacement detector tests the row's flags, never a cross-partition read of a source (which flips meaning once retention
+        // drops it). A reused row also carries its source's own flags (a refusal, no_ai_overview_for_query). UNIONED with the row's
+        // existing flags, never overwriting them.
+        ...(emptyAnswer ? [EMPTY_ANSWER_FLAG, ...(resolved?.kind === "empty" ? resolved.flags.filter((flag) => CARRIED_FLAGS.has(flag)) : [])] : []),
+      ].filter((flag, index, all) => all.indexOf(flag) === index),
       ...structuredOf(record, rawObject),
     };
 
@@ -332,6 +355,17 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
   return phasedProcessor<ParsePrepared, RawObjectBody | null>({ prepare, run, commit: (tx, prepared, rawObject) => commit(tx, prepared, rawObject) });
 }
 
+const ENGINE_REFUSED_FLAG = "engine_refused_to_answer";
+const EMPTY_ANSWER_FLAG = "empty_answer";
+/** The source flags a reused empty row inherits: exactly the contract's capture flags (captureFlagSchema), nothing internal. */
+const CARRIED_FLAGS: ReadonlySet<string> = new Set(captureFlagSchema.options);
+
+/** The row carries a text field and it is the empty string - an answer of nothing, as opposed to no text field at all. */
+function answeredWithNothing(record: CaptureRecord, rawObject: RawObjectBody | null): boolean {
+  const text = rawObject !== null ? rawObject.text : record.payload?.text;
+  return typeof text === "string" && text.trim() === "";
+}
+
 /** The prior parse's identity, or null when this row has never been parsed. */
 function priorOf(record: CaptureRecord): Parameters<typeof decideL3>[1] {
   // A reused row counts as already matched only once it HAS been: `brand_present` is NULL until the first re-match.
@@ -357,8 +391,11 @@ function priorOf(record: CaptureRecord): Parameters<typeof decideL3>[1] {
  */
 function textOf(record: CaptureRecord, rawObject: RawObjectBody | null): string | null {
   const text = rawObject !== null ? rawObject.text : record.payload?.text;
-  return typeof text === "string" && text.length > 0 ? text : null;
+  return typeof text === "string" && text.trim().length > 0 ? text : null;
 }
+
+/** What a reused row's answer resolved to: text, an answer of nothing (a refusal or an empty answer - a measurement), or nothing recoverable. */
+type ReusedText = { kind: "text"; text: string } | { kind: "empty"; flags: readonly string[] } | { kind: "missing" };
 
 /**
  * STORY-032 AC7 — the answer text of a REUSED row.
@@ -372,15 +409,23 @@ function textOf(record: CaptureRecord, rawObject: RawObjectBody | null): string 
  * `id` alone is not indexed (the key is (captured_at, id)), so this scans partitions as the handler's own lookup
  * by id does; one read per reused cell, and the planner already paid the larger scan.
  */
-async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<string | null> {
-  const own = textOf(record, null);
-  if (own !== null || record.source_result_id === null) return own;
-  const source = await tx.query<{ payload: CaptureRecord["payload"] }>(
-    "SELECT payload FROM answer_captures WHERE id = $1 AND workspace_id = $2 AND project_id = $3",
+async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<ReusedText> {
+  const own = (record.payload as { text?: unknown } | null)?.text;
+  if (typeof own === "string") {
+    if (own.trim().length > 0) return { kind: "text", text: own };
+    // A truncated empty answer is a failure, not an answer; a reused row cannot be marked parsed, so it is unavailable.
+    return record.truncated ? { kind: "missing" } : { kind: "empty", flags: record.flags };
+  }
+  if (record.source_result_id === null) return { kind: "missing" };
+  const source = await tx.query<{ payload: CaptureRecord["payload"]; flags: string[]; truncated: boolean }>(
+    "SELECT payload, flags, truncated FROM answer_captures WHERE id = $1 AND workspace_id = $2 AND project_id = $3",
     [record.source_result_id, workspaceId, record.project_id],
   );
-  const text = source.rows[0]?.payload?.text;
-  return typeof text === "string" && text.length > 0 ? text : null;
+  const row = source.rows[0];
+  const text = row?.payload?.text;
+  if (row === undefined || typeof text !== "string") return { kind: "missing" };
+  if (text.trim().length > 0) return { kind: "text", text };
+  return row.truncated ? { kind: "missing" } : { kind: "empty", flags: row.flags };
 }
 
 function structuredOf(record: CaptureRecord, rawObject: RawObjectBody | null): Partial<Pick<CaptureRow, "structuredCitations" | "structuredElements">> {

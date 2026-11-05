@@ -60,8 +60,14 @@ export interface L1Candidate {
  * envelope it cannot read must be a MISS rather than a crash or, worse, a
  * partially-populated row.
  */
+/**
+ * v2 (audit round 4): v1 entries could hold a truncated, flagged or empty answer, which a later run would read back as a complete,
+ * unflagged one. Bumping the version drops every entry cached before the fix at deploy - they read as misses and are re-captured.
+ */
+export const L1_ENVELOPE_VERSION = 2;
+
 export interface L1Envelope {
-  readonly v: 1;
+  readonly v: 2;
   /** Hex sha256 of the answer, as stored in `answer_captures.content_hash`. */
   readonly contentHash: string;
   /** The adapter's normalised response — what the parser reads. */
@@ -97,14 +103,14 @@ export function parseL1Envelope(raw: string): L1Envelope | undefined {
   }
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const candidate = parsed as Partial<L1Envelope>;
-  if (candidate.v !== 1) return undefined;
+  if (candidate.v !== L1_ENVELOPE_VERSION) return undefined;
   if (typeof candidate.contentHash !== "string" || !/^[0-9a-f]{64}$/u.test(candidate.contentHash)) return undefined;
   if (typeof candidate.payload !== "object" || candidate.payload === null || Array.isArray(candidate.payload)) {
     return undefined;
   }
   const excerpt = candidate.excerpt;
   if (excerpt !== null && typeof excerpt !== "string") return undefined;
-  return { v: 1, contentHash: candidate.contentHash, payload: candidate.payload, excerpt: excerpt ?? null };
+  return { v: L1_ENVELOPE_VERSION, contentHash: candidate.contentHash, payload: candidate.payload, excerpt: excerpt ?? null };
 }
 
 export interface L1ProbeContext {
