@@ -7,6 +7,13 @@ import { resultDocumentSchema } from "../../contracts/tracking/index.js";
 import { ResultDocumentService } from "../../src/modules/tracking/result-document.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { normalize } from "../../src/lib/parser/normalize.js";
+import { createCaptureParseHandler } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { recordSuppressedCells } from "../../src/lib/capture/record-suppressed.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { testCacheRedisUrl } from "../support/test-valkey.js";
+import type { Job } from "bullmq";
 
 // STORY-034 AC7 and STORY-091's drawer — `GET /v1/results/{id}`.
 //
@@ -204,6 +211,95 @@ describe("STORY-034 AC7 · the parser document", () => {
     // cell means.
     await db.query("UPDATE answer_captures SET status = 'failed', error_code = 'engine_timeout' WHERE id = $1", [resultId]);
     await expect(get()).rejects.toMatchObject({ code: "precondition_unmet" });
+  });
+
+  // ---- STORY-091 audit: the document serves the text its offsets index -------------------------------------------------
+
+  /** CRLF, a zero-width space inside a name, an NFD e-acute, and a run of blank lines - each one shifts every offset after it. */
+  const DRIFTY = "Intro\r\n\r\n\r\n\r\nHub\u200bSpot is great.\r\nCafe\u0301 notes: HubSpot wins. Salesforce lags.\n\n\n\n\nFinally HubSpot again.";
+
+  async function parseForReal(id: string): Promise<void> {
+    const context = { pool: undefined, env: { VALKEY_CACHE_URL: testCacheRedisUrl() } } as unknown as QueueHandlerContext;
+    const job = {
+      data: { payload: { workspaceId, kid: "k", resultId: id, projectId, promptId, engineKey: "chatgpt", capturedAt: new Date().toISOString(), force: true } },
+    } as unknown as Job;
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => createCaptureParseHandler(context, { enqueueRollup: async () => undefined })(tx, job));
+  }
+
+  it("STORY-091 audit B1 - serves the NORMALISED text, so every highlight slices to its matched alias (CRLF, ZWSP, NFD, 3+ newlines)", async () => {
+    await db.query("DELETE FROM answer_captures WHERE id = $1", [resultId]);
+    await seedCapture({ text: DRIFTY, status: "captured" });
+    await parseForReal(resultId);
+
+    const document = await get();
+    expect(document.raw_response.text).toBe(normalize(DRIFTY));
+    expect(document.raw_response.char_count).toBe(normalize(DRIFTY).length);
+    expect(document.highlight_map.length).toBeGreaterThanOrEqual(3);
+    const aliases = document.entities.flatMap((entity) => entity.occurrences.map((o) => [o.char_start, entity.matched_alias] as const));
+    for (const highlight of document.highlight_map) {
+      const alias = aliases.find(([start]) => start === highlight.char_start)![1];
+      expect(document.raw_response.text.slice(highlight.char_start, highlight.char_end).toLowerCase()).toBe(alias.toLowerCase());
+    }
+    for (const entity of document.entities) {
+      const first = entity.occurrences[0]!;
+      const { evidence_char_start: from, evidence_char_end: to } = entity.sentiment;
+      expect(from).not.toBeNull();
+      const evidence = document.raw_response.text.slice(from!, to!);
+      expect(evidence.toLowerCase()).toContain(entity.matched_alias.toLowerCase());
+      expect(from!).toBeLessThanOrEqual(first.char_start);
+      expect(to!).toBeGreaterThanOrEqual(first.char_end);
+    }
+    expect(document.flags).not.toContain("highlights_withheld_normalizer_stale");
+  });
+
+  it("STORY-091 audit B1 - a row parsed under another normaliser version gets the normalised text, NO highlights, and a flag saying so", async () => {
+    await db.query("DELETE FROM answer_captures WHERE id = $1", [resultId]);
+    await seedCapture({ text: DRIFTY, status: "captured" });
+    await parseForReal(resultId);
+    await db.query("UPDATE answer_captures SET normalizer_version = 'n0' WHERE id = $1", [resultId]);
+
+    const document = await get();
+    expect(document.raw_response.text).toBe(normalize(DRIFTY));
+    expect(document.highlight_map).toEqual([]);
+    expect(document.flags).toContain("highlights_withheld_normalizer_stale");
+    expect(resultDocumentSchema.safeParse(document).success).toBe(true);
+  });
+
+  it("STORY-091 audit B3 - an L2 cell (no payload text) shows its SOURCE's text, with highlights that line up", async () => {
+    await db.query("DELETE FROM answer_captures WHERE id = $1", [resultId]);
+    await seedCapture({ text: DRIFTY, status: "captured" });
+    await parseForReal(resultId);
+    const fingerprint = (await db.query<{ alias_fingerprint: Buffer }>("SELECT alias_fingerprint FROM answer_captures WHERE id = $1", [resultId])).rows[0]!.alias_fingerprint;
+    const runId = uuidV7();
+    await db.query("INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, status) VALUES ($1,$2,$3,'scheduled',ARRAY['perplexity'],'completed')", [runId, workspaceId, projectId]);
+    await recordSuppressedCells(
+      db,
+      { workspaceId, projectId, runId, normalizerVersion: "n1", captureMode: "api", aliasFingerprint: fingerprint },
+      [{ layer: "l2", promptId, engineKey: "perplexity", sampleIndex: 0, sourceResultId: resultId, sourceContentHash: createHash("sha256").update(DRIFTY).digest(), adapterVersion: "1.0.0" }],
+    );
+    const l2 = (await db.query<{ id: string }>("SELECT id FROM answer_captures WHERE run_id = $1 AND status = 'skipped'", [runId])).rows[0]!.id;
+    expect((await db.query("SELECT payload FROM answer_captures WHERE id = $1", [l2])).rows[0]!.payload).toEqual({});
+    await parseForReal(l2);
+
+    const document = await get(l2);
+    expect(document.raw_response.text).toBe(normalize(DRIFTY));
+    expect(document.highlight_map.length).toBeGreaterThanOrEqual(3);
+    for (const highlight of document.highlight_map) {
+      expect(document.raw_response.text.slice(highlight.char_start, highlight.char_end).toLowerCase()).toMatch(/hubspot|salesforce/u);
+    }
+  });
+
+  it("STORY-091 audit B3 - an L2 cell whose source is in ANOTHER project resolves to an empty answer, never that project's text", async () => {
+    const otherProject = randomUUID();
+    const foreign = randomUUID();
+    await db.query("INSERT INTO projects (id,workspace_id,name,slug,root_url,root_domain) VALUES ($1,$2,'Other',$3,'https://o.com','o.com')", [otherProject, workspaceId, `o-${randomUUID().slice(0, 8)}`]);
+    await db.query(
+      `INSERT INTO answer_captures (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,scoring_version,content_hash,payload,flags,cache_layer,status,truncated)
+       VALUES ($1,$2,$3,$4,$5,'chatgpt',now(),'api','1.0.0','n1','v1',$6,$7::jsonb,'{}','live','parsed',false)`,
+      [foreign, workspaceId, otherProject, uuidV7(), promptId, createHash("sha256").update("x").digest(), JSON.stringify({ text: "SECRET OTHER PROJECT" })],
+    );
+    await db.query("UPDATE answer_captures SET payload = '{}'::jsonb, cache_layer = 'l2', source_result_id = $2, status = 'skipped' WHERE id = $1", [resultId, foreign]);
+    expect((await get()).raw_response.text).toBe("");
   });
 
   it("404s for a result that does not exist", async () => {

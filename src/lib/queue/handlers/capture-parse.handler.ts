@@ -269,7 +269,14 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       await requestRollupIfRunComplete(tx, record, payload.workspaceId);
       return;
     }
-    if (text === null) {
+    // scoring-models s2.5: "Engine refused to answer: sov = 0, flag engine_refused_to_answer, the cell counts in the denominator", and
+    // FR-SIM-01f makes an empty answer a valid observation too. The cell WAS asked and answered with nothing, so it is a measurement:
+    // brand_present = false, sov = 0, no mentions - not NULL, which the denominator reads as "not measured". This is a `captured`/`parsed`
+    // row only: `blocked` and `failed` returned above ("we could not ask" is not data), and a reused row whose source is gone returned
+    // above too. A row with NO text at all (payload expired, no object) is not an empty answer and keeps the NULL below.
+    const emptyAnswer = !reused && text === null && (record.flags.includes(ENGINE_REFUSED_FLAG) || answeredWithNothing(record, rawObject));
+    const parseText = emptyAnswer ? "" : text;
+    if (parseText === null) {
       // A suppressed (L1/L2) row carries an excerpt and no payload text, and a
       // refusal carries neither. Marked parsed with no facts rather than left
       // `captured` forever: there is genuinely nothing in it to match, and a
@@ -291,7 +298,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
       promptId: record.prompt_id,
       engineKey: record.engine_key,
       capturedAt: record.captured_at,
-      text,
+      text: parseText,
       flags: record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
       ...structuredOf(record, rawObject),
     };
@@ -330,6 +337,13 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
   };
 
   return phasedProcessor<ParsePrepared, RawObjectBody | null>({ prepare, run, commit: (tx, prepared, rawObject) => commit(tx, prepared, rawObject) });
+}
+
+const ENGINE_REFUSED_FLAG = "engine_refused_to_answer";
+
+/** The row carries a text field and it is the empty string - an answer of nothing, as opposed to no text field at all. */
+function answeredWithNothing(record: CaptureRecord, rawObject: RawObjectBody | null): boolean {
+  return (rawObject !== null ? rawObject.text : record.payload?.text) === "";
 }
 
 /** The prior parse's identity, or null when this row has never been parsed. */

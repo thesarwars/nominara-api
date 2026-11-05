@@ -6,6 +6,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createCaptureParseHandler, type CaptureParseDeps } from "../../src/lib/queue/handlers/capture-parse.handler.js";
+import { aggregateRange } from "../../src/lib/rollup/aggregate-day.js";
 import { ParseAlertMonitor } from "../../src/lib/parser/parse-alerts.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -470,5 +471,67 @@ describe("STORY-135 · capture.parse", () => {
     ).resolves.toBeUndefined();
     const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE id = $1", [resultId]);
     expect(row.rows[0]!.status).toBe("parsed");
+  });
+  // ---- STORY-091 audit B2 - scoring-models s2.5: a refusal is a measurement; a blocked or failed cell is not ----------
+  async function seedEmpty(status: string, flags: string[], text: string | null = ""): Promise<string> {
+    const id = await seedCapture("x", { status });
+    await db.query("UPDATE answer_captures SET payload = $2::jsonb, flags = $3, response_excerpt = NULL WHERE id = $1", [
+      id,
+      JSON.stringify(text === null ? { format: "markdown" } : { format: "markdown", text }),
+      flags,
+    ]);
+    return id;
+  }
+  const presenceOf = async (id: string) =>
+    (await db.query<{ status: string; brand_present: boolean | null; sov: string | null; flags: string[] }>(
+      "SELECT status, brand_present, sov, flags FROM answer_captures WHERE id = $1",
+      [id],
+    )).rows[0]!;
+
+  it("[s2.5 refusal] an engine refusal (empty text + engine_refused_to_answer) parses as brand_present = false, sov = 0, no mentions", async () => {
+    const id = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    await run(handler(), job(id));
+    const row = await presenceOf(id);
+    expect(row).toMatchObject({ status: "parsed", brand_present: false });
+    expect(Number(row.sov)).toBe(0);
+    expect(row.flags).toContain("engine_refused_to_answer");
+    expect((await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [id])).rowCount).toBe(0);
+  });
+
+  it("[s2.5 empty answer] an empty answer with no flag is also brand_present = false, not NULL", async () => {
+    const id = await seedEmpty("captured", []);
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ status: "parsed", brand_present: false });
+  });
+
+  it("[s2.5 blocked/failed] blocked and failed cells stay NULL and are out of the denominator", async () => {
+    const blocked = await seedEmpty("blocked", []);
+    const failed = await seedEmpty("failed", []);
+    await run(handler(), job(blocked));
+    await run(handler(), job(failed));
+    expect(await presenceOf(blocked)).toMatchObject({ status: "blocked", brand_present: null });
+    expect(await presenceOf(failed)).toMatchObject({ status: "failed", brand_present: null });
+  });
+
+  it("[s2.5 agreement] per-prompt presence and the rollup agree: the refusal is in the denominator and not present; blocked is out", async () => {
+    const present = await seedCapture(ANSWER);
+    const refused = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const blocked = await seedEmpty("blocked", []);
+    for (const id of [present, refused, blocked]) await run(handler(), job(id));
+
+    const rows = await db.query<{ id: string; brand_present: boolean | null }>(
+      "SELECT id, brand_present FROM answer_captures WHERE project_id = $1 AND status IN ('parsed','captured')",
+      [projectId],
+    );
+    const perPromptDenominator = rows.rows.filter((row) => row.brand_present !== null).length;
+    const perPromptPresent = rows.rows.filter((row) => row.brand_present === true).length;
+
+    const aggregates = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+      aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null),
+    );
+    const brand = aggregates.find((row) => row.entityType === "brand")!;
+    expect(perPromptDenominator).toBe(2);
+    expect(brand.cellsTotal).toBe(perPromptDenominator);
+    expect(brand.cellsPresent).toBe(perPromptPresent);
   });
 });
