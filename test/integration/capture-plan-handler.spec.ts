@@ -13,6 +13,7 @@ import type { ScheduledRun } from "../../src/lib/capture/scheduler.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
 import { createCaptureExecuteHandler } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "../../src/lib/queue/handlers/capture-plan.handler.js";
+import { onboardingAuditId } from "../../src/lib/aux/onboarding-audit.js";
 import { QUEUE_HANDLERS, type QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
@@ -35,6 +36,8 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
   let appDb: Client;
   let dispatched: ScheduledRun[];
   let dispatchSawRun: boolean[];
+  let audits: { workspaceId: string; payload: Record<string, unknown>; key: string; sawRun: boolean }[];
+  let auditEnqueue: (() => Promise<unknown>) | undefined;
   let wsA: string;
   let projA: string;
   let projB: string;
@@ -99,6 +102,8 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     process.env.GEMINI_API_KEY = "test-key-not-a-secret";
     dispatched = [];
     dispatchSawRun = [];
+    audits = [];
+    auditEnqueue = undefined;
     ({ ws: wsA, project: projA } = await seedTenant());
     ({ project: projB } = await seedTenant());
   });
@@ -118,6 +123,13 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
         const seen = await db.query("SELECT 1 FROM capture_runs WHERE id = $1", [scheduled.runId]);
         dispatchSawRun.push(seen.rows.length === 1);
         dispatched.push(scheduled);
+      },
+      enqueueCrawlAudit: async (workspaceId, payload, key) => {
+        // Called after COMMIT: the superuser connection must already see the run row.
+        const seen = await db.query("SELECT 1 FROM capture_runs WHERE project_id = $1", [payload.projectId]);
+        audits.push({ workspaceId, payload, key, sawRun: seen.rows.length === 1 });
+        if (auditEnqueue !== undefined) return auditEnqueue();
+        return undefined;
       },
     });
     return createJobProcessor(ENTRY, { keys: TEST_SIGNING_KEYS, getClient: () => appDb, process: handler });
@@ -225,6 +237,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
         dispatch: async (scheduled) => {
           dispatched.push(scheduled);
         },
+        enqueueCrawlAudit: async () => undefined,
       });
       const other = createJobProcessor(ENTRY, { keys: TEST_SIGNING_KEYS, getClient: () => second, process: handler });
       await Promise.all([processor()(job), other(job)]);
@@ -298,6 +311,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     const handler = createCapturePlanHandler(context, {
       cache: new InMemoryCacheAdapter(),
       dispatch: () => Promise.reject(new Error("queue unreachable")),
+      enqueueCrawlAudit: async () => undefined,
       withClient: (fn) => fn(appDb),
     });
     const proc = createJobProcessor(ENTRY, { keys: TEST_SIGNING_KEYS, getClient: () => appDb, process: handler });
@@ -333,6 +347,7 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     const handler = createCapturePlanHandler(context, {
       cache: new InMemoryCacheAdapter(),
       dispatch,
+      enqueueCrawlAudit: async () => undefined,
       withClient: (fn) => fn(appDb),
     });
     return createJobProcessor(ENTRY, { keys: TEST_SIGNING_KEYS, getClient: () => appDb, process: handler });
@@ -412,5 +427,187 @@ describe("NEW-A-10 · capture.plan plans and dispatches one scheduled run", () =
     expect(event).toMatchObject({ workspace_id: wsA, project_id: projA });
     const serialised = JSON.stringify(lines);
     expect(serialised).not.toContain("best crm");
+  });
+
+  // ---- STORY-auxlive (owner decision 34, item 1): the free onboarding audit rides on the project's first scan.
+
+  it("AUXLIVE-1 AC1 · the first planned run enqueues ONE free onboarding crawl.audit, after commit, keyed aux:{project}:{audit}", async () => {
+    await processor()(signedJob(wsA, projA));
+    await settle();
+
+    expect(audits).toHaveLength(1);
+    const auditId = onboardingAuditId(projA);
+    expect(audits[0]).toMatchObject({
+      workspaceId: wsA,
+      payload: { projectId: projA, auditId, trigger: "onboarding" },
+      key: `aux:${projA}:${auditId}`,
+      sawRun: true,
+    });
+    // No scope asked for: which scope applies is decided by the verification state inside crawl.audit.
+    expect(audits[0]!.payload).not.toHaveProperty("scope");
+    // 0 credits: nothing was debited for it.
+    expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
+  });
+
+  // OWNER DECISION 47 (supersedes the round-3 reading that skipped Free): plans-and-entitlements.md says "Site-file AUX checks ... are free and unlimited" on
+  // Free, while the full page audit (aux.scheduled_audits) is a paid-plan feature. So a Free first scan enqueues a SITE-FILES-ONLY onboarding audit, at no charge.
+  it("AUXLIVE-1 D47 · a Free workspace's first scan enqueues ONE onboarding audit marked siteFilesOnly, with zero debit: the plan, and the scan, still go ahead", async () => {
+    await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [wsA]);
+    const lines: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      lines.push(message);
+    });
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      workspaceId: wsA,
+      payload: { projectId: projA, auditId: onboardingAuditId(projA), trigger: "onboarding", siteFilesOnly: true },
+      key: `aux:${projA}:${onboardingAuditId(projA)}`,
+    });
+    expect(audits[0]!.payload).not.toHaveProperty("scope");
+    // the job is one the contract accepts
+    const { crawlAuditJobPayloadSchema } = await import("../../contracts/aux/index.js");
+    expect(crawlAuditJobPayloadSchema.safeParse({ ...audits[0]!.payload, workspaceId: wsA, kid: "k" }).success).toBe(true);
+    // zero debit: no ledger entry, no reservation, no audit row made here (crawl.audit makes it)
+    expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [wsA])).rowCount).toBe(0);
+    // the request is counted as a site-files-only one, and the old "not in plan" skip is gone
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_requested_total")).toMatchObject({ kind: "site_files_only" });
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_skipped_total")).toBeUndefined();
+    // and the project WAS claimed and handled
+    const outcome = lines.find((l) => (l as { metric?: string }).metric === "nominara_capture_plan_runs_total") as { outcome?: string } | undefined;
+    expect(outcome?.outcome).toBeDefined();
+    expect(outcome?.outcome).not.toBe("skipped");
+  });
+
+  it("AUXLIVE-1 D47 · a Free workspace still gets it ONCE: a second scan, or one after any audit exists, enqueues nothing more", async () => {
+    await db.query("UPDATE workspaces SET plan_key = 'free' WHERE id = $1", [wsA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(1);
+    audits.length = 0;
+    await db.query(
+      `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, excluded_rules, rule_version, tokenizer, status)
+       VALUES ($1,$2,$3,'onboarding','public_surface','{}','{}','2026.10.1','cl100k','completed')`,
+      [onboardingAuditId(projA), wsA, projA],
+    );
+    await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' WHERE id = $1", [projA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toEqual([]);
+  });
+
+  it("AUXLIVE-1 D47 · a plan that includes AUX audits keeps the FULL onboarding audit: no siteFilesOnly on the job, and the request is counted as full", async () => {
+    const lines: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      lines.push(message);
+    });
+    for (const plan of ["starter", "growth", "business"]) {
+      audits.length = 0;
+      await db.query("UPDATE workspaces SET plan_key = $2 WHERE id = $1", [wsA, plan]);
+      await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' WHERE id = $1", [projA]);
+      await db.query("DELETE FROM aux_audits WHERE project_id = $1", [projA]);
+      await processor()(signedJob(wsA, projA));
+      await settle();
+      expect(audits, plan).toHaveLength(1);
+      expect(audits[0]!.payload, plan).not.toHaveProperty("siteFilesOnly");
+    }
+    expect(lines.find((l) => (l as { metric?: string }).metric === "nominara_aux_onboarding_audit_requested_total")).toMatchObject({ kind: "full" });
+  });
+
+  it("AUXLIVE-1 AC10 · every plan that includes AUX audits gets the onboarding audit: starter, growth and business", async () => {
+    for (const plan of ["starter", "growth", "business"]) {
+      audits.length = 0;
+      await db.query("UPDATE workspaces SET plan_key = $2 WHERE id = $1", [wsA, plan]);
+      await db.query("UPDATE projects SET next_run_at = now() - interval '10 minutes' WHERE id = $1", [projA]);
+      await db.query("DELETE FROM aux_audits WHERE project_id = $1", [projA]);
+      await processor()(signedJob(wsA, projA));
+      await settle();
+      expect(audits, plan).toHaveLength(1);
+    }
+  });
+
+  it("AUXLIVE-1 AC2 · the audit id is deterministic per project and differs between projects, and parses as a UUID the job contract accepts", async () => {
+    const { crawlAuditJobPayloadSchema } = await import("../../contracts/aux/index.js");
+    expect(onboardingAuditId(projA)).toBe(onboardingAuditId(projA));
+    expect(onboardingAuditId(projA)).not.toBe(onboardingAuditId(projB));
+    expect(
+      crawlAuditJobPayloadSchema.safeParse({ projectId: projA, auditId: onboardingAuditId(projA), trigger: "onboarding", workspaceId: wsA, kid: "k" }).success,
+    ).toBe(true);
+  });
+
+  it("AUXLIVE-1 AC3 · a duplicate delivery of the plan job enqueues the audit once", async () => {
+    const job = signedJob(wsA, projA);
+    await processor()(job);
+    await processor()(job);
+    await settle();
+    expect(audits).toHaveLength(1);
+  });
+
+  it("AUXLIVE-1 AC4 · a later scheduled run of the same project does not enqueue another onboarding audit once one exists", async () => {
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(1);
+    // The audit ran (the crawl.audit handler wrote its row); the project falls due again.
+    await db.query(
+      `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, excluded_rules, rule_version, tokenizer, status)
+       VALUES ($1,$2,$3,'onboarding','public_surface','{}','{}','2026.10.1','cl100k','completed')`,
+      [onboardingAuditId(projA), wsA, projA],
+    );
+    await db.query("UPDATE projects SET next_run_at = now() - interval '1 minute' WHERE id = $1", [projA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(1);
+  });
+
+  it("AUXLIVE-1 AC5 · a project that already has any audit (a manual one) gets no onboarding audit", async () => {
+    await db.query(
+      `INSERT INTO aux_audits (id, workspace_id, project_id, trigger, scope, target_urls, excluded_rules, rule_version, tokenizer, status)
+       VALUES ($1,$2,$3,'manual','key_pages','{}','{}','2026.10.1','cl100k','completed')`,
+      [randomUUID(), wsA, projA],
+    );
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(0);
+  });
+
+  it("AUXLIVE-1 AC6 · the audit does not depend on an engine: a project with no capturable engine still gets its onboarding audit", async () => {
+    delete process.env.GEMINI_API_KEY;
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(await runsFor(projA)).toEqual([]);
+    expect(audits).toHaveLength(1);
+  });
+
+  it("AUXLIVE-1 AC7 · a project that is not due, or another tenant's, enqueues nothing", async () => {
+    await processor()(signedJob(wsA, projB));
+    await db.query("UPDATE projects SET next_run_at = now() + interval '1 day' WHERE id = $1", [projA]);
+    await processor()(signedJob(wsA, projA));
+    await settle();
+    expect(audits).toHaveLength(0);
+  });
+
+  it("AUXLIVE-1 AC8 · a failed audit enqueue never fails the scan: the run is planned and dispatched, the failure is counted and logged without the workspace name", async () => {
+    auditEnqueue = () => Promise.reject(new Error("queue down"));
+    const errors: unknown[] = [];
+    vi.spyOn(Logger.prototype, "error").mockImplementation((message: unknown) => {
+      errors.push(message);
+    });
+    await expect(processor()(signedJob(wsA, projA))).resolves.not.toThrow();
+    await settle();
+    expect(await runsFor(projA)).toHaveLength(1);
+    expect(dispatched).toHaveLength(1);
+    const line = errors.find((e) => (e as { event?: string }).event === "aux.onboarding_audit.enqueue_failed");
+    expect(line).toMatchObject({ workspace_id: wsA, project_id: projA });
+    expect(JSON.stringify(errors)).not.toContain("queue down");
+  });
+
+  it("AUXLIVE-1 AC9 · a rolled-back plan transaction enqueues no audit", async () => {
+    // A tampered payload is rejected before any context is set; nothing is registered for after-commit.
+    const job = signedJob(wsA, projA);
+    (job.data as { payload: Record<string, unknown> }).payload.projectId = projB;
+    await expect(processor()(job)).rejects.toThrow();
+    await settle();
+    expect(audits).toHaveLength(0);
   });
 });

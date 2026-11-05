@@ -10,7 +10,7 @@
 // Pure: it takes rows the caller already read, so it neither reads the table
 // (the audit service does) nor holds a clock.
 
-import { AUX_CATEGORY_WEIGHTS } from "../scoring/aux.js";
+import { AUX_CATEGORY_WEIGHTS, isValidAuxWeight } from "../scoring/aux.js";
 
 export interface AuxCatalogRule {
   readonly code: string;
@@ -51,6 +51,7 @@ export function assertCatalogWeights(
   for (const rule of rules) {
     if (seen.has(rule.code)) throw new AuxCatalogWeightError(rule.category, null, `lists rule ${rule.code} twice`);
     seen.add(rule.code);
+    if (!isValidAuxWeight(rule.weight)) throw new AuxCatalogWeightError(rule.category, null, `has an invalid weight on rule ${rule.code} (needs finite, non-negative, whole basis points)`);
     sums.set(rule.category, (sums.get(rule.category) ?? 0) + rule.weight);
   }
   for (const category of requiredCategories) {

@@ -286,6 +286,7 @@ describe("NEW-A-13 · the scheduler sweep claims due projects and enqueues signe
       process: createCapturePlanHandler({ pool: undefined, env: {} } as unknown as QueueHandlerContext, {
         cache: new InMemoryCacheAdapter(),
         dispatch: async () => undefined,
+        enqueueCrawlAudit: async () => undefined,
       }),
     });
 

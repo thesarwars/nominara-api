@@ -5,6 +5,7 @@ import { capturePlanJobSchema } from "../../../../contracts/tracking/capture-pla
 import type { Cache } from "../../cache/cache.port.js";
 import { ValkeyCacheAdapter } from "../../cache/valkey-cache.adapter.js";
 import { cacheKeyNamespace } from "../../cache/key-namespace.js";
+import { auxAuditsIncluded, crawlAuditIdempotencyKey, onboardingAuditId, onboardingAuditWanted, type EnqueueCrawlAudit } from "../../aux/onboarding-audit.js";
 import { releaseFairUseCapacity } from "../../capture/fair-use.js";
 import { claimDueProject, planScheduledRun, priorityVariantFor, type ScheduledRun } from "../../capture/scheduler.js";
 import { resolveEntitlements } from "../../entitlements/resolution.js";
@@ -61,6 +62,11 @@ export interface CapturePlanDeps {
    * production borrows one from the worker pool.
    */
   readonly withClient?: <T>(fn: (client: ClientBase) => Promise<T>) => Promise<T>;
+  /**
+   * The producer of the project's free onboarding `crawl.audit` (owner decision 34). Injected in tests; production signs and enqueues on first
+   * use. Called AFTER the job's transaction commits, and a failure is logged and counted, never thrown.
+   */
+  readonly enqueueCrawlAudit?: EnqueueCrawlAudit;
 }
 
 type Outcome = "planned" | "skipped" | "no_capturable_engine" | "dispatch_failed";
@@ -88,6 +94,45 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
         cadence: scheduled.plan.cadence,
       });
     });
+
+  const enqueueCrawlAudit: EnqueueCrawlAudit =
+    deps?.enqueueCrawlAudit ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("crawl.audit", workspaceId, payload, { idempotencyKey });
+    });
+
+  /**
+   * OWNER DECISION 34, item 1 - the project's FIRST scan also starts its free onboarding AUX audit, so the AUX screen is never empty on a real
+   * project. Asked for once the project has been claimed as due, whether or not an engine was capturable (the audit needs none), and only while
+   * the project has no audit at all. The enqueue is after COMMIT and its failure never fails the scan: the audit is retried by the next call
+   * that finds the project still without one (a manual audit, or the next scheduled scan).
+   *
+   * OWNER DECISION 47 - a plan WITHOUT the page audit (Free: `aux.scheduled_audits` is off) still gets the free SITE-FILES-ONLY check (robots.txt, llms.txt,
+   * sitemap), which plans-and-entitlements.md makes "free and unlimited": the job carries `siteFilesOnly`, so `crawl.audit` fetches no page. A plan that
+   * includes the page audit gets the full one. Neither is charged.
+   */
+  const requestOnboardingAudit = async (tx: ClientBase, workspaceId: string, projectId: string, auxIncluded: boolean): Promise<void> => {
+    const siteFilesOnly = !auxIncluded;
+    if (!(await onboardingAuditWanted(tx, projectId))) return;
+    const auditId = onboardingAuditId(projectId);
+    afterCommit(() => {
+      void enqueueCrawlAudit(workspaceId, { projectId, auditId, trigger: "onboarding", ...(siteFilesOnly ? { siteFilesOnly: true as const } : {}) }, crawlAuditIdempotencyKey(projectId, auditId))
+        .then(() => {
+          incrementCounter("nominara_aux_onboarding_audit_requested_total", { kind: siteFilesOnly ? "site_files_only" : "full" });
+          logger.log({ event: "aux.onboarding_audit.requested", workspace_id: workspaceId, project_id: projectId, audit_id: auditId, kind: siteFilesOnly ? "site_files_only" : "full" });
+        })
+        .catch((error: unknown) => {
+          incrementCounter("nominara_aux_onboarding_audit_request_failed_total", {});
+          // The error NAME only: a queue error's message can carry a connection string.
+          logger.error({ event: "aux.onboarding_audit.enqueue_failed", workspace_id: workspaceId, project_id: projectId, error: error instanceof Error ? error.name : "unknown" });
+        });
+    });
+  };
 
   const withClient =
     deps?.withClient ??
@@ -152,6 +197,7 @@ export function createCapturePlanHandler(context: QueueHandlerContext, deps?: Ca
 
     cache ??= new ValkeyCacheAdapter(context.env.VALKEY_CACHE_URL);
     const resolved = await resolveEntitlements(tx, project.workspaceId);
+    await requestOnboardingAudit(tx, project.workspaceId, project.projectId, auxAuditsIncluded(resolved.entitlements));
     const runId = uuidV7();
     const periodStart = (await resolveBillingPeriod(tx, project.workspaceId, now)).start;
     const scheduled = await planScheduledRun(

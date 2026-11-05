@@ -8,11 +8,10 @@ import {
 } from "./structured-data.js";
 import type { AuxRule } from "./types.js";
 
-// NOT WIRED. Nothing in src calls evaluateDocuments / AUX_RULES yet: EVALUATE (aux-and-geo-analysis.md section 1, step 6) is not part
-// of crawl.audit, so crawled pages get no finding from these rules and `excluded_rules` still names every one of them. STORY-052
-// AC1 and AC9 and STORY-051 AC13 ("per page within the audit's latency budget") wait for the follow-up that wires it. That follow-up:
-// loadDocumentSnapshot -> buildAuxDocument(cl100kTokenizer) -> evaluateDocuments OUTSIDE the transaction, reconcile inside it,
-// remove the codes it runs from EXCLUDED_RULES (except, per page, AUX-R-026 and AUX-R-027 when rendered is null and AUX-R-029 when there is no measured timing: those stay excluded for that audit), and surface AUX_RULES_PARTIAL as a separate annotation.
+// WIRED (owner decision 34, AC13). `crawl.audit` calls `runPageRules` (../page-rules.ts), which runs AUX_RULES over every crawled page in the fetch phase,
+// outside any transaction; `commit` reconciles the findings. An audit names a rule in `excluded_rules` only when it ran on NO page: the codes in
+// AUX_RULES_NOT_EVALUATED always, AUX-R-026 and AUX-R-027 when no page had a rendered copy, AUX-R-029 when no page had a measured timing. The rules
+// in AUX_RULES_PARTIAL that did run are surfaced separately, as `error_summary.rules_partial`.
 //
 // STORY-051 — the document-model rules, in the reference's order. The five site-file rules (AUX-R-001, 002, 003, 004, 007) live in
 // ../site-files.ts and judge fetched files, not a page.
@@ -62,8 +61,8 @@ export const AUX_RULES_NOT_EVALUATED: Readonly<Record<string, string>> = {
 
 /**
  * Rules in AUX_RULES that run on an INTERIM reading because the document model lacks a field. They are built and they fire, but each
- * covers only part of its reference row, so the audit must not report them as fully checked: when the rules are wired into the audit,
- * surface this map next to AUX_RULES_NOT_EVALUATED. Closing a gap means a STORY-050 field, then the rule reads it.
+ * covers only part of its reference row, so the audit must not report them as fully checked: `crawl.audit` lists the ones that ran in
+ * `error_summary.rules_partial`, beside `excluded_rules`. Closing a gap means a STORY-050 field, then the rule reads it.
  */
 const PARTIAL_READINGS: Readonly<Record<string, string>> = {
   "AUX-R-006": "Sees only directives for Googlebot or everyone: STORY-050 meta.directives drops directives scoped to an AI agent (X-Robots-Tag: GPTBot: noai). Needs the agent-scoped directives in the document model.",

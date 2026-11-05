@@ -55,6 +55,18 @@ export const auxErrorSummarySchema = z
       })
       .strict()
       .optional(),
+    /**
+     * STORY-051 AC13: the rules that ran on an INTERIM reading (`AUX_RULES_PARTIAL`), so the audit does not read as having fully checked them.
+     * Only rules that ran on at least one page are listed; a rule that did not run is in `aux_audits.excluded_rules` instead. Absent = none.
+     */
+    rules_partial: z.array(z.string().regex(/^AUX-R-\d{3}$/)).optional(),
+    /**
+     * The URLs the page rules MODELLED in this audit (an upper bound of 500 for the plan's page cap). `crawl.audit` reads it from the audits before
+     * the current one to tell whether a page finding was LOOKED AT then: a page that failed, was skipped or was no longer selected was not, and a finding
+     * on it must go stale (STORY-052 AC8), which the audit-level `excluded_rules` cannot say for a rule that ran on the other pages. Absent on an audit
+     * that modelled no page.
+     */
+    pages_modelled: z.array(z.string().max(2048)).max(500).optional(),
     /** Written only as `false`: the manifest could not be stored, so the audit cannot be reproduced from storage. */
     manifest_stored: z.literal(false).optional(),
   })

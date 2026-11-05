@@ -3,7 +3,6 @@ import { Logger } from "@nestjs/common";
 import { guidanceFor, NON_FIXABLE_RULES } from "../patches/guidance.js";
 import { loadAuxCatalog, type AuxCatalog } from "../catalog.js";
 import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateDocuments } from "./engine.js";
-import { EXCLUDED_RULES } from "../../queue/handlers/crawl-audit.handler.js";
 import { ALL_AUX_RULES, AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL, HELD_RULES } from "./index.js";
 import { CATALOG, CATALOG_ROWS, PROJECT_ID, evaluatorFindings, findings, runAll } from "../../../../test/support/aux-rules.js";
 import { CLEAN_TEXT, block, makeDoc, variant } from "../../../../test/support/aux-document.js";
@@ -110,12 +109,6 @@ describe("STORY-051 · the rule engine", () => {
       expect(Object.keys(AUX_RULES_NOT_EVALUATED), code).not.toContain(code);
       expect(why.length, code).toBeGreaterThan(40);
     }
-  });
-
-  it("STORY-051 AC1 · the audit does not yet run these rules, so crawl.audit's excluded_rules names every one of them", () => {
-    // EVALUATE (aux-and-geo-analysis.md section 1, step 6) is not wired into crawl.audit. Until it is, silence would read as "checked and fine".
-    // The stream that wires it removes the codes it runs from EXCLUDED_RULES and deletes this test.
-    for (const rule of AUX_RULES) expect(EXCLUDED_RULES, rule.code).toContain(rule.code);
   });
 
   it("STORY-051 #11 · a non-fixable rule's finding carries guidance and an alignment link, never an empty patch", async () => {

@@ -5,3 +5,4 @@ export * from "./aux-finding.schema.js";
 export * from "./crawl-manifest.schema.js";
 export * from "./patch.schema.js";
 export * from "./rule-finding.schema.js";
+export * from "./trigger-aux-audit.schema.js";

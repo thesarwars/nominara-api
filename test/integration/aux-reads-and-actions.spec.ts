@@ -67,12 +67,12 @@ describe("NEW-C-10 · AuxService — real SQL under RLS", () => {
        VALUES ($1, $2, $3, 'https://example.com', $4) RETURNING id`,
       [workspaceId, `Project ${seq}`, `project-${seq}`, `example-${seq}.com`])).rows[0]!.id;
   }
-  async function createAudit(ws: string, project: string, over: { score?: number | null; status?: string; breakdown?: unknown; created?: string } = {}): Promise<string> {
+  async function createAudit(ws: string, project: string, over: { score?: number | null; status?: string; breakdown?: unknown; created?: string; ruleVersion?: string; excluded?: string[] } = {}): Promise<string> {
     return (await client.query<{ id: string }>(
-      `INSERT INTO aux_audits (workspace_id, project_id, trigger, target_urls, rule_version, tokenizer, status, aux_score, score_breakdown, created_at, finished_at)
-       VALUES ($1, $2, 'scheduled', ARRAY['https://example.com/'], 'test', 'none', $3, $4, $5::jsonb, COALESCE($6::timestamptz, now()), COALESCE($6::timestamptz, now()))
+      `INSERT INTO aux_audits (workspace_id, project_id, trigger, target_urls, rule_version, tokenizer, status, aux_score, score_breakdown, created_at, finished_at, excluded_rules)
+       VALUES ($1, $2, 'scheduled', ARRAY['https://example.com/'], $7, 'none', $3, $4, $5::jsonb, COALESCE($6::timestamptz, now()), COALESCE($6::timestamptz, now()), $8::text[])
        RETURNING id`,
-      [ws, project, over.status ?? "completed", over.score === undefined ? 70 : over.score, JSON.stringify(over.breakdown ?? { crawler_access: 0.5 }), over.created ?? null])).rows[0]!.id;
+      [ws, project, over.status ?? "completed", over.score === undefined ? 70 : over.score, JSON.stringify(over.breakdown ?? { crawler_access: 0.5 }), over.created ?? null, over.ruleVersion ?? "test", over.excluded ?? []])).rows[0]!.id;
   }
   async function createFinding(ws: string, project: string, audit: string, status = "open", rule = "AUX-R-001"): Promise<string> {
     seq += 1;
@@ -97,6 +97,30 @@ describe("NEW-C-10 · AuxService — real SQL under RLS", () => {
     expect(page.items.map((a) => a.audit_id)).toEqual([newest]);
     expect(page.items[0]).toMatchObject({ aux_score: 68.5, delta: 8.5 });
     expect(page.pagination.has_more).toBe(true);
+  });
+
+  it("[NEW-C-10 AC4] round 6 · the real LATERAL join gives a delta only between audits measured the same way: null across a rule-version change and across a different excluded set", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
+    const a1 = await createAudit(ws, p, { score: 60, created: "2026-09-01T00:00:00Z", ruleVersion: "v1" });
+    const a2 = await createAudit(ws, p, { score: 70, created: "2026-09-02T00:00:00Z", ruleVersion: "v1" });
+    const a3 = await createAudit(ws, p, { score: 75, created: "2026-09-03T00:00:00Z", ruleVersion: "v2" });
+    const a4 = await createAudit(ws, p, { score: 80, created: "2026-09-04T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a5 = await createAudit(ws, p, { score: 82, created: "2026-09-05T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a6 = await createAudit(ws, p, { score: null, status: "partial", created: "2026-09-06T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a7 = await createAudit(ws, p, { score: 90, created: "2026-09-07T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a8 = await createAudit(ws, p, { score: 0, created: "2026-09-08T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const a9 = await createAudit(ws, p, { score: 5, created: "2026-09-09T00:00:00Z", ruleVersion: "v2", excluded: ["AUX-R-026"] });
+    const page = await inTenant(CTX(ws, actor), () => service.listProjectAudits(p, { limit: 20 }));
+    const delta = Object.fromEntries(page.items.map((a) => [a.audit_id, a.delta]));
+    expect(delta[a6]).toBeNull(); // no score of its own
+    expect(delta[a7]).toBe(8); // skips the unscored a6 and compares with a5 (82)
+    expect(delta[a8]).toBe(-90);
+    expect(delta[a9]).toBe(5); // a predecessor scored 0 is a score, not an absence: 5 - 0, never null
+    expect(delta[a1]).toBeNull(); // no previous audit
+    expect(delta[a2]).toBe(10); // control: same rule version, same excluded set
+    expect(delta[a3]).toBeNull(); // rule version v1 -> v2
+    expect(delta[a4]).toBeNull(); // excluded set [] -> [AUX-R-026]
+    expect(delta[a5]).toBe(2); // control again
   });
 
   it("[NEW-C-10 AC4] an audit with no score reads aux_score null and delta null", async () => {

@@ -8,6 +8,10 @@ import { ConflictError, NotFoundError, type DomainError, PreconditionUnmetError 
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
 import { AUDIT_METADATA_KEY } from "../../api/decorators/audit.decorator.js";
+import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
+import { RATE_LIMIT_CLASS_KEY } from "../../api/rate-limit/route-class.js";
+import { PROJECT_PARAM_KEY } from "../../api/decorators/project-param.decorator.js";
+import { CREDITS_KEY } from "../../api/decorators/credits.decorator.js";
 import { updateAuxFindingRequestSchema } from "../../../contracts/aux/index.js";
 
 // STORY-022 — one compiles-test per scaffolded module.
@@ -75,7 +79,11 @@ function auditRow(over: Record<string, unknown> = {}) {
     llms_txt_present: false,
     sitemap_url_count: 0,
     excluded: [{ rule_code: "AUX-R-010", title: "Product schema" }],
+    excluded_by_category: { structured_data: ["AUX-R-010"], crawler_access: ["AUX-R-005"] },
     previous_score: "60.000",
+    previous_rule_version: "2026.10.1",
+    excluded_codes: ["AUX-R-010", "AUX-R-005"],
+    previous_excluded_codes: ["AUX-R-005", "AUX-R-010"],
     in_scope: true,
     ...over,
   };
@@ -166,7 +174,35 @@ describe("NEW-C-10 · controller", () => {
 
   it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the reads and the one finding action (a patch is read, never written, by a client)", () => {
     const routes = Object.getOwnPropertyNames(AuxController.prototype).filter((n) => n !== "constructor").sort();
-    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "updateFinding"]);
+    // + triggerAudit and previewAudit (AUXLIVE-3): one creates an audit, the other quotes it; neither can touch a finding.
+    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "previewAudit", "triggerAudit", "updateFinding"]);
+  });
+
+  it("AUXLIVE-3 · POST /projects/{id}/aux-audits requires aux:trigger, is project-scoped, audited, idempotent and in the project_aux_audits rate class (10/hour per user, burst 3)", () => {
+    expect(meta(REQUIRE_PERMISSION_KEY, "triggerAudit")).toBe("aux:trigger");
+    expect(meta(PROJECT_PARAM_KEY, "triggerAudit")).toBe("id");
+    expect(meta(AUDIT_METADATA_KEY, "triggerAudit")).toMatchObject({ action: "aux_audit.triggered", resourceType: "project" });
+    expect(meta(IDEMPOTENT_KEY, "triggerAudit")).toBe(true);
+    expect(meta(RATE_LIMIT_CLASS_KEY, "triggerAudit")).toBe("project_aux_audits");
+    // The price is variable, so the flat-price guard is deliberately not on it: the service debits inline.
+    expect(meta(CREDITS_KEY, "triggerAudit")).toBeUndefined();
+  });
+
+  it("AUXLIVE-3 (decision 39) · POST /projects/{id}/aux-audits/preview needs the same permission, is project-scoped, audited, free (no credits guard) and carries no Idempotency-Key requirement", () => {
+    expect(meta(REQUIRE_PERMISSION_KEY, "previewAudit")).toBe("aux:trigger");
+    expect(meta(PROJECT_PARAM_KEY, "previewAudit")).toBe("id");
+    expect(meta(AUDIT_METADATA_KEY, "previewAudit")).toMatchObject({ action: "aux_audit.previewed", resourceType: "project" });
+    expect(meta(IDEMPOTENT_KEY, "previewAudit")).toBeUndefined();
+    // review round 2: a quote is a read - an explicit class, not the POST default of "writes".
+    expect(meta(RATE_LIMIT_CLASS_KEY, "previewAudit")).toBe("reads");
+    expect(meta(CREDITS_KEY, "previewAudit")).toBeUndefined();
+  });
+
+  it("AUXLIVE-3 · the service refuses to charge when it was built without the queue or the pool (fail closed, before any debit)", async () => {
+    const query = vi.fn();
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client: { query }, context: { workspaceId: "w", actorId: "a" } } as never);
+    await expect(new AuxService().triggerAudit(PROJECT_ID, {}, { id: "a", type: "user" }, { idempotencyKey: "k", confirmedCredits: "10" })).rejects.toThrow(/queue producer/);
+    expect(query).not.toHaveBeenCalled();
   });
 });
 
@@ -191,9 +227,59 @@ describe("NEW-C-10 · AuxService.getAudit", () => {
   it("[NEW-C-10 AC4] the breakdown becomes weighted categories; a subscore of 0 is kept, an absent category is not invented", async () => {
     const audit = await serviceWith(() => [auditRow()]).getAudit(AUDIT_ID);
     expect(audit.categories).toEqual([
-      { category: "crawler_access", weight: 0.28, subscore: 0.4 },
-      { category: "freshness", weight: 0.06, subscore: 0 },
+      { category: "crawler_access", weight: 0.28, subscore: 0.4, rules_not_evaluated: ["AUX-R-005"] },
+      { category: "freshness", weight: 0.06, subscore: 0, rules_not_evaluated: [] },
     ]);
+  });
+
+  it("AUXLIVE-5 (decision 38) · a score over fewer than six categories is labelled partial and names the categories left out; a null score is not partial", async () => {
+    const partial = await serviceWith(() => [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 0.9, context_fitness: 1, render_mode: 1, freshness: 1 } })]).getAudit(AUDIT_ID);
+    expect(partial).toMatchObject({ aux_score: 68.5, score_partial: true, unmeasured_categories: ["entity_clarity"] });
+    const none = await serviceWith(() => [auditRow({ aux_score: null, score_breakdown: {} })]).getAudit(AUDIT_ID);
+    expect(none).toMatchObject({ aux_score: null, score_partial: false });
+    expect(none.unmeasured_categories).toHaveLength(6);
+  });
+
+  it("AUXLIVE-5 (decision 38, 52) · all six categories published AND every rule decided: a full score, partial false, nothing unmeasured", async () => {
+    // Decision 52 changes this test: it used to take the default fixture, whose published categories list rules_not_evaluated and so are NOT fully measured.
+    const full = await serviceWith(() =>
+      [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 0.5, freshness: 1 }, excluded_by_category: {}, excluded: [], excluded_codes: [], previous_excluded_codes: [] })],
+    ).getAudit(AUDIT_ID);
+    expect(full).toMatchObject({ score_partial: false, unmeasured_categories: [] });
+  });
+
+  it("D52 · all six categories published but a rule went unmeasured (rules_not_evaluated non-empty): the headline is partial", async () => {
+    const audit = await serviceWith(() =>
+      [auditRow({ score_breakdown: { crawler_access: 1, structured_data: 1, context_fitness: 1, render_mode: 1, entity_clarity: 1, freshness: 1 }, excluded_by_category: { structured_data: ["AUX-R-013"] } })],
+    ).getAudit(AUDIT_ID);
+    expect(audit.unmeasured_categories).toEqual([]);
+    expect(audit.score_partial).toBe(true);
+  });
+
+  it("D52 · a null score is not partial even when rules are listed as unmeasured", async () => {
+    const audit = await serviceWith(() => [auditRow({ aux_score: null, previous_score: null, score_breakdown: { crawler_access: 1 } })]).getAudit(AUDIT_ID);
+    expect(audit.score_partial).toBe(false);
+  });
+
+  it("D52 · delta is suppressed when the two audits' unmeasured rule sets differ", async () => {
+    const audit = await serviceWith(() => [auditRow({ previous_excluded_codes: ["AUX-R-005", "AUX-R-010", "AUX-R-026"] })]).getAudit(AUDIT_ID);
+    expect(audit.aux_score).toBe(68.5);
+    expect(audit.delta).toBeNull();
+  });
+
+  it("D52 · delta is suppressed when the two audits' rule versions differ", async () => {
+    const audit = await serviceWith(() => [auditRow({ previous_rule_version: "2026.10.1", rule_version: "2026.11.1" })]).getAudit(AUDIT_ID);
+    expect(audit.delta).toBeNull();
+  });
+
+  it("D52 · delta stays when the unmeasured sets are the same in a different order and the versions agree", async () => {
+    const audit = await serviceWith(() => [auditRow({ excluded_codes: ["AUX-R-010", "AUX-R-005"], previous_excluded_codes: ["AUX-R-005", "AUX-R-010"] })]).getAudit(AUDIT_ID);
+    expect(audit.delta).toBe(8.5);
+  });
+
+  it("D52 · a delta of 0 between like audits is 0, not null", async () => {
+    const audit = await serviceWith(() => [auditRow({ previous_score: "68.500" })]).getAudit(AUDIT_ID);
+    expect(audit.delta).toBe(0);
   });
 
   it("[NEW-C-10 AC4] a real site-file audit: aux_score null stays null, delta null, no breakdown beyond what ran, 0 and null distinguished", async () => {
@@ -205,7 +291,7 @@ describe("NEW-C-10 · AuxService.getAudit", () => {
     expect(audit.status).toBe("partial");
     expect(audit.llms_txt_present).toBeNull();
     expect(audit.sitemap_url_count).toBeNull();
-    expect(audit.categories).toEqual([{ category: "crawler_access", weight: 0.28, subscore: 1 }]);
+    expect(audit.categories).toEqual([{ category: "crawler_access", weight: 0.28, subscore: 1, rules_not_evaluated: ["AUX-R-005"] }]);
   });
 
   it("[NEW-C-10 AC4] a score of 0 is 0, not null; a null breakdown is no categories", async () => {

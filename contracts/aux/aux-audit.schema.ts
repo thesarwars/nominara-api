@@ -45,6 +45,11 @@ export const auxAuditCategorySchema = z
     weight: z.number(),
     /** 0..1 */
     subscore: z.number().min(0).max(1),
+    /**
+     * Rules of this category that did NOT run in this audit (a held rule, one with no input, one the document model cannot judge). A rule that
+     * did not run adds no penalty, so a non-empty list means the subscore is not a full measurement of the category: a client labels it.
+     */
+    rules_not_evaluated: z.array(z.string()),
   })
   .strict();
 
@@ -68,11 +73,25 @@ export const auxAuditSchema = z
     created_at: z.string(),
     pages_crawled: z.number().int(),
     pages_failed: z.number().int(),
-    /** 0..100, or null when the audit did not produce a score. */
+    /**
+     * 0..100, or null when the audit did not produce a score. When `score_partial` is true it is computed over the RULES that were decided (owner
+     * decisions 38 and 52): a category is scored on the decided rules only, a category with none is left out, and the sum is renormalised to 100.
+     * Never present it as a full score.
+     */
     aux_score: z.number().nullable(),
+    /**
+     * True when any rule went unmeasured (owner decision 52): a category is missing, or a published category lists `rules_not_evaluated`.
+     * False only for a score in which every rule of every category was decided, and for no score.
+     */
+    score_partial: z.boolean(),
+    /** The categories with no published subscore in this audit (all six when nothing was measured). Never empty on a partial score. */
+    unmeasured_categories: z.array(auxCategorySchema),
     /** True when the critical-access hard cap applied; the interface states it whenever it is. */
     capped: z.boolean(),
-    /** aux_score minus the previous scored audit's; null when either is absent. */
+    /**
+     * aux_score minus the previous scored audit's; null when either is absent, and null when the two audits were not measured the same way (a different
+     * `rule_version`, or a different set of unmeasured rules): two scores over different rules are not a movement.
+     */
     delta: z.number().nullable(),
     rule_version: z.string(),
     categories: z.array(auxAuditCategorySchema),
