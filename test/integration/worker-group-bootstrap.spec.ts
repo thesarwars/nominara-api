@@ -47,6 +47,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "maintenance.integrity",
     // STORY-180 r5 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "report.cleanup",
+    // STORY-073 AC4 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "credit.verify",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
@@ -299,6 +301,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
 
   it.each([
     ["credit.housekeeping", "30 2 * * *", 2, 30],
+    ["credit.verify", "45 2 * * *", 2, 45],
     ["retention.purge", "40 3 * * *", 3, 40],
     ["report.cleanup", "30 3 * * *", 3, 30],
   ] as const)("⚠ WORKER_GROUP=rollup schedules %s at %s UTC", async (queue, pattern, hour, minute) => {

@@ -14,6 +14,7 @@ import { createCreditHousekeepingHandler } from "./handlers/credit-housekeeping.
 import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
 import { createReportCleanupHandler } from "./handlers/report-cleanup.handler.js";
 import { createRetentionPurgeHandler } from "./handlers/retention-purge.handler.js";
+import { createCreditVerifyHandler } from "./handlers/credit-verify.handler.js";
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
 import { createMaintenanceIntegrityHandler } from "./handlers/maintenance-integrity.handler.js";
@@ -126,6 +127,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "rollup.metric_daily": (context) => createRollupMetricDailyHandler(context),
   "credit.reconcile": (context) => createCreditReconcileHandler(context),
   "credit.housekeeping": (context) => createCreditHousekeepingHandler(context),
+  "credit.verify": (context) => createCreditVerifyHandler(context),
   "retention.purge": (context) => createRetentionPurgeHandler(context),
   "maintenance.partition": (context) => createMaintenancePartitionHandler(context),
   "maintenance.integrity": (context) => createMaintenanceIntegrityHandler(context),

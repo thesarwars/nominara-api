@@ -348,6 +348,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "older than 35 days are purged nightly (schemas/billing-and-credits.md). expireCredits and purgeDailyCounters were built and tested and had no caller. " +
       "§4's table allocates no queue to either. One queue because both need the same privileged cross-tenant connection; independent steps in the handler.",
   },
+  "credit.verify": {
+    workerGroup: "rollup",
+    because:
+      "STORY-073 AC4 / NFR-CRD-03: 'a nightly job asserts equality and pages on mismatch'. verifyAllWallets (workers/rollup/credit-verify.ts) was built and tested and ran only as " +
+      "`pnpm credits:verify`. §4's table allocates it no queue. A queue of its own (not a housekeeping step) so a mismatch is ONE dead-letter entry that names the verifier, " +
+      "and is never retried alongside the idempotent expiry. Cross-tenant on the owner connection, advisory-locked, concurrency 1.",
+  },
   "retention.purge": {
     workerGroup: "rollup",
     because:
@@ -449,6 +456,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
       "audit.verify",
       "credit.housekeeping",
       "credit.reconcile",
+      "credit.verify",
       "domain.reverify",
       "identity.sweep_unverified",
       "maintenance.integrity",

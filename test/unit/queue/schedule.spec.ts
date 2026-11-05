@@ -79,6 +79,12 @@ const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; sou
     section: "STORY-173",
     source: "STORY-173 (owner decision, 2026-10-05) — the stale-unverified-account sweep runs daily",
   },
+  "credit.verify": {
+    cron: "45 2 * * *",
+    section: "STORY-073 AC4 / NFR-CRD-03",
+    source:
+      "NFR-CRD-03 (a nightly job asserts the wallet equals its ledger replay and pages on mismatch) - the reference states no time of day; 02:45 UTC is a chosen quiet window, after credit.housekeeping (02:30) has written its expiry entries",
+  },
   "credit.housekeeping": {
     cron: "30 2 * * *",
     section: "STORY-076 AC4 / STORY-071 AC10",
@@ -179,9 +185,9 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(undatedSchedules().map((s) => s.queue).sort()).toEqual([...ON_DEMAND_ONLY].sort());
   });
 
-  it("STORY-140 AC11 · sixteen of eighteen cron queues are dated, two are on demand", () => {
-    // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5) + maintenance.integrity (STORY-013) + report.cleanup (STORY-180 r5).
-    expect(datedSchedules()).toHaveLength(16);
+  it("STORY-140 AC11 · seventeen of nineteen cron queues are dated, two are on demand", () => {
+    // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5) + maintenance.integrity (STORY-013) + report.cleanup (STORY-180 r5) + credit.verify (STORY-073 AC4).
+    expect(datedSchedules()).toHaveLength(17);
     expect(undatedSchedules()).toHaveLength(2);
   });
 
@@ -235,6 +241,7 @@ describe("G12 · the schedule table matches the reference", () => {
       "audit.verify",
       "credit.housekeeping",
       "credit.reconcile",
+      "credit.verify",
       "domain.reverify",
       "identity.sweep_unverified",
       "maintenance.integrity",
@@ -282,6 +289,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("16 of 18 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("17 of 19 cron queues state a time");
   });
 });

@@ -502,6 +502,20 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "reportclean:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // NOT IN §4 EITHER - STORY-073 AC4 / NFR-CRD-03: "a nightly job asserts equality and pages on mismatch". `verifyAllWallets`
+  // (workers/rollup/credit-verify.ts) was complete and ran only as `pnpm credits:verify`. A queue of its own, not a
+  // `credit.housekeeping` step: a mismatch must be ONE dead-letter entry naming the verifier, never retried beside the idempotent
+  // expiry. Not tenant-scoped (cross-tenant by definition); advisory-locked as `credit.reconcile` is.
+  {
+    name: "credit.verify",
+    producer: "cron daily (STORY-073 AC4, NFR-CRD-03; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "creditver:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

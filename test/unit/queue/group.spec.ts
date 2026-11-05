@@ -43,6 +43,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "maintenance.integrity",
     // STORY-180 r5 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "report.cleanup",
+    // STORY-073 AC4 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "credit.verify",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
