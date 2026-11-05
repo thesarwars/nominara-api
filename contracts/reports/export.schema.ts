@@ -12,16 +12,20 @@ import { reportFormatSchema, reportSectionSchema, reportTimeframeSchema } from "
 // taken.
 //
 // STORY-180 (owner decision 54, 2026-11-02): the file is stored in the reports
-// bucket (uploaded after the request commits) and `download_url` is a
-// presigned https URL that lives 15 minutes, minted afresh on each response. It
-// is no longer a `data:` URL; a client must open it, not decode it. In local
-// development the URL points at the dev object store and so may be http.
+// bucket (uploaded after the request commits). `download_url` is the API route
+// GET /v1/exports/{id}/download (cookie-authenticated, export:data), which
+// answers 302 to a presigned URL that lives 15 minutes, minted afresh on EVERY
+// fetch from the STORED key (so an Idempotency-Key replay still downloads, and
+// a click never lands before the upload does: 409 until the file is stored).
+// It is no longer a `data:` URL; a client must open it (navigate or window.open,
+// so the session cookie travels), not decode it. The redirect target carries
+// `Content-Disposition: attachment; filename="<filename>"`.
 //
 // Permission export:data (step-up for owner/admin). 0 credits. One
 // `pdf_exports` usage unit for PDF via @Meter; CSV is gated by exports.csv.
 // Idempotency-Key is honoured (header, not part of this body).
 
-/** How long an on-screen `download_url` stays valid (owner decision 54 (2)). */
+/** How long the presigned URL an on-screen download redirects to stays valid (owner decision 54 (2)). */
 export const EXPORT_DOWNLOAD_URL_SECONDS = 900;
 
 export const exportRequestSchema = z
@@ -40,7 +44,7 @@ export const exportResponseSchema = z
     export_id: z.uuid(),
     format: reportFormatSchema,
     filename: z.string().min(1),
-    /** A presigned object-storage URL valid for EXPORT_DOWNLOAD_URL_SECONDS (15 minutes). Never a `data:` URL. */
+    /** The API download route for this export (an http(s) URL). Opening it redirects to a fresh EXPORT_DOWNLOAD_URL_SECONDS presign. Never a `data:` URL. */
     download_url: z.url({ protocol: /^https?$/ }),
     /** Always present, in every format (NFR-AGY-05). */
     footer: methodologyFooterSchema,
@@ -48,6 +52,10 @@ export const exportResponseSchema = z
     pdf: z.object({ used: z.number().int().nonnegative(), cap: z.number().int().nonnegative().nullable() }).strict(),
   })
   .strict();
+
+/** GET /v1/exports/{id}/download - `id` is report_artifacts.id (the response's `export_id`). */
+export const exportDownloadParamsSchema = z.object({ id: z.uuid() }).strict();
+export type ExportDownloadParams = z.infer<typeof exportDownloadParamsSchema>;
 
 /**
  * Export refusal keeps the two conditions distinct (NFR-API-13):
