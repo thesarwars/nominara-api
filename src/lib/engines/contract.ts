@@ -101,7 +101,10 @@ export type AnswerElement = z.infer<typeof answerElementSchema>;
 // STORY-029 / NFR-SIM-12 - `no_ai_overview_for_query`: a licensed-SERP request that WAS sent with the async-load parameter set and
 // still came back with no AI Overview. A genuine absence, stored with brand_present=false. Without the parameter the same payload is
 // an adapter defect and never reaches this flag - it fails the capture.
-export const captureFlagSchema = z.enum(["engine_refused_to_answer", "empty_answer", "no_ai_overview_for_query"]);
+//
+// Owner decision 43 - `simulated`: the capture came from a free development model standing in for a tracked engine (model_fingerprint
+// names it). Written only by the development-only simulated OpenRouter slots; never present in production data.
+export const captureFlagSchema = z.enum(["engine_refused_to_answer", "empty_answer", "no_ai_overview_for_query", "simulated"]);
 export type CaptureFlag = z.infer<typeof captureFlagSchema>;
 
 export const rawCaptureSchema = z

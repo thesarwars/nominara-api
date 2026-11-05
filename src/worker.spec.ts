@@ -4,6 +4,13 @@ import { bootstrapWorker, WorkerGroupError } from "./worker.js";
 import { setAlertEmailerForTests } from "./lib/alerts/alerts.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../test/support/test-valkey.js";
 
+// Every real engine now has a default ceiling, so the D13 boot warning has nothing to name. To keep the warning covered END TO END (the real
+// function and the real logger), the registry's active list gets one extra key that has no default: grok, a reserved engine.
+vi.mock("./lib/engines/registry.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/engines/registry.js")>();
+  return { ...actual, ACTIVE_ENGINE_KEYS: [...actual.ACTIVE_ENGINE_KEYS, "grok"] };
+});
+
 // STORY-022 — NFR-ARCH-06 cold start (<=8s) plus the worker's own
 // acceptance criterion: refuses to boot without a valid WORKER_GROUP.
 describe("STORY-022 · worker.ts cold start and group selection", () => {
@@ -57,7 +64,7 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
   // (src/lib/engines/spend-meter.ts's warnMissingSpendCeilings) had no
   // production caller anywhere. The capture group is where every other
   // engine-scoped boot concern (the canary) is already wired.
-  it("D13: logs a boot warning per active engine missing an ENGINE_SPEND_CEILINGS_USD entry, for the capture group", async () => {
+  it("D13: logs a boot warning per active engine missing an ENGINE_SPEND_CEILINGS_USD entry (and none for engines with a default), for the capture group", async () => {
     process.env.WORKER_GROUP = "capture";
     delete process.env.ENGINE_SPEND_CEILINGS_USD;
     const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
@@ -65,7 +72,8 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     const app = await bootstrapWorker();
     try {
       const messages = warnSpy.mock.calls.map((call) => String(call[0]));
-      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(true);
+      expect(messages.filter((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'grok'"))).toHaveLength(1);
+      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(false);
     } finally {
       await app.close();
       warnSpy.mockRestore();
@@ -89,7 +97,7 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     }
   }, 15_000);
 
-  it("E2E-B6d: gemini has a safe default spend ceiling, so no boot warning names it; other engines still warn", async () => {
+  it("E2E-B6d: gemini, and the OpenRouter engines, have a safe default spend ceiling, so no boot warning names them", async () => {
     process.env.WORKER_GROUP = "capture";
     delete process.env.ENGINE_SPEND_CEILINGS_USD;
     const warnSpy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
@@ -97,8 +105,9 @@ describe("STORY-022 · worker.ts cold start and group selection", () => {
     const app = await bootstrapWorker();
     try {
       const messages = warnSpy.mock.calls.map((call) => String(call[0]));
-      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'gemini'"))).toBe(false);
-      expect(messages.some((message) => message.includes("no ENGINE_SPEND_CEILINGS_USD entry for engine 'chatgpt'"))).toBe(true);
+      for (const engine of ["gemini", "chatgpt", "claude", "perplexity"]) {
+        expect(messages.some((message) => message.includes(`no ENGINE_SPEND_CEILINGS_USD entry for engine '${engine}'`))).toBe(false);
+      }
     } finally {
       await app.close();
       warnSpy.mockRestore();

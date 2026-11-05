@@ -64,10 +64,11 @@ export type EngineSpendCeilings = z.infer<typeof engineSpendCeilingsSchema>;
  * engines with a real adapter (gemini, and the two SerpApi Google surfaces of STORY-029) are the
  * ones that spend real money, so each gets a placeholder (USD/month): gemini 100 pending owner
  * decision O9; google_aio / google_ai_mode 5 each pending the owner's figure (250 Free-plan
- * searches at the metered $0.015 is $3.75 across both). A configured entry always wins; an engine
+ * searches at the metered $0.015 is $3.75 across both); chatgpt 4 / claude 4 / perplexity 1 (placeholders PENDING the owner, like gemini's O9: decision 42 sets only the 10 USD OpenRouter key limit, and these total 9 so they fit inside it; one native-search
+ * capture costs about $0.07 / $0.11 / $0.006 through OpenRouter). A configured entry always wins; an engine
  * with no default has NO alerts and NO hard stop (spend-meter.ts computes both only when a ceiling exists).
  */
-export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100, google_aio: 5, google_ai_mode: 5 };
+export const DEFAULT_ENGINE_SPEND_CEILINGS_USD: EngineSpendCeilings = { gemini: 100, google_aio: 5, google_ai_mode: 5, chatgpt: 4, claude: 4, perplexity: 1 };
 
 /** The effective ceilings: defaults, overridden per engine by the configured JSON (already validated at boot). */
 export function resolveEngineSpendCeilings(configuredJson: string | undefined): EngineSpendCeilings {
@@ -433,6 +434,29 @@ export const envSchema = z
     // STORY-133 - optional: absent leaves the embedding port on the deterministic stand-in outside production (and refusing in
     // production), it does not fail boot. Selecting the real adapter is this one variable. Never logged, never echoed in an error.
     OPENAI_API_KEY: requiredString.optional(),
+    // Owner decision 41/42 (2026-10-30) - OpenRouter. Optional like the other vendor keys: absent leaves chatgpt / claude / perplexity honestly
+    // not capture-ready and the embedding port unchanged. Never logged, never echoed in an error.
+    OPENROUTER_API_KEY: requiredString.optional(),
+    // Which embedding provider this process runs. `auto` (default) = OPENAI_API_KEY ? OpenAI : stand-in (refusing in production). `openrouter`
+    // = the free nvidia/nemotron-3.5-embed-1b:free at 1536 dimensions, DEVELOPMENT ONLY. Having an OPENROUTER_API_KEY never selects it by itself.
+    EMBEDDING_PROVIDER: z.enum(["auto", "stand-in", "openrouter", "openai"]).default("auto"),
+    // Conservative pace for the OpenRouter free embedding tier (the vendor allows 20 a minute, and a daily cap on an account with no credit).
+    OPENROUTER_EMBED_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
+    // Owner decision 42 - the pace the capture dispatcher holds EACH of chatgpt / claude / perplexity to (a one-token bucket per engine,
+    // overriding ENGINE_TOKEN_BUCKETS for them). Default 10. Paces throughput only; the monthly limit is the spend ceiling.
+    OPENROUTER_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
+    // Owner decision 43 - DEVELOPMENT ONLY. `openrouter-free` backs the chatgpt / claude / perplexity slots with free OpenRouter models
+    // (results flagged `simulated`). Refused at boot under NODE_ENV=production (superRefine below), and again by the registry and adapter.
+    // Decision 44: the PAID OpenRouter path for chatgpt / claude / perplexity is an explicit opt-in. Default off: the key alone binds nothing.
+    ENGINE_OPENROUTER: z.enum(["off", "paid"]).optional(),
+    ENGINE_SIMULATION: z.enum(["off", "openrouter-free"]).optional(),
+    OPENROUTER_SIMULATED_MODEL_CHATGPT: requiredString.optional(),
+    OPENROUTER_SIMULATED_MODEL_CLAUDE: requiredString.optional(),
+    OPENROUTER_SIMULATED_MODEL_PERPLEXITY: requiredString.optional(),
+    // Owner decision 42 - the OpenRouter model id behind each engine (placeholders; model tier is a fidelity decision). A ':free' id is refused.
+    OPENROUTER_MODEL_CHATGPT: requiredString.optional(),
+    OPENROUTER_MODEL_CLAUDE: requiredString.optional(),
+    OPENROUTER_MODEL_PERPLEXITY: requiredString.optional(),
     // SCANFIX D3 - the pace the capture dispatcher holds Gemini to, in requests per minute. Default 10 =
     // the free tier of gemini-2.5-flash; raise it with the paid quota. It builds a ONE-token bucket
     // (no burst above the rate) and takes precedence over ENGINE_TOKEN_BUCKETS.gemini.
@@ -521,6 +545,20 @@ export const envSchema = z
             "DATABASE_URL must be the direct Postgres connection, not the pgBouncer pooler (a session advisory lock cannot survive transaction pooling); the pooler belongs in DATABASE_URL_POOLED.",
         });
       }
+    }
+    if (env.NODE_ENV === "production" && env.ENGINE_SIMULATION === "openrouter-free") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ENGINE_SIMULATION"],
+        message: "ENGINE_SIMULATION backs tracked engines with free simulated models and is a development-only mode; it cannot be set under NODE_ENV=production.",
+      });
+    }
+    if (env.ENGINE_SIMULATION === "openrouter-free" && env.ENGINE_OPENROUTER === "paid") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ENGINE_OPENROUTER"],
+        message: "ENGINE_SIMULATION=openrouter-free and ENGINE_OPENROUTER=paid are mutually exclusive: a slot is either simulated by a free model or paid, never both.",
+      });
     }
     if (env.NODE_ENV === "production" && env.RESEND_TO_EMAIL !== undefined) {
       ctx.addIssue({
