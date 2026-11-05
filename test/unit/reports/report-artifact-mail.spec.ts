@@ -39,15 +39,16 @@ function fixture(rows: Row[], over: Partial<ArtifactMailDeps> = {}) {
     }),
   } as unknown as ClientBase;
   const get = vi.fn(async (_ns: string, relative: string) => Buffer.from(`bytes-of-${relative}`));
+  const head = vi.fn(async (_ns: string, _relative: string) => ({ contentLength: 1 }));
   const uploaded = vi.fn(async () => undefined);
   const deps: ArtifactMailDeps = {
-    store: { bind: () => ({ get }) } as never,
+    store: { bind: () => ({ get, head }) } as never,
     apiBaseUrl: BASE,
     signingKey: KEY,
     uploaded,
     ...over,
   };
-  return { tx, sql, get, uploaded, deps };
+  return { tx, sql, get, head, uploaded, deps };
 }
 
 describe("STORY-180 AC3 · the link token", () => {
@@ -240,5 +241,27 @@ describe("STORY-180 AC3 · the email", () => {
     const result = await sendReportEmails(email as never, { name: "M", recipients: ["a@example.test", "b@example.test"] }, plan, {});
     expect(email.send).not.toHaveBeenCalled();
     expect(result).toEqual({ sent: 0, failed: 2, suppressed: 0 });
+  });
+
+  it("a LINKED file that never reached storage fails every recipient and sends nothing (the link would 404 for its whole 7 days)", async () => {
+    const f = fixture([
+      { id: A1, format: "pdf", bytes: 10, period_end: "2026-10-31" },
+      { id: A2, format: "csv", bytes: 9_000_000, period_end: "2026-10-31" },
+    ]);
+    f.head.mockRejectedValue(new Error("no such object"));
+    const plan = await planArtifactMail(f.tx, f.deps, WS, [A1, A2]);
+    const email = { send: vi.fn() };
+    const result = await sendReportEmails(email as never, { name: "M", recipients: ["a@example.test", "b@example.test"] }, plan, {});
+    expect(email.send).not.toHaveBeenCalled();
+    expect(result).toEqual({ sent: 0, failed: 2, suppressed: 0 });
+    expect(f.head).toHaveBeenCalledWith("reports", `${A2}.csv`);
+  });
+
+  it("a linked file that is in storage is checked once and never downloaded", async () => {
+    const f = fixture([{ id: A1, format: "pdf", bytes: 9_000_000, period_end: "2026-10-31" }]);
+    const parts = await resolveMailParts(await planArtifactMail(f.tx, f.deps, WS, [A1]));
+    expect(parts.links).toHaveLength(1);
+    expect(f.head).toHaveBeenCalledTimes(1);
+    expect(f.get).not.toHaveBeenCalled();
   });
 });

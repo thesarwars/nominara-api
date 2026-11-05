@@ -85,7 +85,7 @@ function harness(opts: { artifactBytes?: number; pdfCap?: unknown; row?: Record<
     }),
     uploaded: vi.fn(async () => undefined),
   };
-  const objects = { bind: () => ({ get: async (_ns: string, relative: string) => Buffer.from(`file:${relative}`) }) };
+  const objects = { bind: () => ({ get: async (_ns: string, relative: string) => Buffer.from(`file:${relative}`), head: async () => ({ contentLength: 1 }) }) };
   const email: Harness["email"] = {
     ...(opts.delivers === undefined ? {} : { delivers: opts.delivers }),
     send: vi.fn(async (m: Harness["sent"][number]) => {

@@ -236,6 +236,17 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(row.download_count).toBe(2);
   }, 120_000);
 
+  it("STORY-180 AC2 · more concurrent downloads than the pool holds all complete (the route takes no pooled connection beyond the request's own)", async () => {
+    const { a, p } = await seeded();
+    const exported = exportResponseSchema.parse(data(await exportReport(a, p, body())));
+    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    // The app pool's default max is 10: 40 in flight at once would hang forever if each request waited for a second connection.
+    const all = await Promise.all(Array.from({ length: 40 }, () => downloadRoute(exported, a.cookie)));
+    expect(all.map((r) => r.statusCode)).toEqual(Array.from({ length: 40 }, () => 302));
+    const row = (await harness.db().query(`SELECT download_count FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { download_count: number };
+    expect(row.download_count).toBe(40);
+  }, 60_000);
+
   it("STORY-180 AC2 · a manager scoped to the export's project may download it; one scoped to another project gets the neutral 404", async () => {
     const { a, p } = await seeded();
     const other = await project(a.workspaceId, "Other");

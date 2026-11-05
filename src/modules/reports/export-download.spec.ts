@@ -22,25 +22,23 @@ type Row = { object_key: string; format: string; period_end: string };
 function build(opts: { rows?: Row[]; presign?: () => Promise<string> } = {}) {
   const order: string[] = [];
   const queries: Array<{ text: string; params: unknown[] }> = [];
-  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ context: { workspaceId: WS, actorId: "actor" } } as never);
-  vi.spyOn(tenantContext, "withTenantContext").mockImplementation(async (_c, _ctx, fn) => {
-    const tx = {
-      query: vi.fn(async (text: string, params: unknown[]) => {
-        queries.push({ text, params });
-        return { rows: opts.rows ?? [], rowCount: (opts.rows ?? []).length };
-      }),
-    };
-    const out = await fn(tx as never);
-    order.push("tx-committed");
-    return out;
-  });
-  const release = vi.fn();
+  // The ambient request client: the route runs inside the interceptor's transaction, so the service must use THIS client and
+  // check out nothing further (a second checkout per request exhausts the pool under load).
+  const client = {
+    query: vi.fn(async (text: string, params: unknown[]) => {
+      if (/SAVEPOINT/.test(text)) return { rows: [], rowCount: 0 };
+      order.push(text.includes("download_count") ? "count" : "lookup");
+      queries.push({ text, params });
+      return { rows: opts.rows ?? [], rowCount: (opts.rows ?? []).length };
+    }),
+  };
+  vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ context: { workspaceId: WS, actorId: "actor" }, client } as never);
   const presignGetStored = vi.fn(async (..._a: unknown[]) => {
     order.push("presign");
     return opts.presign ? opts.presign() : `https://s3.example.test/${KEY}?sig=x`;
   });
-  const service = new ExportDownloadService({ connect: async () => ({ release }) } as never, { bind: () => ({ presignGetStored }) } as never);
-  return { service, queries, order, release, presignGetStored };
+  const service = new ExportDownloadService({ bind: () => ({ presignGetStored }) } as never);
+  return { service, queries, order, client, presignGetStored };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -53,15 +51,21 @@ describe("STORY-180 AC2 · the download_url the export carries", () => {
 });
 
 describe("STORY-180 AC2 · GET /v1/exports/{id}/download", () => {
-  it("redirects to a 15-minute presign of the STORED key with the server-chosen filename, minted AFTER the transaction", async () => {
+  it("redirects to a 15-minute presign of the STORED key with the server-chosen filename", async () => {
     const h = build({ rows: [{ object_key: KEY, format: "pdf", period_end: "2026-10-31" }] });
     const out = await h.service.resolve({ id: ID });
     expect(out.url).toBe(`https://s3.example.test/${KEY}?sig=x`);
     expect(h.presignGetStored).toHaveBeenCalledWith("reports", KEY, { expiresInSeconds: EXPORT_DOWNLOAD_URL_SECONDS, downloadFilename: "nominara-report-2026-10-31.pdf" });
     expect(EXPORT_DOWNLOAD_URL_SECONDS).toBe(900);
-    // The lookup transaction ends before the presign; a second short one then counts the served download.
-    expect(h.order).toEqual(["tx-committed", "presign", "tx-committed"]);
-    expect(h.release).toHaveBeenCalledTimes(2);
+    // Lookup, then the (local) presign, then the served download is counted: all on the ambient client.
+    expect(h.order).toEqual(["lookup", "presign", "count"]);
+  });
+
+  it("many concurrent downloads all complete: the service takes no pooled connection of its own (hold-and-wait on the pool)", async () => {
+    const h = build({ rows: [{ object_key: KEY, format: "pdf", period_end: "2026-10-31" }] });
+    const results = await Promise.all(Array.from({ length: 50 }, () => h.service.resolve({ id: ID })));
+    expect(results).toHaveLength(50);
+    expect(h.presignGetStored).toHaveBeenCalledTimes(50);
   });
 
   it("every fetch mints a new presign (nothing is cached or replayed)", async () => {

@@ -146,17 +146,17 @@ export async function buildReportArtifacts(exporter: ReportExporter, report: Sch
  * the artifacts and the delivery row at the same `now()`, so the earliest artifact at or after the delivery's `attempted_at` is
  * that prepare's. Reusing them keeps a retried email byte-identical, which the provider's idempotency key requires.
  */
-async function recordedArtifacts(tx: ClientBase, report: ScheduledReportRow, deliveryId: string): Promise<string[] | undefined> {
+async function recordedArtifacts(tx: ClientBase, workspaceId: string, report: ScheduledReportRow, deliveryId: string): Promise<string[] | undefined> {
   const formats = report.format === "both" ? (["pdf", "csv"] as const) : ([report.format] as const);
   const ids: string[] = [];
   for (const projectId of report.project_ids) {
     for (const format of formats) {
       const found = await tx.query<{ id: string }>(
         `SELECT a.id FROM report_artifacts a
-           JOIN scheduled_report_deliveries d ON d.id = $1
-          WHERE a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now() AND a.object_key NOT LIKE 'pending:%'
+           JOIN scheduled_report_deliveries d ON d.id = $1 AND d.workspace_id = $4
+          WHERE a.workspace_id = $4 AND a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now() AND a.object_key NOT LIKE 'pending:%'
           ORDER BY a.created_at, a.id LIMIT 1`,
-        [deliveryId, projectId, format],
+        [deliveryId, projectId, format, workspaceId],
       );
       const id = found.rows[0]?.id;
       if (id === undefined) return undefined;
@@ -387,7 +387,7 @@ export async function prepareScheduledRun(tx: ClientBase, deps: ReportRunDeps, i
   await tx.query("SAVEPOINT scheduled_report_build");
   let artifacts: string[];
   try {
-    artifacts = (resuming ? await recordedArtifacts(tx, report, deliveryId) : undefined) ?? (await buildReportArtifacts(deps.exports, report));
+    artifacts = (resuming ? await recordedArtifacts(tx, workspaceId, report, deliveryId) : undefined) ?? (await buildReportArtifacts(deps.exports, report));
     await tx.query("RELEASE SAVEPOINT scheduled_report_build");
   } catch (error) {
     await tx.query("ROLLBACK TO SAVEPOINT scheduled_report_build");

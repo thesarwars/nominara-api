@@ -14,7 +14,7 @@ import type { BoundObjectStore, TenantObjectStore } from "../storage/tenant-obje
 //
 // THE TOKEN IS DERIVED, NOT RANDOM. A cadence delivery that fails is retried and REUSES its artifacts, and its email must then be
 // byte-identical (Resend refuses a changed body under the same idempotency key). A random token cannot be recovered from the SHA-256
-// the database keeps, so the token is HMAC-SHA256(job signing key, purpose || artifact id): the same artifact always yields the same
+// the database keeps, so the token is HMAC-SHA256(HKDF-subkey(job signing key), artifact id): the same artifact always yields the same
 // link, the key never leaves the process, and the table holds only the hash, so a database read cannot be replayed as a link.
 // The HMAC key is a SUBKEY (HKDF, info "nominara/report-link") of the job-signing key, so the queue envelope's key is never used
 // directly for a second purpose. The stored hash is written once and never overwritten: if the signing key rotates between a
@@ -67,7 +67,7 @@ export interface MailArtifact {
 
 export interface ArtifactMailPlan {
   readonly items: readonly MailArtifact[];
-  readonly store: Pick<BoundObjectStore, "get">;
+  readonly store: Pick<BoundObjectStore, "get" | "head">;
   readonly uploaded: () => Promise<void>;
 }
 
@@ -131,13 +131,18 @@ export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, w
   return { items, store, uploaded: () => deps.uploaded(artifactIds) };
 }
 
-/** Waits for the uploads, then reads each attached file once. NO transaction may be open. Throws if a file is not in storage. */
+/** Waits for the uploads, then reads each attached file once and confirms each linked file exists. NO transaction may be open. Throws if a file is not in storage. */
 export async function resolveMailParts(plan: ArtifactMailPlan): Promise<MailParts> {
   await plan.uploaded();
   const attachments: EmailAttachment[] = [];
   const links: Array<{ filename: string; url: string }> = [];
   for (const item of plan.items) {
-    if (item.link !== null) links.push({ filename: item.filename, url: item.link });
+    if (item.link !== null) {
+      // A linked file is not downloaded, but it must exist: a failed post-commit put leaves the row `pending:` and the link would 404
+      // for its whole life. `head` throws when the object is absent, which fails the delivery like a missing attachment.
+      await plan.store.head("reports", item.relativeKey);
+      links.push({ filename: item.filename, url: item.link });
+    }
     else attachments.push({ filename: item.filename, contentType: item.contentType, content: await plan.store.get("reports", item.relativeKey) });
   }
   return { attachments, links };

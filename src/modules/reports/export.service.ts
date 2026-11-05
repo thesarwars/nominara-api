@@ -281,24 +281,27 @@ export class ExportService {
       logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "put_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
       return;
     }
+    let recorded: boolean;
     try {
       const client = await this.pool.connect();
       try {
-        const recorded = await withTenantContext(client, context, (tx) =>
+        const result = await withTenantContext(client, context, (tx) =>
           tx.query("UPDATE report_artifacts SET object_key = $2 WHERE id = $1 AND object_key = $3 AND workspace_id = $4", [artifact.id, key, `pending:${artifact.id}`, context.workspaceId]),
         );
-        if ((recorded.rowCount ?? 0) === 0) {
-          await bound.delete("reports", artifact.relativeKey);
-          incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "orphan_removed" });
-          logger.warn({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "orphan_removed", duration_ms: Date.now() - started });
-          return;
-        }
+        recorded = (result.rowCount ?? 0) > 0;
       } finally {
         client.release();
       }
     } catch (error) {
       incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "record_failed" });
       logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "record_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
+      return;
+    }
+    if (!recorded) {
+      // The row is gone (rolled back to a savepoint after the upload was registered): remove the orphan with NO connection held.
+      await bound.delete("reports", artifact.relativeKey);
+      incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "orphan_removed" });
+      logger.warn({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "orphan_removed", duration_ms: Date.now() - started });
       return;
     }
     incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "ok" });
