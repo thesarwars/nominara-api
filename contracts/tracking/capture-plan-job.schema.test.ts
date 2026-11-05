@@ -23,3 +23,21 @@ describe("NEW-A-10 · capturePlanJobSchema", () => {
     expect(capturePlanJobSchema.safeParse(body).success).toBe(false);
   });
 });
+
+describe("STORY-067 · capturePlanJobSchema, the verification trigger", () => {
+  const VERIFICATION = { ...BASE, trigger: "verification", verificationId: "01a06ccd-9e37-7f0c-957b-195fa6d263df" };
+
+  it("accepts a verification plan job that names its verification row", () => {
+    expect(capturePlanJobSchema.parse(VERIFICATION)).toEqual(VERIFICATION);
+  });
+
+  it.each([
+    ["no verification id", { ...VERIFICATION, verificationId: undefined }],
+    ["a non-uuid verification id", { ...VERIFICATION, verificationId: "nope" }],
+    ["a cluster chosen by the payload", { ...VERIFICATION, promptClusterId: "01a06ccd-9e37-7f0c-957b-195fa6d263dd" }],
+    ["a credits field", { ...VERIFICATION, credits: 10 }],
+    ["a verification id on a scheduled job", { ...BASE, verificationId: VERIFICATION.verificationId }],
+  ])("refuses %s", (_label, body) => {
+    expect(capturePlanJobSchema.safeParse(body).success).toBe(false);
+  });
+});
