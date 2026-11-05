@@ -45,6 +45,13 @@ describe("NEW-C-8 AC3 · catalog weight assertion", () => {
     }
   });
 
+  it("round 8 · a negative or sub-basis-point weight is refused at load", () => {
+    for (const weight of [-0.1, 0.30005]) {
+      const broken = CRAWLER.map((r) => (r.code === "AUX-R-001" ? { ...r, weight } : r));
+      expect(() => assertCatalogWeights(broken, ["crawler_access"]), String(weight)).toThrow(AuxCatalogWeightError);
+    }
+  });
+
   it("NEW-C-8 AC3.5 · an empty catalog, or a required category with no rules, is refused (not a vacuous pass)", () => {
     expect(() => loadAuxCatalog([], SUBSET)).toThrow(AuxCatalogWeightError);
     expect(() => loadAuxCatalog(CRAWLER, ["crawler_access", "structured_data"])).toThrow(AuxCatalogWeightError);

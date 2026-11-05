@@ -86,8 +86,8 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // scored on the decided rules only (its max_penalty is their weights' sum, so an unmeasured rule does not count as passed), a category with no decided rule is
 // dropped, a finding whose rule was not decided in this audit (stale / not re-checked) costs nothing and weighs nothing (decision 55), and the sum is renormalised to 100 and capped at 72 by a critical crawler_access finding; the API serves it with `score_partial` and `unmeasured_categories`, and each category lists the rules that did not run in it. With no page judged
 // (site files only) it stays null: one category's subscore is published, but that is not a headline. `score_capped` says whether the cap applies to the number
-// (decision 57): it is set when a critical crawler_access finding is open AND crawler_access is in this audit's basis, so a flag of true always accompanies a headline held at 72 or
-// below. An audit that decided nothing in crawler_access (every site file but llms.txt timed out) carries false, and no headline.
+// (decision 57): it is set when a critical crawler_access finding is open AND crawler_access is in this audit's basis, so a true flag never accompanies a headline above 72.
+// When no page is judged the flag can be true while the headline is null (decision 56).
 //
 // A JOB THAT FAILS (review round 1). A rule that crashes on one page's markup is that page's problem (page-rules.ts: unmodelled, `rule_error:<code>`), so the audit
 // ends `partial` instead of never publishing. Anything else that throws walks the retry ladder; on the LAST attempt a MANUAL audit is failed and its charge
@@ -1076,7 +1076,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       for (const category of basis.categories) breakdown[category] = scored.subscores[category];
       // `basis.categories.includes("crawler_access")` is always true whenever a headline exists: a headline needs a judged page, and a judged page decides AUX-R-006
       // (a crawler_access page rule). It is kept so the cap and the flag below stay one rule that cannot drift apart if that ever stops holding.
-      if (pageEvaluated.size > 0) headline = capped && capAppliesToBasis ? Math.min(scored.score, AUX_HARD_CAP) : scored.score;
+      if (pageEvaluated.size > 0) headline = scoreCapped ? Math.min(scored.score, AUX_HARD_CAP) : scored.score;
     }
 
     await tx.query(

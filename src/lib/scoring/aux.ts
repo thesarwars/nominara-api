@@ -121,12 +121,19 @@ export interface AuxDecidedRule {
  * rule nobody could judge is out of the denominator and so cannot count as passed. A category with no decided rule is absent from `categories` (it is
  * dropped, as decision 38 already did for a whole category). The result feeds `auxScore` as `evaluatedCategories` and `categoryMaxPenalty`.
  */
+/** A weight is valid when it is finite, non-negative and a whole number of basis points (four decimals at most). Shared by catalog load and score time. */
+export function isValidAuxWeight(w: number): boolean {
+  if (!Number.isFinite(w) || w < 0) return false;
+  const points = w * 10_000;
+  return Math.abs(points - Math.round(points)) <= 1e-6;
+}
+
 export function auxDecidedBasis(rules: readonly AuxDecidedRule[]): { readonly categories: readonly AuxCategory[]; readonly categoryMaxPenalty: Partial<Record<AuxCategory, number>> } {
   // Integer basis points (weights carry four decimals at most): the sum is exact and independent of the order of `rules`, so identical inputs give identical output.
   const basisPoints: Partial<Record<AuxCategory, number>> = {};
   for (const rule of rules) {
     const points = rule.weight * 10_000;
-    if (!Number.isFinite(rule.weight) || rule.weight < 0 || Math.abs(points - Math.round(points)) > 1e-6) {
+    if (!isValidAuxWeight(rule.weight)) {
       throw new RangeError(`auxDecidedBasis needs a finite, non-negative weight in whole basis points; got ${String(rule.weight)}`);
     }
     basisPoints[rule.category] = (basisPoints[rule.category] ?? 0) + Math.round(points);
