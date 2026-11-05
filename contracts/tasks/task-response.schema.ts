@@ -13,6 +13,25 @@ import { actionItemEffortSchema, actionItemKindSchema, actionItemSeveritySchema,
 // `TasksService.listActionItems` derives it (aux_findings.severity, then
 // project_source_index.gap_severity, else null) — null is "no signal", never
 // a fabricated value.
+/**
+ * Owner decision 30 / STORY-055 AC6 + AC11 — why a task sits `in_review`. `pending`: the URL is queued or being fetched.
+ * `unverified`: the fetch finished and the task STAYS in review with a specific `reason` (the customer may submit another URL).
+ * Null on every task that is not `in_review`.
+ */
+export const TASK_VERIFICATION_REASONS = ["no_mention", "unreachable", "not_a_page", "unsafe_target", "wrong_domain", "no_brand_names", "url_echoes_brand"] as const;
+export const taskVerificationReasonSchema = z.enum(TASK_VERIFICATION_REASONS);
+export const taskVerificationSchema = z
+  .object({
+    state: z.enum(["pending", "unverified"]),
+    /** The URL the customer submitted. */
+    url: z.string(),
+    submitted_at: z.string(),
+    /** Null while `pending`; the specific reason once `unverified`. */
+    reason: taskVerificationReasonSchema.nullable(),
+  })
+  .strict();
+export type TaskVerification = z.infer<typeof taskVerificationSchema>;
+
 export const taskPrioritySchema = z.number().int().min(1).max(5);
 
 export const taskSchema = z
@@ -40,6 +59,14 @@ export const taskSchema = z
     resurface_at: z.string().nullable(),
     completed_at: z.string().nullable(),
     affected_url: z.string().nullable(),
+    /**
+     * STORY-055: true when the task CAN BE COMPLETED WITH A URL - it has a source domain (`source_domain_id IS NOT NULL`). A playbook-only
+     * task is refused by `POST /tasks/{id}/complete` (`no_source_domain`, nothing to verify the URL against), so it is false here: the UI
+     * must not offer a URL form that can only fail. Served so the UI shows the form before the click instead of learning it from a 400.
+     */
+    seeding: z.boolean(),
+    /** Owner decision 30: why a seeding task is `in_review`. Null on every other task. (Not the STORY-067 `verification` of the complete response.) */
+    review: taskVerificationSchema.nullable(),
     created_at: z.string(),
     updated_at: z.string(),
   })

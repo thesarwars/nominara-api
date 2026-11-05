@@ -18146,6 +18146,7 @@
                             "enum": [
                               "todo",
                               "in_progress",
+                              "in_review",
                               "done",
                               "dismissed"
                             ]
@@ -18272,6 +18273,60 @@
                               }
                             ]
                           },
+                          "seeding": {
+                            "type": "boolean"
+                          },
+                          "review": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "state": {
+                                    "type": "string",
+                                    "enum": [
+                                      "pending",
+                                      "unverified"
+                                    ]
+                                  },
+                                  "url": {
+                                    "type": "string"
+                                  },
+                                  "submitted_at": {
+                                    "type": "string"
+                                  },
+                                  "reason": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string",
+                                        "enum": [
+                                          "no_mention",
+                                          "unreachable",
+                                          "not_a_page",
+                                          "unsafe_target",
+                                          "wrong_domain",
+                                          "no_brand_names",
+                                          "url_echoes_brand"
+                                        ]
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "state",
+                                  "url",
+                                  "submitted_at",
+                                  "reason"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "created_at": {
                             "type": "string"
                           },
@@ -18301,6 +18356,8 @@
                           "resurface_at",
                           "completed_at",
                           "affected_url",
+                          "seeding",
+                          "review",
                           "created_at",
                           "updated_at"
                         ],
@@ -25989,7 +26046,8 @@
                                 "type": "string",
                                 "enum": [
                                   "todo",
-                                  "in_progress"
+                                  "in_progress",
+                                  "in_review"
                                 ]
                               }
                             },
@@ -44154,6 +44212,7 @@
                             "enum": [
                               "todo",
                               "in_progress",
+                              "in_review",
                               "done",
                               "dismissed"
                             ]
@@ -44280,6 +44339,60 @@
                               }
                             ]
                           },
+                          "seeding": {
+                            "type": "boolean"
+                          },
+                          "review": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "state": {
+                                    "type": "string",
+                                    "enum": [
+                                      "pending",
+                                      "unverified"
+                                    ]
+                                  },
+                                  "url": {
+                                    "type": "string"
+                                  },
+                                  "submitted_at": {
+                                    "type": "string"
+                                  },
+                                  "reason": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string",
+                                        "enum": [
+                                          "no_mention",
+                                          "unreachable",
+                                          "not_a_page",
+                                          "unsafe_target",
+                                          "wrong_domain",
+                                          "no_brand_names",
+                                          "url_echoes_brand"
+                                        ]
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "state",
+                                  "url",
+                                  "submitted_at",
+                                  "reason"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "created_at": {
                             "type": "string"
                           },
@@ -44309,6 +44422,8 @@
                           "resurface_at",
                           "completed_at",
                           "affected_url",
+                          "seeding",
+                          "review",
                           "created_at",
                           "updated_at"
                         ],
@@ -44644,6 +44759,7 @@
               "enum": [
                 "todo",
                 "in_progress",
+                "in_review",
                 "done",
                 "dismissed"
               ]
@@ -44717,6 +44833,7 @@
                           "enum": [
                             "todo",
                             "in_progress",
+                            "in_review",
                             "done",
                             "dismissed"
                           ]
@@ -44843,6 +44960,60 @@
                             }
                           ]
                         },
+                        "seeding": {
+                          "type": "boolean"
+                        },
+                        "review": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "state": {
+                                  "type": "string",
+                                  "enum": [
+                                    "pending",
+                                    "unverified"
+                                  ]
+                                },
+                                "url": {
+                                  "type": "string"
+                                },
+                                "submitted_at": {
+                                  "type": "string"
+                                },
+                                "reason": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "enum": [
+                                        "no_mention",
+                                        "unreachable",
+                                        "not_a_page",
+                                        "unsafe_target",
+                                        "wrong_domain",
+                                        "no_brand_names",
+                                        "url_echoes_brand"
+                                      ]
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "state",
+                                "url",
+                                "submitted_at",
+                                "reason"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "created_at": {
                           "type": "string"
                         },
@@ -44872,6 +45043,8 @@
                         "resurface_at",
                         "completed_at",
                         "affected_url",
+                        "seeding",
+                        "review",
                         "created_at",
                         "updated_at"
                       ],
@@ -53431,6 +53604,7 @@
                           "enum": [
                             "todo",
                             "in_progress",
+                            "in_review",
                             "done",
                             "dismissed"
                           ]
@@ -53557,6 +53731,60 @@
                             }
                           ]
                         },
+                        "seeding": {
+                          "type": "boolean"
+                        },
+                        "review": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "state": {
+                                  "type": "string",
+                                  "enum": [
+                                    "pending",
+                                    "unverified"
+                                  ]
+                                },
+                                "url": {
+                                  "type": "string"
+                                },
+                                "submitted_at": {
+                                  "type": "string"
+                                },
+                                "reason": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "enum": [
+                                        "no_mention",
+                                        "unreachable",
+                                        "not_a_page",
+                                        "unsafe_target",
+                                        "wrong_domain",
+                                        "no_brand_names",
+                                        "url_echoes_brand"
+                                      ]
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "state",
+                                "url",
+                                "submitted_at",
+                                "reason"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "created_at": {
                           "type": "string"
                         },
@@ -53586,6 +53814,8 @@
                         "resurface_at",
                         "completed_at",
                         "affected_url",
+                        "seeding",
+                        "review",
                         "created_at",
                         "updated_at"
                       ],
@@ -53950,7 +54180,9 @@
                             "reopened",
                             "dismissed",
                             "evidence_refreshed",
-                            "due_changed"
+                            "due_changed",
+                            "verification_submitted",
+                            "verification_failed"
                           ]
                         },
                         "actor": {
@@ -54399,6 +54631,7 @@
                               "enum": [
                                 "todo",
                                 "in_progress",
+                                "in_review",
                                 "done",
                                 "dismissed"
                               ]
@@ -54525,6 +54758,60 @@
                                 }
                               ]
                             },
+                            "seeding": {
+                              "type": "boolean"
+                            },
+                            "review": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "state": {
+                                      "type": "string",
+                                      "enum": [
+                                        "pending",
+                                        "unverified"
+                                      ]
+                                    },
+                                    "url": {
+                                      "type": "string"
+                                    },
+                                    "submitted_at": {
+                                      "type": "string"
+                                    },
+                                    "reason": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string",
+                                          "enum": [
+                                            "no_mention",
+                                            "unreachable",
+                                            "not_a_page",
+                                            "unsafe_target",
+                                            "wrong_domain",
+                                            "no_brand_names",
+                                            "url_echoes_brand"
+                                          ]
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "state",
+                                    "url",
+                                    "submitted_at",
+                                    "reason"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "created_at": {
                               "type": "string"
                             },
@@ -54554,33 +54841,42 @@
                             "resurface_at",
                             "completed_at",
                             "affected_url",
+                            "seeding",
+                            "review",
                             "created_at",
                             "updated_at"
                           ],
                           "additionalProperties": false
                         },
                         "milestone": {
-                          "type": "object",
-                          "properties": {
-                            "id": {
-                              "type": "string",
-                              "format": "uuid",
-                              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "kind": {
+                                  "type": "string",
+                                  "const": "task_completed"
+                                },
+                                "occurred_at": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "kind",
+                                "occurred_at"
+                              ],
+                              "additionalProperties": false
                             },
-                            "kind": {
-                              "type": "string",
-                              "const": "task_completed"
-                            },
-                            "occurred_at": {
-                              "type": "string"
+                            {
+                              "type": "null"
                             }
-                          },
-                          "required": [
-                            "id",
-                            "kind",
-                            "occurred_at"
-                          ],
-                          "additionalProperties": false
+                          ]
                         },
                         "verification": {
                           "anyOf": [
@@ -54865,6 +55161,23 @@
               }
             }
           }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
         }
       }
     },
@@ -54907,7 +55220,9 @@
                               "reopened",
                               "dismissed",
                               "evidence_refreshed",
-                              "due_changed"
+                              "due_changed",
+                              "verification_submitted",
+                              "verification_failed"
                             ]
                           },
                           "actor": {
@@ -66600,6 +66915,7 @@
                                 "enum": [
                                   "todo",
                                   "in_progress",
+                                  "in_review",
                                   "done",
                                   "dismissed"
                                 ]
@@ -66726,6 +67042,60 @@
                                   }
                                 ]
                               },
+                              "seeding": {
+                                "type": "boolean"
+                              },
+                              "review": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "state": {
+                                        "type": "string",
+                                        "enum": [
+                                          "pending",
+                                          "unverified"
+                                        ]
+                                      },
+                                      "url": {
+                                        "type": "string"
+                                      },
+                                      "submitted_at": {
+                                        "type": "string"
+                                      },
+                                      "reason": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "enum": [
+                                              "no_mention",
+                                              "unreachable",
+                                              "not_a_page",
+                                              "unsafe_target",
+                                              "wrong_domain",
+                                              "no_brand_names",
+                                              "url_echoes_brand"
+                                            ]
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "state",
+                                      "url",
+                                      "submitted_at",
+                                      "reason"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "created_at": {
                                 "type": "string"
                               },
@@ -66755,6 +67125,8 @@
                               "resurface_at",
                               "completed_at",
                               "affected_url",
+                              "seeding",
+                              "review",
                               "created_at",
                               "updated_at"
                             ],

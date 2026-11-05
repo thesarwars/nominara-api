@@ -5,6 +5,7 @@ import {
   type TaskGenerationCondition,
 } from "../../../contracts/tasks/index.js";
 import { citationGapSchema } from "../../../contracts/analytics/index.js";
+import { playbookTemplateFor } from "../sources/playbook-templates.js";
 import { actionableAuthorityDomains, authorityTargets, authorityTaskFingerprint } from "../analytics/displacement-recovery.js";
 import { SOURCE_INDEX_WINDOWS } from "../rollup/refresh-project-source-index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
@@ -339,7 +340,7 @@ async function evaluateSourceGap(
   // recurrence event is the witness), not on every rollup.
   const actionable = await actionableAuthorityDomains(ctx.tx, ctx.workspaceId, ctx.projectId, null, AUTHORITY_WINDOW_DAYS);
   if (actionable.size === 0) return [];
-  const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null; verified_at: Date }>(
+  const found = await ctx.tx.query<{ id: string; domain: string; gap_severity: string; seeding_playbook_slug: string | null; source_class: string; verified_at: Date }>(
     `WITH ranked AS (
        SELECT psi.source_domain_id, psi.gap_severity, psi.verified_at,
               row_number() OVER (PARTITION BY psi.source_domain_id ORDER BY psi.window_start DESC) AS rn
@@ -347,7 +348,7 @@ async function evaluateSourceGap(
         WHERE psi.project_id = $1::uuid AND psi.engine_key = 'all' AND psi.window_days = $2::int
           AND psi.source_domain_id = ANY($3::uuid[])
      )
-     SELECT sd.id, lower(sd.domain) AS domain, r.gap_severity, sd.seeding_playbook_slug, r.verified_at
+     SELECT sd.id, lower(sd.domain) AS domain, r.gap_severity, sd.seeding_playbook_slug, sd.source_class, r.verified_at
        FROM ranked r
        JOIN source_domains sd ON sd.id = r.source_domain_id
       WHERE r.rn = 1
@@ -382,7 +383,7 @@ async function evaluateSourceGap(
     affectedEngines: [],
     affectedPromptIds: [],
     sourceDomainId: row.id,
-    playbook: { slug: row.seeding_playbook_slug, domain: row.domain, url: null, angle: "source_gap" },
+    playbook: { slug: row.seeding_playbook_slug ?? playbookTemplateFor(row.source_class)?.slug ?? null, domain: row.domain, url: null, angle: "source_gap" },
     discrete: true,
   }));
 }
@@ -439,10 +440,11 @@ async function absorbedByFingerprint(
 async function playbookSlugs(tx: ClientBase, domainIds: readonly string[]): Promise<Map<string, string | null>> {
   const slugs = new Map<string, string | null>();
   if (domainIds.length === 0) return slugs;
-  const rows = await tx.query<{ id: string; seeding_playbook_slug: string | null }>(
-    `SELECT id, seeding_playbook_slug FROM source_domains WHERE id = ANY($1::uuid[])`,
+  const rows = await tx.query<{ id: string; seeding_playbook_slug: string | null; source_class: string }>(
+    `SELECT id, seeding_playbook_slug, source_class FROM source_domains WHERE id = ANY($1::uuid[])`,
     [[...domainIds]],
   );
-  for (const row of rows.rows) slugs.set(row.id, row.seeding_playbook_slug);
+  // STORY-055 AC1: the playbook is selected by the gap's source class when the domain carries no stored slug (nothing writes one).
+  for (const row of rows.rows) slugs.set(row.id, row.seeding_playbook_slug ?? playbookTemplateFor(row.source_class)?.slug ?? null);
   return slugs;
 }

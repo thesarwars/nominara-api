@@ -85,7 +85,7 @@ describe("STORY-169 · TasksService.listActionItems", () => {
     await serviceReading([]).listActionItems({ limit: 50 } as never);
     expect(calls[0]!.sql).toContain("p.deleted_at IS NULL");
     expect(calls[0]!.sql).toContain("t.deleted_at IS NULL");
-    expect(calls[0]!.sql).toContain("t.status IN ('todo', 'in_progress')");
+    expect(calls[0]!.sql).toContain("t.status IN ('todo', 'in_progress', 'in_review')"); // owner decision 30: in review is still open
   });
 
   // Ordering (FR-GD-02) is asserted on real rows in test/integration/action-items.spec.ts, not as an SQL substring here.

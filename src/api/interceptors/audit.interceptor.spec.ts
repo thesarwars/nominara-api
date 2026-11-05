@@ -33,6 +33,13 @@ class ProjectController {
   })
   selectiveState(): void {}
 
+  @Audit({
+    action: "task.completed",
+    actionFrom: (body) => ((body as { status: string }).status === "in_review" ? "task.verification_submitted" : "task.completed"),
+    resourceType: "task",
+  })
+  actionFromResponse(): void {}
+
   unannotatedMutation(): void {}
 
   @Audit({ action: "project.read_ignored", resourceType: "project" })
@@ -457,5 +464,21 @@ describe("STORY-085-A CP2 · AuditOptions.afterState", () => {
     });
     const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
     expect(input.afterState).toEqual({ ok: true });
+  });
+
+  // STORY-055 review r3 — one route, two outcomes: the action name may be chosen from the response.
+  it.each([
+    ["in_review", "task.verification_submitted"],
+    ["done", "task.completed"],
+  ])("actionFrom picks the audit action from the response (%s -> %s)", async (status, action) => {
+    const auditChain = fakeAuditChain();
+    const interceptor = new AuditInterceptor(new Reflector(), auditChain);
+    const { client } = fakePoolClient();
+    const req: Partial<AuditableRequest> = { method: "POST", id: "r", headers: {}, params: { id: "11111111-1111-1111-1111-111111111111" }, authMethod: "session" };
+    await withTenantContext(client, { workspaceId: "ws-1", actorId: "user-1" }, async () => {
+      await firstValueFrom(interceptor.intercept(makeContext("actionFromResponse", req), { handle: () => of({ status }) }));
+    });
+    const [, input] = (auditChain.append as ReturnType<typeof vi.fn>).mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(input).toMatchObject({ action });
   });
 });

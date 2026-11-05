@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from 
 import {
   bulkTaskRequestSchema,
   bulkTaskResponseSchema,
+  completeTaskRequestSchema,
   completeTaskResponseSchema,
   createCommentRequestSchema,
   createTaskRequestSchema,
@@ -14,6 +15,7 @@ import {
   updateTaskRequestSchema,
   type BulkTaskRequest,
   type BulkTaskResponse,
+  type CompleteTaskRequest,
   type CompleteTaskResponse,
   type CreateCommentRequest,
   type CreateTaskRequest,
@@ -113,17 +115,29 @@ export class TasksController {
     return this.service.createComment(id, body);
   }
 
-  // STORY-064 (step D) — `POST /tasks/{id}/complete`, `task:move`. No body.
+  // STORY-064 (step D) — `POST /tasks/{id}/complete`, `task:move`. The body is optional: owner decision 30 (STORY-055) takes
+  // the contribution `url` of a seeding task, which goes in_review until a job verifies it.
   // Idempotent: a replayed key returns the first response, not a second 409.
   @Post("tasks/:id/complete")
   @HttpCode(200)
   @Idempotent()
   @RequirePermission("task:move")
   @ScopedByQuery()
-  @Audit({ action: "task.completed", resourceType: "task" })
-  @ApiContract({ operationId: "completeTask", responseSchema: completeTaskResponseSchema })
-  complete(@Param("id") id: string): Promise<CompleteTaskResponse> {
-    return this.service.completeTask(id);
+  @Audit({
+    action: "task.completed",
+    // A seeding task is only SUBMITTED for review here; the job audits the completion (`task.verification_completed`).
+    actionFrom: (body) => ((body as { task?: { status?: string } }).task?.status === "in_review" ? "task.verification_submitted" : "task.completed"),
+    resourceType: "task",
+    // The audit chain is append-only and long-lived: it keeps the OUTCOME (the status), never the customer's submitted URL
+    // (`task.review.url`) or any other part of the response.
+    afterState: (body) => ({ status: (body as { task?: { status?: string } }).task?.status ?? null }),
+  })
+  @ApiContract({ operationId: "completeTask", requestSchema: completeTaskRequestSchema, responseSchema: completeTaskResponseSchema })
+  complete(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(completeTaskRequestSchema.default({}))) body: CompleteTaskRequest,
+  ): Promise<CompleteTaskResponse> {
+    return this.service.completeTask(id, body);
   }
 
   // `GET /tasks/{id}/events`, `task:read` — the timeline, newest first.

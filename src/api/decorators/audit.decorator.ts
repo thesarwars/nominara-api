@@ -8,6 +8,11 @@ import type { AuditSeverity } from "../../lib/crypto/audit-chain.js";
 // the URL. `resourceIdFrom` says which one to read.
 export interface AuditOptions {
   readonly action: string;
+  /**
+   * When one route has more than one audit-worthy outcome (STORY-055: a completion that is a submission for review), picks the action
+   * from the handler's response. `action` stays the default and the documented name (the route table reads it); a throw or a non-string falls back to it.
+   */
+  readonly actionFrom?: (responseBody: unknown) => string;
   readonly resourceType: string;
   /**
    * Where to read resource_id from. "params" reads req.params[paramName] (default); "response" reads the handler's returned body's `.id`.

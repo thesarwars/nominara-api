@@ -151,7 +151,7 @@ describe("STORY-064 · PATCH /tasks/{id} route", () => {
 // STORY-064 (step C) — POST /projects/{id}/tasks, POST /tasks/{id}/comments, GET /tasks/{id}/events.
 import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
 import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
-import { createCommentRequestSchema, createTaskRequestSchema } from "../../../contracts/tasks/index.js";
+import { completeTaskRequestSchema, createCommentRequestSchema, createTaskRequestSchema } from "../../../contracts/tasks/index.js";
 
 describe("STORY-064-C · route wiring and contracts", () => {
   const reflector = new Reflector();
@@ -242,10 +242,46 @@ describe("STORY-064-D · complete route wiring", () => {
     expect(reflector.get(AUDIT_METADATA_KEY, h)).toMatchObject({ action: "task.completed", resourceType: "task" });
   });
 
-  it("STORY-064-D AC1 · complete publishes the completeTask operation with a response schema and no request body", () => {
+  it("STORY-064-D AC1 · complete publishes the completeTask operation with a response schema and (owner decision 30) an optional-url request body", () => {
     const contract = reflector.get(API_CONTRACT_KEY, proto.complete!) as { operationId: string; requestSchema?: unknown; responseSchema?: unknown };
     expect(contract.operationId).toBe("completeTask");
     expect(contract.responseSchema).toBeDefined();
-    expect(contract.requestSchema).toBeUndefined();
+    expect(contract.requestSchema).toBe(completeTaskRequestSchema);
+  });
+});
+
+// STORY-055 (owner decision 30) — the complete body is OPTIONAL: a client that sends nothing (every non-seeding completion) still
+// parses, a `url` parses, and an unknown key is a 400 rather than a silent drop.
+describe("STORY-055 · complete takes an optional strict body", () => {
+  function bodyPipe(): { transform: (value: unknown) => unknown } {
+    const args = Reflect.getMetadata("__routeArguments__", TasksController, "complete") as Record<string, { data?: unknown; pipes: { transform: (v: unknown) => unknown }[] }>;
+    const body = Object.entries(args).find(([key]) => key.startsWith("3:"))?.[1]; // RouteParamtypes.BODY = 3
+    return body!.pipes[0]!;
+  }
+
+  it("review r3 - the route audits a submission as task.verification_submitted and a completion as task.completed", () => {
+    const options = Reflect.getMetadata("auditOptions", TasksController.prototype.complete) as { action: string; actionFrom: (body: unknown) => string };
+    expect(options.action).toBe("task.completed");
+    expect(options.actionFrom({ task: { status: "in_review" } })).toBe("task.verification_submitted");
+    expect(options.actionFrom({ task: { status: "done" } })).toBe("task.completed");
+  });
+
+  it("review r4 - the audit chain keeps the outcome status only, never the customer's submitted URL", () => {
+    const options = Reflect.getMetadata("auditOptions", TasksController.prototype.complete) as { afterState: (body: unknown) => unknown };
+    const body = { task: { status: "in_review", review: { state: "pending", url: "https://reddit.com/r/secret-path", reason: null }, title: "t" }, milestone: null, verification: null };
+    expect(options.afterState(body)).toEqual({ status: "in_review" });
+    expect(JSON.stringify(options.afterState(body))).not.toContain("reddit");
+    expect(options.afterState({})).toEqual({ status: null });
+  });
+
+  it("no body at all is {} (a content task completes exactly as before)", () => {
+    expect(bodyPipe().transform(undefined)).toEqual({});
+  });
+
+  it("a url passes through; an unknown key, an empty url, and a non-string url are refused", () => {
+    expect(bodyPipe().transform({ url: "https://reddit.com/r/x" })).toEqual({ url: "https://reddit.com/r/x" });
+    expect(() => bodyPipe().transform({ status: "done" })).toThrow();
+    expect(() => bodyPipe().transform({ url: "" })).toThrow();
+    expect(() => bodyPipe().transform({ url: 5 })).toThrow();
   });
 });

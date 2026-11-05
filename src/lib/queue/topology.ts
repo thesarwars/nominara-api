@@ -332,6 +332,13 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
   // STORY-066 AC8 adds a second producer: `TasksService.completeTask` enqueues
   // one job per completed authority task (payload `taskId`), after its commit,
   // keyed `srcver:seeded:{task}:{completed_at_ms}` — the pattern below is the rollup's key.
+  // STORY-055 (owner decision 30) adds the producer that matters now: `TasksService.completeTask` enqueues one job per SUBMITTED
+  // contribution URL of a seeding task (payload `taskId` + `submissionId`), after its commit, keyed `taskverify:{submission_event_id}`
+  // - the id of the task's `verification_submitted` event, so the key is per SUBMISSION (a resubmission after a failed check is a new
+  // job). A resubmit while the check is still pending re-enqueues the SAME key (a 409 for the caller), which is how a submission whose
+  // first enqueue failed recovers. The pattern below is still the rollup's; this job's key is `taskverify:{submission}`. The job
+  // never retries a fetch error: it answers `unreachable` and leaves the task in review. It publishes `task.moved` and audits.
+  // The `taskId`-only mode above has no producer any more and is kept for jobs already queued at deploy time.
   // Phased (ADR-0003): no transaction is held across either kind of fetch.
   {
     name: "source.verify_presence",

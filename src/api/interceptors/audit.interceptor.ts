@@ -93,6 +93,16 @@ function resourceIdFromResponse(body: unknown, resourceType: string, idPath?: st
  * existing posture for a missing @Audit() decorator or a missing tenant
  * context store.
  */
+function resolveAction(options: AuditOptions, responseBody: unknown): string {
+  if (options.actionFrom === undefined) return options.action;
+  try {
+    const action = options.actionFrom(responseBody);
+    return typeof action === "string" && action.length > 0 ? action : options.action;
+  } catch {
+    return options.action;
+  }
+}
+
 function resolveResourceId(req: AuditableRequest, options: AuditOptions, responseBody: unknown): string {
   const routeLabel = `action "${options.action}" (resourceType "${options.resourceType}")`;
 
@@ -213,7 +223,7 @@ export class AuditInterceptor implements NestInterceptor {
       actorId: store.context.actorId,
       actorIp: req.ip ?? null,
       actorUa: firstHeaderValue(req.headers["user-agent"]),
-      action: options.action,
+      action: resolveAction(options, responseBody),
       resourceType: options.resourceType,
       resourceId,
       beforeState: req.auditBeforeState ?? null,

@@ -5,6 +5,7 @@ import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.sc
 import type {
   BulkTaskRequest,
   BulkTaskResponse,
+  CompleteTaskRequest,
   CompleteTaskResponse,
   CreateCommentRequest,
   CreateTaskRequest,
@@ -12,10 +13,12 @@ import type {
   TaskEvent,
   TaskEventListQuery,
   TaskListQuery,
+  TaskVerification,
   TaskSort,
   UpdateTaskRequest,
 } from "../../../contracts/tasks/index.js";
-import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, NotFoundError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { checkSubmittedUrl, isSeedingTask } from "../../lib/sources/verify-submission.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import {
   taskBaselineMetricsSchema,
@@ -46,7 +49,7 @@ export interface PortalCompletedRow {
 export interface PortalOpenRow {
   title: string;
   severity: "critical" | "high" | "medium" | "low" | null;
-  status: "todo" | "in_progress";
+  status: "todo" | "in_progress" | "in_review";
 }
 export interface PortalTasksRead {
   completed: PortalCompletedRow[];
@@ -160,7 +163,8 @@ export class TasksService {
    * STORY-062 AC10 — the OPEN task behind each GEO finding's rule, for the digest's levers. Read-only, one query for however many
    * rules the digest promoted (at most three levers, but the caller passes the rules it needs).
    *
-   * OPEN MEANS `todo` OR `in_progress`: a dismissed or done task is never shown as "the action" for a finding, so it is not
+   * OPEN MEANS `todo`, `in_progress` OR `in_review` (owner decision 30: a seeding task whose URL awaits verification is unfinished
+   * work, so it is still "the action"): a dismissed or done task is never shown as "the action" for a finding, so it is not
    * returned and the lever's link is null. A match needs the rule code AND `source_geo_analysis` = the analysis, so a rule shared by
    * two analyses cannot cross-link. When several tasks are open for the pair the highest-impact one wins, then the oldest, then the
    * id, so the answer is deterministic. RLS bounds the workspace; the scope predicate (the same one the task list uses) bounds the
@@ -176,7 +180,7 @@ export class TasksService {
       `SELECT DISTINCT ON (rule_code, source_geo_analysis) id, title, rule_code, source_geo_analysis
          FROM tasks
         WHERE project_id = $1 AND rule_code = ANY($2::text[]) AND source_geo_analysis IS NOT NULL
-          AND status IN ('todo', 'in_progress') AND deleted_at IS NULL
+          AND status IN ('todo', 'in_progress', 'in_review') AND deleted_at IS NULL
           AND (cardinality(app.current_scope_projects()) = 0 OR project_id = ANY(app.current_scope_projects()))
         ORDER BY rule_code, source_geo_analysis, impact_score DESC, created_at, id`,
       [projectId, [...ruleCodes]],
@@ -224,6 +228,8 @@ export class TasksService {
            t.source_finding_id, t.source_domain_id, t.source_displacement_id,
            t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
            t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
+           (t.source_domain_id IS NOT NULL) AS seeding,
+           ${REVIEW_SELECT},
            ${SORT_KEYS[query.sort]}
          FROM tasks t
          LEFT JOIN goals g ON g.id = t.goal_id
@@ -288,7 +294,7 @@ export class TasksService {
    *
    * - completed: status `done`, newest first; the measurement comes from the task's milestone, and a milestone hidden
    *   from the portal (`visible_in_portal = false`) contributes none — filtered here, not in the view.
-   * - open: `todo` / `in_progress`, ordered by impact (a READ ordering — no stored position exists); dismissed is not open.
+   * - open: `todo` / `in_progress` / `in_review` (a seeding task awaiting verification is still open work), ordered by impact (a READ ordering — no stored position exists); dismissed is not open.
    * - `completedSince` bounds completed work to a token's timeframe lock; null is unbounded.
    * - `hideCompetitors` excludes a task born of a displacement event: it names a competitor by construction.
    */
@@ -327,7 +333,7 @@ export class TasksService {
          ) psi ON t.source_domain_id IS NOT NULL
         WHERE t.project_id = $1
           AND t.deleted_at IS NULL
-          AND t.status IN ('todo', 'in_progress')
+          AND t.status IN ('todo', 'in_progress', 'in_review')
           AND ($4::boolean = false OR t.source_displacement_id IS NULL)
         ORDER BY t.impact_score DESC, t.priority DESC, t.created_at, t.id
         LIMIT $5`,
@@ -587,7 +593,9 @@ export class TasksService {
                    THEN COALESCE(af.severity, psi.gap_severity) END AS severity,
               t.source_finding_id, t.source_domain_id, t.source_displacement_id,
               t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
-              t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at
+              t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
+              (t.source_domain_id IS NOT NULL) AS seeding,
+              ${REVIEW_SELECT}
          FROM tasks t
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
          LEFT JOIN LATERAL (
@@ -724,7 +732,7 @@ export class TasksService {
               impact_score = CASE WHEN $6::boolean THEN GREATEST(impact_score, $3::real) ELSE $3::real END,
               affected_engines = CASE WHEN $6::boolean THEN ARRAY(SELECT DISTINCT e FROM unnest(affected_engines || $4::text[]) AS e ORDER BY e) ELSE $4::text[] END,
               affected_prompt_ids = CASE WHEN $6::boolean THEN ARRAY(SELECT DISTINCT p FROM unnest(affected_prompt_ids || $5::uuid[]) AS p ORDER BY p) ELSE $5::uuid[] END
-        WHERE id = $1 AND status IN ('todo', 'in_progress')
+        WHERE id = $1 AND status IN ('todo', 'in_progress', 'in_review')
           AND ($6::boolean OR last_evidence_at IS NULL OR last_evidence_at < $2)
         RETURNING recurrence_count`,
       [taskId, refresh.evidenceAt, refresh.impactScore, [...refresh.affectedEngines], [...refresh.affectedPromptIds], everyEvent],
@@ -822,27 +830,61 @@ export class TasksService {
    * cannot keep.
    *
    * A `done` or `dismissed` task is a 409 carrying `current_state`.
+   *
+   * STORY-055 (owner decision 30) — A SEEDING TASK (a playbook or a source class) is completed WITH the customer's contribution
+   * URL and does NOT become `done` here. No URL is a 400; an address the pure host rules cannot prove safe is `422 unsafe_target`
+   * (scenario 8; no DNS, no socket: KAD-06). Both are refused before any write. Otherwise the task goes `in_review`, a
+   * `verification_submitted` event records the URL, and `source.verify_presence` is enqueued AFTER COMMIT for that submission; the
+   * job fetches the URL and either completes the task or leaves it in review with a reason. The response is the in_review task
+   * with a null milestone. A task already in review whose URL is still being checked is a 409; one whose last check failed may be
+   * submitted again. A task that is not a seeding task completes exactly as above, and a `url` sent for it is ignored.
    */
-  async completeTask(taskId: string): Promise<CompleteTaskResponse> {
+  async completeTask(taskId: string, body: CompleteTaskRequest = {}): Promise<CompleteTaskResponse> {
     const store = currentTenantStore()!;
     const client = store.client;
     const actorId = store.context.actorId;
 
-    const found = await client.query<{ project_id: string; status: string; title: string; in_scope: boolean; kind: string; source_domain_id: string | null }>(
-      `SELECT t.project_id, t.status, t.title, t.kind, t.source_domain_id,
+    const found = await client.query<{
+      project_id: string;
+      status: string;
+      title: string;
+      in_scope: boolean;
+      kind: string;
+      source_domain_id: string | null;
+      playbook_slug: string | null;
+    }>(
+      `SELECT t.project_id, t.status, t.title, t.kind, t.source_domain_id, t.playbook_slug,
               (cardinality(app.current_scope_projects()) = 0 OR t.project_id = ANY(app.current_scope_projects())) AS in_scope
          FROM tasks t
          JOIN projects p ON p.id = t.project_id
-        WHERE t.id = $1 AND t.deleted_at IS NULL AND p.deleted_at IS NULL
+        WHERE t.id = $1 AND t.workspace_id = app.current_workspace() AND t.deleted_at IS NULL AND p.deleted_at IS NULL
         FOR UPDATE OF t`,
       [taskId],
     );
     const current = found.rows[0];
     if (current === undefined) throw new NotFoundError({ message: "no such task" });
     if (!current.in_scope) throw new ProjectOutOfScopeException();
-    if (current.status !== "todo" && current.status !== "in_progress") {
+    const seeding = isSeedingTask(current);
+    if (current.status !== "todo" && current.status !== "in_progress" && !(seeding && current.status === "in_review")) {
       throw new ConflictError({ message: `a ${current.status} task cannot be completed`, details: { current_state: current.status } });
     }
+
+    if (seeding && current.source_domain_id === null) {
+      // FAIL CLOSED (review r3, the orchestrator's default, open to the owner): a verification needs a domain to hold the page to, and
+      // a playbook-only task has none. Refused with a reason rather than verified against "anywhere on the web".
+      throw new ConflictError({
+        message: "this task has no source domain, so a contribution URL cannot be verified against it",
+        details: { reason: "no_source_domain", current_state: current.status },
+      });
+    }
+    if (!seeding && body.url !== undefined) {
+      throw new ValidationFailedError({
+        message: "url: only a seeding task is completed with a URL",
+        details: { issues: [{ path: ["url"], message: "not accepted: this task has no playbook or source class" }] },
+      });
+    }
+
+    if (seeding) return this.submitForVerification(store, taskId, current, body);
 
     const milestone = await client.query<{ id: string; occurred_at: Date }>(
       `INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title, severity, source_type, source_id, created_by)
@@ -852,7 +894,7 @@ export class TasksService {
     );
     const pinned = milestone.rows[0]!;
     await client.query(
-      `UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1`,
+      `UPDATE tasks SET status = 'done', completed_at = $2, completed_by = $3, milestone_id = $4 WHERE id = $1 AND workspace_id = app.current_workspace()`,
       [taskId, pinned.occurred_at, actorId, pinned.id],
     );
     await client.query(
@@ -867,9 +909,6 @@ export class TasksService {
     // IDs only — never the title.
     this.logger.log({ message: "task completed", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, milestone_id: pinned.id });
     this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
-    if (current.kind === "authority" && current.source_domain_id !== null) {
-      this.requestSeededVerification(store.context.workspaceId, current.project_id, taskId, pinned.occurred_at);
-    }
 
     return {
       task: await this.readTask(client, taskId),
@@ -879,37 +918,108 @@ export class TasksService {
   }
 
   /**
-   * STORY-066 AC8 — `source_seeded` fires on "completion of an authority task with a verified target URL" (`scoring-models.md`
-   * §13). The fetch is never the request's (KAD-06): this enqueues `source.verify_presence` for THIS task AFTER COMMIT (a job
-   * enqueued inside the transaction could run before the `done` row is visible; a rolled-back completion asks for nothing). One
-   * job per COMPLETION: the key is the task's and its `completed_at`, so a double click (a 409 the second time) cannot queue two,
-   * while a task reopened and completed again is verified again rather than deduplicated by the first job's id. At most one pin
-   * still holds: the job skips a task already pinned, and `ux_milestones_source` is unique over the per-task source id. A failed enqueue is logged, never thrown — the
-   * completion is durable, and the domain's next periodic verification still records its presence.
+   * STORY-055 AC5 + AC6 — the seeding-task half of `completeTask`, inside the same transaction and under the same row lock.
+   * Everything refusable is refused BEFORE the first write. The fetch is never the request's (KAD-06): this enqueues
+   * `source.verify_presence` for THIS submission AFTER COMMIT (a job enqueued inside the transaction could run before the
+   * `in_review` row is visible; a rolled-back submission asks for nothing). The key is the submission's event id, so a replayed
+   * request cannot queue two, while a resubmission after a failed check is a new submission and a new job. A failed enqueue is
+   * logged, never thrown - the submission is durable, and the task stays in review pending until the next submit's 409 re-queues it.
    */
-  private requestSeededVerification(workspaceId: string, projectId: string, taskId: string, completedAt: Date): void {
+  private async submitForVerification(
+    store: NonNullable<ReturnType<typeof currentTenantStore>>,
+    taskId: string,
+    current: { project_id: string; status: string },
+    body: CompleteTaskRequest,
+  ): Promise<CompleteTaskResponse> {
+    const client = store.client;
+    if (body.url === undefined) {
+      throw new ValidationFailedError({
+        message: "url: completing a seeding task requires the URL of your contribution",
+        details: { issues: [{ path: ["url"], message: "required: the URL of the contribution to verify" }] },
+      });
+    }
+    const checked = checkSubmittedUrl(body.url);
+    if (!checked.ok && checked.reason === "credentials") {
+      // A malformed submission, not an unsafe target - and the message never echoes what was typed (it may be a password).
+      throw new ValidationFailedError({
+        message: "url: must not contain a user name or password",
+        details: { issues: [{ path: ["url"], message: "must not contain credentials" }] },
+      });
+    }
+    if (!checked.ok) throw new UnsafeTargetError({ message: "this URL cannot be fetched", details: { reason: checked.reason } });
+
+    if (current.status === "in_review") {
+      const latest = await client.query<{ id: string; pending: boolean }>(
+        `SELECT s.id, NOT EXISTS (SELECT 1 FROM task_events a
+                             WHERE a.task_id = s.task_id AND a.workspace_id = app.current_workspace() AND a.event = 'verification_failed' AND a.payload->>'submission_id' = s.id::text) AS pending
+           FROM task_events s
+          WHERE s.task_id = $1 AND s.workspace_id = app.current_workspace() AND s.event = 'verification_submitted'
+          ORDER BY s.occurred_at DESC, s.id DESC LIMIT 1`,
+        [taskId],
+      );
+      const pending = latest.rows[0];
+      if (pending?.pending === true) {
+        // A submission whose job was never queued (the enqueue failed after the commit) or was lost would otherwise sit pending for
+        // ever, and every resubmit would land here. So the 409 RE-QUEUES THE SAME SUBMISSION: the key is the submission's, so a job
+        // that does exist is not duplicated and one that does not is created. Not deferred to after-commit: this request is about to
+        // roll back, and the submission it names was committed long ago.
+        // THE BOUND: `enqueueJob` (queue-factory) dedupes by `deduplication: { id: <the key>, ttl: removeOnComplete.age * 1000 }` - a
+        // DEDUPLICATION WINDOW of 1 hour (removeOnComplete age 3600), not job-id retention: while a job with this key is inside that
+        // window the add returns the existing job, so a re-queue changes nothing for a job that exists, and a job that was never created
+        // is the case it repairs. The 7-day removeOnFail retention does NOT apply to this: it keeps a failed job's record, it does not
+        // block a new add. A job that exists and ends without answering is closed by the handler's `recover` (a terminal failure writes
+        // `unreachable`), so a resubmit is never refused for ever.
+        this.enqueueVerification(store.context.workspaceId, current.project_id, taskId, pending.id);
+        throw new ConflictError({ message: "the submitted URL is still being verified; it is queued again, so check back shortly - if the check cannot finish it will answer \"unreachable\" and you can submit again", details: { current_state: "in_review" } });
+      }
+    }
+
+    const actorId = store.context.actorId;
+    const submitted = await client.query<{ id: string }>(
+      `INSERT INTO task_events (workspace_id, task_id, actor_id, actor_type, event, from_value, to_value, payload, occurred_at)
+       VALUES (app.current_workspace(), $1, $2, 'user', 'verification_submitted', $3, 'in_review', $4::jsonb, clock_timestamp())
+       RETURNING id`,
+      [taskId, actorId, current.status, JSON.stringify({ url: checked.url })],
+    );
+    const submissionId = submitted.rows[0]!.id;
+    await client.query(`UPDATE tasks SET status = 'in_review' WHERE id = $1 AND workspace_id = app.current_workspace()`, [taskId]);
+
+    incrementCounter("nominara_tasks_events_written_total", { event: "verification_submitted" });
+    incrementCounter("nominara_tasks_verification_submitted_total", {});
+    // IDs only — never the title or the URL.
+    this.logger.log({ message: "task submitted for verification", workspace_id: store.context.workspaceId, task_id: taskId, project_id: current.project_id, submission_id: submissionId });
+    this.publishMoved(store.context.workspaceId, { task_id: taskId, project_id: current.project_id });
+    this.requestSubmissionVerification(store.context.workspaceId, current.project_id, taskId, submissionId);
+
+    return { task: await this.readTask(client, taskId), milestone: null, verification: null };
+  }
+
+  private requestSubmissionVerification(workspaceId: string, projectId: string, taskId: string, submissionId: string): void {
+    afterCommit(() => this.enqueueVerification(workspaceId, projectId, taskId, submissionId));
+  }
+
+  /** Enqueues the submission's job (idempotent by key). Never throws: a failed enqueue is logged and counted, and the next submit re-queues it. */
+  private enqueueVerification(workspaceId: string, projectId: string, taskId: string, submissionId: string): void {
     const queues = this.queues;
     if (queues === undefined) {
-      this.logger.warn({ message: "no queue producer: the completed authority task's target is not verified", workspace_id: workspaceId, task_id: taskId });
+      this.logger.warn({ message: "no queue producer: the submitted URL is not verified", workspace_id: workspaceId, task_id: taskId });
       return;
     }
-    afterCommit(() => {
-      void queues
-        .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId }, { idempotencyKey: `srcver:seeded:${taskId}:${completedAt.getTime()}` })
-        .then(() => {
-          incrementCounter("nominara_sources_seeded_requested_total", {});
-        })
-        .catch((error: unknown) => {
-          incrementCounter("nominara_sources_seeded_request_failed_total", {});
-          this.logger.error({
-            message: "seeded verification request failed",
-            workspace_id: workspaceId,
-            project_id: projectId,
-            task_id: taskId,
-            error: error instanceof Error ? error.name : "unknown",
-          });
+    void queues
+      .enqueueTenantJob("source.verify_presence", workspaceId, { projectId, taskId, submissionId }, { idempotencyKey: `taskverify:${submissionId}` })
+      .then(() => {
+        incrementCounter("nominara_tasks_verification_requested_total", {});
+      })
+      .catch((error: unknown) => {
+        incrementCounter("nominara_tasks_verification_request_failed_total", {});
+        this.logger.error({
+          message: "submission verification request failed",
+          workspace_id: workspaceId,
+          project_id: projectId,
+          task_id: taskId,
+          error: error instanceof Error ? error.name : "unknown",
         });
-    });
+      });
   }
 
   /**
@@ -1145,7 +1255,7 @@ export const ACTION_ITEMS_SQL = `WITH open_tasks AS MATERIALIZED (
          SELECT t.id, t.short_ref, t.project_id, t.rule_code, t.title, t.kind, t.impact_score, t.effort_band, t.playbook_slug,
                 t.source_finding_id, t.source_domain_id, t.source_displacement_id, t.created_at, t.affected_url
            FROM tasks t
-          WHERE t.status IN ('todo', 'in_progress')
+          WHERE t.status IN ('todo', 'in_progress', 'in_review')
             AND t.deleted_at IS NULL
           ORDER BY t.impact_score DESC, t.priority DESC
        ),
@@ -1347,6 +1457,22 @@ const SORT_KEYS: Record<TaskSort, string> = {
     `(CASE WHEN ${GOAL_CONTRIBUTES_SQL} THEN 0 ELSE 1 END)::float8 AS k2, (-t.impact_score)::float8 AS k3, t.created_at AS k4`,
 };
 
+/**
+ * Owner decision 30 / STORY-055 - why a task sits `in_review`, read from its latest `verification_submitted` event and that
+ * submission's `verification_failed` answer (migration 0155 keeps both in `task_events`, no column). Evaluated only for an
+ * `in_review` row, so every other task pays nothing. `reason` is null while the job has not answered.
+ */
+const REVIEW_SELECT = `CASE WHEN t.status = 'in_review' THEN (
+             SELECT jsonb_build_object(
+                      'url', s.payload->>'url',
+                      'submitted_at', to_char(s.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                      'reason', f.payload->>'reason')
+               FROM task_events s
+               LEFT JOIN task_events f ON f.task_id = s.task_id AND f.workspace_id = app.current_workspace() AND f.event = 'verification_failed' AND f.payload->>'submission_id' = s.id::text
+              WHERE s.task_id = t.id AND s.workspace_id = app.current_workspace() AND s.event = 'verification_submitted'
+              ORDER BY s.occurred_at DESC, s.id DESC LIMIT 1)
+           END AS review`;
+
 interface TaskRow {
   id: string;
   short_ref: string;
@@ -1373,6 +1499,8 @@ interface TaskRow {
   affected_url: string | null;
   created_at: Date;
   updated_at: Date;
+  seeding: boolean;
+  review: { url: string; submitted_at: string; reason: TaskVerification["reason"] } | null;
   k1_key: string;
   k2_key: string;
   k3_key: string;
@@ -1402,6 +1530,11 @@ function toTask(row: TaskRow): Task {
     resurface_at: row.resurface_at?.toISOString() ?? null,
     completed_at: row.completed_at?.toISOString() ?? null,
     affected_url: row.affected_url,
+    seeding: row.seeding,
+    review:
+      row.review === null || row.review === undefined
+        ? null
+        : { state: row.review.reason === null ? "pending" : "unverified", url: row.review.url, submitted_at: row.review.submitted_at, reason: row.review.reason },
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
   };
