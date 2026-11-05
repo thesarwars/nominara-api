@@ -8,6 +8,8 @@ import {
   POLICY_IN_OWN_MIGRATION,
   PORTAL_SELF_SCOPED_TABLES,
   RLS_POLICY_ROLES,
+  MAINTENANCE_COUNT_ROLE,
+  MAINTENANCE_COUNT_TABLES,
   SHARE_LOOKUP_ROLE,
   TENANT_SCOPE_COLUMN,
 } from "../conventions.js";
@@ -400,6 +402,14 @@ export function computeDefinerOwnerPolicies(tables: readonly TableDescriptor[]):
   if (!tables.some((t) => t.name === "share_tokens")) {
     throw new Error('src/db/rls/generate.ts: the definer-owner policy targets "share_tokens", which is not present in the introspected schema.');
   }
+  // ADR-0004 — one SELECT policy per table the count-only maintenance functions read (migration 0160). Declared so rls-check expects
+  // them; a table missing from the introspected schema fails loud rather than expecting a policy on nothing.
+  const maintenance: ExpectedPolicy[] = MAINTENANCE_COUNT_TABLES.map((table) => {
+    if (!tables.some((t) => t.name === table)) {
+      throw new Error(`src/db/rls/generate.ts: the maintenance definer policy targets "${table}", which is not present in the introspected schema.`);
+    }
+    return { table, policyName: `maintenance_count_${table}`, cmd: "SELECT", roles: [MAINTENANCE_COUNT_ROLE], using: "true", withCheck: null };
+  });
   return [
     {
       table: "share_tokens",
@@ -409,6 +419,7 @@ export function computeDefinerOwnerPolicies(tables: readonly TableDescriptor[]):
       using: "true",
       withCheck: null,
     },
+    ...maintenance,
   ];
 }
 

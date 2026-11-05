@@ -278,6 +278,37 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     }
   }, 180_000);
 
+  it("AC6 / owner decision 58(b) · below the threshold the tick ALERTS (metric + error log) and issues NO REINDEX on any connection: the rebuild is operator-run", async () => {
+    captureAlerts();
+    const { workspaceId, projectId } = await workspaceAndProject();
+    await insertPrompts(workspaceId, projectId, 400);
+    const issued: string[] = [];
+    const original = Client.prototype.query;
+    const spy = vi.spyOn(Client.prototype, "query").mockImplementation(function (this: Client, ...args: unknown[]) {
+      const first = args[0];
+      issued.push(typeof first === "string" ? first : ((first as { text?: string } | undefined)?.text ?? ""));
+      return (original as (...a: unknown[]) => unknown).apply(this, args);
+    } as never);
+    await db.query("ALTER DATABASE nominara_test SET hnsw.ef_search = 1");
+    await db.query("ALTER DATABASE nominara_test SET enable_seqscan = off");
+    try {
+      spy.mockClear();
+      issued.length = 0;
+      const { lines, result } = await captureErrorLogs(run);
+      expect(result.status).toBe("fulfilled");
+      expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_findings_total" && m.labels.check === "vector_recall")).toBe(true);
+      const line = lines.find((l) => l.includes("ix_prompts_embedding"));
+      expect(line).toBeDefined();
+      expect(line).toMatch(/operator-run/);
+      expect(issued.length).toBeGreaterThan(0);
+      expect(issued.filter((q) => /REINDEX|CREATE INDEX|DROP INDEX/i.test(q))).toEqual([]);
+    } finally {
+      spy.mockRestore();
+      await db.query("ALTER DATABASE nominara_test RESET hnsw.ef_search");
+      await db.query("ALTER DATABASE nominara_test RESET enable_seqscan");
+    }
+  }, 180_000);
+
   it("AC14 · a paging finding that coexists with a check that could not run is UNRECOVERABLE (one page, not a retry ladder) and names both", async () => {
     captureAlerts();
     const { workspaceId, projectId } = await workspaceAndProject();
@@ -321,35 +352,72 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows").reduce((sum, m) => sum + m.value, 0)).toBe(1);
   }, 60_000);
 
-  describe("fails closed when the connection cannot see tenant rows (FORCE ROW LEVEL SECURITY)", () => {
-    const blindRole = "integrity_blind";
+  describe("under the documented production role (NOSUPERUSER NOBYPASSRLS, tables FORCE RLS) — owner decision 58(a)", () => {
+    const prodRole = "integrity_prod_like";
+    const deniedRole = "integrity_no_execute";
+    const roleEnv = (user: string, password: string): Env => {
+      const url = new URL(container.getConnectionUri());
+      url.username = user;
+      url.password = password;
+      return { DATABASE_URL: url.toString() } as unknown as Env;
+    };
 
     beforeAll(async () => {
-      await db.query(`CREATE ROLE ${blindRole} LOGIN PASSWORD 'blind' NOSUPERUSER NOBYPASSRLS`);
-      await db.query(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${blindRole}`);
+      await db.query(`CREATE ROLE ${prodRole} LOGIN PASSWORD 'pl' NOSUPERUSER NOBYPASSRLS`);
+      await db.query(`GRANT nominara_owner TO ${prodRole} WITH INHERIT TRUE`);
+      // In production nominara_owner OWNS the tables (so it can read purge_failures, and a direct SELECT on the FORCE-RLS tables returns 0
+      // rows). The test schema is owned by the superuser, so the grant stands in for that ownership.
+      await db.query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO nominara_owner");
+      // Can read purge_failures (the one table read directly) but holds no EXECUTE on the maintenance functions.
+      await db.query(`CREATE ROLE ${deniedRole} LOGIN PASSWORD 'nd' NOSUPERUSER NOBYPASSRLS`);
+      await db.query(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${deniedRole}`);
     });
 
-    it("AC14 / AC6 · a NOSUPERUSER NOBYPASSRLS connection REJECTS instead of reporting orphan_fact_rows = 0", async () => {
+    it("AC14 / AC6 · the orphan scan sees the REAL count across tenants and pages, instead of reading 0", async () => {
       captureAlerts();
-      const { workspaceId, projectId } = await workspaceAndProject();
-      await insertOrphanMention(workspaceId, projectId); // seeded as superuser: the blind role cannot see it
+      const a = await workspaceAndProject();
+      const b = await workspaceAndProject();
+      await insertOrphanMention(a.workspaceId, a.projectId);
+      await insertOrphanMention(a.workspaceId, a.projectId);
+      await insertOrphanMention(b.workspaceId, b.projectId);
+      await insertPrompts(a.workspaceId, a.projectId, 12);
 
-      const url = new URL(container.getConnectionUri());
-      url.username = blindRole;
-      url.password = "blind";
-      const blindEnv = { DATABASE_URL: url.toString() } as unknown as Env;
-
-      const { lines, result } = await captureErrorLogs(() =>
-        createMaintenanceIntegrityHandler({ pool: noPool, env: blindEnv })(db, tick()),
+      const { result } = await captureErrorLogs(() =>
+        createMaintenanceIntegrityHandler({ pool: noPool, env: roleEnv(prodRole, "pl") })(db, tick()),
       );
 
       expect(result.status).toBe("rejected");
-      expect(String((result as PromiseRejectedResult).reason)).toMatch(/privilege/);
+      expect((result as PromiseRejectedResult).reason).toBeInstanceOf(UnrecoverableError);
+      expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows").reduce((sum, m) => sum + m.value, 0)).toBe(3);
+      // The recall check read the tenant's vectors too: an observation, not a skip.
+      expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts")).toBe(true);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total")).toBe(false);
+    }, 120_000);
+
+    it("AC14 / AC6 · a clean estate under that role is an explicit 0, not a failure", async () => {
+      captureAlerts();
+      await expect(createMaintenanceIntegrityHandler({ pool: noPool, env: roleEnv(prodRole, "pl") })(db, tick())).resolves.toBeUndefined();
+      const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows");
+      expect(orphan).toHaveLength(1);
+      expect(orphan[0]!.value).toBe(0);
+    }, 60_000);
+
+    it("AC14 / AC6 · a connection that cannot EXECUTE the definer functions REJECTS instead of reporting orphan_fact_rows = 0", async () => {
+      captureAlerts();
+      const { workspaceId, projectId } = await workspaceAndProject();
+      await insertOrphanMention(workspaceId, projectId); // seeded as superuser: the unprivileged role cannot see it
+
+      const { lines, result } = await captureErrorLogs(() =>
+        createMaintenanceIntegrityHandler({ pool: noPool, env: roleEnv(deniedRole, "nd") })(db, tick()),
+      );
+
+      expect(result.status).toBe("rejected");
+      expect(String((result as PromiseRejectedResult).reason)).toMatch(/definer_function/);
       // No false clean: neither the 0 observation nor a recall skip is emitted.
       expect(metrics.some((m) => m.name === "nominara_maintenance_orphan_fact_rows")).toBe(false);
       expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_skipped_total")).toBe(false);
-      expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total" && m.labels.check === "privilege")).toBe(true);
-      expect(lines.some((l) => l.includes("cannot see tenant rows"))).toBe(true);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total" && m.labels.check === "definer_function")).toBe(true);
+      expect(lines.some((l) => l.includes("maintenance definer functions"))).toBe(true);
     }, 60_000);
   });
 

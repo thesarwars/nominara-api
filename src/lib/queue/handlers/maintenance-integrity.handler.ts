@@ -11,7 +11,7 @@ import {
   findUnresolvedPurgeFailures,
   PURGE_FAILURE_GRACE_DAYS,
 } from "../../../db/purge-check.js";
-import { assertCanSeeTenantRows, computeRecallAtK, TENANT_BLIND_MESSAGE } from "../../../workers/rollup/maintenance.js";
+import { assertMaintenanceDefinerAvailable, computeRecallAtK, MAINTENANCE_DEFINER_UNAVAILABLE_MESSAGE } from "../../../workers/rollup/maintenance.js";
 import { scanForOrphans } from "../../../workers/rollup/retention.js";
 import { drainAlertEmails, emailAlert } from "../../alerts/alerts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
@@ -36,18 +36,21 @@ import type { JobProcessor } from "../worker-factory.js";
 // dead-letter queue is the one channel here an operator actually reads (see `audit-verify.handler.ts`, whose reasoning this follows).
 // `db:purge-check` remains the release-train gate; wiring it into a pipeline is the infrastructure remainder.
 //
-// ⚠ READ-ONLY, AND THE REBUILD IS DELIBERATELY NOT HERE. A recall below `VECTOR_RECALL_THRESHOLD` is reported and flagged; the
-// `REINDEX CONCURRENTLY` at a higher ef_construction stays operator-invoked (`pnpm db:maintenance:run`), which is the split
-// `maintenance-partition.handler.ts` documents for every destructive or resource-heavy step. Whether the nightly tick may rebuild
-// by itself is an owner decision, raised in the STORY-013 evidence.
+// ⚠ READ-ONLY, AND THE REBUILD IS DELIBERATELY NOT HERE (owner decision 58(b)). A recall below `VECTOR_RECALL_THRESHOLD` raises an ALERT
+// ONLY: a metric (`nominara_maintenance_integrity_findings_total{check="vector_recall"}`), an error log and an alert email. The job does
+// NOT rebuild. The `REINDEX CONCURRENTLY` at a higher ef_construction stays OPERATOR-RUN (`pnpm db:maintenance:run`), which is the split
+// `maintenance-partition.handler.ts` documents for every destructive or resource-heavy step. Nothing in this file may import
+// `rebuildHnswIndex` or `runRecallCheck`; the integration case "issues NO REINDEX on any connection" fails if the tick ever rebuilds.
 //
 // ⚠ ONE CHECK THROWING DOES NOT SKIP THE OTHERS, and a check that could not RUN is not a clean check. An orphan scan that errors
 // must never read as "no orphans", so a check failure fails the job (an ordinary error: retrying a database fault is right) after
 // the other checks have reported.
 //
-// ⚠ THE OWNER CONNECTION: `scanForOrphans` and `purge_failures` are cross-tenant by definition and `purge_failures` has no runtime
-// grant; the pooled role would see nothing and report a clean estate, the worst outcome for an integrity check. Direct (not the
-// pooler) because it holds a session advisory lock; keepalives so a partitioned replica cannot strand it for two hours.
+// ⚠ THE OWNER CONNECTION AND THE COUNT-ONLY DEFINER (owner decision 58(a), docs/adr/ADR-0004): the orphan scan and the recall check read
+// FORCE-RLS tenant tables across every workspace, which the documented NOSUPERUSER NOBYPASSRLS identity cannot do directly (it reads 0 rows
+// and looks clean). They call three count-only SECURITY DEFINER functions (migration 0160) owned by `nominara_maintenance`. `purge_failures`
+// is global with no RLS and no runtime grant, so it is still read directly by the owner connection. Direct (not the pooler) because it
+// holds a session advisory lock; keepalives so a partitioned replica cannot strand it for two hours.
 //
 // ⚠ WHAT IS LOGGED: workspace and project IDs, table and partition names, counts. Never a workspace name, a purge-failure `reason`
 // (an error message, which can carry row values) or any row content.
@@ -137,17 +140,17 @@ export function createMaintenanceIntegrityHandler(
         return { kind: "yielded", findings, checkErrors };
       }
 
-      // ⚠ FAIL CLOSED FIRST. Every table below is FORCE ROW LEVEL SECURITY: a connection that is neither superuser nor BYPASSRLS reads
-      // zero rows without an error, which would present as "no orphans" and "nothing to measure" every night. Not a row count — the
-      // privilege. If it fails, NOTHING is checked and nothing is observed: no 0 and no skip.
+      // ⚠ FAIL CLOSED FIRST. If the connection cannot EXECUTE the count-only definer functions, the orphan scan and the recall check cannot
+      // see the FORCE-RLS tables and would present as "no orphans" and "nothing to measure" every night. Not a row count: the functions'
+      // existence and EXECUTE. If it fails, NOTHING is checked and nothing is observed: no 0 and no skip.
       try {
-        await assertCanSeeTenantRows(client);
+        await assertMaintenanceDefinerAvailable(client);
       } catch {
-        checkErrors.push("privilege");
-        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "privilege" });
+        checkErrors.push("definer_function");
+        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "definer_function" });
         logger.error({
-          message: `integrity checks not run: the connection ${TENANT_BLIND_MESSAGE} (FORCE ROW LEVEL SECURITY)`,
-          check: "privilege",
+          message: `integrity checks not run: the connection ${MAINTENANCE_DEFINER_UNAVAILABLE_MESSAGE} (FORCE ROW LEVEL SECURITY)`,
+          check: "definer_function",
         });
         return { kind: "ran", findings, checkErrors };
       }
@@ -325,7 +328,7 @@ export function createMaintenanceIntegrityHandler(
           {
             check: "vector_recall",
             pages: false,
-            summary: `vector recall for ${indexName} is below ${String(VECTOR_RECALL_THRESHOLD)} — a concurrent rebuild is due (operator-run)`,
+            summary: `vector recall for ${indexName} is below ${String(VECTOR_RECALL_THRESHOLD)} — alert only, NOT rebuilt: the concurrent rebuild is operator-run (pnpm db:maintenance:run)`,
           },
           "maintenance_vector_recall_below_threshold",
           { table, indexName, recall, threshold: VECTOR_RECALL_THRESHOLD },

@@ -7,6 +7,7 @@ import { assertIso23ViewsSecurityInvoker } from "./assertions/iso-23-views-secur
 import { assertIso26ShareLookupReturnsOnlyHashedRow } from "./assertions/iso-26-share-lookup-returns-only-hashed-row.js";
 import { assertIso24DefinerOwnerNoMembers } from "./assertions/iso-24-definer-owner-no-members.js";
 import { assertIso25ShareLookupDefinerShape } from "./assertions/iso-25-share-lookup-definer-shape.js";
+import { assertIso27MaintenanceDefinerShape } from "./assertions/iso-27-maintenance-definer-shape.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
 import { getAssertionContext } from "./support/context.js";
 
@@ -68,5 +69,11 @@ describe("ISO-25 · app.share_token_by_hash is a pinned SECURITY DEFINER functio
 describe("ISO-26 · app.share_token_by_hash returns only the hashed token's row", () => {
   it("as nominara_app with no context: one row per own hash, gate columns only, none for an unknown hash, share_tokens unreadable", async () => {
     await expect(assertIso26ShareLookupReturnsOnlyHashedRow(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-27 · the app.maintenance_* functions are pinned, count-only SECURITY DEFINERs executable by nominara_owner alone", () => {
+  it("holds in pg_proc", async () => {
+    await expect(assertIso27MaintenanceDefinerShape(getAssertionContext())).resolves.toBeUndefined();
   });
 });

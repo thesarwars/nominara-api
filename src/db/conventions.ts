@@ -164,6 +164,22 @@ export const BREAKGLASS_ROLE = "nominara_breakglass";
 // share_tokens through one role-targeted SELECT policy, and its reach is bounded by a 14-column SELECT grant.
 export const SHARE_LOOKUP_ROLE = "nominara_share_lookup";
 
+// STORY-013 round 2 (migration 0160, ADR-0004) — the dedicated, NOLOGIN owner of the three count-only app.maintenance_* functions the
+// nightly integrity checks call. Same shape as the role above: NOBYPASSRLS, no members, admitted by one SELECT policy per table it
+// reads, reach bounded by column-level SELECT grants on key columns.
+export const MAINTENANCE_COUNT_ROLE = "nominara_maintenance";
+
+/** The tables the maintenance role reads (through the parents, so new partitions need nothing). One policy each, declared to rls-check. */
+export const MAINTENANCE_COUNT_TABLES = [
+  "answer_captures",
+  "mention_facts",
+  "citation_facts",
+  "tracked_prompts",
+  "topic_clusters",
+  "content_chunks",
+  "corpus_passages",
+] as const;
+
 // Ordered src/api, src/gateway, src/workers/*, replica-only reporting,
 // share-token portal — matches the comments in security-and-tenancy.md §2.
 export const RUNTIME_ROLES = ["nominara_app", "nominara_worker", "nominara_report", "nominara_portal"] as const;
@@ -205,6 +221,7 @@ export const DATABASE_ROLES: Record<string, DatabaseRoleSpec> = {
  */
 export const DEFINER_OWNER_ROLES: Record<string, DatabaseRoleSpec> = {
   nominara_share_lookup: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
+  nominara_maintenance: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
 };
 
 // STORY-120 — the migration ledger (src/db/migrate-runner.ts's BOOTSTRAP_SQL)

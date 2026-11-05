@@ -14,7 +14,6 @@ import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
 import { appendMark, appendTombstone, findBrokenMark, readChainHead } from "../../modules/audit/audit-chain-marks.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
-import { listPartitions } from "./maintenance.js";
 
 const auditChain = new AuditChainService();
 const logger = new Logger("retention.sweep");
@@ -69,10 +68,6 @@ const logger = new Logger("retention.sweep");
 //   Proven, not just claimed: retention-cascade.spec.ts includes an explicit
 //   test connecting as `nominara_worker` and asserting the `ALTER TABLE ...
 //   DISABLE TRIGGER` step fails with a permission error.
-
-function quoteIdent(value: string): string {
-  return `"${value.replace(/"/g, '""')}"`;
-}
 
 // ---------------------------------------------------------------------------
 // Retention-window resolution — plans.entitlements->'retention.*_days'->'value'.
@@ -734,23 +729,15 @@ export interface OrphanReport {
 }
 
 export async function scanForOrphans(client: ClientBase): Promise<OrphanReport[]> {
-  const reports: OrphanReport[] = [];
-  for (const table of ["mention_facts", "citation_facts"] as const) {
-    for (const partition of await listPartitions(client, table)) {
-      const result = await client.query<{ count: string }>(
-        `SELECT count(*)::text AS count
-           FROM ${quoteIdent(partition.name)} f
-          WHERE NOT EXISTS (
-            SELECT 1 FROM answer_captures a WHERE a.id = f.result_id AND a.captured_at = f.captured_at AND a.workspace_id = f.workspace_id
-          )`,
-      );
-      const orphanCount = Number(result.rows[0]!.count);
-      if (orphanCount > 0) {
-        reports.push({ table, partition: partition.name, orphanCount });
-      }
-    }
-  }
-  return reports;
+  // Cross-tenant by definition, so it goes through the count-only SECURITY DEFINER function (migration 0160, ADR-0004): a direct scan
+  // from a NOSUPERUSER NOBYPASSRLS connection would read 0 rows under FORCE RLS. Counts and partition names only; a partition with no
+  // orphan is not returned.
+  const result = await client.query<{ parent_table: "mention_facts" | "citation_facts"; partition_name: string; orphan_count: string }>(
+    "SELECT parent_table, partition_name, orphan_count::text AS orphan_count FROM app.maintenance_orphan_counts() ORDER BY parent_table, partition_name",
+  );
+  return result.rows
+    .map((row) => ({ table: row.parent_table, partition: row.partition_name, orphanCount: Number(row.orphan_count) }))
+    .filter((report) => report.orphanCount > 0);
 }
 
 export const ORPHAN_SCAN_PAGE_MESSAGE = "orphan fact row(s) detected — a fact was written outside its parent's transaction";

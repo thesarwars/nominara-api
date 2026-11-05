@@ -299,23 +299,42 @@ describe("STORY-142 · maintenance.partition handler", () => {
     }
   }, 60_000);
 
-  it("STORY-013 AC3 · a connection that cannot see tenant rows FAILS the job and emits no false 0 gauge", async () => {
-    await db.query("CREATE ROLE partition_blind LOGIN PASSWORD 'blind' NOSUPERUSER NOBYPASSRLS");
-    await db.query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO partition_blind");
-    // The runway is already complete from earlier cases, so the blind role needs no DDL right to get as far as the reading.
+  it("STORY-013 r2 AC3 · under a NOSUPERUSER NOBYPASSRLS role the default-partition count is the REAL count (owner decision 58a)", async () => {
+    await db.query("CREATE ROLE partition_prod_like LOGIN PASSWORD 'pl' NOSUPERUSER NOBYPASSRLS");
+    await db.query("GRANT nominara_owner TO partition_prod_like WITH INHERIT TRUE");
+    // The runway is already complete from earlier cases, so the role needs no DDL right to get as far as the reading.
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    await insertCapture(new Date(Date.UTC(2031, 5, 15)).toISOString());
+    const url = new URL(container.getConnectionUri());
+    url.username = "partition_prod_like";
+    url.password = "pl";
+    observations.length = 0;
+    counters.length = 0;
+
+    await expect(createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick())).resolves.toBeUndefined();
+
+    const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
+    expect(gauge.length).toBeGreaterThan(0);
+    expect(gauge.at(-1)!.value).toBeGreaterThanOrEqual(1);
+    expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total")).toBe(false);
+  }, 60_000);
+
+  it("STORY-013 r2 AC3 · a connection that cannot EXECUTE the definer function FAILS the job and emits no false 0 gauge", async () => {
+    await db.query("CREATE ROLE partition_no_execute LOGIN PASSWORD 'nd' NOSUPERUSER NOBYPASSRLS");
+    await db.query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO partition_no_execute");
     await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
     const url = new URL(container.getConnectionUri());
-    url.username = "partition_blind";
-    url.password = "blind";
+    url.username = "partition_no_execute";
+    url.password = "nd";
     observations.length = 0;
     counters.length = 0;
 
     await expect(
       createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick()),
-    ).rejects.toThrow(/cannot see tenant rows/);
+    ).rejects.toThrow(/definer/);
 
     expect(observations.some((o) => o.name === "nominara_partition_default_rows")).toBe(false);
-    expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "default_partition_rows")).toBe(true);
+    expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "definer_function")).toBe(true);
   }, 60_000);
 
   it("STORY-013 · partition DDL behind a long reader of the parent FAILS FAST (lock_timeout) instead of queueing writers behind it", async () => {

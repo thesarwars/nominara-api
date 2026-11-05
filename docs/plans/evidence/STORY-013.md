@@ -62,3 +62,31 @@ Spans: `maintenance.integrity` with outcome and finding-count attributes; not as
 
 * STORY-013 status check: AC3, AC6, AC14, AC16 code hooks closed; the infra remainders above stay open.
 * `system-architecture.md` §4: add `maintenance.integrity` (daily, not in the original table) to the added-queues list, as for `audit.verify`.
+
+## Review round 2 — owner decision 58 (migration 0160, ADR-0004)
+
+* (a) The integrity checks now work under the documented `NOSUPERUSER NOBYPASSRLS` identity. Migration `0160` adds the NOLOGIN NOBYPASSRLS role
+  `nominara_maintenance` and three count-only SECURITY DEFINER functions it owns: `app.maintenance_default_partition_rows()` (AC3),
+  `app.maintenance_orphan_counts()` (AC14), `app.maintenance_recall_overlap(text, halfvec, int)` (AC6 inputs: a non-null count and the ANN/exact
+  top-k overlap; no id or vector leaves it). One `FOR SELECT TO nominara_maintenance USING (true)` policy per table read (seven), column-level SELECT
+  on key columns only, EXECUTE for `nominara_owner` only. `assertCanSeeTenantRows` is gone: the handlers assert the functions exist and are
+  executable (`check="definer_function"`), and still fail closed with no 0 and no skip. `purge_failures` (global, no RLS) is still read directly.
+* A column-level grant does not cover `tableoid`, so partitions are identified by their range bounds (`pg_class.relpartbound`) applied through the
+  parent; the first cut with `tableoid` failed with a table-level permission error and is why (ADR-0004 consequences).
+* `runPartitionRunwayMaintenance` now records a failed default-partition count instead of throwing before the runway is extended; the handler then
+  fails the job after the runway, as before.
+* (b) A recall below 0.98 raises the alert (metric + error log naming "operator-run") and does NOT rebuild; the code header and the log line say so, and a
+  case fails if any REINDEX / CREATE INDEX / DROP INDEX is issued on any connection during the tick.
+* (c) The 03:10 UTC cron is unchanged.
+* Tests: `maintenance-count-definer.spec.ts` MD-1..MD-9 (real counts across three tenants as a NOSUPERUSER NOBYPASSRLS role with a blind-control read;
+  counts-only output types and hostile `p_table`/`p_k`; column-only grants; runtime roles get 42501; owner/policy shape; ISO-07; missing default
+  partition raises; 0160 rolls back and re-applies), `ISO-27` with a breaker (EXECUTE granted to PUBLIC), DEF-U1/U4/U5 in `rls-generate.spec.ts`.
+  The retention-cascade "privilege proof" now asserts the worker is refused (42501) and reads 0 directly.
+* Evidence: red `013r2-red-unit.log`, `013r2-red-int.log`; green `013r2-*.log`.
+
+### Doc changes needed (docs repo; not edited here)
+
+* security-and-tenancy.md section 2: add `nominara_maintenance` (NOLOGIN, NOBYPASSRLS, definer-owner) next to `nominara_share_lookup`; section 3: seven
+  role-targeted SELECT policies; ADR-0004 to the ADR index.
+* data-model.md section 8 step 4: the nightly check ALERTS only; the rebuild is operator-run (decision 58b).
+* STORY-013 Technical notes: new files (migration 0160, ADR-0004, `maintenance-count-definer.spec.ts`, ISO-27) and `src/db/conventions.ts`, `src/db/rls/generate.ts`.

@@ -2,7 +2,7 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
-import { assertCanSeeTenantRows, runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
+import { assertMaintenanceDefinerAvailable, runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
 import { PARTITIONED_FACT_TABLES } from "../../../db/conventions.js";
 import { drainAlertEmails, emailAlert } from "../../alerts/alerts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
@@ -86,15 +86,21 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
         logger.error(`could not create ${failure.partition}: ${failure.reason}`);
       }
 
-      // ⚠ FAIL CLOSED, AFTER the runway (the DDL needs no tenant visibility, so a blind role must not stop the runway being extended):
-      // the default-partition count below reads under FORCE RLS, and a blind role reads a structural 0. No false-clean gauge, no alert
-      // logic on that 0: the job fails and the check error is counted.
-      try {
-        await assertCanSeeTenantRows(client);
-      } catch (error) {
-        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "default_partition_rows" });
-        logger.error("default-partition check could not run: the connection cannot see tenant rows (FORCE ROW LEVEL SECURITY)");
-        throw error;
+      // ⚠ FAIL CLOSED, AFTER the runway (the DDL needs no tenant visibility, so a connection that cannot count must not stop the runway
+      // being extended): the default-partition count goes through the count-only definer function (migration 0160, ADR-0004). If the
+      // connection cannot execute it, or the count failed, there is no false-clean gauge and no alert logic on an unknown: the job fails
+      // and the check error is counted.
+      if (result.defaultPartitionCheckError !== undefined) {
+        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "definer_function" });
+        try {
+          await assertMaintenanceDefinerAvailable(client);
+        } catch (unavailable) {
+          logger.error("default-partition check could not run: the connection cannot execute the maintenance definer functions (FORCE ROW LEVEL SECURITY)");
+          throw unavailable;
+        }
+        // The functions are callable, so the count itself failed. The error CLASS only: a database message can carry row values.
+        logger.error({ message: "default-partition check could not run", error: result.defaultPartitionCheckError.name });
+        throw result.defaultPartitionCheckError;
       }
 
       // ⚠ AN ALERT DOES NOT FAIL THE JOB, and the distinction matters. Rows in
