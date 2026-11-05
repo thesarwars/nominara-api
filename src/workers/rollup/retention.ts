@@ -741,7 +741,7 @@ export async function scanForOrphans(client: ClientBase): Promise<OrphanReport[]
         `SELECT count(*)::text AS count
            FROM ${quoteIdent(partition.name)} f
           WHERE NOT EXISTS (
-            SELECT 1 FROM answer_captures a WHERE a.id = f.result_id AND a.captured_at = f.captured_at
+            SELECT 1 FROM answer_captures a WHERE a.id = f.result_id AND a.captured_at = f.captured_at AND a.workspace_id = f.workspace_id
           )`,
       );
       const orphanCount = Number(result.rows[0]!.count);

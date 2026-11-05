@@ -25,6 +25,25 @@ sends an alert email per table with stranded rows. It still does not fail the jo
 Existing metrics/log names were left as they were (`partition_default_rows_detected`, the warn line), so no existing assertion changed.
 Spans: `maintenance.integrity` with outcome and finding-count attributes; not asserted, because no in-memory span exporter exists in the repo.
 
+## Review round 1 — what changed, and what is NOT working in production yet
+
+* ⚠ AC3, AC6 and AC14 are NOT working production hooks under the documented role model. Every table they read is FORCE ROW LEVEL SECURITY
+  (0006) and `nominara_owner` is NOSUPERUSER NOBYPASSRLS (security-and-tenancy.md §2), so on that role they would read zero rows and look clean.
+  They now FAIL CLOSED: `assertCanSeeTenantRows` (rolsuper OR rolbypassrls) runs before any check; if it fails, no 0 and no recall skip is
+  observed, `nominara_maintenance_integrity_check_errors_total{check="privilege"}` (or `default_partition_rows`) is counted, an error log is
+  written and the job fails. Proven by an integration case on a NOSUPERUSER NOBYPASSRLS login role (mutation: guard removed -> red).
+  They report truthfully only on a connection that can see tenant rows (a superuser or BYPASSRLS role, which is what the tests use).
+  The lasting fix (a count-only SECURITY DEFINER function owned by a dedicated role, admitted by one role-targeted policy, the ADR-0002
+  pattern) needs an ADR and an owner decision: raised, not chosen.
+* A paging finding that coexists with a check that could not run is now `UnrecoverableError` naming both (one page, no retry ladder).
+* The orphan scan also requires the parent's `workspace_id` to match (a cross-workspace mis-parent is an orphan).
+* Partition DDL: `SET LOCAL lock_timeout = 5s` in `createPartition` (applies to the operator-run monthly maintenance too), and the orphan
+  scan runs under a transaction-local `statement_timeout` of 300 s, so the 03:10 reader cannot stall writers behind the 03:20 DDL.
+* The purge-failure alert no longer claims a release is blocked: `db:purge-check` is not wired into any pipeline.
+* Alert mail is best-effort (90 s drain budget); the failed job in the dead-letter queue is the reliable signal.
+* Evidence honesty: the original red-before-green was structural (registry/topology/schedule unit tests); the integration red was killed
+  (013-red-int.log EXIT=143), so behavioural evidence for the first cut is 013-mutation1.log. Round 1 has its own red/green and mutation logs (013r1-*).
+
 ## Deliberately NOT done (decisions kept)
 
 * The scheduled tick takes no ACCESS EXCLUSIVE-class lock and issues no DDL. `catchUpDefaultPartition` stays operator-run.

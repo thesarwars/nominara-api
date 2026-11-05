@@ -11,7 +11,7 @@ import {
   findUnresolvedPurgeFailures,
   PURGE_FAILURE_GRACE_DAYS,
 } from "../../../db/purge-check.js";
-import { computeRecallAtK } from "../../../workers/rollup/maintenance.js";
+import { assertCanSeeTenantRows, computeRecallAtK, TENANT_BLIND_MESSAGE } from "../../../workers/rollup/maintenance.js";
 import { scanForOrphans } from "../../../workers/rollup/retention.js";
 import { drainAlertEmails, emailAlert } from "../../alerts/alerts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
@@ -54,6 +54,10 @@ import type { JobProcessor } from "../worker-factory.js";
 
 const tracer = trace.getTracer("nominara-api");
 
+const ALERT_DRAIN_BUDGET_MS = 90_000;
+/** Bounds each scan statement (transaction-local) so the nightly reader cannot hold AccessShareLock on the hot parents indefinitely. */
+const SCAN_STATEMENT_TIMEOUT_MS = 300_000;
+
 interface Finding {
   readonly check:
     | "orphan_facts"
@@ -84,21 +88,28 @@ export function createMaintenanceIntegrityHandler(
         );
         const paging = outcome.findings.filter((finding) => finding.pages);
 
-        // Alerts leave AFTER the lock and the connection are gone: a mail provider can take ~90 s with retries.
-        if (outcome.findings.length > 0) await drainAlertEmails();
+        // Alerts leave AFTER the lock and the connection are gone, and the drain waits for the provider's stated budget (~90 s with
+        // retries) rather than the 5 s default. Even so the email is BEST-EFFORT: the failed job in the dead-letter queue is the
+        // reliable signal, never the mail.
+        if (outcome.findings.length > 0) await drainAlertEmails(ALERT_DRAIN_BUDGET_MS);
 
-        if (outcome.checkErrors.length > 0) {
-          span.setStatus({ code: SpanStatusCode.ERROR });
-          throw new Error(
-            `maintenance.integrity: ${String(outcome.checkErrors.length)} check(s) could not run: ${outcome.checkErrors.join(", ")}`,
-          );
-        }
+        const couldNotRun =
+          outcome.checkErrors.length > 0
+            ? `${String(outcome.checkErrors.length)} check(s) could not run: ${outcome.checkErrors.join(", ")}`
+            : undefined;
         if (paging.length > 0) {
           span.setStatus({ code: SpanStatusCode.ERROR });
-          // Unrecoverable: ONE page per night, never a retry ladder re-running a scan whose answer has not changed.
+          // Unrecoverable: ONE page per night, never a retry ladder re-running a scan whose answer has not changed and re-sending the
+          // page. A check that also could not run is named in the same message, so neither is lost.
           throw new UnrecoverableError(
-            `maintenance.integrity paged: ${paging.map((finding) => finding.summary).join("; ")}`,
+            `maintenance.integrity paged: ${paging.map((finding) => finding.summary).join("; ")}` +
+              (couldNotRun === undefined ? "" : `; ${couldNotRun}`),
           );
+        }
+        if (couldNotRun !== undefined) {
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          // Retryable: nothing has paged, so retrying a database fault sends no duplicate.
+          throw new Error(`maintenance.integrity: ${couldNotRun}`);
         }
       } finally {
         span.end();
@@ -124,6 +135,21 @@ export function createMaintenanceIntegrityHandler(
           "another replica holds the maintenance-integrity lock; yielding this tick",
         );
         return { kind: "yielded", findings, checkErrors };
+      }
+
+      // ⚠ FAIL CLOSED FIRST. Every table below is FORCE ROW LEVEL SECURITY: a connection that is neither superuser nor BYPASSRLS reads
+      // zero rows without an error, which would present as "no orphans" and "nothing to measure" every night. Not a row count — the
+      // privilege. If it fails, NOTHING is checked and nothing is observed: no 0 and no skip.
+      try {
+        await assertCanSeeTenantRows(client);
+      } catch {
+        checkErrors.push("privilege");
+        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "privilege" });
+        logger.error({
+          message: `integrity checks not run: the connection ${TENANT_BLIND_MESSAGE} (FORCE ROW LEVEL SECURITY)`,
+          check: "privilege",
+        });
+        return { kind: "ran", findings, checkErrors };
       }
 
       const checks: { name: string; run: () => Promise<void> }[] = [
@@ -182,11 +208,30 @@ export function createMaintenanceIntegrityHandler(
     emailAlert(finding.summary, { alertName, ...context });
   }
 
+  /**
+   * The orphan scan anti-joins whole fact partitions against `answer_captures` and so holds AccessShareLock on it for as long as a
+   * statement runs; the partition DDL needs ACCESS EXCLUSIVE on that parent. Bounded here (transaction-local, so never session
+   * state) and, on the DDL side, by `lock_timeout` in `createPartition`. A timeout is a check error: the job fails, never a clean 0.
+   * (The recall check touches only the vector tables, which no partition DDL takes, and opens its own transaction.)
+   */
+  async function withStatementTimeout<T>(client: Client, fn: () => Promise<T>): Promise<T> {
+    await client.query("BEGIN");
+    try {
+      await client.query(`SET LOCAL statement_timeout = '${String(SCAN_STATEMENT_TIMEOUT_MS)}ms'`);
+      const value = await fn();
+      await client.query("COMMIT");
+      return value;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
   async function checkOrphans(
     client: Client,
     findings: Finding[],
   ): Promise<void> {
-    const reports = await scanForOrphans(client);
+    const reports = await withStatementTimeout(client, () => scanForOrphans(client));
     const total = reports.reduce((sum, report) => sum + report.orphanCount, 0);
     // 0 is an observation, not absence.
     observeValue("nominara_maintenance_orphan_fact_rows", total);
@@ -245,7 +290,7 @@ export function createMaintenanceIntegrityHandler(
         {
           check: "purge_failures_blocking",
           pages: true,
-          summary: `${String(blocking.length)} purge failure(s) unresolved past ${String(PURGE_FAILURE_GRACE_DAYS)} days — the release train is blocked`,
+          summary: `${String(blocking.length)} purge failure(s) unresolved past ${String(PURGE_FAILURE_GRACE_DAYS)} days — db:purge-check will fail the release gate once it is wired (not yet enforced)`,
         },
         "retention_purge_failure_blocking",
         { blocking: blocking.length, graceDays: PURGE_FAILURE_GRACE_DAYS },

@@ -142,6 +142,8 @@ async function createPartitionStatements(
   }
 }
 
+export const PARTITION_DDL_LOCK_TIMEOUT_MS = 5_000;
+
 /**
  * Creates one partition, atomically. `CREATE TABLE ... PARTITION OF` and
  * `apply_tenant_rls` used to run as two separate autocommitted statements —
@@ -156,6 +158,9 @@ async function createPartitionStatements(
 async function createPartition(client: ClientBase, table: string, name: string, start: Date, end: Date): Promise<void> {
   await client.query("BEGIN");
   try {
+    // Bounded wait for the ACCESS EXCLUSIVE lock on the parent: a long reader (the nightly integrity scan) must make this DDL fail and
+    // retry tomorrow, never queue every capture INSERT behind a pending exclusive lock. Transaction-local.
+    await client.query(`SET LOCAL lock_timeout = '${String(PARTITION_DDL_LOCK_TIMEOUT_MS)}ms'`);
     await createPartitionStatements(client, table, name, start, end);
     await client.query("COMMIT");
   } catch (error) {
@@ -277,6 +282,25 @@ export interface DefaultPartitionAlert {
   readonly table: PartitionedFactTable;
   readonly defaultPartition: string;
   readonly rowCount: number;
+}
+
+/**
+ * ⚠ FAIL CLOSED: every tenant table carries FORCE ROW LEVEL SECURITY, so a role that is neither a superuser nor BYPASSRLS reads ZERO rows
+ * with no error. A cross-tenant READ made on such a connection (orphan scan, recall check, default-partition count) would report a clean
+ * estate. The check is on the privilege, never on a row count (a blind role also sees an empty `workspaces`) — same query and reasoning
+ * as `assertVerifierCanSee` in audit-verify.ts. The lasting fix (a count-only SECURITY DEFINER function behind a role-targeted policy)
+ * needs an ADR and an owner decision; see docs/plans/evidence/STORY-013.md.
+ */
+export const TENANT_BLIND_MESSAGE = "cannot see tenant rows";
+
+export async function assertCanSeeTenantRows(client: ClientBase): Promise<void> {
+  const result = await client.query<{ can_see: boolean }>(
+    "SELECT (rolsuper OR rolbypassrls) AS can_see FROM pg_roles WHERE rolname = current_user",
+  );
+  if (result.rows[0]?.can_see === true) return;
+  throw new Error(
+    `this connection ${TENANT_BLIND_MESSAGE}: its role neither is a superuser nor bypasses row-level security (privilege), so a count would read 0 whatever the data holds`,
+  );
 }
 
 export async function detectDefaultPartitionRows(client: ClientBase): Promise<DefaultPartitionAlert[]> {

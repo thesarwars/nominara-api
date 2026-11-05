@@ -2,7 +2,7 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
-import { runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
+import { assertCanSeeTenantRows, runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
 import { PARTITIONED_FACT_TABLES } from "../../../db/conventions.js";
 import { drainAlertEmails, emailAlert } from "../../alerts/alerts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
@@ -86,6 +86,17 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
         logger.error(`could not create ${failure.partition}: ${failure.reason}`);
       }
 
+      // ⚠ FAIL CLOSED, AFTER the runway (the DDL needs no tenant visibility, so a blind role must not stop the runway being extended):
+      // the default-partition count below reads under FORCE RLS, and a blind role reads a structural 0. No false-clean gauge, no alert
+      // logic on that 0: the job fails and the check error is counted.
+      try {
+        await assertCanSeeTenantRows(client);
+      } catch (error) {
+        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "default_partition_rows" });
+        logger.error("default-partition check could not run: the connection cannot see tenant rows (FORCE ROW LEVEL SECURITY)");
+        throw error;
+      }
+
       // ⚠ AN ALERT DOES NOT FAIL THE JOB, and the distinction matters. Rows in
       // the default partition are a fact about the estate that this run has
       // just reported — throwing would send the tick down the retry ladder and
@@ -114,8 +125,11 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
         observeValue("nominara_partition_default_rows", stranded?.rowCount ?? 0, { table });
       }
     } finally {
-      await client.end();
-      await drainAlertEmails();
+      try {
+        await client.end();
+      } finally {
+        await drainAlertEmails();
+      }
     }
   };
 }

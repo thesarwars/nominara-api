@@ -5,7 +5,7 @@ import type { Job } from "bullmq";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createMaintenancePartitionHandler } from "../../src/lib/queue/handlers/maintenance-partition.handler.js";
 import type { Env } from "../../src/config/env.schema.js";
-import { PARTITION_LEAD_MONTHS } from "../../src/db/conventions.js";
+import { PARTITION_LEAD_MONTHS, PARTITIONED_FACT_TABLES } from "../../src/db/conventions.js";
 
 // STORY-142 — the tick for `maintenance.partition`.
 //
@@ -285,6 +285,12 @@ describe("STORY-142 · maintenance.partition handler", () => {
       const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
       expect(gauge).toHaveLength(1);
       expect(gauge[0]!.value).toBeGreaterThanOrEqual(1);
+      // 0 is an observation, not absence: EVERY fact table reports exactly once, and the clean ones report 0.
+      for (const table of PARTITIONED_FACT_TABLES) {
+        const perTable = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === table);
+        expect(perTable, table).toHaveLength(1);
+        if (table !== "answer_captures") expect(perTable[0]!.value, table).toBe(0);
+      }
       const alert = sent.find((a) => a.context.alertName === "partition_default_rows");
       expect(alert).toBeDefined();
       expect(alert!.context.table).toBe("answer_captures");
@@ -292,6 +298,48 @@ describe("STORY-142 · maintenance.partition handler", () => {
       setAlertEmailerForTests(undefined);
     }
   }, 60_000);
+
+  it("STORY-013 AC3 · a connection that cannot see tenant rows FAILS the job and emits no false 0 gauge", async () => {
+    await db.query("CREATE ROLE partition_blind LOGIN PASSWORD 'blind' NOSUPERUSER NOBYPASSRLS");
+    await db.query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO partition_blind");
+    // The runway is already complete from earlier cases, so the blind role needs no DDL right to get as far as the reading.
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    const url = new URL(container.getConnectionUri());
+    url.username = "partition_blind";
+    url.password = "blind";
+    observations.length = 0;
+    counters.length = 0;
+
+    await expect(
+      createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick()),
+    ).rejects.toThrow(/cannot see tenant rows/);
+
+    expect(observations.some((o) => o.name === "nominara_partition_default_rows")).toBe(false);
+    expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "default_partition_rows")).toBe(true);
+  }, 60_000);
+
+  it("STORY-013 · partition DDL behind a long reader of the parent FAILS FAST (lock_timeout) instead of queueing writers behind it", async () => {
+    const inWindow = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + PARTITION_LEAD_MONTHS, 15));
+    const suffix = `${String(inWindow.getUTCFullYear())}_${String(inWindow.getUTCMonth() + 1).padStart(2, "0")}`;
+    await db.query(`DROP TABLE IF EXISTS mention_facts_${suffix}`);
+    const reader = new Client({ connectionString: container.getConnectionUri() });
+    await reader.connect();
+    counters.length = 0;
+    try {
+      await reader.query("BEGIN");
+      await reader.query("LOCK TABLE mention_facts IN ACCESS SHARE MODE");
+      const started = Date.now();
+      await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).resolves.toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(30_000);
+      expect(counters.some((c) => c.name === "partition_create_failed" && c.labels.partition === `mention_facts_${suffix}`)).toBe(true);
+    } finally {
+      await reader.query("ROLLBACK");
+      await reader.end();
+    }
+    // Once the reader is gone, tomorrow's tick creates it.
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    expect((await monthsFor("mention_facts")).some((n) => n.endsWith(suffix))).toBe(true);
+  }, 90_000);
 
   async function insertCapture(capturedAt: string): Promise<void> {
     await db.query(

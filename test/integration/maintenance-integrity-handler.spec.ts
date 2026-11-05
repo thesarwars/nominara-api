@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, type Pool } from "pg";
 import { UnrecoverableError, type Job } from "bullmq";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
 import { createMaintenanceIntegrityHandler } from "../../src/lib/queue/handlers/maintenance-integrity.handler.js";
 import { setAlertEmailerForTests } from "../../src/lib/alerts/alerts.js";
@@ -51,6 +51,11 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     setAlertEmailerForTests(undefined);
     await db.end();
     await container.stop();
+  });
+
+  // Every case seeds its own rows: nothing here depends on run order.
+  beforeEach(async () => {
+    await db.query("TRUNCATE mention_facts, citation_facts, purge_failures, tracked_prompts CASCADE");
   });
 
   afterEach(() => {
@@ -170,7 +175,6 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
 
   it("AC16 · a purge failure still inside the grace window ALERTS but does not fail the job", async () => {
     captureAlerts();
-    await db.query("DELETE FROM mention_facts"); // the orphan from the previous case is not what this one is about
     await db.query(
       "INSERT INTO purge_failures (scope, scope_id, reason) VALUES ('project', '44444444-4444-4444-4444-444444444444', 'secret reason text')",
     );
@@ -186,8 +190,8 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
   it("AC16 / T14 · a purge failure unresolved past the 7-day grace window fails the job (the release-train block's runtime hook)", async () => {
     captureAlerts();
     await db.query(
-      `UPDATE purge_failures SET failed_at = now() - make_interval(days => $1)
-        WHERE scope_id = '44444444-4444-4444-4444-444444444444'`,
+      `INSERT INTO purge_failures (scope, scope_id, reason, failed_at)
+       VALUES ('project', '44444444-4444-4444-4444-444444444444', 'secret reason text', now() - make_interval(days => $1))`,
       [PURGE_FAILURE_GRACE_DAYS + 1],
     );
 
@@ -202,6 +206,10 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
   }, 60_000);
 
   it("AC16 · resolving the failure clears the page", async () => {
+    await db.query(
+      `INSERT INTO purge_failures (scope, scope_id, reason, failed_at)
+       VALUES ('project', '44444444-4444-4444-4444-444444444444', 'x', now() - interval '30 days')`,
+    );
     await db.query("UPDATE purge_failures SET resolved_at = now(), resolved_by = NULL WHERE resolved_at IS NULL");
     await expect(run()).resolves.toBeUndefined();
     expect(metrics.filter((m) => m.name === "nominara_retention_purge_failures_unresolved").at(-1)!.value).toBe(0);
@@ -220,9 +228,6 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     expect(result.status).toBe("rejected");
     const checks = metrics.filter((m) => m.name === "nominara_maintenance_integrity_findings_total").map((m) => m.labels.check);
     expect(checks).toEqual(expect.arrayContaining(["orphan_facts", "purge_failures_blocking"]));
-
-    await db.query("DELETE FROM mention_facts");
-    await db.query("UPDATE purge_failures SET resolved_at = now(), resolved_by = NULL WHERE resolved_at IS NULL");
   }, 60_000);
 
   it("AC6 · a vector index with too few rows to measure is SKIPPED (no recall observation, no alert): null is not 0", async () => {
@@ -272,6 +277,81 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
       await db.query("ALTER DATABASE nominara_test RESET enable_seqscan");
     }
   }, 180_000);
+
+  it("AC14 · a paging finding that coexists with a check that could not run is UNRECOVERABLE (one page, not a retry ladder) and names both", async () => {
+    captureAlerts();
+    const { workspaceId, projectId } = await workspaceAndProject();
+    await insertOrphanMention(workspaceId, projectId);
+    await db.query("ALTER TABLE purge_failures RENAME TO purge_failures_hidden");
+    try {
+      const { result } = await captureErrorLogs(run);
+      expect(result.status).toBe("rejected");
+      const reason = (result as PromiseRejectedResult).reason as Error;
+      expect(reason).toBeInstanceOf(UnrecoverableError);
+      expect(reason.message).toMatch(/orphan fact row/);
+      expect(reason.message).toMatch(/purge_failures/);
+    } finally {
+      await db.query("ALTER TABLE purge_failures_hidden RENAME TO purge_failures");
+    }
+  }, 60_000);
+
+  it("AC14 · a fact whose parent capture belongs to ANOTHER workspace is an orphan, not healthy", async () => {
+    captureAlerts();
+    const a = await workspaceAndProject();
+    const b = await workspaceAndProject();
+    const cap = await db.query<{ id: string; captured_at: Date }>(
+      `INSERT INTO answer_captures
+         (workspace_id, project_id, run_id, prompt_id, engine_key, captured_at,
+          capture_mode, adapter_version, normalizer_version, content_hash)
+       VALUES ($1, $2, gen_random_uuid(), gen_random_uuid(), 'chatgpt', now(), 'api', 'v1', 'v1', decode('00', 'hex'))
+       RETURNING id, captured_at`,
+      [a.workspaceId, a.projectId],
+    );
+    await db.query(
+      `INSERT INTO mention_facts
+         (workspace_id, project_id, result_id, prompt_id, engine_key, captured_at,
+          entity_type, entity_label, matched_alias, occurrence_index, char_start, char_end,
+          first_token_index, prominence, sentiment_label, sentiment_score, sentiment_confidence, sentiment_method)
+       VALUES ($1, $2, $3, gen_random_uuid(), 'chatgpt', $4, 'brand', 'Acme', 'acme', 0, 0, 4, 0, 0.5, 'neutral', 0, 1, 'heuristic')`,
+      [b.workspaceId, b.projectId, cap.rows[0]!.id, cap.rows[0]!.captured_at],
+    );
+    const { result } = await captureErrorLogs(run);
+    expect(result.status).toBe("rejected");
+    expect((result as PromiseRejectedResult).reason).toBeInstanceOf(UnrecoverableError);
+    expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows").reduce((sum, m) => sum + m.value, 0)).toBe(1);
+  }, 60_000);
+
+  describe("fails closed when the connection cannot see tenant rows (FORCE ROW LEVEL SECURITY)", () => {
+    const blindRole = "integrity_blind";
+
+    beforeAll(async () => {
+      await db.query(`CREATE ROLE ${blindRole} LOGIN PASSWORD 'blind' NOSUPERUSER NOBYPASSRLS`);
+      await db.query(`GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${blindRole}`);
+    });
+
+    it("AC14 / AC6 · a NOSUPERUSER NOBYPASSRLS connection REJECTS instead of reporting orphan_fact_rows = 0", async () => {
+      captureAlerts();
+      const { workspaceId, projectId } = await workspaceAndProject();
+      await insertOrphanMention(workspaceId, projectId); // seeded as superuser: the blind role cannot see it
+
+      const url = new URL(container.getConnectionUri());
+      url.username = blindRole;
+      url.password = "blind";
+      const blindEnv = { DATABASE_URL: url.toString() } as unknown as Env;
+
+      const { lines, result } = await captureErrorLogs(() =>
+        createMaintenanceIntegrityHandler({ pool: noPool, env: blindEnv })(db, tick()),
+      );
+
+      expect(result.status).toBe("rejected");
+      expect(String((result as PromiseRejectedResult).reason)).toMatch(/privilege/);
+      // No false clean: neither the 0 observation nor a recall skip is emitted.
+      expect(metrics.some((m) => m.name === "nominara_maintenance_orphan_fact_rows")).toBe(false);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_skipped_total")).toBe(false);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total" && m.labels.check === "privilege")).toBe(true);
+      expect(lines.some((l) => l.includes("cannot see tenant rows"))).toBe(true);
+    }, 60_000);
+  });
 
   it("yields without doing any work when another replica holds the tick's lock", async () => {
     const holder = new Client({ connectionString: container.getConnectionUri() });
