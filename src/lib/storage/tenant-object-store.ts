@@ -46,6 +46,9 @@ export interface PutOptions {
 
 const logger = new Logger("object-storage");
 
+/** The key `assertReady` signs. It names no workspace and is never read or written. */
+const READINESS_PROBE_KEY = "readiness-probe";
+
 /** A store fixed to ONE workspace at capture time. Obtain it with `TenantObjectStore.bind()` inside the tenant context. */
 export class BoundObjectStore {
   constructor(
@@ -150,6 +153,15 @@ export class TenantObjectStore {
     private readonly port: ObjectStoragePort,
     private readonly keyEnv: string,
   ) {}
+
+  /**
+   * Readiness: can this process presign at all? Mints a 1-second URL for a fixed key of NO workspace and discards it, so it needs no
+   * tenant context and can run BEFORE a request transaction opens (credential resolution is the only thing that can block). Throws
+   * the port's error (503 `degraded` when storage is not configured).
+   */
+  async assertReady(): Promise<void> {
+    await this.port.presignGet("reports", READINESS_PROBE_KEY, 1);
+  }
 
   /** Captures the CURRENT tenant context's workspace. Call it inside the context; use the result anywhere, later. */
   bind(): BoundObjectStore {

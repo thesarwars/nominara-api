@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Param, Post, Query, UseGuards } from "@nestjs/common";
 import {
   exportRequestSchema,
   exportResponseSchema,
@@ -19,6 +19,7 @@ import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { isMeteredPdfExport } from "./export-metering.js";
 import { ExportService } from "./export.service.js";
 import { MethodologyService } from "./methodology.service.js";
+import { StorageReadyGuard } from "./storage-ready.guard.js";
 
 // NEW-E-100a — NFR-AGY-05. A read of rollup-derived figures: same permission
 // as the scorecards it sits beside, scoped to the project in the path.
@@ -45,6 +46,7 @@ export class ReportsController {
   // consumes one pdf_exports unit (QuotaGuard reserves, the service commits);
   // a CSV is gated by exports.csv in the service.
   @Post("export")
+  @UseGuards(StorageReadyGuard)
   @RequirePermission("export:data")
   @ProjectParam("id")
   @Meter("pdf_exports", 1, isMeteredPdfExport)
@@ -56,6 +58,6 @@ export class ReportsController {
     @Body(new ZodValidationPipe(exportRequestSchema)) body: ExportRequest,
     @Headers("idempotency-key") idempotencyKey: string | undefined,
   ): Promise<ExportResponse> {
-    return this.exports.export(projectId, body, idempotencyKey);
+    return this.exports.export(projectId, body, idempotencyKey, { awaitUpload: true });
   }
 }

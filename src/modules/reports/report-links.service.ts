@@ -1,14 +1,15 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { Pool } from "pg";
-import { REPORT_LINK_REDIRECT_SECONDS, type ReportLinkParams } from "../../../contracts/reports/index.js";
-import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { REPORT_LINK_REDIRECT_SECONDS, type ReportLinkParams, type ReportLinkRevokeParams, type ReportLinkRevokeResponse } from "../../../contracts/reports/index.js";
+import { NotFoundError, TokenRevokedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import { isStoredObjectKey } from "../../lib/reports/artifact-key.js";
 import { hashReportLinkToken } from "../../lib/reports/report-artifact-mail.js";
 import { StorageTenancyError } from "../../lib/storage/storage-keys.js";
 import { TenantObjectStore, type BoundObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
-import { withTenantContext } from "../../tenancy/tenant-context.js";
+import { currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 
 // STORY-180 AC3 (owner decision 54 (3), option 3B) - GET /v1/report-links/{workspaceId}/{token}.
 //
@@ -21,10 +22,12 @@ import { withTenantContext } from "../../tenancy/tenant-context.js";
 // unique index inside THAT workspace (row-level security is the guarantee; the workspace predicate is for the planner), so a token from workspace A presented under workspace B finds no row. The context carries the
 // system actor and runs only the two statements below.
 //
-// ONE NEUTRAL REFUSAL. An unknown token, the wrong workspace, a revoked or expired link, an artifact whose file never landed, and a
+// ONE NEUTRAL REFUSAL. An unknown token, the wrong workspace, an expired link, an artifact whose file is not stored (marker key), and a
 // stored key outside the workspace prefix are all the same 404, so the route is not an oracle for which tokens exist. The reason goes
-// to the log (workspace ID only) and to a counter, never to the caller. No network call is made (KAD-06): the presign is a local
-// signature.
+// to the log (workspace ID only) and to a counter, never to the caller. ONE EXCEPTION (owner decision 60 (d)): a token that matches a
+// live artifact IN THE PATH'S WORKSPACE but was revoked answers 401 `token_revoked`, "This link was revoked." - reachable only by
+// holding the real token, so it is not an oracle. No network call is made (KAD-06): the presign is a local signature and runs after
+// the lookup transaction has ended.
 
 const logger = new Logger("report-links");
 
@@ -45,7 +48,7 @@ export class ReportLinksService {
       outcome = "redirected";
       return { url };
     } catch (error) {
-      outcome = error instanceof NotFoundError ? "refused" : error instanceof Error ? error.name : "error";
+      outcome = error instanceof NotFoundError ? "refused" : error instanceof TokenRevokedError ? "revoked" : error instanceof Error ? error.name : "error";
       throw error;
     } finally {
       incrementCounter("nominara_reports_link_clicks_total", { outcome });
@@ -60,7 +63,7 @@ export class ReportLinksService {
       const client = await this.pool.connect();
       try {
         await withTenantContext(client, { workspaceId: params.workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
-          tx.query("UPDATE report_artifacts SET download_count = download_count + 1 WHERE link_token_hash = $1 AND workspace_id = $2", [hashReportLinkToken(params.token), params.workspaceId]),
+          tx.query("UPDATE report_artifacts SET download_count = download_count + 1 WHERE link_token_hash = $1 AND workspace_id = app.current_workspace()", [hashReportLinkToken(params.token)]),
         );
       } finally {
         client.release();
@@ -72,44 +75,53 @@ export class ReportLinksService {
   }
 
   /**
-   * The row still says `pending:` but a link was mailed, which happens only when the put landed and recording the key then failed
-   * (the mail step confirms the object exists before it sends). The object sits at the deterministic key `{id}.{format}`: serve it if
-   * it is really there, no transaction open. Absent (or unreadable) stays the neutral 404.
+   * Owner decision 60 (d). Revokes the link of one artifact of the caller's workspace, on the ambient request transaction. Idempotent:
+   * the FIRST revocation's time is kept. An artifact that is not in this workspace is a 404 (the RLS predicate and the explicit one).
    */
-  private async servePending(params: ReportLinkParams, bound: BoundObjectStore, relative: string): Promise<string> {
-    try {
-      await bound.head("reports", relative);
-    } catch {
-      throw refusal();
+  async revoke(params: ReportLinkRevokeParams): Promise<ReportLinkRevokeResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("ReportLinksService.revoke requires an active tenant context");
+    const result = await store.client.query<{ id: string; link_revoked_at: Date }>(
+      `UPDATE report_artifacts SET link_revoked_at = COALESCE(link_revoked_at, now())
+        WHERE id = $1 AND workspace_id = app.current_workspace()
+        RETURNING id, link_revoked_at`,
+      [params.id],
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      incrementCounter("nominara_reports_link_revocations_total", { outcome: "not_found" });
+      throw new NotFoundError({ message: "no such export" });
     }
-    const url = await bound.presignGet("reports", relative, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });
-    await this.countClick(params);
-    incrementCounter("nominara_reports_link_clicks_total", { outcome: "served_unrecorded" });
-    return url;
+    incrementCounter("nominara_reports_link_revocations_total", { outcome: "revoked" });
+    // Workspace ID only: never the artifact id, the token or the URL.
+    logger.log({ span: "reports.link.revoke", workspace_id: store.context.workspaceId, outcome: "revoked" });
+    return { export_id: row.id, link_revoked_at: row.link_revoked_at.toISOString() };
   }
 
   private async lookup(params: ReportLinkParams): Promise<string> {
     const client = await this.pool.connect();
-    let found: { key: string | undefined; id: string | undefined; format: string | undefined; bound: BoundObjectStore };
+    let found: { key: string | undefined; revoked: boolean; bound: BoundObjectStore };
     try {
       found = await withTenantContext(client, { workspaceId: params.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-        // Revocation, expiry and the workspace's own state are decided in the WHERE clause, by the database clock. 
+        // Expiry and the workspace's own state are decided in the WHERE clause, by the database clock. Revocation is returned, not
+        // filtered, so a revoked link can say so; it is only ever returned for the real token's hash in THIS workspace.
         const bound = this.objects.bind();
-        const hit = await tx.query<{ object_key: string; id: string; format: string }>(
-          `SELECT a.object_key, a.id, a.format FROM report_artifacts a
-            WHERE a.link_token_hash = $1 AND a.workspace_id = $2 AND a.link_revoked_at IS NULL AND a.expires_at > now()
-              AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = a.workspace_id AND w.deleted_at IS NULL AND w.deletion_execute_at IS NULL)
-`,
-          [hashReportLinkToken(params.token), params.workspaceId],
+        const hit = await tx.query<{ object_key: string; revoked: boolean }>(
+          `SELECT a.object_key, (a.link_revoked_at IS NOT NULL) AS revoked FROM report_artifacts a
+            WHERE a.link_token_hash = $1 AND a.workspace_id = app.current_workspace() AND a.expires_at > now()
+              AND EXISTS (SELECT 1 FROM workspaces w WHERE w.id = a.workspace_id AND w.deleted_at IS NULL AND w.deletion_execute_at IS NULL)`,
+          [hashReportLinkToken(params.token)],
         );
-        return { key: hit.rows[0]?.object_key, id: hit.rows[0]?.id, format: hit.rows[0]?.format, bound };
+        return { key: hit.rows[0]?.object_key, revoked: hit.rows[0]?.revoked === true, bound };
       });
     } finally {
       client.release();
     }
-    const { key, id, format, bound } = found;
-    if (key === undefined || id === undefined || format === undefined) throw refusal();
-    if (key.startsWith("pending:")) return this.servePending(params, bound, `${id}.${format}`);
+    const { key, revoked, bound } = found;
+    if (key === undefined) throw refusal();
+    if (revoked) throw new TokenRevokedError({ message: "This link was revoked." });
+    // A marker (pending, failed, purged) is not a key: nothing is presigned and nothing is guessed.
+    if (!isStoredObjectKey(key)) throw refusal();
     // Minted AFTER the transaction ended: no pooled connection is held while the SDK may resolve credentials.
     try {
       const url = await bound.presignGetStored("reports", key, { expiresInSeconds: REPORT_LINK_REDIRECT_SECONDS });

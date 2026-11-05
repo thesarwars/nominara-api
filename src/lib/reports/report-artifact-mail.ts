@@ -138,7 +138,7 @@ export async function resolveMailParts(plan: ArtifactMailPlan): Promise<MailPart
   const links: Array<{ filename: string; url: string }> = [];
   for (const item of plan.items) {
     if (item.link !== null) {
-      // A linked file is not downloaded, but it must exist: a failed post-commit put leaves the row `pending:` and the link would 404
+      // A linked file is not downloaded, but it must exist: a failed upload marks the row failed (or leaves it pending) and the link would 404
       // for its whole life. `head` throws when the object is absent, which fails the delivery like a missing attachment.
       await plan.store.head("reports", item.relativeKey);
       links.push({ filename: item.filename, url: item.link });

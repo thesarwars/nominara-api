@@ -1,10 +1,12 @@
 import { Pool } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportResponseSchema } from "../../contracts/reports/index.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { hashReportLinkToken, reportLinkToken } from "../../src/lib/reports/report-artifact-mail.js";
+import { OBJECT_STORAGE, type ObjectStoragePort } from "../../src/lib/storage/storage.port.js";
 import { METHODOLOGY_NOTE } from "../../src/lib/reports/methodology-footer.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
@@ -89,7 +91,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
 
-  async function member(workspaceId: string, role: "manager" | "analyst" | "viewer", projectScope: string[] | null = null): Promise<Actor> {
+  async function member(workspaceId: string, role: "admin" | "manager" | "analyst" | "viewer", projectScope: string[] | null = null): Promise<Actor> {
     const userId = await newUser();
     await harness.db().query(
       `INSERT INTO workspace_members (id, workspace_id, user_id, role, project_scope, status) VALUES ($1,$2,$3,$4,$5,'active')`,
@@ -146,32 +148,21 @@ describe("STORY-100 · on-demand export over HTTP", () => {
   const errorOf = (res: { json(): unknown }) => (res.json() as { error: { code: string; details?: Record<string, unknown> } }).error;
   type Exported = ReturnType<typeof exportResponseSchema.parse>;
   // STORY-180: download_url is the API's own route. The browser follows it with the session cookie of whoever exported (the latest
-  // exportReport call), gets 409 until the post-commit upload has landed, then a 302 to a fresh presign it fetches.
+  // exportReport call). Since owner decision 60 (c) the export answers only once the file is stored, so the FIRST request is a 302.
   let lastActor: Actor | undefined;
   const downloadRoute = (e: Exported, cookie: string) => harness.app().inject({ method: "GET", url: new URL(e.download_url).pathname, headers: { cookie } });
   const fileOf = async (e: Exported): Promise<Buffer> => {
-    const deadline = Date.now() + 15_000;
-    for (;;) {
-      const res = await downloadRoute(e, lastActor!.cookie);
-      if (res.statusCode === 302) return fetchStored(String(res.headers.location));
-      if (res.statusCode !== 409 || Date.now() > deadline) throw new Error(`download route answered ${String(res.statusCode)}: ${res.body}`);
-      await new Promise((r) => setTimeout(r, 100));
-    }
+    const res = await downloadRoute(e, lastActor!.cookie);
+    if (res.statusCode !== 302) throw new Error(`download route answered ${String(res.statusCode)}: ${res.body}`);
+    return fetchStored(String(res.headers.location));
   };
+  const objectKeyOf = async (id: string): Promise<string> => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [id])).rows[0] as { object_key: string }).object_key;
   const usage = async (workspaceId: string) =>
     (await harness.db().query(`SELECT used_value::int AS used, reserved_value::int AS reserved FROM usage_counters WHERE workspace_id = $1 AND metric = 'pdf_exports'`, [workspaceId])).rows[0] as
       | { used: number; reserved: number }
       | undefined;
   const credits = async (workspaceId: string) =>
     ((await harness.db().query(`SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1`, [workspaceId])).rows[0] as { n: number }).n;
-
-  async function waitFor(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (!(await check())) {
-      if (Date.now() > deadline) throw new Error("condition not met in time");
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
 
   async function seeded(plan: "starter" | "growth" | "business" = "growth") {
     const a = await owner(plan);
@@ -204,8 +195,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(row.workspace_id).toBe(a.workspaceId);
     expect(row.project_ids).toEqual([p]);
     expect(row.format).toBe("pdf");
-    // The upload ran after the commit and a second transaction recorded the REAL key (the file was fetched above, so it has landed).
-    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    // r5 (c): the real key was recorded BEFORE the export answered - no waiting.
     const stored = (await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string };
     expect(stored.object_key).toBe(`inttest/${a.workspaceId}/${exported.export_id}.pdf`);
     expect(row.bytes).toBe(file.length);
@@ -219,7 +209,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
   it("STORY-180 AC2 · the download route 302s to a fresh 15-minute presign of the STORED key, named for the file, uncached", async () => {
     const { a, p } = await seeded();
     const exported = exportResponseSchema.parse(data(await exportReport(a, p, body())));
-    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    expect(await objectKeyOf(exported.export_id)).toBe(`inttest/${a.workspaceId}/${exported.export_id}.${exported.format}`);
     const res = await downloadRoute(exported, a.cookie);
     expect(res.statusCode, res.body).toBe(302);
     const location = String(res.headers.location);
@@ -239,7 +229,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
   it("STORY-180 AC2 · more concurrent downloads than the pool holds all complete (the route takes no pooled connection beyond the request's own)", async () => {
     const { a, p } = await seeded();
     const exported = exportResponseSchema.parse(data(await exportReport(a, p, body())));
-    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    expect(await objectKeyOf(exported.export_id)).toBe(`inttest/${a.workspaceId}/${exported.export_id}.${exported.format}`);
     // The app pool's default max is 10: 40 in flight at once would hang forever if each request waited for a second connection.
     const all = await Promise.all(Array.from({ length: 40 }, () => downloadRoute(exported, a.cookie)));
     expect(all.map((r) => r.statusCode)).toEqual(Array.from({ length: 40 }, () => 302));
@@ -251,33 +241,81 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const { a, p } = await seeded();
     const other = await project(a.workspaceId, "Other");
     const exported = exportResponseSchema.parse(data(await exportReport(a, p, body({ format: "csv" }))));
-    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    expect(await objectKeyOf(exported.export_id)).toBe(`inttest/${a.workspaceId}/${exported.export_id}.${exported.format}`);
     const inScope = await member(a.workspaceId, "manager", [p]);
     const outOfScope = await member(a.workspaceId, "manager", [other]);
     expect((await downloadRoute(exported, inScope.cookie)).statusCode).toBe(302);
     expect((await downloadRoute(exported, outOfScope.cookie)).statusCode).toBe(404);
   }, 180_000);
 
-  it("STORY-180 AC2 · while the file has not landed (key still pending) the route is 409, with no redirect", async () => {
+  it.each(["pending", "failed", "purged"])("STORY-180 r5 · a row whose key is only a %s marker answers a clear 503 degraded, with no redirect and no Retry-After", async (marker) => {
     const { a, p } = await seeded();
     const id = uuidV7();
     await harness.db().query(
       `INSERT INTO report_artifacts (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at)
        VALUES ($1,$2,$3,'2026-10-01','2026-10-31','pdf',$4,10,'{}'::jsonb, now() + interval '7 days')`,
-      [id, a.workspaceId, [p], `pending:${id}`],
+      [id, a.workspaceId, [p], `${marker}:${id}`],
     );
     const res = await harness.app().inject({ method: "GET", url: apiUrl(`/exports/${id}/download`), headers: { cookie: a.cookie } });
-    expect(res.statusCode, res.body).toBe(409);
+    expect(res.statusCode, res.body).toBe(503);
+    expect(errorOf(res).code).toBe("degraded");
     expect(res.headers.location).toBeUndefined();
-    // A plain navigation cannot recover from a 409 by itself: the contract tells the client to poll, and Retry-After says how soon.
-    expect(res.headers["retry-after"]).toBe("1");
+    expect(res.headers["retry-after"]).toBeUndefined();
+  }, 120_000);
+
+  it("STORY-180 r5 (c) · the export answers only after the file is stored: the first download after the response is a 302 to an existing object", async () => {
+    const { a, p } = await seeded();
+    const res = await exportReport(a, p, body({ format: "csv" }));
+    expect(res.statusCode, res.body).toBe(201);
+    const exported = exportResponseSchema.parse(data(res));
+    const first = await downloadRoute(exported, a.cookie);
+    expect(first.statusCode, first.body).toBe(302);
+    const fetched = await fetch(String(first.headers.location));
+    expect(fetched.status).toBe(200);
+    await fetched.arrayBuffer();
+  }, 120_000);
+
+  it("STORY-180 r5 (c) · a failed upload answers 503 degraded, the row is marked failed (never left pending), and its download is a 503", async () => {
+    const { a, p } = await seeded();
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const put = vi.spyOn(port, "put").mockRejectedValueOnce(new Error("s3 down"));
+    try {
+      const res = await exportReport(a, p, body({ format: "csv" }));
+      expect(res.statusCode, res.body).toBe(503);
+      expect(errorOf(res).code).toBe("degraded");
+    } finally {
+      put.mockRestore();
+    }
+    const rows = (await harness.db().query(`SELECT id, object_key FROM report_artifacts WHERE workspace_id = $1`, [a.workspaceId])).rows as Array<{ id: string; object_key: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.object_key).toBe(`failed:${rows[0]!.id}`);
+    expect(await harness.db().query(`SELECT 1 FROM report_artifacts WHERE workspace_id = $1 AND object_key LIKE 'pending:%'`, [a.workspaceId]).then((r) => r.rowCount)).toBe(0);
+    const download = await harness.app().inject({ method: "GET", url: apiUrl(`/exports/${rows[0]!.id}/download`), headers: { cookie: a.cookie } });
+    expect(download.statusCode, download.body).toBe(503);
+  }, 120_000);
+
+  it("STORY-180 r5 (c) · a put that landed but could not be recorded: the object is deleted, the row is marked failed, the export answers 503", async () => {
+    const { a, p } = await seeded();
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    // Fail exactly the statement that records the real key (an UPDATE setting a full `inttest/...` key), nothing else.
+    await harness.db().query(`CREATE OR REPLACE FUNCTION s180_block_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 's180 record blocked'; END $$`);
+    await harness.db().query(`CREATE TRIGGER s180_block_record_trg BEFORE UPDATE ON report_artifacts FOR EACH ROW WHEN (NEW.object_key LIKE 'inttest/%') EXECUTE FUNCTION s180_block_record()`);
+    try {
+      const res = await exportReport(a, p, body({ format: "csv" }));
+      expect(res.statusCode, res.body).toBe(503);
+    } finally {
+      await harness.db().query(`DROP TRIGGER s180_block_record_trg ON report_artifacts`);
+    }
+    const row = (await harness.db().query(`SELECT id, object_key FROM report_artifacts WHERE workspace_id = $1`, [a.workspaceId])).rows[0] as { id: string; object_key: string };
+    expect(row.object_key).toBe(`failed:${row.id}`);
+    await expect(port.head("reports", `inttest/${a.workspaceId}/${row.id}.csv`)).rejects.toMatchObject({ name: "NotFoundError" });
   }, 120_000);
 
   it("STORY-180 AC2 · another workspace's export, an expired one and an unknown id are the same 404; no session is 401; a malformed id is 400", async () => {
     const { a, p } = await seeded();
     const other = await seeded();
     const exported = exportResponseSchema.parse(data(await exportReport(other.a, other.p, body({ format: "csv" }))));
-    await waitFor(async () => ((await harness.db().query(`SELECT object_key FROM report_artifacts WHERE id = $1`, [exported.export_id])).rows[0] as { object_key: string }).object_key.startsWith("inttest/"));
+    expect(await objectKeyOf(exported.export_id)).toBe(`inttest/${other.a.workspaceId}/${exported.export_id}.${exported.format}`);
     const foreign = await downloadRoute(exported, a.cookie);
     await harness.db().query(`UPDATE report_artifacts SET expires_at = now() - interval '1 minute' WHERE id = $1`, [exported.export_id]);
     const expired = await downloadRoute(exported, other.a.cookie);
@@ -549,4 +587,74 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(rows).toMatch(/overview,,brand,gemini,sentiment_score,,low,3,/);
     expect(rows).not.toMatch(/sentiment_score,0,/);
   }, 120_000);
+
+  // ---- STORY-180 r5 (d): revoking a sent link --------------------------------------------------------------------------------------
+  const LINK_KEY = Buffer.alloc(32, 9);
+  async function linked(workspaceId: string, projectId: string): Promise<{ id: string; token: string }> {
+    const id = uuidV7();
+    const token = reportLinkToken(LINK_KEY, id);
+    await harness.db().query(
+      `INSERT INTO report_artifacts (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at, link_token_hash)
+       VALUES ($1,$2,$3,'2026-10-01','2026-10-31','pdf',$4,10,'{}'::jsonb, now() + interval '7 days', $5)`,
+      [id, workspaceId, [projectId], `inttest/${workspaceId}/${id}.pdf`, hashReportLinkToken(token)],
+    );
+    return { id, token };
+  }
+  const revoke = (a: Actor, id: string) =>
+    harness.app().inject({ method: "POST", url: apiUrl(`/exports/${id}/revoke-link`), headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf } });
+  const clickLink = (workspaceId: string, token: string) => harness.app().inject({ method: "GET", url: apiUrl(`/report-links/${workspaceId}/${token}`) });
+  const revokedAt = async (id: string) => ((await harness.db().query(`SELECT link_revoked_at FROM report_artifacts WHERE id = $1`, [id])).rows[0] as { link_revoked_at: Date | null }).link_revoked_at;
+
+  it("STORY-180 r5 (d) · an owner revokes a sent link: link_revoked_at is set, it is audited, and the link route then says 'This link was revoked.' (not a 404)", async () => {
+    const { a, p } = await seeded();
+    const l = await linked(a.workspaceId, p);
+    expect((await clickLink(a.workspaceId, l.token)).statusCode).toBe(302);
+    const res = await revoke(a, l.id);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(data<{ export_id: string; link_revoked_at: string }>(res).export_id).toBe(l.id);
+    expect(await revokedAt(l.id)).not.toBeNull();
+    const audit = (await harness.db().query(`SELECT action, resource_type, resource_id FROM audit_log WHERE workspace_id = $1 AND action = 'report_link.revoked'`, [a.workspaceId])).rows;
+    expect(audit).toEqual([{ action: "report_link.revoked", resource_type: "report_artifact", resource_id: l.id }]);
+    const click = await clickLink(a.workspaceId, l.token);
+    expect(click.statusCode, click.body).toBe(401);
+    expect(errorOf(click).code).toBe("token_revoked");
+    expect((click.json() as { error: { message: string } }).error.message).toBe("This link was revoked.");
+    expect(click.headers.location).toBeUndefined();
+  }, 120_000);
+
+  it("STORY-180 r5 (d) · revoking twice is idempotent: the first revocation's time stands", async () => {
+    const { a, p } = await seeded();
+    const l = await linked(a.workspaceId, p);
+    const first = data<{ link_revoked_at: string }>(await revoke(a, l.id)).link_revoked_at;
+    await new Promise((r) => setTimeout(r, 20));
+    const second = data<{ link_revoked_at: string }>(await revoke(a, l.id)).link_revoked_at;
+    expect(second).toBe(first);
+  }, 120_000);
+
+  it("STORY-180 r5 (d) · an admin may revoke; a manager, analyst and viewer are refused 403 naming agency:branding and nothing is revoked", async () => {
+    const { a, p } = await seeded();
+    const l = await linked(a.workspaceId, p);
+    for (const role of ["manager", "analyst", "viewer"] as const) {
+      const res = await revoke(await member(a.workspaceId, role), l.id);
+      expect(res.statusCode, `${role}: ${res.body}`).toBe(403);
+      expect(JSON.stringify(res.json())).toContain("agency:branding");
+    }
+    // A project-scoped manager is refused too (the permission is workspace-wide).
+    expect((await revoke(await member(a.workspaceId, "manager", [p]), l.id)).statusCode).toBe(403);
+    expect(await revokedAt(l.id)).toBeNull();
+    expect((await revoke(await member(a.workspaceId, "admin"), l.id)).statusCode).toBe(200);
+    expect(await revokedAt(l.id)).not.toBeNull();
+  }, 180_000);
+
+  it("STORY-180 r5 (d) · another workspace's owner cannot revoke this workspace's link: a 404, and the link keeps working", async () => {
+    const { a, p } = await seeded();
+    const other = await seeded();
+    const l = await linked(a.workspaceId, p);
+    const res = await revoke(other.a, l.id);
+    expect(res.statusCode, res.body).toBe(404);
+    expect(await revokedAt(l.id)).toBeNull();
+    expect((await clickLink(a.workspaceId, l.token)).statusCode).toBe(302);
+    expect((await harness.app().inject({ method: "POST", url: apiUrl(`/exports/${l.id}/revoke-link`) })).statusCode).toBe(401);
+    expect((await revoke(a, "not-a-uuid")).statusCode).toBe(400);
+  }, 180_000);
 });

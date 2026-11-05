@@ -44,7 +44,7 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
   }
 
   /** An artifact row in `workspaceId`, its file in the bucket under `objectWorkspaceId`'s prefix, and a link token hash. */
-  async function artifact(workspaceId: string, over: { bytes?: Buffer; objectWorkspaceId?: string; pending?: boolean; expired?: boolean; revoked?: boolean; noLink?: boolean; noObject?: boolean } = {}): Promise<Artifact> {
+  async function artifact(workspaceId: string, over: { bytes?: Buffer; objectWorkspaceId?: string; pending?: boolean; marker?: "failed" | "purged"; expired?: boolean; revoked?: boolean; noLink?: boolean; noObject?: boolean } = {}): Promise<Artifact> {
     const id = randomUUID();
     const bytes = over.bytes ?? Buffer.from("%PDF-1.4 report bytes");
     const key = `${REPORT_STORAGE_KEY_ENV}/${over.objectWorkspaceId ?? workspaceId}/${id}.pdf`;
@@ -55,7 +55,7 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
                                      expires_at, link_token_hash, link_revoked_at)
        VALUES ($1,$2,'{}','2026-10-01','2026-10-31','pdf',$3,$4,'{}'::jsonb, $5, $6, $7)`,
       [
-        id, workspaceId, over.pending === true ? `pending:${id}` : key, bytes.length,
+        id, workspaceId, over.pending === true ? `pending:${id}` : over.marker !== undefined ? `${over.marker}:${id}` : key, bytes.length,
         over.expired === true ? new Date(Date.now() - 60_000) : new Date(Date.now() + 7 * 86_400_000),
         over.noLink === true ? null : hashReportLinkToken(token),
         over.revoked === true ? new Date() : null,
@@ -85,14 +85,34 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
     expect(row.download_count).toBe(1);
   }, 120_000);
 
-  it("STORY-180 AC3 · every click re-checks the token: after revocation the NEXT click is a 404 (a presign already issued stays valid for its 15 minutes)", async () => {
+  it("STORY-180 AC3 / r5 (d) · every click re-checks the token: after revocation the NEXT click says 'This link was revoked.' (token_revoked, not a 404); a presign already issued stays valid for its 15 minutes", async () => {
     const ws = await workspace();
     const a = await artifact(ws);
-    expect((await click(ws, a.token)).statusCode).toBe(302);
+    const first = await click(ws, a.token);
+    expect(first.statusCode).toBe(302);
     await harness.db().query("UPDATE report_artifacts SET link_revoked_at = now() WHERE id = $1", [a.id]);
     const res = await click(ws, a.token);
-    expect(res.statusCode).toBe(404);
+    expect(res.statusCode, res.body).toBe(401);
+    expect(refusal(res)).toMatchObject({ code: "token_revoked", message: "This link was revoked." });
     expect(res.headers.location).toBeUndefined();
+    expect((await fetch(String(first.headers.location))).status).toBe(200);
+    const row = (await harness.db().query("SELECT download_count FROM report_artifacts WHERE id = $1", [a.id])).rows[0] as { download_count: number };
+    expect(row.download_count).toBe(1);
+  }, 120_000);
+
+  it("STORY-180 r5 (d) · a revoked token presented under ANOTHER workspace's id is the neutral 404, not 'revoked' (the revoked answer needs the right workspace)", async () => {
+    const ws = await workspace();
+    const other = await workspace();
+    const a = await artifact(ws, { revoked: true });
+    const res = await click(other, a.token);
+    expect(res.statusCode).toBe(404);
+    expect(refusal(res).code).toBe("not_found");
+  }, 120_000);
+
+  it("STORY-180 r5 (d) · a revoked link that has also expired is the neutral 404 (a dead link says nothing more)", async () => {
+    const ws = await workspace();
+    const a = await artifact(ws, { revoked: true, expired: true });
+    expect((await click(ws, a.token)).statusCode).toBe(404);
   }, 120_000);
 
   it("STORY-180 AC3 · a link past its 7 days, an unknown token, another workspace's id and an artifact with no link are all the SAME 404", async () => {
@@ -138,19 +158,11 @@ describe("STORY-180 · the emailed report link over HTTP", () => {
     expect(row.download_count).toBe(0);
   }, 120_000);
 
-  it("STORY-180 AC1 · an artifact whose upload never landed (key still pending) is not linkable", async () => {
+  it.each([["pending"], ["failed"], ["purged"]] as const)("STORY-180 AC1 / r5 · an artifact whose key is only a %s marker is not linkable, even if an object sits at the deterministic key", async (marker) => {
     const ws = await workspace();
-    const a = await artifact(ws, { pending: true, noObject: true });
+    const a = await artifact(ws, marker === "pending" ? { pending: true } : { marker });
     const res = await click(ws, a.token);
     expect(res.statusCode).toBe(404);
     expect(res.headers.location).toBeUndefined();
-  }, 120_000);
-
-  it("STORY-180 AC1 · a row still pending whose object IS stored (put landed, recording the key failed) is served from the deterministic key", async () => {
-    const ws = await workspace();
-    const a = await artifact(ws, { pending: true });
-    const res = await click(ws, a.token);
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toContain(`${a.id}.pdf`);
   }, 120_000);
 });
