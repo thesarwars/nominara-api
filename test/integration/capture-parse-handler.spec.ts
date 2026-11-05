@@ -504,6 +504,20 @@ describe("STORY-135 · capture.parse", () => {
     expect(await presenceOf(id)).toMatchObject({ status: "parsed", brand_present: false });
   });
 
+  it("[s2.5 truncated] an empty answer that was cut off (truncated) is a token-budget failure, not an answer: brand_present stays NULL", async () => {
+    const id = await seedEmpty("captured", []);
+    await db.query("UPDATE answer_captures SET truncated = true WHERE id = $1", [id]);
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ brand_present: null, sov: null });
+  });
+
+  it("[s2.5 missing source] an L2 cell whose source is gone stays rematch_unavailable with NULL, not an empty answer", async () => {
+    const id = await seedReused("l2", { source: randomUUID() });
+    await run(handler(), job(id));
+    expect(await presenceOf(id)).toMatchObject({ status: "skipped", brand_present: null });
+    expect((await presenceOf(id)).flags).toContain("rematch_unavailable");
+  });
+
   it("[s2.5 blocked/failed] blocked and failed cells stay NULL and are out of the denominator", async () => {
     const blocked = await seedEmpty("blocked", []);
     const failed = await seedEmpty("failed", []);
@@ -513,14 +527,37 @@ describe("STORY-135 · capture.parse", () => {
     expect(await presenceOf(failed)).toMatchObject({ status: "failed", brand_present: null });
   });
 
+  /** A reused row as the planner writes it: `skipped`, a cache layer, and either its own payload (L1) or `{}` plus a source (L2). */
+  async function seedReused(layer: "l1" | "l2", over: { ownText?: string; source?: string }): Promise<string> {
+    const id = await seedCapture("x", { status: "skipped" });
+    await db.query("UPDATE answer_captures SET cache_layer = $2, source_result_id = $3, payload = $4::jsonb, response_excerpt = NULL WHERE id = $1", [
+      id,
+      layer,
+      over.source ?? null,
+      JSON.stringify(over.ownText === undefined ? {} : { format: "markdown", text: over.ownText }),
+    ]);
+    return id;
+  }
+
   it("[s2.5 agreement] per-prompt presence and the rollup agree: the refusal is in the denominator and not present; blocked is out", async () => {
     const present = await seedCapture(ANSWER);
     const refused = await seedEmpty("captured", ["engine_refused_to_answer"]);
     const blocked = await seedEmpty("blocked", []);
-    for (const id of [present, refused, blocked]) await run(handler(), job(id));
+    // Audit round 2 - reused cells whose source answered with nothing are measurements too, and stay `skipped`.
+    const l1Empty = await seedReused("l1", { ownText: "" });
+    const refusedSource = await seedEmpty("captured", ["engine_refused_to_answer"]);
+    const l2Refused = await seedReused("l2", { source: refusedSource });
+    for (const id of [present, refused, blocked, l1Empty, refusedSource, l2Refused]) await run(handler(), job(id));
+    expect(await presenceOf(l1Empty)).toMatchObject({ status: "skipped", brand_present: false });
+    expect(Number((await presenceOf(l1Empty)).sov)).toBe(0);
+    expect((await presenceOf(l1Empty)).flags).not.toContain("rematch_unavailable");
+    expect(await presenceOf(l2Refused)).toMatchObject({ status: "skipped", brand_present: false });
+    expect(Number((await presenceOf(l2Refused)).sov)).toBe(0);
+    expect((await presenceOf(l2Refused)).flags).toContain("engine_refused_to_answer");
+    expect((await presenceOf(l2Refused)).flags).not.toContain("rematch_unavailable");
 
     const rows = await db.query<{ id: string; brand_present: boolean | null }>(
-      "SELECT id, brand_present FROM answer_captures WHERE project_id = $1 AND status IN ('parsed','captured')",
+      "SELECT id, brand_present FROM answer_captures WHERE project_id = $1 AND status IN ('parsed','captured','skipped')",
       [projectId],
     );
     const perPromptDenominator = rows.rows.filter((row) => row.brand_present !== null).length;
@@ -530,7 +567,7 @@ describe("STORY-135 · capture.parse", () => {
       aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null),
     );
     const brand = aggregates.find((row) => row.entityType === "brand")!;
-    expect(perPromptDenominator).toBe(2);
+    expect(perPromptDenominator).toBe(5); // present, refused, L1-empty, the refused source, the L2 row; blocked is out
     expect(brand.cellsTotal).toBe(perPromptDenominator);
     expect(brand.cellsPresent).toBe(perPromptPresent);
   });

@@ -128,8 +128,8 @@ export class ResultDocumentService {
     // THE TEXT EVERY OFFSET INDEXES. `mention_facts.char_*` and `evidence_*` are computed against normalize(raw) by the parse stage, and
     // the document asserts `normalized_text_offsets: true`; serving the raw text shifted every highlight after the first CRLF, zero-width
     // space, NFD sequence or 3+ newline run. An L2 row has no text of its own and reads its source's, scoped to this workspace and project.
-    const rawText = await resolveRawText(store.client, capture);
-    const text = normalize(rawText);
+    const resolved = await resolveRawText(store.client, capture);
+    const text = normalize(resolved.text);
     // Offsets written under another normaliser version index a string this normaliser no longer produces: serve the text, withhold the
     // highlights, and say so. A wrong highlight is worse than none.
     const withheld = requiresReparse(capture.normalizer_version);
@@ -207,12 +207,12 @@ export class ResultDocumentService {
         source_result_id: capture.source_result_id,
       },
       raw_response: {
-        format: typeof capture.payload?.format === "string" ? capture.payload.format : "markdown",
+        format: resolved.format,
         char_count: text.length,
         text,
         normalized_text_offsets: true,
       },
-      entities: groupEntities(mentions.rows),
+      entities: groupEntities(mentions.rows, withheld),
       citations: citations.rows.map(toCitation),
       metrics: {
         scoring_version: capture.scoring_version,
@@ -242,16 +242,19 @@ export class ResultDocumentService {
 async function resolveRawText(
   client: { query: <R>(text: string, values: unknown[]) => Promise<{ rows: R[] }> },
   capture: CaptureRow,
-): Promise<string> {
+): Promise<{ text: string; format: string }> {
   const own = capture.payload?.text;
-  if (typeof own === "string" && own.length > 0) return own;
-  if (capture.source_result_id === null) return typeof own === "string" ? own : "";
+  const formatOf = (payload: CaptureRow["payload"]): string => (typeof payload?.format === "string" ? payload.format : "markdown");
+  if (typeof own === "string" && own.length > 0) return { text: own, format: formatOf(capture.payload) };
+  if (capture.source_result_id === null) return { text: typeof own === "string" ? own : "", format: formatOf(capture.payload) };
   const source = await client.query<{ payload: CaptureRow["payload"] }>(
     "SELECT payload FROM answer_captures WHERE id = $1 AND workspace_id = app.current_workspace() AND project_id = $2",
     [capture.source_result_id, capture.project_id],
   );
-  const text = source.rows[0]?.payload?.text;
-  return typeof text === "string" ? text : "";
+  const sourcePayload = source.rows[0]?.payload ?? null;
+  const text = sourcePayload?.text;
+  // An L2 row stores no payload of its own, so the format is the SOURCE's.
+  return { text: typeof text === "string" ? text : "", format: formatOf(sourcePayload) };
 }
 
 /**
@@ -264,7 +267,7 @@ async function resolveRawText(
  * on the best-placed mention, and the parse stage writes the same entity-level
  * prominence onto every row of that entity).
  */
-function groupEntities(rows: readonly MentionRow[]): ResultEntity[] {
+function groupEntities(rows: readonly MentionRow[], withheld: boolean): ResultEntity[] {
   const byEntity = new Map<string, MentionRow[]>();
   for (const row of rows) {
     const key = `${row.entity_type}:${row.entity_id ?? row.entity_label}`;
@@ -278,7 +281,10 @@ function groupEntities(rows: readonly MentionRow[]): ResultEntity[] {
       entity_id: first.entity_id,
       label: first.entity_label,
       matched_alias: first.matched_alias,
-      occurrences: occurrences.map((row) => ({
+      // WITHHELD: every offset indexes a string this normaliser no longer produces, so none leaves the server. `char_start`/`char_end` are
+      // non-nullable in the contract, so the occurrences are omitted (the entity, its sentiment and its prominence stay); the evidence
+      // span is nullable and is nulled.
+      occurrences: (withheld ? [] : occurrences).map((row) => ({
         occurrence_index: row.occurrence_index,
         char_start: row.char_start,
         char_end: row.char_end,
@@ -300,8 +306,8 @@ function groupEntities(rows: readonly MentionRow[]): ResultEntity[] {
         score: first.sentiment_score,
         confidence: first.sentiment_confidence,
         method: first.sentiment_method,
-        evidence_char_start: first.evidence_start,
-        evidence_char_end: first.evidence_end,
+        evidence_char_start: withheld ? null : first.evidence_start,
+        evidence_char_end: withheld ? null : first.evidence_end,
         negative_reasons: first.negative_reasons,
       },
     };

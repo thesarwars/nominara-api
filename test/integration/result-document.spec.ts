@@ -262,6 +262,14 @@ describe("STORY-034 AC7 · the parser document", () => {
     expect(document.raw_response.text).toBe(normalize(DRIFTY));
     expect(document.highlight_map).toEqual([]);
     expect(document.flags).toContain("highlights_withheld_normalizer_stale");
+    // Audit round 2 - every OTHER offset indexes the same stale string, so none may leave the server: occurrences are omitted (the
+    // contract's char_start/char_end are non-nullable) and the evidence span is null (it is nullable). The entities themselves stay.
+    expect(document.entities.length).toBeGreaterThan(0);
+    for (const entity of document.entities) {
+      expect(entity.occurrences).toEqual([]);
+      expect(entity.sentiment.evidence_char_start).toBeNull();
+      expect(entity.sentiment.evidence_char_end).toBeNull();
+    }
     expect(resultDocumentSchema.safeParse(document).success).toBe(true);
   });
 
@@ -284,6 +292,9 @@ describe("STORY-034 AC7 · the parser document", () => {
     const document = await get(l2);
     expect(document.raw_response.text).toBe(normalize(DRIFTY));
     expect(document.highlight_map.length).toBeGreaterThanOrEqual(3);
+    // The format comes from the SOURCE payload for an L2 row (its own payload is {}).
+    await db.query("UPDATE answer_captures SET payload = jsonb_set(payload, '{format}', '\"plain\"') WHERE id = $1", [resultId]);
+    expect((await get(l2)).raw_response.format).toBe("plain");
     for (const highlight of document.highlight_map) {
       expect(document.raw_response.text.slice(highlight.char_start, highlight.char_end).toLowerCase()).toMatch(/hubspot|salesforce/u);
     }

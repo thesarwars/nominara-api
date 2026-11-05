@@ -120,6 +120,8 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     cls?: string; // the brand's position class
     render?: string;
     status?: string;
+    flags?: string[];
+    text?: string; // payload.text; "" is an empty answer
     rival?: { position: number; cls?: string };
     other?: { label: string; position: number };
   }
@@ -130,9 +132,9 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await db.query(
       `INSERT INTO answer_captures
          (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version,
-          normalizer_version, content_hash, brand_present, brand_rank_position, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1','n1',$8,$9,$10,$11)`,
-      [id, workspaceId, projectId, randomUUID(), spec.prompt ?? promptId, engine, spec.at, createHash("sha256").update(id).digest(), spec.present, spec.position ?? null, spec.status ?? "parsed"],
+          normalizer_version, content_hash, brand_present, brand_rank_position, status, flags, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1','n1',$8,$9,$10,$11,$12::text[],$13::jsonb)`,
+      [id, workspaceId, projectId, randomUUID(), spec.prompt ?? promptId, engine, spec.at, createHash("sha256").update(id).digest(), spec.present, spec.position ?? null, spec.status ?? "parsed", spec.flags ?? [], JSON.stringify(spec.text === undefined ? {} : { text: spec.text })],
     );
     const mention = async (type: string, entityId: string | null, label: string, position: number, cls: string, render: string): Promise<void> => {
       await db.query(
@@ -251,6 +253,45 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await run(D2);
     // the pair is against the previous capture of the cell, the null one included in time order but never a baseline
     expect((await events()).every((e) => e.recovered_at === null)).toBe(true);
+  });
+
+  // Owner decision 57a - a refused or empty answer counts as "not mentioned" in presence but is NO OBSERVATION for displacement.
+  it("STORY-056 · decision 57a: present, refused, present again opens no event and records no recovery", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, text: "", flags: ["engine_refused_to_answer"] });
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+    await capture({ at: `${D3}T10:00:00Z`, present: true, position: 1 });
+    await run(D3);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: an EMPTY answer with no flag is no observation either", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, text: "" });
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: a reused (L2) row whose source answered with nothing is no observation", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    const source = await capture({ at: `${D1}T12:00:00Z`, present: null, engine: "chatgpt", text: "" });
+    const reused = await capture({ at: `${D2}T10:00:00Z`, present: false, status: "skipped" });
+    await db.query("UPDATE answer_captures SET cache_layer = 'l2', source_result_id = $2 WHERE id = $1", [reused, source]);
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: a refused answer does not close an open event, and is not the baseline of the next one", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    await run(D2);
+    expect((await events())[0]!.recovered_at).toBeNull();
+    await capture({ at: `${D3}T10:00:00Z`, present: false, text: "", flags: ["engine_refused_to_answer"] });
+    await run(D3);
+    const rows = await events();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.recovered_at).toBeNull();
   });
 
   it("STORY-056 · cells are independent: another engine's capture is never the 'previous' capture", async () => {

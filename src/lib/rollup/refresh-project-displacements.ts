@@ -90,6 +90,22 @@ interface CellContext {
 
 const CLASS_ORDER = ["recommendation", "ranked", "neutral_list", "also_consider", "caveat"];
 
+/**
+ * Owner decision 57a - a refused or empty answer counts as "not mentioned" in presence, but it is NO OBSERVATION for displacement: it
+ * never opens an event, never closes one, and is never the baseline of the next comparison (the brand was not lost, the engine said
+ * nothing). Excludes rows flagged `engine_refused_to_answer`, rows whose own payload text is the empty string, and an L2 row whose
+ * SOURCE refused or answered with nothing. `table` is a fixed identifier, never user input.
+ */
+function observedAnswerSql(table: string): string {
+  return `NOT ('engine_refused_to_answer' = ANY(${table}.flags))
+          AND ${table}.payload->>'text' IS DISTINCT FROM ''
+          AND NOT EXISTS (
+            SELECT 1 FROM answer_captures src
+             WHERE src.id = ${table}.source_result_id AND src.workspace_id = ${table}.workspace_id AND src.project_id = ${table}.project_id
+               AND ('engine_refused_to_answer' = ANY(src.flags) OR src.payload->>'text' = '')
+          )`;
+}
+
 export async function refreshProjectDisplacements(
   tx: ClientBase,
   projectId: string,
@@ -149,6 +165,7 @@ async function refreshProjectDisplacementsInner(
         WHERE project_id = $1 AND sample_index = 0 AND brand_present IS NOT NULL
           AND (captured_at AT TIME ZONE $2)::date = $3::date
           AND ${measurementStatusSql("status")}
+          AND ${observedAnswerSql("answer_captures")}
         ORDER BY captured_at, id`,
       [projectId, timezone, date],
     )
@@ -177,6 +194,7 @@ async function refreshProjectDisplacementsInner(
            FROM answer_captures
           WHERE project_id = $1 AND prompt_id = $2 AND engine_key = $3 AND sample_index = 0 AND brand_present IS NOT NULL
             AND ${measurementStatusSql("status")}
+            AND ${observedAnswerSql("answer_captures")}
             AND (captured_at, id) < ($4::timestamptz, $5::uuid)
           ORDER BY captured_at DESC, id DESC LIMIT 1`,
         [projectId, after.prompt_id, after.engine_key, after.captured_at, after.id],
