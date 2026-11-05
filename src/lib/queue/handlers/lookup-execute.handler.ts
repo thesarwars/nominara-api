@@ -225,7 +225,9 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
             await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
           }
           if (error instanceof CaptureFailureError) {
-            await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
+            // Our own cancellation (the scan resolved and aborted the run) is not the vendor's failure: spend is recorded above, the breaker is not told.
+            const selfCancelled = runAbort.signal.aborted;
+            if (!selfCancelled) await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
             if (classifyCaptureFailure(error.code) === null && error.code === "content_policy_refusal") throw new ScanCaptureError("content_policy_refusal");
             throw new ScanCaptureError(error.code);
           }

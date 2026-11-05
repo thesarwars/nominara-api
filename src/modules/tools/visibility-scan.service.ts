@@ -13,7 +13,7 @@ import {
   type VisibilityScanEstimateResponse,
   type VisibilityScanRequest,
 } from "../../../contracts/tools/index.js";
-import { ConflictError, IdempotencyConflictError, PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, DomainError, IdempotencyConflictError, PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { SseStream } from "../../api/streaming/sse-stream.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
@@ -68,6 +68,12 @@ export interface ScanAccepted {
   readonly resumed: boolean;
   readonly startedAtMs: number;
 }
+
+/**
+ * A 16-hex-character tag of the Idempotency-Key, written on the run's audit row. The audit redactor blanks any 20+ character high-entropy string, so the full
+ * hash cannot be stored there; 64 bits is a correlation tag scoped to one workspace and actor, which is all the ambiguous-commit probe needs.
+ */
+const keyTag = (key: string): string => hashIdempotencyKey(key).slice(0, 16);
 
 /** Who is asking, for the audit row the route writes itself (a streaming route has no AuditInterceptor). */
 export interface ScanRequestMeta {
@@ -221,11 +227,12 @@ export class VisibilityScanService {
         }
         let accepted: ScanAccepted;
         try {
-          accepted = await this.start(tenant, body, meta);
+          accepted = await this.start(tenant, body, meta, keyTag(key));
         } catch (error) {
           // A `start` that threw releases the claim - UNLESS the failure was the COMMIT itself (the connection dropped while Postgres committed): then the run and
-          // its debit exist, and releasing the claim would let a retry charge a second scan. So the database is asked first.
-          const committed = await this.committedRunSince(tenant, body, claimedAt);
+          // its debit exist, and releasing the claim would let a retry charge a second scan. A typed domain error (402, 412, 409, 403...) is raised BEFORE any
+          // COMMIT and is a definitive refusal, so it is never probed; only an unclassified (connection / driver) error asks the database, by this exact key.
+          const committed = error instanceof DomainError ? undefined : await this.committedRunFor(tenant, keyTag(key), claimedAt);
           if (committed === undefined) {
             await this.cache.delete(claimKey).catch(() => undefined);
             throw error;
@@ -233,6 +240,8 @@ export class VisibilityScanService {
           logger.error({ event: "tools.scan.commit_ambiguous", workspace_id: tenant.workspaceId, run_id: committed });
           incrementCounter("nominara_tools_scan_commit_ambiguous_total");
           await this.recordRunOnClaim(claimKey, bodyHash, committed, claimedAt);
+          // The run exists and is charged: it keeps its daily allowance (the outer catch must not give it back).
+          created = true;
           throw error;
         }
         // From here the run exists, is charged, and its job is scheduled: the claim is NEVER deleted. A retry of the same key must find a claim, so it
@@ -258,21 +267,21 @@ export class VisibilityScanService {
     });
   }
 
-  /** The id of a scan this actor's identical request committed since the claim was taken, or undefined (also when the database cannot be asked). */
-  private async committedRunSince(tenant: TenantContext, body: VisibilityScanRequest, claimedAt: string): Promise<string | undefined> {
+  /** The id of the scan THIS Idempotency-Key started, or undefined (also when the database cannot be asked). Exact: the key's tag is in the run's audit row, written in the run's own transaction. */
+  private async committedRunFor(tenant: TenantContext, keyTag: string, claimedAt: string): Promise<string | undefined> {
     try {
       const client = await this.pool.connect();
       try {
         return await withTenantContext(client, tenant, async (tx) => {
-          // A few seconds of tolerance: the claim time is this process's clock, `created_at` is the database's.
-          const rows = await tx.query<{ id: string }>(
-            `SELECT id FROM tool_runs
-              WHERE workspace_id = app.current_workspace() AND tool_key = 'visibility_scan' AND created_by = $1
-                AND brand_name = $2 AND query_text = $3 AND created_at >= $4::timestamptz - interval '5 seconds'
-              ORDER BY created_at DESC LIMIT 1`,
-            [tenant.actorId, body.brand_name, body.query_text, claimedAt],
+          const rows = await tx.query<{ resource_id: string }>(
+            `SELECT resource_id FROM audit_log
+              WHERE workspace_id = app.current_workspace() AND action = 'tool_run.scan_started' AND resource_type = 'tool_run'
+                AND actor_id = $2 AND occurred_at >= $3::timestamptz - interval '1 minute'
+                AND after_state->>'idempotency_key_tag' = $1
+              ORDER BY seq DESC LIMIT 1`,
+            [keyTag, tenant.actorId, claimedAt],
           );
-          return rows.rows[0]?.id;
+          return rows.rows[0]?.resource_id;
         });
       } finally {
         client.release();
@@ -295,7 +304,7 @@ export class VisibilityScanService {
     return false;
   }
 
-  private async start(tenant: TenantContext, body: VisibilityScanRequest, meta: ScanRequestMeta): Promise<ScanAccepted> {
+  private async start(tenant: TenantContext, body: VisibilityScanRequest, meta: ScanRequestMeta, keyTag: string): Promise<ScanAccepted> {
     // RESOLVED BEFORE A CONNECTION IS TAKEN. `resolveForWorkspace` opens its own pooled connection; doing it while holding one made N concurrent scans
     // need 2N connections, and a burst as large as the pool deadlocked every request waiting on its second one.
     const resolved = await this.entitlements.resolveForWorkspace(tenant.workspaceId);
@@ -332,7 +341,7 @@ export class VisibilityScanService {
           resourceType: "tool_run",
           resourceId: started.id,
           beforeState: null,
-          afterState: { engines: engineKeys, credits: VISIBILITY_SCAN_CREDITS },
+          afterState: { engines: engineKeys, credits: VISIBILITY_SCAN_CREDITS, idempotency_key_tag: keyTag },
           requestId: meta.requestId,
           supportGrantId: null,
           severity: "info",

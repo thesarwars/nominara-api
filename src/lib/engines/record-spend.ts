@@ -12,10 +12,10 @@ export interface SpendLog {
 }
 
 /** Never throws: the money is already spent. A meter that cannot record is logged and counted, not silent. */
-export async function recordEngineSpend(meter: SpendMeter, log: SpendLog, engineKey: string, usd: number, source?: string): Promise<void> {
+export async function recordEngineSpend(meter: SpendMeter, log: SpendLog, engineKey: string, usd: number, source: "capture" | "lookup"): Promise<void> {
   const key = engineKeySchema.safeParse(engineKey);
   if (!key.success) return;
-  const labels = { engine_key: key.data, ...(source !== undefined ? { source } : {}) };
+  const labels = { engine_key: key.data, source };
   let result: Awaited<ReturnType<SpendMeter["recordCost"]>>;
   try {
     result = await meter.recordCost(key.data, usd);

@@ -196,7 +196,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
     }
     return reached;
   };
-  const recordSpend = (engineKey: string, usd: number): Promise<void> => recordEngineSpend(meter(), logger, engineKey, usd);
+  const recordSpend = (engineKey: string, usd: number): Promise<void> => recordEngineSpend(meter(), logger, engineKey, usd, "capture");
 
   // `async`, so that BUILDING the producer is inside the promise too.
   //

@@ -606,6 +606,60 @@ describe("STORY-079 · Visibility Scan", () => {
     expect(w.purchased_balance).toBeGreaterThanOrEqual(0);
   }, 60_000);
 
+  it("round 3 - a 402 refusal is not bound to another key's run: after a top-up the SAME refused key starts its own scan, charged once", async () => {
+    const a = await owner("starter");
+    const same = body();
+    const first = await post(a, { body: same });
+    expect(first.statusCode, first.body).toBe(200);
+    await harness.db().query("UPDATE credit_wallets SET included_balance = 0, purchased_balance = 0, reserved = 0 WHERE workspace_id = $1", [a.workspaceId]);
+    const refusedKey = uuidV7();
+    const refused = await post(a, { key: refusedKey, body: same });
+    expect(refused.statusCode, refused.body).toBe(402);
+    await harness.db().query("UPDATE credit_wallets SET included_balance = 10 WHERE workspace_id = $1", [a.workspaceId]);
+    const retry = await post(a, { key: refusedKey, body: same });
+    expect(retry.statusCode, retry.body).toBe(200);
+    expect(frames(retry.body)[0]!.data).not.toMatchObject({ resumed: true });
+    expect(enqueued).toHaveLength(2);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(2);
+    expect(await available(a)).toBe(0);
+  }, 60_000);
+
+  it("round 3 - a start that threw AFTER Postgres committed (the real probe query) keeps the claim: the retry of the same key attaches, one run, one debit", async () => {
+    const a = await owner("starter");
+    const service = harness.app().get(VisibilityScanService) as unknown as { start: (...args: unknown[]) => Promise<unknown> };
+    const real = service.start.bind(service);
+    vi.spyOn(service, "start").mockImplementationOnce(async (...args: unknown[]) => {
+      await real(...args);
+      throw new Error("connection terminated during COMMIT");
+    });
+    const before = await available(a);
+    const key = uuidV7();
+    const same = body();
+    expect((await post(a, { key, body: same })).statusCode).toBe(500);
+    const retry = await post(a, { key, body: same });
+    expect(retry.statusCode, retry.body).toBe(200);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(1);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit'", [a.workspaceId])).toBe(1);
+    expect(await available(a)).toBe(before - 10);
+  }, 60_000);
+
+  it("round 3 - a capture cancelled by the scan's own abort is not recorded as an engine failure on the breaker; a real failure still is", async () => {
+    const a = await owner("starter");
+    const recorded: { key: string; code?: string }[] = [];
+    adapters = {
+      perplexity: async () => raw(),
+      chatgpt: (ctx) => new Promise<RawCapture>((_resolve, reject) => ctx.signal.addEventListener("abort", () => reject(new CaptureFailureError("timeout", "chatgpt" as never)), { once: true })),
+    };
+    workerDeps = {
+      deadlineMs: 300,
+      engineGate: { admit: async () => ({ kind: "admit" as const }), record: async (key: string, outcome: { outcome: string; code?: string }) => { if (outcome.outcome === "failure") recorded.push({ key, ...(outcome.code !== undefined ? { code: outcome.code } : {}) }); } },
+    } as Partial<LookupExecuteDeps>;
+    const res = await post(a);
+    expect(res.statusCode, res.body).toBe(200);
+    await Promise.allSettled(workers);
+    expect(recorded.filter((r) => r.key === "chatgpt")).toEqual([]);
+  }, 60_000);
+
   it("the job is enqueued on the dedicated interactive pool, keyed by the run", async () => {
     const a = await owner("starter");
     await post(a);

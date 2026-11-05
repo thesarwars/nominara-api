@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { scanStreamCompletedSchema } from "../../../contracts/tools/index.js";
-import { ConflictError, IdempotencyConflictError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, IdempotencyConflictError, InsufficientCreditsError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { InMemoryCacheAdapter } from "../../lib/cache/in-memory-cache.adapter.js";
 import type { Cache } from "../../lib/cache/cache.port.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
@@ -137,10 +137,32 @@ describe("STORY-079 review round 2", () => {
     const cache = new InMemoryCacheAdapter();
     const { service, start } = build(cache);
     start.mockRejectedValueOnce(new Error("connection terminated during COMMIT"));
-    (service as unknown as { committedRunSince: unknown }).committedRunSince = vi.fn(async () => RUN_ID);
+    (service as unknown as { committedRunFor: unknown }).committedRunFor = vi.fn(async () => RUN_ID);
     await expect(service.accept(TENANT, BODY, headers("k9"), META)).rejects.toThrow("COMMIT");
     const again = await service.accept(TENANT, BODY, headers("k9"), META);
     expect(start).toHaveBeenCalledTimes(1);
     expect(again).toMatchObject({ runId: RUN_ID, resumed: true });
+  });
+
+  it("round 3 - an ambiguous commit still counts as a started scan: its daily allowance is NOT given back", async () => {
+    const { service, start } = build(new InMemoryCacheAdapter());
+    start.mockRejectedValueOnce(new Error("connection terminated during COMMIT"));
+    (service as unknown as { committedRunFor: unknown }).committedRunFor = vi.fn(async () => RUN_ID);
+    await expect(service.accept(TENANT, BODY, headers("k10"), META)).rejects.toThrow("COMMIT");
+    expect((service as unknown as { giveBackDailyAllowance: ReturnType<typeof vi.fn> }).giveBackDailyAllowance).not.toHaveBeenCalled();
+  });
+
+  it("round 3 - a typed refusal (402) is definitive: the database is NOT probed for a 'committed' run, the claim is released and the allowance is given back", async () => {
+    const cache = new InMemoryCacheAdapter();
+    const { service, start } = build(cache);
+    start.mockRejectedValueOnce(new InsufficientCreditsError({ message: "no credits", details: {} } as never));
+    const probe = vi.fn(async () => RUN_ID);
+    (service as unknown as { committedRunFor: unknown }).committedRunFor = probe;
+    await expect(service.accept(TENANT, BODY, headers("k11"), META)).rejects.toBeInstanceOf(InsufficientCreditsError);
+    expect(probe).not.toHaveBeenCalled();
+    expect((service as unknown as { giveBackDailyAllowance: ReturnType<typeof vi.fn> }).giveBackDailyAllowance).toHaveBeenCalledTimes(1);
+    // The claim was released: the retry of the same key starts a run.
+    await service.accept(TENANT, BODY, headers("k11"), META);
+    expect(start).toHaveBeenCalledTimes(2);
   });
 });
