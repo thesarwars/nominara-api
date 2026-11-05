@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Param, Post, Query, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Param, Post, Query } from "@nestjs/common";
 import {
   exportRequestSchema,
   exportResponseSchema,
@@ -15,11 +15,11 @@ import { Idempotent } from "../../api/decorators/idempotent.decorator.js";
 import { Meter } from "../../api/decorators/meter.decorator.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { RequireStorage } from "../../api/decorators/require-storage.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { isMeteredPdfExport } from "./export-metering.js";
 import { ExportService } from "./export.service.js";
 import { MethodologyService } from "./methodology.service.js";
-import { StorageReadyGuard } from "./storage-ready.guard.js";
 
 // NEW-E-100a — NFR-AGY-05. A read of rollup-derived figures: same permission
 // as the scorecards it sits beside, scoped to the project in the path.
@@ -46,12 +46,14 @@ export class ReportsController {
   // consumes one pdf_exports unit (QuotaGuard reserves, the service commits);
   // a CSV is gated by exports.csv in the service.
   @Post("export")
-  @UseGuards(StorageReadyGuard)
+  @RequireStorage()
   @RequirePermission("export:data")
   @ProjectParam("id")
   @Meter("pdf_exports", 1, isMeteredPdfExport)
   @Idempotent()
-  @Audit({ action: "report.exported", resourceType: "report_artifact", resourceIdFrom: "response", responseIdPath: "export_id" })
+  // The interceptor's row says only that an export was ATTEMPTED (it is written in the request transaction, before the file is stored).
+  // The outcome is a second row from ExportService: `report.exported` once the file is stored, `report.export_failed` if it was not.
+  @Audit({ action: "report.export_attempted", resourceType: "report_artifact", resourceIdFrom: "response", responseIdPath: "export_id" })
   @ApiContract({ operationId: "exportProjectReport", requestSchema: exportRequestSchema, responseSchema: exportResponseSchema })
   export(
     @Param("id") projectId: string,

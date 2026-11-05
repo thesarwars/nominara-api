@@ -3,6 +3,7 @@ import * as afterTx from "../../api/after-transaction.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
 import * as metrics from "../../lib/telemetry/metrics.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
+import { AuditChainService } from "../audit/audit-chain.service.js";
 import { ExportService } from "./export.service.js";
 
 // STORY-180 AC1 - the upload runs AFTER the request transaction commits, and a second short transaction records the real key.
@@ -12,8 +13,11 @@ const WS = "0190cccc-0000-7000-8000-000000000001";
 const ID = "0190cccc-0000-7000-8000-0000000000a1";
 const context = { workspaceId: WS, actorId: "actor", scopeProjectIds: [] } as never;
 const artifact = { id: ID, relativeKey: `${ID}.pdf`, file: Buffer.from("%PDF"), contentType: "application/pdf" };
+const UNIT_KEY = "idem-key-1";
+const pdfArtifact = { ...artifact, pdfUnitKey: UNIT_KEY };
 
 function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?: boolean; deleteFails?: boolean; markFails?: boolean } = {}) {
+  const order: string[] = [];
   const tasks: Array<() => void> = [];
   vi.spyOn(tenantContext, "afterCommit").mockImplementation((t) => void tasks.push(t));
   const recorded: Array<{ text: string; params: unknown[] }> = [];
@@ -29,6 +33,8 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
     // The record (UPDATE ... SET object_key = $2 ...) may fail; the mark-failed statement has its own switch.
     return fn({
       query: async (text: string, params: unknown[]) => {
+        if (text.includes("SET state = 'committed'")) order.push("commit_unit");
+        if (text.includes("SET state = 'released'")) order.push("release_unit");
         const isMark = typeof params[1] === "string" && (params[1] as string).startsWith("failed:");
         if (isMark) {
           order.push("mark_failed");
@@ -40,9 +46,13 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
       },
     } as never);
   });
+  const audits: Array<{ action: string; afterState: unknown }> = [];
+  vi.spyOn(AuditChainService.prototype, "append").mockImplementation(async (_c, input) => {
+    order.push(`audit:${input.action}`);
+    audits.push({ action: input.action, afterState: input.afterState });
+  });
   const release = vi.fn();
   const pool = { connect: vi.fn(async () => ({ release })) };
-  const order: string[] = [];
   const bound = {
     put: vi.fn(async (_ns: string, relative: string) => {
       order.push("put");
@@ -55,7 +65,7 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
     }),
   };
   const service = new ExportService({} as never, {} as never, {} as never, pool as never, {} as never, "https://api.example.test");
-  return { service, bound, tasks, recorded, release, pool, order, requestTasks };
+  return { service, bound, tasks, recorded, release, pool, order, requestTasks, audits, txClient };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -105,12 +115,14 @@ describe("STORY-180 AC1 · the artifact upload", () => {
   });
 });
 
-describe("STORY-180 r5 (c) · the export waits for the upload and fails when it fails", () => {
-  it("registers ONE request-side wait, which resolves once the file is stored", async () => {
+describe("STORY-180 r5 (c) + r6 · the export waits for the upload and fails when it fails", () => {
+  // r6: the HTTP path does its upload INSIDE the afterTransaction task (post-commit, post-release); it registers nothing with afterCommit.
+  it("registers ONE request-side task and NO afterCommit task; the put happens only when that task runs (after the connection is released)", async () => {
     const h = build();
     h.service.scheduleUpload(h.bound as never, context, artifact, true);
     expect(h.requestTasks).toHaveLength(1);
-    h.tasks[0]!();
+    expect(h.tasks).toHaveLength(0);
+    expect(h.bound.put).not.toHaveBeenCalled();
     await expect(h.requestTasks[0]!()).resolves.toBeUndefined();
     expect(h.bound.put).toHaveBeenCalledTimes(1);
   });
@@ -120,7 +132,6 @@ describe("STORY-180 r5 (c) · the export waits for the upload and fails when it 
     let release!: () => void;
     h.bound.put.mockImplementation(() => new Promise<string>((r) => { release = () => r(`unit/${WS}/${ID}.pdf`); }));
     h.service.scheduleUpload(h.bound as never, context, artifact, true);
-    h.tasks[0]!();
     let settled = false;
     const wait = h.requestTasks[0]!().then(() => { settled = true; });
     await new Promise((r) => setTimeout(r, 20));
@@ -134,7 +145,6 @@ describe("STORY-180 r5 (c) · the export waits for the upload and fails when it 
     const count = vi.spyOn(metrics, "incrementCounter");
     const h = build({ putFails: true });
     h.service.scheduleUpload(h.bound as never, context, artifact, true);
-    h.tasks[0]!();
     await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
     expect(h.recorded).toHaveLength(1);
     expect(h.recorded[0]!.text).toMatch(/SET object_key = \$2 WHERE id = \$1 AND object_key = \$3 AND workspace_id = app\.current_workspace\(\)/);
@@ -147,9 +157,8 @@ describe("STORY-180 r5 (c) · the export waits for the upload and fails when it 
     const count = vi.spyOn(metrics, "incrementCounter");
     const h = build({ recordThrows: true });
     h.service.scheduleUpload(h.bound as never, context, artifact, true);
-    h.tasks[0]!();
     await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
-    expect(h.order).toEqual(["put", "delete", "mark_failed"]);
+    expect(h.order).toEqual(["put", "delete", "mark_failed", "audit:report.export_failed"]);
     expect(h.bound.delete).toHaveBeenCalledWith("reports", `${ID}.pdf`);
     expect(count).toHaveBeenCalledWith("nominara_reports_artifact_uploads_total", { outcome: "record_failed" });
   });
@@ -157,15 +166,13 @@ describe("STORY-180 r5 (c) · the export waits for the upload and fails when it 
   it("when the orphan cannot be deleted the row is NOT marked (it stays pending for the retention sweep, which deletes the object first)", async () => {
     const h = build({ recordThrows: true, deleteFails: true });
     h.service.scheduleUpload(h.bound as never, context, artifact, true);
-    h.tasks[0]!();
     await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
-    expect(h.order).toEqual(["put", "delete"]);
+    expect(h.order).toEqual(["put", "delete", "audit:report.export_failed"]);
   });
 
   it("a failure to mark the row failed still fails the request and never throws out of the upload", async () => {
     const h = build({ putFails: true, markFails: true });
     h.service.scheduleUpload(h.bound as never, context, artifact, true);
-    h.tasks[0]!();
     await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
     expect(h.release).toHaveBeenCalled();
   });
@@ -177,9 +184,88 @@ describe("STORY-180 r5 (c) · the export waits for the upload and fails when it 
     expect(h.tasks).toHaveLength(1);
   });
 
-  it("outside a request transaction even an awaiting export does not throw (afterTransaction registers nothing)", () => {
+  it("STORY-180 r6 · an awaiting export outside a request transaction THROWS (it must not answer without waiting for the file)", () => {
     const h = build();
     vi.spyOn(afterTx, "afterTransaction").mockReturnValue(false);
-    expect(() => h.service.scheduleUpload(h.bound as never, context, artifact, true)).not.toThrow();
+    expect(() => h.service.scheduleUpload(h.bound as never, context, artifact, true)).toThrow(/request transaction/);
+    expect(h.tasks).toHaveLength(0);
+  });
+});
+
+describe("STORY-180 r6 · the pdf_exports unit follows the stored file", () => {
+  it("success: the unit is COMMITTED in the same short transaction that records the key, right after the record", async () => {
+    const h = build();
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await h.requestTasks[0]!();
+    expect(h.order).toEqual(["put", "commit_unit", "audit:report.exported"]);
+    const commit = h.recorded.find((r) => r.text.includes("SET state = 'committed'"))!;
+    expect(commit.params).toEqual([WS, "pdf_exports", UNIT_KEY]);
+    expect(h.recorded.some((r) => r.text.includes("SET state = 'released'"))).toBe(false);
+  });
+
+  it("an upload whose row was gone does not commit the unit (orphan_removed): the unit is RELEASED", async () => {
+    const h = build({ recordedRows: 0 });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.order).not.toContain("commit_unit");
+    expect(h.order).toContain("release_unit");
+    expect(h.recorded.find((r) => r.text.includes("SET state = 'released'"))!.params).toEqual([WS, "pdf_exports", UNIT_KEY]);
+  });
+
+  it("put_failed: the unit is RELEASED and never committed", async () => {
+    const h = build({ putFails: true });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.order).toContain("release_unit");
+    expect(h.order).not.toContain("commit_unit");
+  });
+
+  it("record_failed: the unit is RELEASED and never committed", async () => {
+    const h = build({ recordThrows: true });
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.order).toContain("release_unit");
+    expect(h.order).not.toContain("commit_unit");
+  });
+
+  it("a release that itself fails never throws out of the upload (the reservation stands: the safe direction for a ceiling)", async () => {
+    const h = build({ putFails: true });
+    const connect = h.pool.connect as ReturnType<typeof vi.fn>;
+    connect.mockResolvedValueOnce({ release: h.release }).mockRejectedValue(new Error("db down"));
+    h.service.scheduleUpload(h.bound as never, context, pdfArtifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+  });
+
+  it("a CSV (no unit key) never touches the unit", async () => {
+    const h = build();
+    h.service.scheduleUpload(h.bound as never, context, artifact, true);
+    await h.requestTasks[0]!();
+    expect(h.order.filter((o) => o.endsWith("_unit"))).toEqual([]);
+  });
+});
+
+describe("STORY-180 r6 · the audit trail tells the truth about the outcome", () => {
+  it("a failed upload appends report.export_failed (and no report.exported), carrying the outcome", async () => {
+    const h = build({ putFails: true });
+    h.service.scheduleUpload(h.bound as never, context, artifact, true);
+    await expect(h.requestTasks[0]!()).rejects.toBeInstanceOf(DegradedError);
+    expect(h.audits.map((a) => a.action)).toEqual(["report.export_failed"]);
+    expect(h.audits[0]!.afterState).toEqual({ outcome: "put_failed" });
+  });
+
+  it("a stored upload appends report.exported in the SAME transaction as the record (before the connection is released)", async () => {
+    const h = build();
+    h.service.scheduleUpload(h.bound as never, context, artifact, true);
+    await h.requestTasks[0]!();
+    expect(h.audits.map((a) => a.action)).toEqual(["report.exported"]);
+    expect(h.audits[0]!.afterState).toEqual({ outcome: "ok", format: "pdf" });
+  });
+
+  it("the scheduled path appends no audit row of its own (no actor asked for the export)", async () => {
+    const h = build();
+    h.service.scheduleUpload(h.bound as never, context, artifact);
+    h.tasks[0]!();
+    await h.service.uploaded([ID]);
+    expect(h.audits).toEqual([]);
   });
 });

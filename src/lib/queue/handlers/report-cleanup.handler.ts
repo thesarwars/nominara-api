@@ -27,7 +27,6 @@ import type { JobProcessor } from "../worker-factory.js";
 const tracer = trace.getTracer("nominara.report-cleanup");
 
 export interface ReportCleanupDeps {
-  readonly now?: () => Date;
   readonly batchSize?: number;
   /** A test seam; production builds the store from the environment, as `report.build` does. */
   readonly store?: TenantObjectStore;
@@ -64,15 +63,15 @@ export function createReportCleanupHandler(context: QueueHandlerContext, deps: R
       return await tracer.startActiveSpan("report.cleanup", async (span) => {
         try {
           const result = await runReportArtifactCleanup(owner, context.pool, store, {
-            now: deps.now ?? (() => new Date()),
             ...(deps.batchSize === undefined ? {} : { batchSize: deps.batchSize }),
           });
           span.setAttribute("nominara.report_cleanup.purged", result.purged);
           span.setAttribute("nominara.report_cleanup.workspaces", result.workspaces);
           span.setAttribute("nominara.report_cleanup.failed", result.failed);
+          span.setAttribute("nominara.report_cleanup.refused", result.refused);
           incrementCounter("nominara_reports_cleanup_runs_total", { status: result.status });
           // Counts only - never a key, an artifact id or a workspace name.
-          logger.log({ event: "report.cleanup.run", status: result.status, purged: result.purged, workspaces: result.workspaces, failed: result.failed });
+          logger.log({ event: "report.cleanup.run", status: result.status, purged: result.purged, workspaces: result.workspaces, failed: result.failed, refused: result.refused });
           // A partial run fails the job so the retry ladder is the prompt second try (the sweep is idempotent, so re-running costs nothing).
           if (result.failed > 0) throw new Error(`report cleanup: ${String(result.failed)} failure(s) - see the log`);
           return result;

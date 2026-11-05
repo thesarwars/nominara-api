@@ -6,7 +6,8 @@
 --
 --   link_token_hash  sha256 of the token in the email. NULL = no link has been issued for this artifact (every artifact that is
 --                    attached or only shown on screen). Unique where set, so a hash names one artifact.
---   link_revoked_at  set to revoke the link. The route refuses a revoked token exactly as it refuses an unknown one.
+--   link_revoked_at  set to revoke the link. The route answers a revoked token with 401 `token_revoked` ("This link was revoked."); an
+--                    unknown or expired token is still the neutral 404.
 --
 -- The link's lifetime is the artifact's own expires_at (7 days from the build), so no third timestamp.
 --

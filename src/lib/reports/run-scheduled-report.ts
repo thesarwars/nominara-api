@@ -154,7 +154,7 @@ async function recordedArtifacts(tx: ClientBase, workspaceId: string, report: Sc
       const found = await tx.query<{ id: string }>(
         `SELECT a.id FROM report_artifacts a
            JOIN scheduled_report_deliveries d ON d.id = $1 AND d.workspace_id = $4
-          WHERE a.workspace_id = $4 AND a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now() AND a.object_key !~ '^(pending|failed|purged):'
+          WHERE a.workspace_id = $4 AND a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now() AND a.object_key !~ '^(pending|failed|purged|refused):'
           ORDER BY a.created_at, a.id LIMIT 1`,
         [deliveryId, projectId, format, workspaceId],
       );

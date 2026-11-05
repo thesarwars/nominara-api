@@ -320,6 +320,29 @@ describe("STORY-070 · the non-credit tier-cap lifecycle", () => {
     expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(10);
   });
 
+  it("STORY-180 r6 · a RELEASED reservation is re-taken by a retry under the same job id (capped and counted again), and a committed one is still a replay", async () => {
+    await setCounter("pdf_exports", 1);
+    const take = () => reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 1, jobId: "j1" });
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: false });
+    expect(await releaseTierCap(db, workspaceId, "pdf_exports", "j1")).toBe(true);
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: false });
+    expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(1);
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: true });
+    expect(await commitTierCap(db, workspaceId, "pdf_exports", "j1")).toBe(true);
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: true });
+    expect(await readCounter(db, workspaceId, "pdf_exports", PERIOD)).toEqual({ limitValue: 1, usedValue: 1, reservedValue: 0 });
+  });
+
+  it("STORY-180 r6 · a released reservation retried at an exhausted ceiling is REFUSED, not waved through as a replay", async () => {
+    await setCounter("pdf_exports", 1);
+    const take = (jobId: string) => reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 1, jobId });
+    await take("j1");
+    await releaseTierCap(db, workspaceId, "pdf_exports", "j1");
+    await take("j2");
+    expect(await take("j1")).toEqual({ ok: false });
+    expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(1);
+  });
+
   it("a committed reservation cannot then be released", async () => {
     await setCounter("pdf_exports", 25);
     await reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 3, jobId: "j1" });

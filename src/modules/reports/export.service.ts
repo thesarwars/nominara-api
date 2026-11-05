@@ -31,6 +31,7 @@ import { commitTierCap, limitValueFor, readCounter, releaseTierCap, UNLIMITED_LI
 import { exportPaletteFrom, type ExportPalette, type StoredThemeValues } from "../../lib/theme/export-palette.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
+import { AuditChainService } from "../audit/audit-chain.service.js";
 import { exportDownloadUrl, EXPORT_PUBLIC_BASE_URL } from "./export-download.service.js";
 import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 
@@ -51,8 +52,17 @@ import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 // A FAILED UPLOAD IS NEVER LEFT PENDING. If the put fails, the row is marked `failed:<id>`. If the put landed but the key could not
 // be recorded, the object is deleted first (no connection held) and then the row is marked `failed:<id>`. Either way the request
 // answers 503 `degraded`. If the marking itself fails (the database is the thing that is down) the row stays `pending:` and the
-// nightly report cleanup deletes its object and marks it purged. A PDF's `pdf_exports` unit is committed with the row and is NOT
-// returned on a failed upload; a retry under the same Idempotency-Key finds the unit already committed and costs nothing more.
+// nightly report cleanup deletes its object and marks it purged.
+//
+// THE PDF UNIT FOLLOWS THE STORED FILE (round 6). QuotaGuard RESERVES the `pdf_exports` unit under the Idempotency-Key; this service
+// leaves it reserved through the request transaction and COMMITS it in the same short transaction that records the stored key, so a unit
+// is consumed only by a file that exists. On `put_failed`, `record_failed` and `orphan_removed` it is RELEASED (the client sends a fresh
+// key per click, so a 503 retry must not cost a second unit). A retry under the SAME key re-takes the released unit (reserveTierCap).
+// If the release itself cannot be written, the reservation stands until the cycle rolls: the safe direction for a ceiling.
+//
+// AUDIT. The interceptor's row is `report.export_attempted` (written in the request transaction, before the file is stored). The outcome
+// follows from here: `report.exported` in the record transaction, or `report.export_failed` (carrying the outcome) in its own short
+// transaction. The scheduled path has no requesting actor and appends neither.
 //
 // WHAT COMES FROM WHERE
 //   figures   `metric_daily` only (the rollups), cells-weighted over the window
@@ -64,9 +74,7 @@ import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 //             brand-line flag are used.
 //
 // METERING. A PDF consumes one `pdf_exports` unit. QuotaGuard (`@Meter` on the
-// route) has already RESERVED it under the Idempotency-Key, and this service
-// COMMITS that reservation in the same transaction as the artifact row, so a
-// rolled-back export never counts and a committed one always does. A CSV
+// route) has already RESERVED it under the Idempotency-Key; it is committed once the file is stored (see above). A CSV
 // consumes none: it is gated by `exports.csv` here. Zero credits either way.
 
 const logger = new Logger("ExportService");
@@ -79,6 +87,15 @@ const ARTIFACT_TTL_DAYS = 7;
 
 /** How long a failed upload is remembered by `uploaded()`. */
 const FAILED_UPLOAD_MEMORY_MS = 10 * 60_000;
+
+/** What an upload stores. `pdfUnitKey` is the Idempotency-Key the PDF's `pdf_exports` unit is reserved under (absent: nothing to settle). */
+interface UploadArtifact {
+  readonly id: string;
+  readonly relativeKey: string;
+  readonly file: Buffer;
+  readonly contentType: string;
+  readonly pdfUnitKey?: string;
+}
 
 /** How a post-commit upload ended. Only `ok` leaves a stored file and a row that says so. */
 type UploadOutcome = "ok" | "put_failed" | "record_failed" | "orphan_removed" | "error";
@@ -226,12 +243,15 @@ export class ExportService {
         [exportId, workspaceId, [projectId], window.from, window.to, body.format, pendingKey(exportId), file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS],
       );
 
-      this.scheduleUpload(bound, store.context, { id: exportId, relativeKey, file, contentType: body.format === "pdf" ? "application/pdf" : "text/csv" }, options.awaitUpload === true);
+      const pdfUnitKey = body.format === "pdf" ? idempotencyKey : undefined;
+      this.scheduleUpload(
+        bound,
+        store.context,
+        { id: exportId, relativeKey, file, contentType: body.format === "pdf" ? "application/pdf" : "text/csv", ...(pdfUnitKey === undefined ? {} : { pdfUnitKey }) },
+        options.awaitUpload === true,
+      );
 
-      if (body.format === "pdf" && idempotencyKey !== undefined) {
-        await commitTierCap(tx, workspaceId, "pdf_exports", idempotencyKey);
-      }
-      const pdf = await this.pdfUsage(tx, workspaceId, entitlements.entitlements["exports.pdf_per_cycle"]?.value ?? null);
+      const pdf = await this.pdfUsage(tx, workspaceId, entitlements.entitlements["exports.pdf_per_cycle"]?.value ?? null, pdfUnitKey);
 
       incrementCounter("nominara_reports_exports_total", { format: body.format, outcome: "ok" });
       // Workspace ID, never its name; no figures, no names, no engine text.
@@ -266,44 +286,59 @@ export class ExportService {
 
   /**
    * STORY-180 AC1 + owner decision 60 (c). Registers the upload to run AFTER this request's transaction commits (a rolled-back export
-   * uploads nothing), and makes the request WAIT for it: the response is produced only once the file is stored, and fails (503
-   * `degraded`) if it could not be. Public so the ordering is testable; call it only from `export`.
+   * uploads nothing). Public so the ordering is testable; call it only from `export`.
    *
-   * The work: put the object (no transaction open, no connection held), then ONE short tenant transaction records the real key. If the
-   * row is gone by then (rolled back to a savepoint after the upload was registered) the orphan object is deleted. A failed upload
-   * marks the row `failed:` (see the header) and never throws out of the background work; the request-side wait (`awaitInRequest`, the HTTP
-   * export route) is what reports it. The scheduled path holds no response and waits through `uploaded()`.
+   * `awaitInRequest` (the HTTP export route): the upload runs INSIDE the `afterTransaction` task, which TenantContextInterceptor runs
+   * after COMMIT and after the pooled connection is released, so the put is ordered after the release by construction (no afterCommit,
+   * no setImmediate), and the response is produced only once the file is stored; it fails (503 `degraded`) if it could not be. With no
+   * request transaction to hang the task on it THROWS: an export must never answer without waiting.
+   *
+   * Without it (the scheduled path) the upload runs after commit and nothing holds a response; delivery waits through `uploaded()`.
+   *
+   * The work: put the object (no transaction open, no connection held), then ONE short tenant transaction records the real key and
+   * commits the PDF's unit. If the row is gone by then (rolled back to a savepoint after the upload was registered) the orphan object
+   * is deleted. A failed upload marks the row `failed:` (see the header), releases the unit, and never throws out of the background work.
    */
-  scheduleUpload(bound: BoundObjectStore, context: TenantContext, artifact: { id: string; relativeKey: string; file: Buffer; contentType: string }, awaitInRequest = false): void {
-    let settle!: (outcome: UploadOutcome) => void;
-    const outcome = new Promise<UploadOutcome>((resolve) => {
-      settle = resolve;
-    });
+  scheduleUpload(bound: BoundObjectStore, context: TenantContext, artifact: UploadArtifact, awaitInRequest = false): void {
+    if (awaitInRequest) {
+      const registered = afterTransaction(async () => {
+        if ((await this.runUpload(bound, context, artifact, true)) !== "ok") throw new DegradedError({ message: "the export file could not be stored: retry the export" });
+      });
+      if (!registered) throw new Error("an awaited export upload needs a request transaction to follow (afterTransaction registered nothing)");
+      return;
+    }
     afterCommit(() => {
-      const work: Promise<UploadOutcome> = new Promise<void>((resolve) => setImmediate(resolve))
-        .then(() => this.upload(bound, context, artifact))
-        .catch((error: unknown): UploadOutcome => {
-          logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "error", error: error instanceof Error ? error.name : "unknown" });
-          return "error";
-        })
-        .then((result) => {
-          settle(result);
-          // A success is forgotten at once (a later uploaded() finds nothing and resolves). A FAILURE is remembered for a while, so a
-          // scheduled delivery that asks after the upload has already failed still refuses to mail over a file that is not stored.
-          if (result === "ok") this.uploads.delete(artifact.id);
-          else setTimeout(() => this.uploads.delete(artifact.id), FAILED_UPLOAD_MEMORY_MS).unref();
-          return result;
-        });
-      this.uploads.set(artifact.id, work);
-    });
-    if (!awaitInRequest) return;
-    afterTransaction(async () => {
-      if ((await outcome) !== "ok") throw new DegradedError({ message: "the export file could not be stored: retry the export" });
+      void this.runUpload(bound, context, artifact, false, new Promise<void>((resolve) => setImmediate(resolve)));
     });
   }
 
-  private async upload(bound: BoundObjectStore, context: TenantContext, artifact: { id: string; relativeKey: string; file: Buffer; contentType: string }): Promise<UploadOutcome> {
+  /** Runs one upload to its end, remembers a failure for `uploaded()`, and never rejects. */
+  private runUpload(bound: BoundObjectStore, context: TenantContext, artifact: UploadArtifact, audited: boolean, start: Promise<void> = Promise.resolve()): Promise<UploadOutcome> {
+    const work: Promise<UploadOutcome> = start
+      .then(() => this.upload(bound, context, artifact, audited))
+      .catch((error: unknown): UploadOutcome => {
+        logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+        return "error";
+      })
+      .then((result) => {
+        // A success is forgotten at once (a later uploaded() finds nothing and resolves). A FAILURE is remembered for a while, so a
+        // scheduled delivery that asks after the upload has already failed still refuses to mail over a file that is not stored.
+        if (result === "ok") this.uploads.delete(artifact.id);
+        else setTimeout(() => this.uploads.delete(artifact.id), FAILED_UPLOAD_MEMORY_MS).unref();
+        return result;
+      });
+    this.uploads.set(artifact.id, work);
+    return work;
+  }
+
+  private async upload(bound: BoundObjectStore, context: TenantContext, artifact: UploadArtifact, audited: boolean): Promise<UploadOutcome> {
     const started = Date.now();
+    // Every non-ok end releases the PDF's unit and (HTTP path) audits the failure, whatever the cause.
+    const fail = async (outcome: Exclude<UploadOutcome, "ok" | "error">): Promise<UploadOutcome> => {
+      await this.releaseUnit(context.workspaceId, artifact.pdfUnitKey);
+      if (audited) await this.auditFailure(context, artifact, outcome);
+      return outcome;
+    };
     let key: string;
     try {
       key = await bound.put("reports", artifact.relativeKey, artifact.file, { contentType: artifact.contentType });
@@ -311,16 +346,24 @@ export class ExportService {
       incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "put_failed" });
       logger.error({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "put_failed", error: error instanceof Error ? error.name : "unknown", duration_ms: Date.now() - started });
       await this.markFailed(context, artifact.id);
-      return "put_failed";
+      return fail("put_failed");
     }
     let recorded: boolean;
     try {
       const client = await this.pool.connect();
       try {
-        const result = await withTenantContext(client, context, (tx) =>
-          tx.query("UPDATE report_artifacts SET object_key = $2 WHERE id = $1 AND object_key = $3 AND workspace_id = app.current_workspace()", [artifact.id, key, pendingKey(artifact.id)]),
-        );
-        recorded = (result.rowCount ?? 0) > 0;
+        // ONE short transaction: the real key, the PDF's unit (reserved -> used) and the outcome audit row stand or fall together.
+        recorded = await withTenantContext(client, context, async (tx) => {
+          const result = await tx.query("UPDATE report_artifacts SET object_key = $2 WHERE id = $1 AND object_key = $3 AND workspace_id = app.current_workspace()", [artifact.id, key, pendingKey(artifact.id)]);
+          if ((result.rowCount ?? 0) === 0) return false;
+          if (artifact.pdfUnitKey !== undefined && !(await commitTierCap(tx, context.workspaceId, "pdf_exports", artifact.pdfUnitKey))) {
+            // Nothing reserved under this key (released or never made): the file is stored and the unit cannot be taken now. Visible, not fatal.
+            incrementCounter("nominara_reports_pdf_unit_total", { outcome: "commit_missed" });
+            logger.warn({ span: "reports.artifact.unit", workspace_id: context.workspaceId, outcome: "commit_missed" });
+          }
+          if (audited) await this.auditOutcome(tx, context, artifact, "report.exported", { outcome: "ok", format: formatOf(artifact) });
+          return true;
+        });
       } finally {
         client.release();
       }
@@ -330,19 +373,52 @@ export class ExportService {
       // The object is there and the row does not say so. Delete the object FIRST (no connection held), then mark the row: if the delete
       // fails the row stays pending, and the nightly cleanup deletes the object (idempotently) and marks the row.
       if (await this.deleteQuietly(bound, artifact.relativeKey, context)) await this.markFailed(context, artifact.id);
-      return "record_failed";
+      return fail("record_failed");
     }
     if (!recorded) {
       // The row is gone (rolled back to a savepoint after the upload was registered): remove the orphan with NO connection held.
       await this.deleteQuietly(bound, artifact.relativeKey, context);
       incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "orphan_removed" });
       logger.warn({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "orphan_removed", duration_ms: Date.now() - started });
-      return "orphan_removed";
+      return fail("orphan_removed");
     }
     incrementCounter("nominara_reports_artifact_uploads_total", { outcome: "ok" });
     // Workspace ID and sizes only: no key, no URL, no figures.
     logger.log({ span: "reports.artifact.upload", workspace_id: context.workspaceId, outcome: "ok", bytes: artifact.file.length, duration_ms: Date.now() - started });
     return "ok";
+  }
+
+  /** Appends the outcome audit row on the hash chain, inside the caller's tenant transaction. The actor is the one who asked for the export. */
+  private auditOutcome(tx: ClientBase, context: TenantContext, artifact: UploadArtifact, action: "report.exported" | "report.export_failed", afterState: Record<string, string>): Promise<void> {
+    return new AuditChainService().append(tx, {
+      workspaceId: context.workspaceId,
+      actorType: "user",
+      actorId: context.actorId,
+      actorIp: null,
+      actorUa: null,
+      action,
+      resourceType: "report_artifact",
+      resourceId: artifact.id,
+      beforeState: null,
+      afterState,
+      requestId: "",
+      supportGrantId: null,
+      severity: "info",
+    });
+  }
+
+  /** `report.export_failed` in its own short tenant transaction. Best effort: a failure to audit is logged and never changes the 503. */
+  private async auditFailure(context: TenantContext, artifact: UploadArtifact, outcome: string): Promise<void> {
+    try {
+      const client = await this.pool.connect();
+      try {
+        await withTenantContext(client, context, (tx) => this.auditOutcome(tx, context, artifact, "report.export_failed", { outcome }));
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      logger.error({ span: "reports.artifact.audit", workspace_id: context.workspaceId, outcome: "audit_failed", error: error instanceof Error ? error.name : "unknown" });
+    }
   }
 
   /** Deletes the object outside any transaction. True when it is gone (delete is idempotent). Never throws. */
@@ -446,16 +522,29 @@ export class ExportService {
     return exportPaletteFrom(result.rows[0], brandRemovalGranted);
   }
 
-  /** used / cap for the response. `cap` null = uncapped; a zero cap is returned as 0. */
-  private async pdfUsage(tx: ClientBase, workspaceId: string, entitlement: unknown): Promise<{ used: number; cap: number | null }> {
+  /**
+   * used / cap for the response. `cap` null = uncapped; a zero cap is returned as 0. This export's own unit is still RESERVED here (it is
+   * committed once the file is stored, and the response is only produced after that), so it is counted: the response reads what the
+   * counter will read the moment it arrives.
+   */
+  private async pdfUsage(tx: ClientBase, workspaceId: string, entitlement: unknown, unitKey: string | undefined): Promise<{ used: number; cap: number | null }> {
     const period = await resolveBillingPeriod(tx, workspaceId);
     const counter = await readCounter(tx, workspaceId, "pdf_exports", period.start);
     if (counter !== undefined) {
-      return { used: counter.usedValue, cap: counter.limitValue === UNLIMITED_LIMIT ? null : counter.limitValue };
+      const pending = unitKey === undefined ? 0 : await this.reservedQuantity(tx, workspaceId, unitKey);
+      return { used: counter.usedValue + pending, cap: counter.limitValue === UNLIMITED_LIMIT ? null : counter.limitValue };
     }
     // No counter yet (a CSV-only workspace this cycle): nothing used; the cap is the plan's.
     const limit = limitValueFor("pdf_exports", entitlement as Parameters<typeof limitValueFor>[1]);
     return { used: 0, cap: limit === UNLIMITED_LIMIT ? null : limit };
+  }
+
+  private async reservedQuantity(tx: ClientBase, workspaceId: string, unitKey: string): Promise<number> {
+    const held = await tx.query<{ quantity: string }>(
+      "SELECT quantity::text FROM usage_reservations WHERE workspace_id = $1 AND metric = 'pdf_exports' AND job_id = $2 AND state = 'reserved'",
+      [workspaceId, unitKey],
+    );
+    return Number(held.rows[0]?.quantity ?? 0);
   }
 
   /**
@@ -468,6 +557,12 @@ export class ExportService {
    * that retry free.
    */
   private async releaseIfUnserved(workspaceId: string, idempotencyKey: string): Promise<void> {
+    await this.releaseUnit(workspaceId, idempotencyKey);
+  }
+
+  /** Gives a PDF's reserved unit back on its own connection (no request transaction is open). Never throws; `undefined` is nothing to release. */
+  private async releaseUnit(workspaceId: string, idempotencyKey: string | undefined): Promise<void> {
+    if (idempotencyKey === undefined) return;
     try {
       const client = await this.pool.connect();
       try {
@@ -482,4 +577,8 @@ export class ExportService {
       logger.warn({ span: "reports.export.release_failed", workspace_id: workspaceId, reason: error instanceof Error ? error.name : "unknown" });
     }
   }
+}
+
+function formatOf(artifact: UploadArtifact): string {
+  return artifact.relativeKey.slice(artifact.relativeKey.lastIndexOf(".") + 1);
 }

@@ -294,6 +294,57 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     expect(download.statusCode, download.body).toBe(503);
   }, 120_000);
 
+  it("STORY-180 r6 · a PDF whose upload fails uses no unit: a retry under a NEW key that succeeds leaves used = 1 and reserved = 0", async () => {
+    const { a, p } = await seeded();
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const put = vi.spyOn(port, "put").mockRejectedValueOnce(new Error("s3 down"));
+    try {
+      const failed = await exportReport(a, p, body());
+      expect(failed.statusCode, failed.body).toBe(503);
+    } finally {
+      put.mockRestore();
+    }
+    expect(await usage(a.workspaceId)).toEqual({ used: 0, reserved: 0 });
+    const retried = await exportReport(a, p, body());
+    expect(retried.statusCode, retried.body).toBe(201);
+    expect(data<Exported>(retried).pdf).toEqual({ used: 1, cap: 25 });
+    expect(await usage(a.workspaceId)).toEqual({ used: 1, reserved: 0 });
+  }, 120_000);
+
+  it("STORY-180 r6 · a retry under the SAME key after a failed upload re-takes the released unit: it is capped and counted, not free", async () => {
+    const { a, p } = await seeded();
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const key = `same-${uuidV7()}`;
+    const put = vi.spyOn(port, "put").mockRejectedValueOnce(new Error("s3 down"));
+    try {
+      expect((await exportReport(a, p, body(), key)).statusCode).toBe(503);
+    } finally {
+      put.mockRestore();
+    }
+    expect(await usage(a.workspaceId)).toEqual({ used: 0, reserved: 0 });
+    const retried = await exportReport(a, p, body(), key);
+    expect(retried.statusCode, retried.body).toBe(201);
+    expect(await usage(a.workspaceId)).toEqual({ used: 1, reserved: 0 });
+  }, 120_000);
+
+  it("STORY-180 r6 · the audit trail tells the truth: a failed upload leaves report.export_attempted and report.export_failed (outcome put_failed) and NO report.exported; a stored one leaves attempted and exported", async () => {
+    const { a, p } = await seeded();
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const actions = async (): Promise<string[]> =>
+      ((await harness.db().query(`SELECT action FROM audit_log WHERE workspace_id = $1 AND action LIKE 'report.export%' ORDER BY seq`, [a.workspaceId])).rows as Array<{ action: string }>).map((r) => r.action);
+    const put = vi.spyOn(port, "put").mockRejectedValueOnce(new Error("s3 down"));
+    try {
+      expect((await exportReport(a, p, body({ format: "csv" }))).statusCode).toBe(503);
+    } finally {
+      put.mockRestore();
+    }
+    expect(await actions()).toEqual(["report.export_attempted", "report.export_failed"]);
+    const failedRow = (await harness.db().query(`SELECT after_state FROM audit_log WHERE workspace_id = $1 AND action = 'report.export_failed'`, [a.workspaceId])).rows[0] as { after_state: unknown };
+    expect(failedRow.after_state).toEqual({ outcome: "put_failed" });
+    expect((await exportReport(a, p, body({ format: "csv" }))).statusCode).toBe(201);
+    expect(await actions()).toEqual(["report.export_attempted", "report.export_failed", "report.export_attempted", "report.exported"]);
+  }, 120_000);
+
   it("STORY-180 r5 (c) · a put that landed but could not be recorded: the object is deleted, the row is marked failed, the export answers 503", async () => {
     const { a, p } = await seeded();
     const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });

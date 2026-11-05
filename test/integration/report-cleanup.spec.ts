@@ -67,8 +67,7 @@ describe("STORY-180 r5 (b) · report.cleanup and workspace erasure of report obj
   });
 
   const context = (): QueueHandlerContext => ({ pool, env });
-  const run = (over: { now?: Date; store?: TenantObjectStore } = {}) =>
-    createReportCleanupHandler(context(), { now: () => over.now ?? new Date(), store: over.store ?? store })(db, tick());
+  const run = (over: { store?: TenantObjectStore } = {}) => createReportCleanupHandler(context(), { store: over.store ?? store })(db, tick());
 
   async function workspace(): Promise<string> {
     return (await db.query<{ id: string }>("INSERT INTO workspaces (name, slug, plan_key) VALUES ('W', $1, 'free') RETURNING id", [`w-${randomUUID().slice(0, 12)}`])).rows[0]!.id;
@@ -152,7 +151,7 @@ describe("STORY-180 r5 (b) · report.cleanup and workspace erasure of report obj
     expect(await keyOf(bLive.id)).toBe(bLive.key);
   }, 120_000);
 
-  it("a row whose stored key points into ANOTHER workspace's prefix is refused: the foreign object survives and the row is not marked", async () => {
+  it("a row whose stored key points into ANOTHER workspace's prefix is refused: the foreign object survives and the row is quarantined as refused:<id>, once, without failing the job", async () => {
     const a = await workspace();
     const b = await workspace();
     const victim = await artifact(b, { expiresIn: 5 * DAY });
@@ -163,10 +162,12 @@ describe("STORY-180 r5 (b) · report.cleanup and workspace erasure of report obj
        VALUES ($1,$2,'{}','2026-10-01','2026-10-31','pdf',$3,10,'{}'::jsonb, now() - interval '1 hour')`,
       [id, a, victim.key],
     );
-    const out = await run().catch((e: unknown) => e);
-    expect(out).toBeInstanceOf(Error); // the partial run fails the job so the retry ladder is the prompt second try
+    // STORY-180 r6: a tenancy refusal is permanent, so it is quarantined (not retried nightly, not failing the job, not starving the batch).
+    expect(await run()).toMatchObject({ status: "complete", purged: 0, failed: 0 });
     expect(await exists(victim.key)).toBe(true);
-    expect(await keyOf(id)).toBe(victim.key);
+    expect(await keyOf(id)).toBe(`refused:${id}`);
+    expect(await run()).toMatchObject({ status: "complete", purged: 0, workspaces: 0 });
+    expect(await keyOf(victim.id)).toBe(victim.key);
   }, 120_000);
 
   it("stale half-uploaded rows: a pending or failed row older than 24 h loses the object at its deterministic key; a younger one is kept", async () => {

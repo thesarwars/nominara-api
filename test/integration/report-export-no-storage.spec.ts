@@ -77,5 +77,9 @@ describe("STORY-180 AC5 · export with storage not configured", () => {
     }
     const rows = (await harness.db().query(`SELECT count(*)::int AS n FROM report_artifacts WHERE workspace_id = $1`, [workspaceId])).rows[0] as { n: number };
     expect(rows.n).toBe(0);
+    // STORY-180 r6: the readiness refusal comes BEFORE QuotaGuard, so the PDF never reserved a unit (reserved AND used are both 0).
+    const counter = (await harness.db().query(`SELECT used_value::int AS used, reserved_value::int AS reserved FROM usage_counters WHERE workspace_id = $1 AND metric = 'pdf_exports'`, [workspaceId])).rows as Array<{ used: number; reserved: number }>;
+    expect(counter.every((c) => c.used === 0 && c.reserved === 0)).toBe(true);
+    expect(((await harness.db().query(`SELECT count(*)::int AS n FROM usage_reservations WHERE workspace_id = $1`, [workspaceId])).rows[0] as { n: number }).n).toBe(0);
   }, 180_000);
 });

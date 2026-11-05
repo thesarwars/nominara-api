@@ -34,6 +34,7 @@ import { WorkspaceGuard } from "./guards/workspace.guard.js";
 import { RbacGuard } from "./guards/rbac.guard.js";
 import { EntitlementGuard } from "./guards/entitlement.guard.js";
 import { QuotaGuard } from "./guards/quota.guard.js";
+import { StorageReadyGuard } from "../modules/reports/storage-ready.guard.js";
 import { DailyCapGuard } from "./guards/daily-cap.guard.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
 import { CreditGuard } from "./guards/credit.guard.js";
@@ -113,6 +114,8 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     { provide: APP_GUARD, useClass: WorkspaceGuard },
     { provide: APP_GUARD, useClass: RbacGuard },
     { provide: APP_GUARD, useClass: EntitlementGuard },
+    // STORY-180 r6 - BEFORE QuotaGuard: storage unconfigured is refused before a tier-cap unit is reserved (acts only on @RequireStorage()).
+    { provide: APP_GUARD, useClass: StorageReadyGuard },
     { provide: APP_GUARD, useClass: QuotaGuard },
     { provide: APP_GUARD, useClass: DailyCapGuard },
     { provide: APP_GUARD, useClass: RateLimitGuard },

@@ -12,6 +12,7 @@ import { WorkspaceGuard } from "./guards/workspace.guard.js";
 import { RbacGuard } from "./guards/rbac.guard.js";
 import { EntitlementGuard } from "./guards/entitlement.guard.js";
 import { QuotaGuard } from "./guards/quota.guard.js";
+import { StorageReadyGuard } from "../modules/reports/storage-ready.guard.js";
 import { DailyCapGuard } from "./guards/daily-cap.guard.js";
 import { RateLimitedError } from "./errors/domain-errors.js";
 import { RateLimitGuard } from "./guards/rate-limit.guard.js";
@@ -48,6 +49,8 @@ const GUARD_ORDER = [
   WorkspaceGuard,
   RbacGuard,
   EntitlementGuard,
+  // STORY-180 r6 - BEFORE QuotaGuard: a refusal for unconfigured storage must come before a pdf_exports unit is reserved.
+  StorageReadyGuard,
   QuotaGuard,
   DailyCapGuard,
   RateLimitGuard,

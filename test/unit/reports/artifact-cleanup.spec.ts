@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runReportArtifactCleanup, STALE_UPLOAD_MS } from "../../../src/lib/reports/artifact-cleanup.js";
 import * as metrics from "../../../src/lib/telemetry/metrics.js";
+import { StorageTenancyError } from "../../../src/lib/storage/storage-keys.js";
 import * as tenantContext from "../../../src/tenancy/tenant-context.js";
 
 // STORY-180 r5 (b) - the nightly report cleanup: delete the OBJECT first (no transaction open), then mark the row purged.
@@ -10,12 +11,11 @@ const WS_B = "0190ffff-0000-7000-8000-00000000000b";
 const ID1 = "0190ffff-0000-7000-8000-0000000000a1";
 const ID2 = "0190ffff-0000-7000-8000-0000000000a2";
 const ID3 = "0190ffff-0000-7000-8000-0000000000b1";
-const NOW = new Date("2026-11-05T03:30:00.000Z");
 
 interface Due { id: string; workspace_id: string }
 interface Row { id: string; format: string; object_key: string }
 
-function build(opts: { discovered: Due[]; rows: Record<string, Row[]>; deleteFails?: (relative: string) => boolean; markFails?: boolean }) {
+function build(opts: { discovered: Due[]; rows: Record<string, Row[]>; deleteFails?: (relative: string) => boolean; refused?: (relative: string) => boolean; markFails?: boolean }) {
   const order: string[] = [];
   const queries: Array<{ text: string; params: unknown[]; workspace: string | undefined }> = [];
   let inTx = false;
@@ -40,9 +40,10 @@ function build(opts: { discovered: Due[]; rows: Record<string, Row[]>; deleteFai
             order.push(`select:${current}`);
             return { rows: opts.rows[current!] ?? [] };
           }
-          order.push(`mark:${current}`);
+          const refuse = text.includes("'refused:'");
+          order.push(`${refuse ? "refuse" : "mark"}:${current}`);
           if (opts.markFails) throw new Error("db down");
-          return { rows: [], rowCount: (params[2] as string[]).length };
+          return { rows: [], rowCount: (params[1] as string[]).length };
         },
       } as never);
     } finally {
@@ -61,12 +62,13 @@ function build(opts: { discovered: Due[]; rows: Record<string, Row[]>; deleteFai
     deleteStored: vi.fn(async (_ns: string, stored: string) => {
       txOpenDuringDelete.push(inTx);
       order.push(`deleteStored:${ws}:${stored}`);
+      if (opts.refused?.(stored)) throw new StorageTenancyError("key outside the workspace prefix");
       if (opts.deleteFails?.(stored)) throw new Error("s3 down");
       deleted.push(stored);
     }),
   });
   const store = { bind: vi.fn(() => bindFor(current!)) };
-  const run = () => runReportArtifactCleanup(owner as never, pool as never, store as never, { now: () => NOW });
+  const run = () => runReportArtifactCleanup(owner as never, pool as never, store as never, {});
   return { run, order, queries, deleted, txOpenDuringDelete, release, pool, owner };
 }
 
@@ -77,12 +79,14 @@ describe("STORY-180 r5 (b) · runReportArtifactCleanup", () => {
     const h = build({ discovered: [], rows: {} });
     await h.run();
     const q = h.queries[0]!;
-    expect(q.text).toContain("expires_at < $1");
+    // STORY-180 r6: "due" is decided by the DATABASE clock, so a worker host with a skewed clock cannot purge a live link early or hold an
+    // expired one. No timestamp travels from this process.
+    expect(q.text).toContain("expires_at < now()");
     expect(q.text).toContain("object_key ~ '^(pending|failed):'");
-    expect(q.text).toContain("created_at < $2");
-    expect(q.text).toContain("object_key !~ '^purged:'");
-    expect(q.params[0]).toEqual(NOW);
-    expect(q.params[1]).toEqual(new Date(NOW.getTime() - STALE_UPLOAD_MS));
+    expect(q.text).toContain("created_at < now() - make_interval(secs => $1)");
+    expect(q.text).toContain("object_key !~ '^(purged|refused):'");
+    expect(q.params[0]).toBe(STALE_UPLOAD_MS / 1000);
+    expect(q.params.some((p) => p instanceof Date)).toBe(false);
     expect(q.text).not.toContain("methodology_footer");
   });
 
@@ -150,9 +154,36 @@ describe("STORY-180 r5 (b) · runReportArtifactCleanup", () => {
     const result = await h.run();
     expect(result).toMatchObject({ status: "partial", purged: 1, failed: 1 });
     const mark = h.queries.at(-1)!;
-    expect(mark.params[2]).toEqual([ID2]);
+    expect(mark.params[1]).toEqual([ID2]);
     expect(count).toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "delete_failed" });
     expect(count).toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "purged" });
+  });
+
+  it("STORY-180 r6 · a row refused for TENANCY reasons is quarantined as refused:<id> (not retried nightly), counted, logged, and does not fail the job or starve the batch", async () => {
+    const count = vi.spyOn(metrics, "incrementCounter");
+    const foreign = `inttest/${WS_B}/${ID1}.pdf`;
+    const good = `inttest/${WS_A}/${ID2}.pdf`;
+    const h = build({
+      discovered: [{ id: ID1, workspace_id: WS_A }, { id: ID2, workspace_id: WS_A }],
+      rows: { [WS_A]: [{ id: ID1, format: "pdf", object_key: foreign }, { id: ID2, format: "pdf", object_key: good }] },
+      refused: (k) => k === foreign,
+    });
+    const result = await h.run();
+    expect(result).toMatchObject({ status: "complete", purged: 1, failed: 0 });
+    expect(h.deleted).toEqual([good]);
+    const refuse = h.queries.find((q) => q.text.includes("'refused:'"))!;
+    expect(refuse.text).toContain("object_key = 'refused:' || id::text");
+    expect(refuse.text).toContain("workspace_id = app.current_workspace()");
+    expect(refuse.params[1]).toEqual([ID1]);
+    expect(count).toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "refused" });
+    expect(count).not.toHaveBeenCalledWith("nominara_reports_cleanup_objects_total", { outcome: "delete_failed" });
+  });
+
+  it("STORY-180 r6 · a quarantine that cannot be written fails the workspace (reported), never silently", async () => {
+    const foreign = `inttest/${WS_B}/${ID1}.pdf`;
+    const h = build({ discovered: [{ id: ID1, workspace_id: WS_A }], rows: { [WS_A]: [{ id: ID1, format: "pdf", object_key: foreign }] }, refused: () => true, markFails: true });
+    const result = await h.run();
+    expect(result.status).toBe("partial");
   });
 
   it("a failing workspace does not stop the others, and its failure is reported", async () => {

@@ -4,6 +4,7 @@ import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import type { BoundObjectStore, TenantObjectStore } from "../storage/tenant-object-store.js";
 import { incrementCounter } from "../telemetry/metrics.js";
+import { StorageTenancyError } from "../storage/storage-keys.js";
 import { isStoredObjectKey } from "./artifact-key.js";
 
 // STORY-180 r5 (owner decision 60 (b)) - the nightly cleanup of stored report files. Run by the `report.cleanup` queue.
@@ -25,6 +26,8 @@ import { isStoredObjectKey } from "./artifact-key.js";
 //     phase 1   ONE short transaction: re-read the due rows (RLS plus `workspace_id = app.current_workspace()`), bind the object store
 //     phase 2   NO transaction, no connection: delete each object (a delete of an absent object succeeds)
 //     phase 3   ONE short transaction: mark the rows whose object is gone `purged:<id>`
+//
+// A TENANCY REFUSAL (StorageTenancyError: the row's key is outside the workspace prefix) is quarantined, not retried: `refused:<id>`.
 // A crash between phases 2 and 3 leaves a row that is still due: the next run deletes again (harmless) and marks it. An object that
 // cannot be deleted leaves its row unmarked, so it is retried the next night, counted and logged.
 //
@@ -38,7 +41,6 @@ export const STALE_UPLOAD_MS = 24 * 3_600_000;
 export const DEFAULT_CLEANUP_BATCH_SIZE = 1000;
 
 export interface CleanupDeps {
-  readonly now: () => Date;
   readonly batchSize?: number;
 }
 
@@ -49,6 +51,8 @@ export interface CleanupResult {
   readonly workspaces: number;
   /** Objects that could not be deleted, plus workspaces whose marking failed. */
   readonly failed: number;
+  /** Rows quarantined as `refused:` (a stored key outside the workspace prefix). Not failures: they are permanent and are not retried. */
+  readonly refused: number;
 }
 
 interface Due {
@@ -62,15 +66,16 @@ interface DueRow {
   readonly object_key: string;
 }
 
-// The one definition of "due", shared by discovery, the in-workspace re-read and the mark: $1 = now, $2 = the stale cutoff.
-const DUE = `object_key !~ '^purged:' AND (expires_at < $1 OR (object_key ~ '^(pending|failed):' AND created_at < $2))`;
+// The one definition of "due", shared by discovery, the in-workspace re-read and the mark. $1 = the stale cutoff in seconds. "Now" is the
+// DATABASE clock (`now()`), the same clock that stamped `expires_at` and `created_at`, so a worker host's skewed clock cannot purge a live
+// link early or hold an expired one. A `refused:` row is quarantined and never due again.
+const DUE = `object_key !~ '^(purged|refused):' AND (expires_at < now() OR (object_key ~ '^(pending|failed):' AND created_at < now() - make_interval(secs => $1)))`;
+const STALE_SECONDS = STALE_UPLOAD_MS / 1000;
 
 export async function runReportArtifactCleanup(owner: ClientBase, pool: Pool, store: TenantObjectStore, deps: CleanupDeps): Promise<CleanupResult> {
-  const now = deps.now();
-  const staleBefore = new Date(now.getTime() - STALE_UPLOAD_MS);
   const due = await owner.query<Due>(
-    `SELECT id, workspace_id FROM report_artifacts WHERE ${DUE} ORDER BY created_at, id LIMIT $3`,
-    [now, staleBefore, deps.batchSize ?? DEFAULT_CLEANUP_BATCH_SIZE],
+    `SELECT id, workspace_id FROM report_artifacts WHERE ${DUE} ORDER BY created_at, id LIMIT $2`,
+    [STALE_SECONDS, deps.batchSize ?? DEFAULT_CLEANUP_BATCH_SIZE],
   );
 
   const byWorkspace = new Map<string, string[]>();
@@ -82,11 +87,13 @@ export async function runReportArtifactCleanup(owner: ClientBase, pool: Pool, st
 
   let purged = 0;
   let failed = 0;
+  let refused = 0;
   for (const [workspaceId, ids] of byWorkspace) {
     try {
-      const outcome = await cleanWorkspace(pool, store, workspaceId, ids, now, staleBefore);
+      const outcome = await cleanWorkspace(pool, store, workspaceId, ids);
       purged += outcome.purged;
       failed += outcome.failed;
+      refused += outcome.refused;
     } catch (error) {
       failed += 1;
       incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "workspace_failed" });
@@ -94,7 +101,7 @@ export async function runReportArtifactCleanup(owner: ClientBase, pool: Pool, st
       logger.error({ span: "reports.cleanup.workspace", workspace_id: workspaceId, outcome: "failed", error: error instanceof Error ? error.name : "unknown" });
     }
   }
-  return { status: failed === 0 ? "complete" : "partial", purged, workspaces: byWorkspace.size, failed };
+  return { status: failed === 0 ? "complete" : "partial", purged, workspaces: byWorkspace.size, failed, refused };
 }
 
 async function inWorkspace<T>(pool: Pool, workspaceId: string, fn: (tx: ClientBase) => Promise<T>): Promise<T> {
@@ -106,47 +113,60 @@ async function inWorkspace<T>(pool: Pool, workspaceId: string, fn: (tx: ClientBa
   }
 }
 
-async function cleanWorkspace(pool: Pool, store: TenantObjectStore, workspaceId: string, ids: readonly string[], now: Date, staleBefore: Date): Promise<{ purged: number; failed: number }> {
+async function cleanWorkspace(pool: Pool, store: TenantObjectStore, workspaceId: string, ids: readonly string[]): Promise<{ purged: number; failed: number; refused: number }> {
   // Phase 1 - what is still due in THIS workspace, and the store bound to it. No I/O beyond the read.
   const { rows, bound } = await inWorkspace(pool, workspaceId, async (tx) => {
     const bound = store.bind();
     const found = await tx.query<DueRow>(
-      `SELECT id, format, object_key FROM report_artifacts WHERE workspace_id = app.current_workspace() AND id = ANY($3::uuid[]) AND ${DUE}`,
-      [now, staleBefore, ids],
+      `SELECT id, format, object_key FROM report_artifacts WHERE workspace_id = app.current_workspace() AND id = ANY($2::uuid[]) AND ${DUE}`,
+      [STALE_SECONDS, ids],
     );
     return { rows: found.rows, bound };
   });
-  if (rows.length === 0) return { purged: 0, failed: 0 };
+  if (rows.length === 0) return { purged: 0, failed: 0, refused: 0 };
 
   // Phase 2 - NO transaction, no connection: the objects.
   const gone: string[] = [];
+  const refusedIds: string[] = [];
   let failed = 0;
   for (const row of rows) {
-    if (await deleteObject(bound, row, workspaceId)) gone.push(row.id);
+    const outcome = await deleteObject(bound, row, workspaceId);
+    if (outcome === "deleted") gone.push(row.id);
+    else if (outcome === "refused") refusedIds.push(row.id);
     else failed += 1;
   }
-  if (gone.length === 0) return { purged: 0, failed };
+  if (gone.length === 0 && refusedIds.length === 0) return { purged: 0, failed, refused: 0 };
 
   // Phase 3 - mark exactly the rows whose object is gone. Re-checking DUE keeps a row that became live in between.
-  await inWorkspace(pool, workspaceId, (tx) =>
-    tx.query(`UPDATE report_artifacts SET object_key = 'purged:' || id::text WHERE workspace_id = app.current_workspace() AND id = ANY($3::uuid[]) AND ${DUE}`, [now, staleBefore, gone]),
-  );
+  // A tenancy refusal is permanent (the key will never lie inside the prefix), so the row is QUARANTINED in the same short transaction: it
+  // would otherwise fail the job every night and, being oldest first, eventually fill the batch and starve every legitimate row behind it.
+  await inWorkspace(pool, workspaceId, async (tx) => {
+    if (gone.length > 0) await tx.query(`UPDATE report_artifacts SET object_key = 'purged:' || id::text WHERE workspace_id = app.current_workspace() AND id = ANY($2::uuid[]) AND ${DUE}`, [STALE_SECONDS, gone]);
+    if (refusedIds.length > 0) await tx.query(`UPDATE report_artifacts SET object_key = 'refused:' || id::text WHERE workspace_id = app.current_workspace() AND id = ANY($2::uuid[]) AND ${DUE}`, [STALE_SECONDS, refusedIds]);
+  });
   for (let i = 0; i < gone.length; i += 1) incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "purged" });
+  for (let i = 0; i < refusedIds.length; i += 1) incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "refused" });
   // The workspace ID and counts: no key, no artifact id.
-  logger.log({ span: "reports.cleanup.workspace", workspace_id: workspaceId, purged: gone.length, failed });
-  return { purged: gone.length, failed };
+  logger.log({ span: "reports.cleanup.workspace", workspace_id: workspaceId, purged: gone.length, failed, refused: refusedIds.length });
+  return { purged: gone.length, failed, refused: refusedIds.length };
 }
 
 /** A stored key is deleted by the key the row holds (refused if it lies outside the workspace prefix); a marker by the deterministic `{id}.{format}`. */
-async function deleteObject(bound: BoundObjectStore, row: DueRow, workspaceId: string): Promise<boolean> {
+async function deleteObject(bound: BoundObjectStore, row: DueRow, workspaceId: string): Promise<"deleted" | "refused" | "failed"> {
   try {
     if (isStoredObjectKey(row.object_key)) await bound.deleteStored("reports", row.object_key);
     else await bound.delete("reports", `${row.id}.${row.format}`);
-    return true;
+    return "deleted";
   } catch (error) {
+    if (error instanceof StorageTenancyError) {
+      // A security event, not an outage: the row's key lies outside this workspace's prefix. Nothing was deleted. The row is quarantined by the
+      // caller; this is logged at error level (alertable) with the workspace ID only - never the key, which is the very thing that is wrong.
+      logger.error({ span: "reports.cleanup.delete", workspace_id: workspaceId, outcome: "refused", error: "StorageTenancyError" });
+      return "refused";
+    }
     incrementCounter("nominara_reports_cleanup_objects_total", { outcome: "delete_failed" });
     // Never the key or the artifact id: the workspace ID and the error class.
     logger.error({ span: "reports.cleanup.delete", workspace_id: workspaceId, outcome: "delete_failed", error: error instanceof Error ? error.name : "unknown" });
-    return false;
+    return "failed";
   }
 }
