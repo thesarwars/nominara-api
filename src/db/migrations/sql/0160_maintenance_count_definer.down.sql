@@ -5,11 +5,12 @@
 -- USAGE on schema app for nominara_owner is revoked ONLY IF the up granted it (its marker is in the comment of the first function, so this
 -- runs before that function is dropped). nominara_owner already holds USAGE in production and createPartition's call to
 -- app.apply_tenant_rls() depends on it; a blanket revoke would break partition creation. It is ALSO skipped when nominara_owner owns schema
--- app or is a member of its owner (ownership moved after the up): there USAGE is the owner's own and a REVOKE would strip it.
+-- app (ownership moved after the up): there USAGE is the owner's own and a REVOKE would strip it. (Membership of the schema owner needs no
+-- clause: the rights are inherited, a REVOKE from nominara_owner removes only its own ACL entry and leaves them in place.)
 DO $$
 BEGIN
   IF coalesce(position('[0160 granted USAGE on schema app to nominara_owner]' in obj_description(to_regprocedure('app.maintenance_default_partition_rows()'), 'pg_proc')) > 0, false)
-     AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'app' AND pg_has_role('nominara_owner', nspowner, 'USAGE')) THEN
+     AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'app' AND nspowner = 'nominara_owner'::regrole) THEN
     REVOKE USAGE ON SCHEMA app FROM nominara_owner;
   END IF;
 END $$;

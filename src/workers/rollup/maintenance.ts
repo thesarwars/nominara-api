@@ -353,20 +353,20 @@ export async function detectDefaultPartitionRows(
   // The callers are autocommit (runMonthlyMaintenance holds a session advisory lock, not a transaction).
   let result: { rows: { parent_table: PartitionedFactTable; default_partition: string; row_count: string }[] };
   // It owns its transaction, so it must not be called inside one: COMMIT would commit the caller's work and SET LOCAL would outlive this call.
-  // A BEGIN inside a transaction block is a WARNING (SQLSTATE 25001), not an error, and changes nothing: that is how it is detected.
-  let alreadyInTransaction = false;
-  const onNotice = (notice: { code?: string | undefined }): void => {
-    if (notice.code === "25001") alreadyInTransaction = true;
-  };
-  client.on("notice", onNotice);
+  // The probe does not depend on notices (client_min_messages can hide them): SAVEPOINT is legal only inside a transaction block. Outside one it
+  // fails with 25P01 (no_active_sql_transaction), which means "proceed"; any other error (an aborted transaction, 25P02, included) propagates.
+  let inTransaction = false;
   try {
-    await client.query("BEGIN");
-  } finally {
-    client.removeListener("notice", onNotice);
+    await client.query("SAVEPOINT dpr_probe");
+    inTransaction = true;
+  } catch (error) {
+    if ((error as { code?: string }).code !== "25P01") throw error;
   }
-  if (alreadyInTransaction) {
+  if (inTransaction) {
+    await client.query("RELEASE SAVEPOINT dpr_probe");
     throw new Error("detectDefaultPartitionRows must not run inside an existing transaction (it opens, and commits, its own)");
   }
+  await client.query("BEGIN");
   try {
     await client.query(`SET LOCAL statement_timeout = '${String(Math.trunc(timeoutMs))}ms'`);
     result = await client.query<{ parent_table: PartitionedFactTable; default_partition: string; row_count: string }>(

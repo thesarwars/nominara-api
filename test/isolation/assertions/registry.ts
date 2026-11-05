@@ -29,6 +29,7 @@ import { assertIso26ShareLookupReturnsOnlyHashedRow, iso26Breaker } from "./iso-
 import { assertIso24DefinerOwnerNoMembers, iso24Breaker } from "./iso-24-definer-owner-no-members.js";
 import { assertIso25ShareLookupDefinerShape, iso25Breaker } from "./iso-25-share-lookup-definer-shape.js";
 import { assertIso29MaintenanceExecuteEffective, iso29Breaker } from "./iso-29-maintenance-execute-effective.js";
+import { assertIso30MaintenanceExecuteAdminOnly, iso30Breaker } from "./iso-30-maintenance-execute-admin-only.js";
 import { assertIso28DefinerOwnerHoldsNoRoles, iso28Breaker } from "./iso-28-definer-owner-holds-no-roles.js";
 import { assertIso27MaintenanceDefinerShape, iso27Breaker } from "./iso-27-maintenance-definer-shape.js";
 
@@ -213,6 +214,8 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   // STORY-013 r4 — EFFECTIVE execute: no runtime role, share-lookup role or non-BYPASSRLS break-glass role can run a maintenance function,
   // by any route (membership of nominara_owner included). ISO-27 holds the exact ACL; this holds what a role can actually do.
   { id: "ISO-29", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso29MaintenanceExecuteEffective, assertUnderBreaker: assertIso29MaintenanceExecuteEffective, breaker: iso29Breaker },
+  // STORY-013 r5 — the same effective-EXECUTE check, broken by an ADMIN-only membership (no INHERIT, no SET).
+  { id: "ISO-30", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso30MaintenanceExecuteAdminOnly, assertUnderBreaker: assertIso30MaintenanceExecuteAdminOnly, breaker: iso30Breaker },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,

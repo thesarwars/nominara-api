@@ -22,6 +22,16 @@ const FUNCTIONS = [
 ] as const;
 const PROD_LIKE = "maint_prod_like";
 
+/** The non-default monthly partitions of the three partitioned fact tables. */
+async function monthlyPartitions(client: Client): Promise<string[]> {
+  const r = await client.query<{ relname: string }>(
+    `SELECT c.relname::text AS relname FROM pg_class c
+      WHERE c.relkind = 'r' AND c.relispartition AND c.relname ~ '^(answer_captures|mention_facts|citation_facts)_' AND c.relname !~ '_default$'
+      ORDER BY 1`,
+  );
+  return r.rows.map((row) => row.relname);
+}
+
 describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
   let container: StartedPostgreSqlContainer;
   let admin: Client;
@@ -271,18 +281,39 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
       const legit = await admin.query<{ x: boolean }>(`SELECT has_function_privilege('${PROD_LIKE}', '${fn}', 'EXECUTE') AS x`);
       expect(legit.rows[0]!.x, `${PROD_LIKE} is the G-4 login and may execute ${fn}`).toBe(true);
     }
-    // Inline red step: a runtime role granted nominara_owner (INHERIT, then plain/SET) must be flagged.
-    for (const grant of ["GRANT nominara_owner TO nominara_worker WITH INHERIT TRUE", "GRANT nominara_owner TO nominara_worker"]) {
-      await admin.query(grant);
+    // Inline red steps: a runtime role that reaches nominara_owner by ANY membership must be flagged: INHERIT, plain/SET, a chain through an
+    // intermediate role whose own grant is INHERIT-only, and an ADMIN-only grant (no INHERIT, no SET: the holder can grant itself the rest).
+    const bypasses: { name: string; setup: string[]; teardown: string[] }[] = [
+      { name: "INHERIT", setup: ["GRANT nominara_owner TO nominara_worker WITH INHERIT TRUE"], teardown: ["REVOKE nominara_owner FROM nominara_worker"] },
+      { name: "plain (SET)", setup: ["GRANT nominara_owner TO nominara_worker"], teardown: ["REVOKE nominara_owner FROM nominara_worker"] },
+      {
+        name: "chain through an intermediate role (INHERIT TRUE, SET FALSE)",
+        setup: [
+          "CREATE ROLE md5_chain NOLOGIN",
+          "GRANT nominara_owner TO md5_chain WITH INHERIT TRUE, SET FALSE",
+          "GRANT md5_chain TO nominara_worker",
+        ],
+        teardown: ["REVOKE md5_chain FROM nominara_worker", "DROP ROLE md5_chain"],
+      },
+      {
+        name: "ADMIN-only (ADMIN TRUE, INHERIT FALSE, SET FALSE)",
+        setup: ["GRANT nominara_owner TO nominara_worker WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"],
+        teardown: ["REVOKE nominara_owner FROM nominara_worker"],
+      },
+    ];
+    const missed: string[] = [];
+    for (const b of bypasses) {
       try {
+        for (const q of b.setup) await admin.query(q);
         const flagged = await effectiveExecuteHolders(admin);
-        expect(flagged.map((h) => h.role), grant).toContain("nominara_worker");
-        expect(flagged.map((h) => h.role), grant).not.toContain(PROD_LIKE);
+        if (!flagged.some((h) => h.role === "nominara_worker")) missed.push(b.name);
+        expect(flagged.map((h) => h.role), b.name).not.toContain(PROD_LIKE);
       } finally {
-        await admin.query("REVOKE nominara_owner FROM nominara_worker");
+        for (const q of b.teardown) await admin.query(q);
       }
-      expect(await effectiveExecuteHolders(admin)).toEqual([]);
+      expect(await effectiveExecuteHolders(admin), `clean after ${b.name}`).toEqual([]);
     }
+    expect(missed, "membership routes to nominara_owner that effectiveExecuteHolders did not flag").toEqual([]);
     // The same query sees a grant to PUBLIC and to a role without the nominara_ prefix.
     await admin.query("CREATE ROLE md5_plain_reader NOLOGIN");
     try {
@@ -339,18 +370,31 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
         const r = await admin.query<{ relname: string; n: string }>(
           `SELECT c.relname::text AS relname, (coalesce(x.seq_scan, 0) + coalesce(x.idx_scan, 0))::text AS n
              FROM pg_class c LEFT JOIN pg_stat_xact_user_tables x ON x.relid = c.oid
-            WHERE c.relkind = 'r' AND c.relname ~ '^(answer_captures|mention_facts|citation_facts)_'`,
+            WHERE c.relkind = 'r' AND c.relispartition AND c.relname ~ '^(answer_captures|mention_facts|citation_facts)_'`,
         );
         return new Map(r.rows.map((row) => [row.relname, Number(row.n)]));
       };
       const before = await scans();
       // Without a monthly partition to NOT touch, "only the defaults were read" is vacuous.
-      const monthly = [...before.keys()].filter((name) => !name.endsWith("_default"));
+      const monthly = await monthlyPartitions(admin);
       expect(monthly.length, "no non-default monthly partition exists").toBeGreaterThan(0);
       await admin.query("SELECT * FROM app.maintenance_default_partition_rows()");
       const after = await scans();
       const touched = [...after].filter(([name, n]) => n > (before.get(name) ?? 0)).map(([name]) => name).sort();
       expect(touched).toEqual(["answer_captures_default", "citation_facts_default", "mention_facts_default"]);
+    } finally {
+      await admin.query("ROLLBACK");
+    }
+  }, 60_000);
+
+  it("MD-11b · the monthly-partition precondition counts partitions only: a plain table whose name looks like one is not a partition", async () => {
+    await admin.query("BEGIN");
+    try {
+      const real = await monthlyPartitions(admin);
+      await admin.query("CREATE TABLE answer_captures_decoy (id integer)");
+      const withDecoy = await monthlyPartitions(admin);
+      expect(withDecoy, "a non-partition table is not a monthly partition").not.toContain("answer_captures_decoy");
+      expect(withDecoy).toEqual(real);
     } finally {
       await admin.query("ROLLBACK");
     }
@@ -425,8 +469,8 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     expect(memberOf.rowCount).toBe(0);
   }, 180_000);
 
-  // The down revokes USAGE on schema app only if 0160 granted it. It must ALSO not revoke when nominara_owner owns the schema (or is a member of
-  // its owner): there USAGE is the owner's own and a REVOKE would strip it, breaking createPartition's call to app.apply_tenant_rls().
+  // The down revokes USAGE on schema app only if 0160 granted it. It must ALSO not revoke when nominara_owner OWNS the schema: there USAGE is
+  // the owner's own and a REVOKE would strip it, breaking createPartition's call to app.apply_tenant_rls().
   async function downKeepsUsageWhen(transfer: () => Promise<void>, restore: () => Promise<void>): Promise<void> {
     const usage = async (): Promise<boolean> => (await admin.query<{ x: boolean }>("SELECT has_schema_privilege('nominara_owner', 'app', 'USAGE') AS x")).rows[0]!.x;
     await rollbackThrough0160();
@@ -448,27 +492,12 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     const original = (await admin.query<{ o: string }>("SELECT nspowner::regrole::text AS o FROM pg_namespace WHERE nspname = 'app'")).rows[0]!.o;
     await downKeepsUsageWhen(
       async () => void (await admin.query("ALTER SCHEMA app OWNER TO nominara_owner")),
-      async () => void (await admin.query(`ALTER SCHEMA app OWNER TO ${original}`)),
+      async () => {
+        await admin.query(`ALTER SCHEMA app OWNER TO ${original}`);
+        // If the assertion above failed, the down may have stripped USAGE: give the original owner its right back so the next case starts clean.
+        await admin.query(`GRANT USAGE ON SCHEMA app TO ${original}`);
+      },
     );
-  }, 240_000);
-
-  it("MD-9d · rolling 0160 back keeps USAGE on schema app when nominara_owner is a MEMBER of the schema's owner", async () => {
-    const original = (await admin.query<{ o: string }>("SELECT nspowner::regrole::text AS o FROM pg_namespace WHERE nspname = 'app'")).rows[0]!.o;
-    await admin.query("CREATE ROLE md9d_schema_owner NOLOGIN");
-    try {
-      await downKeepsUsageWhen(
-        async () => {
-          await admin.query("ALTER SCHEMA app OWNER TO md9d_schema_owner");
-          await admin.query("GRANT md9d_schema_owner TO nominara_owner WITH INHERIT TRUE");
-        },
-        async () => {
-          await admin.query(`ALTER SCHEMA app OWNER TO ${original}`);
-          await admin.query("REVOKE md9d_schema_owner FROM nominara_owner");
-        },
-      );
-    } finally {
-      await admin.query("DROP ROLE md9d_schema_owner");
-    }
   }, 240_000);
 
   it("MD-13 · detectDefaultPartitionRows refuses to run inside a caller's transaction and leaves that transaction exactly as it was", async () => {
@@ -484,6 +513,24 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
       await client.query("ROLLBACK");
       expect((await client.query<{ r: string | null }>("SELECT to_regclass('md13_marker')::text AS r")).rows[0]!.r).toBeNull();
       // Outside a transaction it still works.
+      await expect(detectDefaultPartitionRows(client)).resolves.toEqual(expect.any(Array));
+    } finally {
+      await client.end();
+    }
+  }, 60_000);
+
+  it("MD-13b · the in-transaction refusal does not depend on notices: with client_min_messages = error it still refuses and the caller's transaction survives", async () => {
+    const client = await connectAs(PROD_LIKE, "pl");
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL client_min_messages = error");
+      await client.query("CREATE TEMP TABLE md13b_marker (x integer)");
+      await expect(detectDefaultPartitionRows(client)).rejects.toThrow(/inside an existing transaction/);
+      // Not committed, still open, no probe savepoint left behind, no timeout applied.
+      expect((await client.query<{ t: string }>("SELECT current_setting('statement_timeout') AS t")).rows[0]!.t).toBe("0");
+      await expect(client.query("RELEASE SAVEPOINT dpr_probe")).rejects.toMatchObject({ code: "3B001" });
+      await client.query("ROLLBACK");
+      expect((await client.query<{ r: string | null }>("SELECT to_regclass('md13b_marker')::text AS r")).rows[0]!.r).toBeNull();
       await expect(detectDefaultPartitionRows(client)).resolves.toEqual(expect.any(Array));
     } finally {
       await client.end();

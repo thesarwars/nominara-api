@@ -102,12 +102,23 @@ Spans: `maintenance.integrity` with outcome and finding-count attributes; not as
   a legitimate member of `nominara_owner`, is not flagged) and `pg_has_role(role, <ACL grantee>, 'SET')` (a NOINHERIT membership still reaches the rights via
   SET ROLE). Its breaker is `GRANT nominara_owner TO nominara_worker WITH INHERIT TRUE`; MD-5 runs the same grant (INHERIT and plain) inline.
 * Output-mode filter is `t`, `o`, `b` (INOUT) in one shared helper (`maintenanceOutputTypes`) used by ISO-27 and MD-2; MD-2c shows INOUT / OUT / plain-return halfvec are seen.
-* 0160 down also skips the USAGE revoke when `nominara_owner` owns schema `app` or is a member of its owner (MD-9c, MD-9d).
+* 0160 down also skips the USAGE revoke when `nominara_owner` owns schema `app` (MD-9c). Round 5 dropped the "member of its owner" clause and MD-9d: a REVOKE from `nominara_owner` cannot strip inherited rights, so MD-9d was green against the old down and proved nothing.
 * `rollbackThrough0160` stops, without rolling back, when the newest applied migration is ordered before 0160.
 * `detectDefaultPartitionRows` refuses to run inside an existing transaction (detected by the SQLSTATE 25001 warning from BEGIN; MD-13) and rejects a timeout < 1 or non-finite (MD-14).
 * drift-check: the converse membership check (a definer owner must be a member of no role; DEF-D3). MD-11 asserts a non-default monthly partition exists.
 * Red: `013r4-red-int.log`, `013r4-red-int-inout.log`, `013r4-red-migr.log`, `013r4-red-iso.log`; MD-5 and MD-10 against the round-2 tree (680b30dc):
   `013r4-red-r2tree-MD-5.log` (fails: TimeZone pin absent), `013r4-red-r2tree-MD-10.log` (fails: membership not stripped).
+
+## Review round 5 — audit of round 4
+
+* **Any membership counts (ISO-29, ISO-30, MD-5).** For each refused role r the check takes r plus every role Y with `pg_has_role(r, Y, 'MEMBER')` and fails when
+  `has_function_privilege(Y, fn, 'EXECUTE')`. Replaces the `SET`-only second route. MD-5's inline loop now runs INHERIT, plain, a chain through an intermediate role
+  (`INHERIT TRUE, SET FALSE`) and an ADMIN-only grant; the last two were missed by round 4 (`013r5-red-md5.log`). ISO-30 is the ADMIN-only breaker (`013r5-red-iso30.log`).
+  The G-4 login (`maint_prod_like`) still passes.
+* `detectDefaultPartitionRows`: the in-transaction guard is `SAVEPOINT dpr_probe` before `BEGIN` (25P01 outside a transaction = proceed; success = `RELEASE` and throw), independent of
+  notices; MD-13b runs it with `client_min_messages = error` (`013r5-red-md13b.log`).
+* MD-9d and the "member of its owner" clause of the 0160 down are dropped. MD-9c's restore re-grants USAGE to the original owner.
+* MD-11's precondition filters on `relispartition`; MD-11b shows a plain table named like a partition is not counted (`013r5-red-md11b.log`).
 
 ### Doc changes needed (docs repo; not edited here)
 

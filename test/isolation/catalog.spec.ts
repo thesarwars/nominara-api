@@ -8,6 +8,7 @@ import { assertIso26ShareLookupReturnsOnlyHashedRow } from "./assertions/iso-26-
 import { assertIso24DefinerOwnerNoMembers } from "./assertions/iso-24-definer-owner-no-members.js";
 import { assertIso25ShareLookupDefinerShape } from "./assertions/iso-25-share-lookup-definer-shape.js";
 import { assertIso29MaintenanceExecuteEffective } from "./assertions/iso-29-maintenance-execute-effective.js";
+import { assertIso30MaintenanceExecuteAdminOnly } from "./assertions/iso-30-maintenance-execute-admin-only.js";
 import { assertIso28DefinerOwnerHoldsNoRoles } from "./assertions/iso-28-definer-owner-holds-no-roles.js";
 import { assertIso27MaintenanceDefinerShape } from "./assertions/iso-27-maintenance-definer-shape.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
@@ -89,5 +90,11 @@ describe("ISO-28 · a definer-owner role is a member of no other role", () => {
 describe("ISO-29 · no runtime, share-lookup or non-BYPASSRLS break-glass role can effectively EXECUTE a maintenance function", () => {
   it("holds for has_function_privilege and for SET ROLE reach", async () => {
     await expect(assertIso29MaintenanceExecuteEffective(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-30 · no refused role is a member (of any kind, ADMIN-only included) of a role that can EXECUTE a maintenance function", () => {
+  it("holds for every membership route", async () => {
+    await expect(assertIso30MaintenanceExecuteAdminOnly(getAssertionContext())).resolves.toBeUndefined();
   });
 });
