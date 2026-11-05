@@ -10,8 +10,12 @@ import type { Cache } from "../../src/lib/cache/cache.port.js";
 import type { RealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
 import { readRunProgress } from "../../src/lib/capture/run-progress.js";
+import { BaseCaptureAdapter } from "../../src/lib/engines/base-adapter.js";
+import type { RawCapture } from "../../src/lib/engines/contract.js";
 import { createCaptureExecuteHandler } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
@@ -332,6 +336,71 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     const second = await planRun();
     const progress = await readRunProgress(db, second.runId, NOW);
     expect(progress.skipped).toBe(1);
+    expect(progress.cachedByLayer.l1).toBe(1);
+  });
+
+  // ---- Audit round 3 - what may enter L1, and how a token-budget failure is recorded ---------------------------------------------
+  // `recordSuppressedCells` writes an L1 row with truncated = false and no flags, so an L1 copy of a truncated empty (brand_present
+  // false) or of a refusal (flag lost) would be wrong in the OTHER tenant. Such an answer must never be seeded. Driven through the real
+  // seed -> probe -> insert path: capture, plan again, read what the planner wrote.
+  const raw = (over: Partial<RawCapture>): RawCapture => ({
+    text: "", format: "markdown", truncated: false, responseTokensEst: 0, latencyMs: 10, costUsd: 0, ...over,
+  });
+
+  async function captureThenReplan(prompt: string, answer?: RawCapture) {
+    if (answer !== undefined) vi.spyOn(BaseCaptureAdapter.prototype, "capture").mockResolvedValueOnce(answer);
+    await addPrompt(prompt);
+    const first = await planRun();
+    // In the job's tenant transaction: a run whose only cell FAILED requests its rollup, which defers the enqueue past COMMIT.
+    await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => handler()(tx, first.jobs[0]!));
+    vi.restoreAllMocks();
+    const second = await planRun();
+    return { first, second, progress: await readRunProgress(db, second.runId, NOW) };
+  }
+
+  it("[audit r3 AC2] a truncated-empty answer (token budget) is recorded FAILED with malformed_response, never parsed", async () => {
+    const { first } = await captureThenReplan("normal", raw({ truncated: true, costUsd: 0.01 }));
+    const row = await db.query<{ status: string; error_code: string | null }>("SELECT status, error_code FROM answer_captures WHERE run_id = $1", [first.runId]);
+    expect(row.rows[0]).toEqual({ status: "failed", error_code: "malformed_response" });
+    expect(parseJobs).toEqual([]);
+    expect(await readRunProgress(db, first.runId, NOW)).toMatchObject({ failed: 1, captured: 0 });
+  });
+
+  it("[audit r3 AC2/AC5] a whitespace-only truncated answer is the same token-budget failure", async () => {
+    const { first } = await captureThenReplan("normal", raw({ text: " \n ", truncated: true }));
+    const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE run_id = $1", [first.runId]);
+    expect(row.rows[0]!.status).toBe("failed");
+  });
+
+  it("[audit r3 AC1] a truncated-empty live answer is NOT seeded into L1: the next plan finds no hit", async () => {
+    const { progress } = await captureThenReplan("normal", raw({ truncated: true }));
+    expect(progress.cachedByLayer.l1).toBe(0);
+    expect(progress.skipped).toBe(0);
+  });
+
+  it("[audit r3 AC1] a flagged refusal is NOT seeded into L1 (an L1 copy would lose its flag)", async () => {
+    const { progress } = await captureThenReplan("refusal");
+    expect(progress.cachedByLayer.l1).toBe(0);
+    expect(progress.skipped).toBe(0);
+  });
+
+  it("[audit r3 AC1] a flagged empty answer is NOT seeded into L1", async () => {
+    const { progress } = await captureThenReplan("empty");
+    expect(progress.cachedByLayer.l1).toBe(0);
+  });
+
+  it("[audit r3 AC1/AC5] an unflagged empty or whitespace-only answer is NOT seeded into L1", async () => {
+    for (const text of ["", "\n", "   \t "]) {
+      await db.query("TRUNCATE answer_captures, capture_runs CASCADE");
+      cache = new InMemoryCacheAdapter();
+      await db.query("TRUNCATE tracked_prompts CASCADE");
+      const { progress } = await captureThenReplan("normal", raw({ text }));
+      expect(progress.cachedByLayer.l1, JSON.stringify(text)).toBe(0);
+    }
+  });
+
+  it("[audit r3 AC1] control: an unflagged, complete, non-empty answer is still seeded", async () => {
+    const { progress } = await captureThenReplan("normal", raw({ text: "HubSpot is a CRM." }));
     expect(progress.cachedByLayer.l1).toBe(1);
   });
 });

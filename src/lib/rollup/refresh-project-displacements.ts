@@ -93,17 +93,15 @@ const CLASS_ORDER = ["recommendation", "ranked", "neutral_list", "also_consider"
 /**
  * Owner decision 57a - a refused or empty answer counts as "not mentioned" in presence, but it is NO OBSERVATION for displacement: it
  * never opens an event, never closes one, and is never the baseline of the next comparison (the brand was not lost, the engine said
- * nothing). Excludes rows flagged `engine_refused_to_answer`, rows whose own payload text is the empty string, and an L2 row whose
- * SOURCE refused or answered with nothing. `table` is a fixed identifier, never user input.
+ * nothing). Excludes rows flagged `engine_refused_to_answer` or `empty_answer` (a reused row carries its source's resolution on its own
+ * flags) and rows whose own payload text is empty after trim. No subquery. `table` is a fixed identifier, never user input.
  */
 function observedAnswerSql(table: string): string {
-  return `NOT ('engine_refused_to_answer' = ANY(${table}.flags))
-          AND ${table}.payload->>'text' IS DISTINCT FROM ''
-          AND NOT EXISTS (
-            SELECT 1 FROM answer_captures src
-             WHERE src.id = ${table}.source_result_id AND src.workspace_id = ${table}.workspace_id AND src.project_id = ${table}.project_id
-               AND ('engine_refused_to_answer' = ANY(src.flags) OR src.payload->>'text' = '')
-          )`;
+  // Only the row's OWN columns: a reused row carries the resolution of its source in its flags (`empty_answer`, `engine_refused_to_answer`,
+  // written by capture.parse), so there is no cross-partition probe of the source and no change of meaning when retention drops it.
+  // Whitespace-only text is empty, like "". A row with no text at all (an L2 row, whose payload is {}) is not excluded by its text.
+  return `NOT (${table}.flags && ARRAY['engine_refused_to_answer', 'empty_answer']::text[])
+          AND (${table}.payload->>'text' IS NULL OR ${table}.payload->>'text' !~ '^\\s*$')`;
 }
 
 export async function refreshProjectDisplacements(

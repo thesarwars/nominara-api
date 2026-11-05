@@ -269,8 +269,17 @@ export async function fetchCell(input: CaptureCellInput, ports: FetchCellPorts =
   }
 
   await meterSpend();
+  // A TRUNCATED EMPTY ANSWER IS A TOKEN-BUDGET FAILURE, NOT AN ANSWER (Gemini MAX_TOKENS, OpenRouter finish "length"). scoring-models
+  // s2.5: a failed cell is excluded from both numerator and denominator, so it is recorded `failed` (`malformed_response`: the engine
+  // returned no usable body) - not `captured` with a NULL presence the per-prompt view drops and the rollup counts. Terminal, not retried
+  // (the same prompt hits the same budget); the vendor billed the call, so its cost is kept. Nothing is stored or seeded.
+  if (isBlank(raw.text) && raw.truncated) {
+    incrementCounter("nominara_capture_truncated_empty_total", { engine: input.engineKey });
+    logger.warn({ event: "capture.truncated_empty", workspace_id: input.workspaceId, run_id: input.runId, engine: input.engineKey });
+    return unansweredCell({ status: "failed", errorCode: "malformed_response" }, { kind: "failed", errorCode: "malformed_response" }, now, costs.usd);
+  }
   const stored = await storeRawObject(input, now, rawObjects, raw);
-  return { write: { status: "captured", adapter, raw }, ...stored, costUsd: costs.usd, seed: raw, now, outcome: { kind: "captured", latencyMs: raw.latencyMs } };
+  return { write: { status: "captured", adapter, raw }, ...stored, costUsd: costs.usd, seed: isSeedable(raw) ? raw : undefined, now, outcome: { kind: "captured", latencyMs: raw.latencyMs } };
 }
 
 /**
@@ -469,8 +478,23 @@ function contentHash(text: string): Buffer {
   return createHash("sha256").update(text, "utf8").digest();
 }
 
+/** Empty after trim: `""`, `"\n"` and spaces are all "the engine said nothing". */
+function isBlank(text: string): boolean {
+  return text.trim() === "";
+}
+
+/**
+ * ONLY A COMPLETE, UNFLAGGED, NON-EMPTY ANSWER MAY ENTER THE SHARED CACHE. `recordSuppressedCells` writes an L1 row with
+ * `truncated = false` and no flags, so an L1 copy of a truncated answer, of a refusal (its flag would be lost) or of an empty answer
+ * (it would read as a measured `brand_present = false` in another tenant) would assert something the source never did.
+ */
+function isSeedable(raw: RawCapture): boolean {
+  return !raw.truncated && !isBlank(raw.text) && (raw.flags ?? []).length === 0;
+}
+
 /** The L1 entry a later run's `probeExactHash` reads. Same envelope, same key. */
 async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw: RawCapture, now: Date): Promise<void> {
+  if (!isSeedable(raw)) return; // belt and braces: the caller already withholds the seed
   const key = captureL1Key({
     env: cacheKeyNamespace(),
     engineKey: input.engineKey,

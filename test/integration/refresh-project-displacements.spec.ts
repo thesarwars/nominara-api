@@ -273,11 +273,50 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(await events()).toHaveLength(0);
   });
 
-  it("STORY-056 · decision 57a: a reused (L2) row whose source answered with nothing is no observation", async () => {
+  it("STORY-056 · decision 57a: a reused (L2) row that resolved to an empty answer is no observation - and stays so after its source is deleted", async () => {
     await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
     const source = await capture({ at: `${D1}T12:00:00Z`, present: null, engine: "chatgpt", text: "" });
-    const reused = await capture({ at: `${D2}T10:00:00Z`, present: false, status: "skipped" });
+    // The parse handler denormalises the resolution onto the reused row's OWN flags; the detector reads nothing else.
+    const reused = await capture({ at: `${D2}T10:00:00Z`, present: false, status: "skipped", flags: ["empty_answer"] });
     await db.query("UPDATE answer_captures SET cache_layer = 'l2', source_result_id = $2 WHERE id = $1", [reused, source]);
+    await db.query("DELETE FROM answer_captures WHERE id = $1", [source]); // retention dropped the source
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: an L1 empty row (own payload text, empty_answer flag) is no observation", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, status: "skipped", flags: ["empty_answer"], text: "" });
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: an L2 row whose source is truncated-empty (unscored, rematch_unavailable) is no observation", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    const source = await capture({ at: `${D1}T12:00:00Z`, present: null, engine: "chatgpt", text: "" });
+    await db.query("UPDATE answer_captures SET truncated = true WHERE id = $1", [source]);
+    const reused = await capture({ at: `${D2}T10:00:00Z`, present: null, status: "skipped", flags: ["rematch_unavailable"] });
+    await db.query("UPDATE answer_captures SET cache_layer = 'l2', source_result_id = $2 WHERE id = $1", [reused, source]);
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: a refused row that is the only earlier row leaves the next observation with no baseline", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: false, text: "", flags: ["engine_refused_to_answer"] });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+  });
+
+  it("STORY-056 · decision 57a: a WHITESPACE-only answer is an empty answer - no observation, no baseline", async () => {
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1 });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, text: "\n  " });
+    await run(D2);
+    expect(await events()).toHaveLength(0);
+    // ... and as the only earlier row it leaves no baseline either.
+    await db.query("DELETE FROM answer_captures WHERE project_id = $1", [projectId]);
+    await capture({ at: `${D1}T10:00:00Z`, present: false, text: " " });
+    await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 } });
     await run(D2);
     expect(await events()).toHaveLength(0);
   });

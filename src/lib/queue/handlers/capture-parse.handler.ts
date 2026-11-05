@@ -311,6 +311,9 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
         ...record.flags.filter((flag) => flag !== REMATCH_UNAVAILABLE_FLAG),
         // The source's refusal travels onto the reused row, so the row reads as the refusal it reuses.
         ...(resolved?.kind === "empty" && resolved.refused && !record.flags.includes(ENGINE_REFUSED_FLAG) ? [ENGINE_REFUSED_FLAG] : []),
+        // DENORMALISED (decision 57a): the displacement detector tests the row's OWN flags, never a cross-partition read of the source
+        // (which also flips meaning once retention drops it). Added for every reused row that resolved to nothing, refused or not.
+        ...(resolved?.kind === "empty" && !record.flags.includes(EMPTY_ANSWER_FLAG) ? [EMPTY_ANSWER_FLAG] : []),
       ],
       ...structuredOf(record, rawObject),
     };
@@ -352,10 +355,12 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 }
 
 const ENGINE_REFUSED_FLAG = "engine_refused_to_answer";
+const EMPTY_ANSWER_FLAG = "empty_answer";
 
 /** The row carries a text field and it is the empty string - an answer of nothing, as opposed to no text field at all. */
 function answeredWithNothing(record: CaptureRecord, rawObject: RawObjectBody | null): boolean {
-  return (rawObject !== null ? rawObject.text : record.payload?.text) === "";
+  const text = rawObject !== null ? rawObject.text : record.payload?.text;
+  return typeof text === "string" && text.trim() === "";
 }
 
 /** The prior parse's identity, or null when this row has never been parsed. */
@@ -383,7 +388,7 @@ function priorOf(record: CaptureRecord): Parameters<typeof decideL3>[1] {
  */
 function textOf(record: CaptureRecord, rawObject: RawObjectBody | null): string | null {
   const text = rawObject !== null ? rawObject.text : record.payload?.text;
-  return typeof text === "string" && text.length > 0 ? text : null;
+  return typeof text === "string" && text.trim().length > 0 ? text : null;
 }
 
 /** What a reused row's answer resolved to: text, an answer of nothing (a refusal or an empty answer - a measurement), or nothing recoverable. */
@@ -404,7 +409,7 @@ type ReusedText = { kind: "text"; text: string } | { kind: "empty"; refused: boo
 async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: string): Promise<ReusedText> {
   const own = (record.payload as { text?: unknown } | null)?.text;
   if (typeof own === "string") {
-    if (own.length > 0) return { kind: "text", text: own };
+    if (own.trim().length > 0) return { kind: "text", text: own };
     // A truncated empty answer is a failure, not an answer; a reused row cannot be marked parsed, so it is unavailable.
     return record.truncated ? { kind: "missing" } : { kind: "empty", refused: record.flags.includes(ENGINE_REFUSED_FLAG) };
   }
@@ -416,7 +421,7 @@ async function reusedTextOf(tx: ClientBase, record: CaptureRecord, workspaceId: 
   const row = source.rows[0];
   const text = row?.payload?.text;
   if (row === undefined || typeof text !== "string") return { kind: "missing" };
-  if (text.length > 0) return { kind: "text", text };
+  if (text.trim().length > 0) return { kind: "text", text };
   return row.truncated ? { kind: "missing" } : { kind: "empty", refused: row.flags.includes(ENGINE_REFUSED_FLAG) };
 }
 
