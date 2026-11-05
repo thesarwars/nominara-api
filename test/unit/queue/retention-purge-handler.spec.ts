@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   clients: [] as { ended: boolean }[],
   locked: true,
   cycleCalls: 0,
+  cycleOptions: undefined as { deleteWorkspaceObjects?: (id: string) => Promise<void> } | undefined,
   cycleThrows: false,
   result: { projectsPurged: ["p1", "p2"] as string[], workspacesPurged: [] as string[], skipped: [] as { scope: string; scopeId: string; reason: string }[] },
   unlocked: 0,
@@ -32,8 +33,9 @@ vi.mock("../../../src/lib/queue/locks.js", async () => {
   };
 });
 vi.mock("../../../src/workers/rollup/retention.js", () => ({
-  runDailyPurgeCycle: vi.fn(async () => {
+  runDailyPurgeCycle: vi.fn(async (_client: unknown, options?: { deleteWorkspaceObjects?: (id: string) => Promise<void> }) => {
     state.cycleCalls += 1;
+    state.cycleOptions = options;
     if (state.cycleThrows) throw new Error("purge exploded");
     return state.result;
   }),
@@ -54,6 +56,7 @@ beforeEach(() => {
   state.clients.length = 0;
   state.locked = true;
   state.cycleCalls = 0;
+  state.cycleOptions = undefined;
   state.cycleThrows = false;
   state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: [], skipped: [] };
   state.unlocked = 0;
@@ -120,5 +123,23 @@ describe("retention.purge — enabled", () => {
     vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
     await expect(run("true")).rejects.toThrow(/purge exploded/u);
     expect(state.clients[0]!.ended).toBe(true);
+  });
+});
+
+describe("retention.purge - STORY-180 r5: workspace erasure deletes the workspace's report files", () => {
+  const storageEnv = { STORAGE_BUCKET_RAW: "raw-b", STORAGE_BUCKET_REPORTS: "reports-b", STORAGE_KEY_ENV: "prod", STORAGE_SSE: "AES256" };
+  const withStorage = (extra: Record<string, string>) =>
+    ({ pool: {} as never, env: { DATABASE_URL: "postgres://owner@direct/db", RETENTION_PURGE_ENABLED: "true", ...extra } }) as unknown as QueueHandlerContext;
+
+  it("hands the purge cycle a deleteWorkspaceObjects hook when object storage is configured", async () => {
+    await createRetentionPurgeHandler(withStorage(storageEnv))({} as never, tick);
+    expect(typeof state.cycleOptions?.deleteWorkspaceObjects).toBe("function");
+  });
+
+  it("with object storage NOT configured the cycle runs without the hook, and says so", async () => {
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    await createRetentionPurgeHandler(withStorage({}))({} as never, tick);
+    expect(state.cycleOptions?.deleteWorkspaceObjects).toBeUndefined();
+    expect(JSON.stringify(warn.mock.calls)).toContain("report_objects_not_deleted");
   });
 });

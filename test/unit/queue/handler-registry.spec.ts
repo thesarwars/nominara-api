@@ -80,6 +80,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "maintenance.partition",
       "notify.dispatch",
       "report.build",
+      "report.cleanup",
       "retention.purge",
       "rollup.metric_daily",
       "source.verify_presence",
@@ -134,6 +135,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "task.resurface",
       // STORY-013 AC6 / AC14 / AC16 — declared after task.resurface in topology.ts.
       "maintenance.integrity",
+      // STORY-180 r5 — declared after task.resurface in topology.ts.
+      "report.cleanup",
     ]);
   });
 

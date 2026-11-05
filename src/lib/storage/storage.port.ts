@@ -34,6 +34,16 @@ export interface ObjectHead {
   readonly serverSideEncryption: string | null;
 }
 
+/**
+ * PURGE-SIDE ONLY (STORY-180 r5, the prefix delete STORY-182 specifies). Deletes EVERY version and delete marker under a prefix of one
+ * bucket, so a purged workspace leaves no recoverable copy. It is a separate interface on purpose: feature code takes TenantObjectStore
+ * (which has no such method), and only `workspace-purge.ts` builds a prefix for it from an explicit workspace id.
+ */
+export interface PrefixDeletingPort {
+  /** Returns how many versions and delete markers were removed. Refuses a prefix that is empty or does not end in `/`. */
+  deletePrefix(bucket: StorageBucketName, prefix: string): Promise<number>;
+}
+
 export interface ObjectStoragePort {
   put(request: PutObjectRequest): Promise<void>;
   /** Throws NotFoundError (404) when the object is absent. Reads the whole object into memory: for small blobs only. */

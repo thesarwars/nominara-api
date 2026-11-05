@@ -305,6 +305,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "notification. The DNS and HTTP checks are network calls an operator must never see on a request path (KAD-06), and §4's table allocates no " +
       "queue to them. A queue of its own, in the crawl group with the other outbound fetchers, so a DLQ entry names the job that failed.",
   },
+  "report.cleanup": {
+    workerGroup: "rollup",
+    because:
+      "STORY-180 r5 (owner decision 60 (b)): stored report files are deleted once their 7-day link has expired, and half-uploaded ones after a day; nothing else removes an " +
+      "object from the reports bucket. The tick has no workspace to name, so the queue is not tenant-scoped: discovery runs cross-tenant on the owner connection and each " +
+      "workspace is cleaned in ONE tenant's context as the runtime role, object first and then the row. A queue of its own so a DLQ entry names the job that failed.",
+  },
   "task.resurface": {
     workerGroup: "rollup",
     because:
@@ -430,7 +437,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("marks tenantScoped=false only for the eight cross-tenant system jobs; true for every other queue", () => {
+  it("marks tenantScoped=false only for the nine cross-tenant system jobs; true for every other queue", () => {
     // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
     // driven by a bare cron tick — `createJobProcessor` verifies a signature
     // before the handler is reached — so this set is exactly the set of
@@ -446,6 +453,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
       "identity.sweep_unverified",
       "maintenance.integrity",
       "maintenance.partition",
+      "report.cleanup",
       "retention.purge",
       "task.resurface",
     ]);

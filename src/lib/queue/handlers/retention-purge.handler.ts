@@ -3,6 +3,9 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { runDailyPurgeCycle } from "../../../workers/rollup/retention.js";
+import { S3Adapter } from "../../storage/s3.adapter.js";
+import { resolveStorageConfig } from "../../storage/storage-config.js";
+import { deleteWorkspaceReports } from "../../storage/workspace-purge.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -65,7 +68,16 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
         return;
       }
 
-      const result = await runDailyPurgeCycle(client);
+      // STORY-180 r5: an erased workspace's stored report files are deleted (every version) AFTER its cascade commits. With object storage
+      // not configured the hook is absent, so the files would be left: say so, loudly, every run.
+      const storage = resolveStorageConfig(context.env);
+      if (storage === null) logger.warn({ event: "report_objects_not_deleted", reason: "storage_unconfigured" });
+      const adapter = storage === null ? undefined : new S3Adapter(storage);
+      const result = await runDailyPurgeCycle(client, {
+        ...(storage !== null && adapter !== undefined
+          ? { deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => void (await deleteWorkspaceReports(adapter, storage.keyEnv, workspaceId)) }
+          : {}),
+      });
 
       incrementCounter("nominara_retention_purge_runs_total");
       // Counts only: a project or workspace ID in a log line is a deletion record that belongs in the purge journal.
