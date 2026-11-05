@@ -5,6 +5,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BREAKGLASS_ROLE, RUNTIME_ROLES } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { MIGRATIONS_DIR, migrateUp, rollbackLast } from "../../src/db/migrate-runner.js";
+import { effectiveExecuteHolders } from "../isolation/assertions/iso-29-maintenance-execute-effective.js";
+import { maintenanceOutputTypes } from "../isolation/assertions/iso-27-maintenance-definer-shape.js";
 import { computeRecallAtK, detectDefaultPartitionRows } from "../../src/workers/rollup/maintenance.js";
 import { scanForOrphans } from "../../src/workers/rollup/retention.js";
 
@@ -144,17 +146,16 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
   }, 120_000);
 
   it("MD-2 · the functions return COUNTS ONLY: every output column is text/bigint/integer, and no function takes a predicate or an arbitrary relation", async () => {
-    const r = await admin.query<{ proname: string; args: string; outs: string[] | null; outtypes: string[] | null; rettype: string }>(
-      `SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, p.proargnames::text[] AS outs,
-              (SELECT array_agg(format_type(t, NULL) ORDER BY ord) FROM unnest(p.proallargtypes, p.proargmodes) WITH ORDINALITY AS u(t, m, ord) WHERE m IN ('t', 'o')) AS outtypes,
-              format_type(p.prorettype, NULL) AS rettype
+    const r = await admin.query<{ proname: string; args: string }>(
+      `SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'app' AND p.proname LIKE 'maintenance\\_%' ORDER BY p.proname`,
     );
     expect(r.rows.map((x) => x.proname)).toEqual(["maintenance_default_partition_rows", "maintenance_orphan_counts", "maintenance_recall_overlap"]);
-    const allowed = new Set(["text", "bigint", "integer", "halfvec"]);
+    const allowed = new Set(["text", "bigint", "integer"]);
+    const outputs = await maintenanceOutputTypes(admin);
     for (const row of r.rows) {
-      for (const t of row.outtypes ?? [row.rettype]) {
+      for (const t of outputs.get(row.proname) ?? []) {
         expect(allowed.has(t), `${row.proname} exposes a ${t} column`).toBe(true);
       }
     }
@@ -162,6 +163,23 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     expect(r.rows.find((x) => x.proname === "maintenance_default_partition_rows")!.args).toBe("");
     expect(r.rows.find((x) => x.proname === "maintenance_orphan_counts")!.args).toBe("");
     expect(r.rows.find((x) => x.proname === "maintenance_recall_overlap")!.args).toBe("p_table text, p_query halfvec, p_k integer");
+  });
+
+  it("MD-2c · an INOUT halfvec (an argument handed back to the caller) is seen by the output-type filter, and an OUT one, and a plain return", async () => {
+    await admin.query("CREATE FUNCTION app.maintenance_zz_probe_inout(INOUT v halfvec, OUT n integer) LANGUAGE sql AS 'SELECT v, 1'");
+    await admin.query("CREATE FUNCTION app.maintenance_zz_probe_out(OUT v halfvec, k integer) LANGUAGE sql AS 'SELECT NULL::halfvec'");
+    await admin.query("CREATE FUNCTION app.maintenance_zz_probe_ret(k integer) RETURNS halfvec LANGUAGE sql AS 'SELECT NULL::halfvec'");
+    try {
+      const seen = await maintenanceOutputTypes(admin, "maintenance\\_zz\\_probe%");
+      // two result columns, so the declared return type is a record and cannot stand in for the modes: the INOUT column must be listed itself
+      expect(seen.get("maintenance_zz_probe_inout")).toEqual(["halfvec", "integer"]);
+      expect(seen.get("maintenance_zz_probe_out")).toEqual(["halfvec"]);
+      expect(seen.get("maintenance_zz_probe_ret")).toEqual(["halfvec"]);
+    } finally {
+      await admin.query("DROP FUNCTION app.maintenance_zz_probe_inout(halfvec)");
+      await admin.query("DROP FUNCTION app.maintenance_zz_probe_out(integer)");
+      await admin.query("DROP FUNCTION app.maintenance_zz_probe_ret(integer)");
+    }
   });
 
   it("MD-2b · a caller cannot steer the recall function at another table or smuggle a predicate through its text argument", async () => {
@@ -216,7 +234,7 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     }
   }, 60_000);
 
-  it("MD-5 · the owner is NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT with no members; each function is SECURITY DEFINER, search_path pinned, EXECUTE for nominara_owner only", async () => {
+  it("MD-5 · the owner is NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT with no members; each function is SECURITY DEFINER, search_path pinned, EXECUTE for nominara_owner only, and no runtime role can reach it through a membership", async () => {
     const role = await admin.query<{ rolcanlogin: boolean; rolsuper: boolean; rolbypassrls: boolean; rolinherit: boolean; rolcreaterole: boolean; rolcreatedb: boolean; rolreplication: boolean }>(
       "SELECT rolcanlogin, rolsuper, rolbypassrls, rolinherit, rolcreaterole, rolcreatedb, rolreplication FROM pg_roles WHERE rolname = $1",
       [OWNER],
@@ -244,6 +262,26 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
       // The ACL itself, not a filtered view of roles: exactly the owner and nominara_owner, and nobody (PUBLIC = grantee 0) else.
       expect(new Set(f.grantees), f.proname).toEqual(new Set(["nominara_maintenance", "nominara_owner"]));
       expect(f.grantees.length, f.proname).toBe(2);
+    }
+    // EFFECTIVE execute (ISO-29): the exact ACL above is not enough, a role that is a MEMBER of nominara_owner executes through it.
+    // The roles that must be refused are NAMED (runtime roles, share-lookup, a non-BYPASSRLS break-glass), not selected by prefix: the
+    // G-4 maintenance login is a legitimate member of nominara_owner and must not be flagged.
+    expect(await effectiveExecuteHolders(admin)).toEqual([]);
+    for (const fn of FUNCTIONS) {
+      const legit = await admin.query<{ x: boolean }>(`SELECT has_function_privilege('${PROD_LIKE}', '${fn}', 'EXECUTE') AS x`);
+      expect(legit.rows[0]!.x, `${PROD_LIKE} is the G-4 login and may execute ${fn}`).toBe(true);
+    }
+    // Inline red step: a runtime role granted nominara_owner (INHERIT, then plain/SET) must be flagged.
+    for (const grant of ["GRANT nominara_owner TO nominara_worker WITH INHERIT TRUE", "GRANT nominara_owner TO nominara_worker"]) {
+      await admin.query(grant);
+      try {
+        const flagged = await effectiveExecuteHolders(admin);
+        expect(flagged.map((h) => h.role), grant).toContain("nominara_worker");
+        expect(flagged.map((h) => h.role), grant).not.toContain(PROD_LIKE);
+      } finally {
+        await admin.query("REVOKE nominara_owner FROM nominara_worker");
+      }
+      expect(await effectiveExecuteHolders(admin)).toEqual([]);
     }
     // The same query sees a grant to PUBLIC and to a role without the nominara_ prefix.
     await admin.query("CREATE ROLE md5_plain_reader NOLOGIN");
@@ -306,6 +344,9 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
         return new Map(r.rows.map((row) => [row.relname, Number(row.n)]));
       };
       const before = await scans();
+      // Without a monthly partition to NOT touch, "only the defaults were read" is vacuous.
+      const monthly = [...before.keys()].filter((name) => !name.endsWith("_default"));
+      expect(monthly.length, "no non-default monthly partition exists").toBeGreaterThan(0);
       await admin.query("SELECT * FROM app.maintenance_default_partition_rows()");
       const after = await scans();
       const touched = [...after].filter(([name, n]) => n > (before.get(name) ?? 0)).map(([name]) => name).sort();
@@ -335,16 +376,19 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     }
   }, 60_000);
 
-  // Roll back until 0160 itself is rolled back, so the case survives a later migration merging after it.
+  // Roll back until 0160 itself is rolled back, so the case survives a later migration merging after it. It STOPS, without rolling anything
+  // back, the moment the newest applied migration is ordered before 0160: a failure here must not unwind the whole chain.
   async function rollbackThrough0160(): Promise<string[]> {
     const undone: string[] = [];
-    for (let i = 0; i < 50; i += 1) {
+    for (;;) {
+      const newest = await admin.query<{ name: string }>("SELECT name FROM _migrations.applied ORDER BY name DESC LIMIT 1");
+      const next = newest.rows[0]?.name;
+      if (next === undefined || next < "0160_") throw new Error(`0160 is not applied (newest applied: ${next ?? "none"}); refusing to roll back further`);
       const name = await rollbackLast(admin, MIGRATIONS_DIR);
       if (name === null) throw new Error("0160 was never rolled back");
       undone.push(name);
       if (name.startsWith("0160_")) return undone;
     }
-    throw new Error("0160 was not reached");
   }
 
   it("MD-9 · 0160 rolls back cleanly (functions, policies and grants gone, rows untouched) and re-applies", async () => {
@@ -380,4 +424,76 @@ describe("STORY-013 r2 · count-only maintenance definer (ADR-0004)", () => {
     const memberOf = await admin.query("SELECT 1 FROM pg_auth_members am JOIN pg_roles m ON m.oid = am.member WHERE m.rolname = $1", [OWNER]);
     expect(memberOf.rowCount).toBe(0);
   }, 180_000);
+
+  // The down revokes USAGE on schema app only if 0160 granted it. It must ALSO not revoke when nominara_owner owns the schema (or is a member of
+  // its owner): there USAGE is the owner's own and a REVOKE would strip it, breaking createPartition's call to app.apply_tenant_rls().
+  async function downKeepsUsageWhen(transfer: () => Promise<void>, restore: () => Promise<void>): Promise<void> {
+    const usage = async (): Promise<boolean> => (await admin.query<{ x: boolean }>("SELECT has_schema_privilege('nominara_owner', 'app', 'USAGE') AS x")).rows[0]!.x;
+    await rollbackThrough0160();
+    await admin.query("REVOKE USAGE ON SCHEMA app FROM nominara_owner");
+    await migrateUp(admin, MIGRATIONS_DIR); // 0160 grants USAGE itself here and leaves its marker
+    expect(await usage()).toBe(true);
+    await transfer();
+    try {
+      expect(await usage(), "owner reaches app through ownership").toBe(true);
+      await rollbackThrough0160();
+      expect(await usage(), "the down must not strip the schema owner's own USAGE").toBe(true);
+    } finally {
+      await restore();
+      await migrateUp(admin, MIGRATIONS_DIR);
+    }
+  }
+
+  it("MD-9c · rolling 0160 back keeps USAGE on schema app when nominara_owner OWNS the schema (ownership transferred after the up)", async () => {
+    const original = (await admin.query<{ o: string }>("SELECT nspowner::regrole::text AS o FROM pg_namespace WHERE nspname = 'app'")).rows[0]!.o;
+    await downKeepsUsageWhen(
+      async () => void (await admin.query("ALTER SCHEMA app OWNER TO nominara_owner")),
+      async () => void (await admin.query(`ALTER SCHEMA app OWNER TO ${original}`)),
+    );
+  }, 240_000);
+
+  it("MD-9d · rolling 0160 back keeps USAGE on schema app when nominara_owner is a MEMBER of the schema's owner", async () => {
+    const original = (await admin.query<{ o: string }>("SELECT nspowner::regrole::text AS o FROM pg_namespace WHERE nspname = 'app'")).rows[0]!.o;
+    await admin.query("CREATE ROLE md9d_schema_owner NOLOGIN");
+    try {
+      await downKeepsUsageWhen(
+        async () => {
+          await admin.query("ALTER SCHEMA app OWNER TO md9d_schema_owner");
+          await admin.query("GRANT md9d_schema_owner TO nominara_owner WITH INHERIT TRUE");
+        },
+        async () => {
+          await admin.query(`ALTER SCHEMA app OWNER TO ${original}`);
+          await admin.query("REVOKE md9d_schema_owner FROM nominara_owner");
+        },
+      );
+    } finally {
+      await admin.query("DROP ROLE md9d_schema_owner");
+    }
+  }, 240_000);
+
+  it("MD-13 · detectDefaultPartitionRows refuses to run inside a caller's transaction and leaves that transaction exactly as it was", async () => {
+    const client = await connectAs(PROD_LIKE, "pl");
+    try {
+      await client.query("BEGIN");
+      await client.query("CREATE TEMP TABLE md13_marker (x integer)");
+      const listeners = client.listenerCount("notice");
+      await expect(detectDefaultPartitionRows(client)).rejects.toThrow(/inside an existing transaction/);
+      expect(client.listenerCount("notice"), "no listener leaked").toBe(listeners);
+      // The caller's transaction was not committed, and no timeout was applied to it.
+      expect((await client.query<{ t: string }>("SELECT current_setting('statement_timeout') AS t")).rows[0]!.t).toBe("0");
+      await client.query("ROLLBACK");
+      expect((await client.query<{ r: string | null }>("SELECT to_regclass('md13_marker')::text AS r")).rows[0]!.r).toBeNull();
+      // Outside a transaction it still works.
+      await expect(detectDefaultPartitionRows(client)).resolves.toEqual(expect.any(Array));
+    } finally {
+      await client.end();
+    }
+  }, 60_000);
+
+  it("MD-14 · detectDefaultPartitionRows rejects a timeout that is zero, negative or not finite, before sending any statement", async () => {
+    const never = { query: () => Promise.reject(new Error("no statement may be sent")), on: () => undefined, removeListener: () => undefined } as never;
+    for (const bad of [0, 0.5, -1, -0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(detectDefaultPartitionRows(never, bad), String(bad)).rejects.toThrow(/timeoutMs/);
+    }
+  });
 });

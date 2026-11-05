@@ -1,3 +1,4 @@
+import type { Client } from "pg";
 import { connectSuperuser, type AssertionContext } from "../support/assertion-context.js";
 import { type Breaker } from "../support/breakers.js";
 
@@ -6,21 +7,36 @@ import { type Breaker } from "../support/breakers.js";
 // by ISO-24 (DEFINER_OWNER_ROLES); this holds the functions' shape.
 const ALLOWED_OUTPUT_TYPES = new Set(["text", "bigint", "integer"]);
 
+/**
+ * The type of every column a maintenance function hands BACK, keyed by function name. One place, shared with MD-2, so the two cannot
+ * drift. Output modes are TABLE (t), OUT (o) and INOUT (b): an INOUT argument is handed back to the caller too. A function with no OUT/TABLE arguments returns its declared return type.
+ */
+export async function maintenanceOutputTypes(client: Client, namePattern: string = "maintenance\\_%"): Promise<Map<string, string[]>> {
+  const r = await client.query<{ proname: string; outtypes: string[] | null; rettype: string }>(
+    `SELECT p.proname::text AS proname,
+            (SELECT array_agg(format_type(t, NULL) ORDER BY ord) FROM unnest(p.proallargtypes, p.proargmodes) WITH ORDINALITY AS u(t, m, ord) WHERE m IN ('t', 'o', 'b')) AS outtypes,
+            format_type(p.prorettype, NULL) AS rettype
+       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'app' AND p.proname LIKE $1 ORDER BY p.proname`,
+    [namePattern],
+  );
+  return new Map(r.rows.map((row) => [row.proname, row.outtypes ?? [row.rettype]]));
+}
+
 export async function assertIso27MaintenanceDefinerShape(ctx: AssertionContext): Promise<void> {
   const client = await connectSuperuser(ctx);
   try {
-    const r = await client.query<{ proname: string; secdef: boolean; config: string[] | null; owner: string; super: boolean; login: boolean; bypass: boolean; pub: boolean; roles: string[]; outtypes: string[] | null; rettype: string }>(
+    const r = await client.query<{ proname: string; secdef: boolean; config: string[] | null; owner: string; super: boolean; login: boolean; bypass: boolean; pub: boolean; roles: string[] }>(
       `SELECT p.proname::text, p.prosecdef AS secdef, p.proconfig AS config, o.rolname::text AS owner, o.rolsuper AS super, o.rolcanlogin AS login,
               o.rolbypassrls AS bypass, has_function_privilege('public', p.oid, 'EXECUTE') AS pub,
               -- The ACL itself, every grantee, whatever it is named: 0 is PUBLIC. A NULL proacl is the default (PUBLIC may execute).
               coalesce((SELECT array_agg(DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END ORDER BY CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END)
-                          FROM aclexplode(p.proacl) a WHERE a.privilege_type = 'EXECUTE'), ARRAY['PUBLIC']) AS roles,
-              (SELECT array_agg(format_type(t, NULL) ORDER BY ord) FROM unnest(p.proallargtypes, p.proargmodes) WITH ORDINALITY AS u(t, m, ord) WHERE m IN ('t', 'o')) AS outtypes,
-              format_type(p.prorettype, NULL) AS rettype
+                          FROM aclexplode(p.proacl) a WHERE a.privilege_type = 'EXECUTE'), ARRAY['PUBLIC']) AS roles
          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles o ON o.oid = p.proowner
         WHERE n.nspname = 'app' AND p.proname LIKE 'maintenance\\_%' ORDER BY p.proname`,
     );
     if (r.rowCount !== 3) throw new Error(`ISO-27: expected exactly three app.maintenance_* functions, found ${r.rowCount}`);
+    const outputTypes = await maintenanceOutputTypes(client);
     for (const row of r.rows) {
       if (!row.secdef) throw new Error(`ISO-27: app.${row.proname} is not SECURITY DEFINER`);
       for (const pin of ["TimeZone=UTC", "DateStyle=ISO, MDY"]) {
@@ -34,7 +50,9 @@ export async function assertIso27MaintenanceDefinerShape(ctx: AssertionContext):
       if ([...row.roles].sort().join(",") !== ["nominara_maintenance", "nominara_owner"].join(",")) {
         throw new Error(`ISO-27: the EXECUTE ACL of app.${row.proname} must be exactly its owner and nominara_owner, with no PUBLIC grantee (got ${JSON.stringify(row.roles)})`);
       }
-      for (const type of row.outtypes ?? [row.rettype]) {
+      const types = outputTypes.get(row.proname);
+      if (types === undefined) throw new Error(`ISO-27: app.${row.proname} has no readable output types`);
+      for (const type of types) {
         if (!ALLOWED_OUTPUT_TYPES.has(type)) throw new Error(`ISO-27: app.${row.proname} returns a ${type} column; maintenance functions return counts only`);
       }
     }

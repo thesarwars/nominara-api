@@ -28,6 +28,7 @@ import { assertIso22ActorOnlyFuzzReplay, iso22Breaker } from "./iso-22-actor-onl
 import { assertIso26ShareLookupReturnsOnlyHashedRow, iso26Breaker } from "./iso-26-share-lookup-returns-only-hashed-row.js";
 import { assertIso24DefinerOwnerNoMembers, iso24Breaker } from "./iso-24-definer-owner-no-members.js";
 import { assertIso25ShareLookupDefinerShape, iso25Breaker } from "./iso-25-share-lookup-definer-shape.js";
+import { assertIso29MaintenanceExecuteEffective, iso29Breaker } from "./iso-29-maintenance-execute-effective.js";
 import { assertIso28DefinerOwnerHoldsNoRoles, iso28Breaker } from "./iso-28-definer-owner-holds-no-roles.js";
 import { assertIso27MaintenanceDefinerShape, iso27Breaker } from "./iso-27-maintenance-definer-shape.js";
 
@@ -209,6 +210,9 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   { id: "ISO-27", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso27MaintenanceDefinerShape, assertUnderBreaker: assertIso27MaintenanceDefinerShape, breaker: iso27Breaker },
   // STORY-013 r3 — the definer-owner roles are members of NO other role (the converse of ISO-24: what they could inherit).
   { id: "ISO-28", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso28DefinerOwnerHoldsNoRoles, assertUnderBreaker: assertIso28DefinerOwnerHoldsNoRoles, breaker: iso28Breaker },
+  // STORY-013 r4 — EFFECTIVE execute: no runtime role, share-lookup role or non-BYPASSRLS break-glass role can run a maintenance function,
+  // by any route (membership of nominara_owner included). ISO-27 holds the exact ACL; this holds what a role can actually do.
+  { id: "ISO-29", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso29MaintenanceExecuteEffective, assertUnderBreaker: assertIso29MaintenanceExecuteEffective, breaker: iso29Breaker },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,

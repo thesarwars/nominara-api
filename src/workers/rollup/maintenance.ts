@@ -344,11 +344,29 @@ export async function detectDefaultPartitionRows(
   client: ClientBase,
   timeoutMs: number = DEFAULT_PARTITION_COUNT_TIMEOUT_MS,
 ): Promise<DefaultPartitionAlert[]> {
+  // A non-positive (or truncated-to-zero, or non-finite) timeout would mean "no bound" to Postgres. Refuse before sending anything.
+  if (!Number.isFinite(timeoutMs) || Math.trunc(timeoutMs) < 1) {
+    throw new Error(`detectDefaultPartitionRows: timeoutMs must be a finite number >= 1 (got ${String(timeoutMs)})`);
+  }
   // ⚠ The bound is set HERE, on the call, in its own short transaction: a statement_timeout in the function's own SET clause is not
   // re-armed for the statement already running, so it would bound nothing (ADR-0004). SET LOCAL ends with the transaction.
   // The callers are autocommit (runMonthlyMaintenance holds a session advisory lock, not a transaction).
   let result: { rows: { parent_table: PartitionedFactTable; default_partition: string; row_count: string }[] };
-  await client.query("BEGIN");
+  // It owns its transaction, so it must not be called inside one: COMMIT would commit the caller's work and SET LOCAL would outlive this call.
+  // A BEGIN inside a transaction block is a WARNING (SQLSTATE 25001), not an error, and changes nothing: that is how it is detected.
+  let alreadyInTransaction = false;
+  const onNotice = (notice: { code?: string | undefined }): void => {
+    if (notice.code === "25001") alreadyInTransaction = true;
+  };
+  client.on("notice", onNotice);
+  try {
+    await client.query("BEGIN");
+  } finally {
+    client.removeListener("notice", onNotice);
+  }
+  if (alreadyInTransaction) {
+    throw new Error("detectDefaultPartitionRows must not run inside an existing transaction (it opens, and commits, its own)");
+  }
   try {
     await client.query(`SET LOCAL statement_timeout = '${String(Math.trunc(timeoutMs))}ms'`);
     result = await client.query<{ parent_table: PartitionedFactTable; default_partition: string; row_count: string }>(

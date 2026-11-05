@@ -95,6 +95,20 @@ Spans: `maintenance.integrity` with outcome and finding-count attributes; not as
 * **Go-live item G-4:** the production maintenance login needs `nominara_owner` `WITH INHERIT TRUE` (PG16 per-grant INHERIT), or the code needs a `SET ROLE nominara_owner`.
   Until then the checks fail closed with `check="definer_function"`.
 
+## Review round 4 — audit of round 3
+
+* **Effective EXECUTE (ISO-29, MD-5).** ISO-27 / MD-5 keep the exact ACL; ISO-29 adds `has_function_privilege(role, fn, 'EXECUTE')` for each NAMED role
+  (the four runtime roles, `nominara_share_lookup`, and `nominara_breakglass` when it is not BYPASSRLS; no prefix filter, so the G-4 maintenance login,
+  a legitimate member of `nominara_owner`, is not flagged) and `pg_has_role(role, <ACL grantee>, 'SET')` (a NOINHERIT membership still reaches the rights via
+  SET ROLE). Its breaker is `GRANT nominara_owner TO nominara_worker WITH INHERIT TRUE`; MD-5 runs the same grant (INHERIT and plain) inline.
+* Output-mode filter is `t`, `o`, `b` (INOUT) in one shared helper (`maintenanceOutputTypes`) used by ISO-27 and MD-2; MD-2c shows INOUT / OUT / plain-return halfvec are seen.
+* 0160 down also skips the USAGE revoke when `nominara_owner` owns schema `app` or is a member of its owner (MD-9c, MD-9d).
+* `rollbackThrough0160` stops, without rolling back, when the newest applied migration is ordered before 0160.
+* `detectDefaultPartitionRows` refuses to run inside an existing transaction (detected by the SQLSTATE 25001 warning from BEGIN; MD-13) and rejects a timeout < 1 or non-finite (MD-14).
+* drift-check: the converse membership check (a definer owner must be a member of no role; DEF-D3). MD-11 asserts a non-default monthly partition exists.
+* Red: `013r4-red-int.log`, `013r4-red-int-inout.log`, `013r4-red-migr.log`, `013r4-red-iso.log`; MD-5 and MD-10 against the round-2 tree (680b30dc):
+  `013r4-red-r2tree-MD-5.log` (fails: TimeZone pin absent), `013r4-red-r2tree-MD-10.log` (fails: membership not stripped).
+
 ### Doc changes needed (docs repo; not edited here)
 
 * security-and-tenancy.md section 2: add `nominara_maintenance` (NOLOGIN, NOBYPASSRLS, definer-owner) next to `nominara_share_lookup`; section 3: seven

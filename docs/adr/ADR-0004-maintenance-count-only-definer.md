@@ -92,6 +92,7 @@ following ADR-0002.
   and `createPartition` calls `app.apply_tenant_rls()` through it; a blanket revoke would break partition creation. The up grants only
   when the owner lacks USAGE and leaves a marker in the comment of `app.maintenance_default_partition_rows()`; the down reads that
   marker before it drops the function (MD-9b; `db:roundtrip-check` covers the case where the up did grant).
+- **Effective EXECUTE is asserted too (ISO-29).** An ACL lists grantees, not who can act as them: a runtime role made a member of `nominara_owner` executes through it. ISO-29 names the roles to refuse (runtime roles, the share-lookup role, a non-BYPASSRLS break-glass role), never filtering by prefix because the G-4 login is a legitimate member, and checks `has_function_privilege` plus `SET ROLE` reach. The down also leaves `USAGE ON SCHEMA app` alone when `nominara_owner` owns the schema or is a member of its owner.
 - **The function ACL is asserted directly** (ISO-27, MD-5: `aclexplode(proacl)` is exactly the function owner and `nominara_owner`, no
   PUBLIC grantee), not through a role-name filter. `TimeZone` and `DateStyle` are pinned on the functions, because the partition
   bounds are read back through `pg_get_expr`, whose text depends on both.
