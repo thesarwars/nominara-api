@@ -7,6 +7,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { assertDemoSeedAllowed, DemoSeedRefusedError } from "../../src/db/seed/demo/guard.js";
 import { runSeedDemo, type SeedDemoPool, type SeedDemoPoolClient } from "../../src/db/seed-demo.js";
+import { ensurePartitionsForTable } from "../../src/workers/rollup/maintenance.js";
 import { refreshProjectSourceIndex } from "../../src/lib/rollup/refresh-project-source-index.js";
 import { readWallet } from "../../src/lib/credits/wallet.js";
 import { verifyProjectSourcePresence } from "../../src/lib/sources/verify-presence.js";
@@ -154,6 +155,11 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
         [at.toISOString(), KIRITIMATI, offsetDays],
       )
     ).rows[0]!.d;
+
+  // 2nd of a month, 12:00Z: today - 5 and today - 10 fall in the PREVIOUS month.
+  const MONTH_BOUNDARY_NOW = new Date("2031-07-02T12:00:00.000Z");
+  const pinnedDay = async (at: Date, offsetDays: number): Promise<string> =>
+    (await client.query<{ d: string }>(`SELECT to_char(($1::timestamptz AT TIME ZONE 'UTC')::date + $2::int, 'YYYY-MM-DD') AS d`, [at.toISOString(), offsetDays])).rows[0]!.d;
 
   it("STORY-169 · seeds a workspace with no projects: creates the 3 fixtures and fills every contract-A field", async () => {
     const workspaceId = await createWorkspace("business");
@@ -1005,10 +1011,15 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     );
     const projectId = project.rows[0]!.id;
 
-    // A REAL prompt and a REAL, present `chatgpt` capture, on a fixed
-    // calendar day well INSIDE the seed's 60-day window (today - 5) —
-    // never derived from `now()` at test-run time, so it cannot flake
-    // across a UTC midnight boundary.
+    // A REAL prompt and a REAL, present `chatgpt` capture, on a calendar day
+    // well INSIDE the seed's 60-day window (pinned today - 5). Both the seed
+    // clock and every date here derive from ONE pinned instant — the 2nd of a
+    // month, so today - 5 falls in the PREVIOUS month — never from the wall
+    // clock. The old CURRENT_DATE - 5 fixture crossed into the previous month
+    // on days 1-5 of every month, where no partition exists yet (the migration
+    // only creates the current and next month), so the real row spilled into
+    // `answer_captures_default` and the seed's `CREATE TABLE ... PARTITION OF`
+    // was refused.
     const realPrompt = await client.query<{ id: string }>(
       `INSERT INTO tracked_prompts (workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
        VALUES ($1,$2,'a real customer prompt no demo template ever produces',
@@ -1016,27 +1027,33 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
        RETURNING id`,
       [workspaceId, projectId],
     );
+    const realFactDay = await pinnedDay(MONTH_BOUNDARY_NOW, -5);
+    const demoOnlyDay = await pinnedDay(MONTH_BOUNDARY_NOW, -10);
+    // A real capture only ever lands in a month that HAS a partition (the
+    // maintenance job guarantees the runway; a missing one is an alert, see
+    // STORY-142). The fixture owns that precondition for its own row.
+    await ensurePartitionsForTable(client, "answer_captures", new Date(`${realFactDay}T00:00:00.000Z`), 0);
     await client.query(
       `INSERT INTO answer_captures
          (workspace_id, project_id, run_id, prompt_id, engine_key, sample_index, captured_at,
           capture_mode, adapter_version, normalizer_version, content_hash, payload,
           brand_present, sov, sentiment_label, status)
        VALUES ($1,$2,gen_random_uuid(),$3,'chatgpt',0,
-               ((CURRENT_DATE - 5)::timestamp + interval '10 hours')::timestamptz,
+               (($4::date)::timestamp + interval '10 hours')::timestamptz,
                'api','1.0.0','real-capture-h',sha256('real-capture-h'::bytea),'{}'::jsonb,
                true,0.5,'positive','parsed')`,
-      [workspaceId, projectId, realPrompt.rows[0]!.id],
+      [workspaceId, projectId, realPrompt.rows[0]!.id, realFactDay],
     );
 
-    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, FAST_OPTIONS);
+    await runSeedDemo({ workspaceId, purge: false }, { ownerClient: client, pool: testPool(), log: () => {} }, { ...FAST_OPTIONS, now: MONTH_BOUNDARY_NOW });
 
     // Before purge: the mixed day's `all`-engine rollup combines the real
     // cell with the seed's own demo cells for that same day — strictly
     // more than the real fact's own count of 1.
     const beforePurge = await client.query<{ cells_total: string }>(
       `SELECT cells_total::text FROM metric_daily
-        WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 5) AND engine_key = 'all' AND entity_type = 'brand'`,
-      [projectId],
+        WHERE project_id = $1 AND metric_date = $2::date AND engine_key = 'all' AND entity_type = 'brand'`,
+      [projectId, realFactDay],
     );
     expect(beforePurge.rows).toHaveLength(1);
     expect(Number(beforePurge.rows[0]!.cells_total)).toBeGreaterThan(1);
@@ -1048,8 +1065,8 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     // ALONE.
     const afterPurgeMixedDay = await client.query<{ cells_total: string }>(
       `SELECT cells_total::text FROM metric_daily
-        WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 5) AND engine_key = 'all' AND entity_type = 'brand'`,
-      [projectId],
+        WHERE project_id = $1 AND metric_date = $2::date AND engine_key = 'all' AND entity_type = 'brand'`,
+      [projectId, realFactDay],
     );
     expect(afterPurgeMixedDay.rows).toHaveLength(1);
     expect(Number(afterPurgeMixedDay.rows[0]!.cells_total)).toBe(1);
@@ -1065,8 +1082,8 @@ describe("STORY-169 · db:seed-demo — end to end", () => {
     // window loses its row entirely — never left behind, and never
     // recreated from nothing.
     const demoOnlyDayRow = await client.query<{ n: string }>(
-      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date = (CURRENT_DATE - 10)`,
-      [projectId],
+      `SELECT count(*)::text AS n FROM metric_daily WHERE project_id = $1 AND metric_date = $2::date`,
+      [projectId, demoOnlyDay],
     );
     expect(Number(demoOnlyDayRow.rows[0]!.n)).toBe(0);
   }, 180_000);
