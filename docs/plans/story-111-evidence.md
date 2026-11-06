@@ -116,12 +116,32 @@ snapshot needs is listed under "Doc changes needed" for carrying to the docs rep
   merged; census 90/67/23) and returns `deferred` with the delay reason; the trail gets `subject_request.deferred`. `executePendingErasures`
   runs the queue under the SAME request id and without a second `received`: from the nightly `retention.purge` handler (after the cycle has
   recorded lapsed holds) and from `releaseLegalHoldAndRunQueue` (manual release). A queued subject who has become a sole owner is marked
-  `blocked`. Tests: S23 D1-D5, CLI cases, handler unit test; mutation (deferral disabled) fails 7 integration tests.
+  `blocked`. Tests: S23 D1-D5, CLI cases, handler unit test; mutation (deferral disabled) fails 6 integration tests (the earlier count of 7 included S7, which was flaky - see round 2).
 - **Not done / needs the owner or infrastructure.** (1) The legal text telling the subject the erasure is delayed (the CLI prints a plain
   reason for the operator to relay; the subject-facing notice wording is the owner's). (2) The nightly job only executes the queue when
   `RETENTION_PURGE_ENABLED=true` (it shares that handler; a disabled purge opens no connection). Until then a manual release runs it, or an
   operator re-runs the erase command after the hold ends. (3) No CLI to place or release holds exists; `releaseLegalHoldAndRunQueue` has no
-  caller yet. (4) A hold placed in the instant between the CLI's hold read and the erasure is not re-checked under the register lock (unlike
-  the purge); the window is one request.
+  caller yet. (4) (closed in round 2) the erasure now re-checks the holds under the register lock.
 - Doc changes: STORY-111 status/ACs (operator-run access and erasure, hold defers erasure); data-model.md: `subject_erasure_queue` global table,
   census 90 / 67 / 23; a runbook entry for the two commands.
+
+## Review round 2 (decision 68 follow-up)
+
+- **Hold check race (major).** `requestIndividualErasure(client, userId, { holdCheckAt })` takes `lockHoldRegister` for every workspace the subject
+  has a membership row in (removed ones too), in sorted id order, and re-reads the holds inside its own transaction; a hold found rolls back and
+  returns `held`, which `processErasureRequest` turns into the queue row and the one `deferred` audit entry. Test S23 D6 (seam `afterHoldsRead`
+  places a hold between the fast-path read and the erasure: subject, membership and audit actor untouched, row queued, hold survives). Mutation:
+  removing `holdCheckAt` fails D6 only (`s111r2-red-mutation.log`).
+- **Repeated deferral audit (major).** The queue runner (`resume`) returns `deferred` for a still-held row with no audit row and no counter
+  increment; `deferred` is written once, when the request is queued. D3 asserts the count stays 1 across two runner passes.
+- **S7 flake (major).** Asserted on structure (no metric for the workspace, none with value 77), not a substring of random UUIDs.
+- **Queue hygiene.** An executed row sets `user_id` and `requested_by` to NULL (`user_id` nullable, `CHECK (user_id IS NOT NULL OR status =
+  'executed')`; migration 0165 edited in place, unmerged). The runner holds a session advisory lock (`pg_advisory_lock`, blocking) so the nightly
+  job and a manual release cannot process one row twice (D9). An operator `--request-id` already on a queue row raises `RequestIdInUseError`
+  (D8). A crash between the erasure commit and the queue update can still repeat the `processed`/`completed` audit rows (erasure is idempotent): accepted.
+- **CLI.** A failed export removes the file it created, so the same `--out` can be retried (test).
+- **Owner reading to confirm.** Decision 68(b) says a hold "blocks individual erasure inside the held workspace". The build defers the WHOLE
+  erasure (profile, email, unheld workspaces too), because the `users` row is global and one erasure is one act; partial erasure would leave a
+  person half-erased. A hold on a workspace the subject LEFT (removed membership) also defers it (D7 pins this conservative reading). Owner: confirm
+  both, or say "only active memberships" / "only the held workspace's rows".
+- **Route.** `dangerous-area-auditor` must review this branch as second engineer before merge (tenant classification, ledger/audit pseudonymisation, minimisation).

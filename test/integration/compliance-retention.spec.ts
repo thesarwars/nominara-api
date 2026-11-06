@@ -11,7 +11,7 @@ import { InMemoryJournalStore, PurgeJournal } from "../../src/lib/compliance/pur
 import { reapplyPurgesAfterRestore } from "../../src/lib/compliance/restore-replay.js";
 import { COMPLIANCE_EXPORT_CLASSES, writeComplianceExports } from "../../src/lib/compliance/storage-adapters.js";
 import { SUBJECT_INVENTORY } from "../../src/lib/compliance/subject-inventory.js";
-import { executePendingErasures, processAccessRequest, processErasureRequest, releaseLegalHoldAndRunQueue, subjectColumnsFor } from "../../src/lib/compliance/subject-request.js";
+import { ERASURE_QUEUE_LOCK, executePendingErasures, processAccessRequest, processErasureRequest, releaseLegalHoldAndRunQueue, subjectColumnsFor } from "../../src/lib/compliance/subject-request.js";
 import type { ObjectStoragePort, PutObjectRequest } from "../../src/lib/storage/storage.port.js";
 import { runSubjectCommand } from "../../src/db/subject-cli.js";
 import { executeWorkspaceHardDelete, runDailyPurgeCycle, runNightlySweep } from "../../src/workers/rollup/retention.js";
@@ -581,8 +581,9 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
         [ws, proj],
       );
       const out = await processAccessRequest(db, u, { requestedBy: u });
+      // Structure, not a substring: the document carries random UUIDs and a millisecond timestamp, any of which can contain "77".
       expect(out.metrics.filter((m) => m.workspace_id === ws)).toEqual([]);
-      expect(JSON.stringify(out)).not.toContain("77");
+      expect(out.metrics.filter((m) => m.value === 77)).toEqual([]);
     });
 
     it("S3 S4 erasure is COMPLETE: the subject's email survives in no base table except the pseudonymised audit and ledger sets", async () => {
@@ -666,6 +667,9 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       placeLegalHold(db, { scope, scopeId, reason: "Litigation hold, matter 88", requestedBy: a, approvedBy: b, expiresAt: new Date(Date.now() + days * DAY) });
     const email = async (u: string): Promise<string> => (await db.query<{ email: string }>("SELECT email FROM users WHERE id = $1", [u])).rows[0]!.email;
     const queue = async (u: string) => (await db.query<{ status: string; request_id: string }>("SELECT status, request_id FROM subject_erasure_queue WHERE user_id = $1", [u])).rows;
+    const queueById = async (requestId: string) =>
+      (await db.query<{ status: string; user_id: string | null; requested_by: string | null }>("SELECT status, user_id, requested_by FROM subject_erasure_queue WHERE request_id = $1", [requestId])).rows;
+    const deferredCount = async (ws: string) => (await auditActions(ws)).filter((x) => x === "subject_request.deferred").length;
     async function held() {
       const ws = await workspace();
       const [a, b, owner, u] = [await user(), await user(), await user(), await user()];
@@ -697,7 +701,10 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       const run = await releaseLegalHoldAndRunQueue(db, h.id, b);
       expect(run).toMatchObject({ executed: 1 });
       expect(await email(u)).toMatch(/^deleted\+.*@nominara\.invalid$/);
-      expect((await queue(u))[0]).toEqual({ status: "executed", request_id: out.requestId });
+      // An executed row no longer names the subject (or the person who raised it - here the subject themself): the surviving audit rows carry
+      // this request id, and a row that re-linked it to the erased user's id would defeat the pseudonymisation.
+      expect(await queueById(out.requestId)).toEqual([{ status: "executed", user_id: null, requested_by: null }]);
+      expect(await queue(u)).toEqual([]);
       expect((await auditActions(ws)).filter((x) => x.startsWith("subject_request."))).toEqual(["subject_request.received", "subject_request.deferred", "subject_request.processed", "subject_request.completed"]);
       expect(await executePendingErasures(db)).toMatchObject({ executed: 0 }); // idempotent
     });
@@ -710,6 +717,10 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect(first.executed).toBe(0);
       expect(first.stillHeld).toBeGreaterThanOrEqual(1);
       expect((await queue(u))[0]!.status).toBe("pending");
+      // A pass over a still-held row is not a new deferral: the trail and the counter record the deferral once, when the request was queued.
+      expect(await deferredCount(ws)).toBe(1);
+      await executePendingErasures(db);
+      expect(await deferredCount(ws)).toBe(1);
       const later = new Date(Date.now() + 2 * DAY);
       await releaseExpiredHolds(db, later);
       expect(await executePendingErasures(db, later)).toMatchObject({ executed: 1 });
@@ -739,6 +750,55 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect((await queue(u))[0]!.status).toBe("blocked");
     });
 
+    it("S23 D6 RACE a hold placed AFTER the hold read but before the erasure still blocks it: the subject, the membership and the audit actor are untouched, the request is queued", async () => {
+      const { ws, a, b, u } = await held();
+      const before = await email(u);
+      let holdId = "";
+      const out = await processErasureRequest(db, u, { requestedBy: u, afterHoldsRead: async () => void (holdId = (await hold("workspace", ws, a, b)).id) });
+      expect(out.status).toBe("deferred");
+      expect(out.heldWorkspaces).toEqual([ws]);
+      expect(await email(u)).toBe(before);
+      expect((await db.query("SELECT status FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [ws, u])).rows[0]!.status).toBe("active");
+      expect((await db.query("SELECT 1 FROM audit_log WHERE workspace_id = $1 AND actor_id = $2", [ws, u])).rowCount).toBeGreaterThan(0);
+      expect(await queueById(out.requestId)).toEqual([{ status: "pending", user_id: u, requested_by: u }]);
+      expect(await deferredCount(ws)).toBe(1);
+      expect((await db.query("SELECT 1 FROM legal_holds WHERE id = $1 AND released_at IS NULL", [holdId])).rowCount).toBe(1);
+    });
+
+    it("S23 D7 a hold on a workspace the subject LEFT (removed membership) still defers the whole erasure - pinned conservative reading, owner to confirm", async () => {
+      const { ws, a, b, u } = await held();
+      await db.query("UPDATE workspace_members SET status = 'removed' WHERE workspace_id = $1 AND user_id = $2", [ws, u]);
+      await hold("workspace", ws, a, b);
+      expect((await processErasureRequest(db, u, { requestedBy: u })).status).toBe("deferred");
+    });
+
+    it("S23 D8 an operator-supplied request id that is already on a queue row is a named failure, not a silent merge", async () => {
+      const first = await held();
+      await hold("workspace", first.ws, first.a, first.b);
+      const queued = await processErasureRequest(db, first.u, { requestedBy: first.u });
+      const second = await held();
+      await hold("workspace", second.ws, second.a, second.b);
+      await expect(processErasureRequest(db, second.u, { requestedBy: second.u, requestId: queued.requestId })).rejects.toMatchObject({ name: "RequestIdInUseError" });
+      expect(await queue(second.u)).toEqual([]);
+    });
+
+    it("S23 D9 the queue runner is serialised: a second run waits for the first instead of processing the same row twice", async () => {
+      const other = new Client({ connectionString: container.getConnectionUri() });
+      await other.connect();
+      try {
+        await other.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [ERASURE_QUEUE_LOCK]);
+        let finished = false;
+        const run = executePendingErasures(db).then((r) => ((finished = true), r));
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        expect(finished).toBe(false);
+        await other.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [ERASURE_QUEUE_LOCK]);
+        await run;
+        expect(finished).toBe(true);
+      } finally {
+        await other.end();
+      }
+    });
+
     // -------- CLI
     const sink = () => {
       const lines: string[] = [];
@@ -765,6 +825,28 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect(await runSubjectCommand(db, ["export", "--user", u, "--requested-by", operator, "--out", file], s2.io)).toBe(1);
       const actor = (await db.query("SELECT actor_id FROM audit_log WHERE workspace_id = $1 AND action = 'subject_request.received' ORDER BY seq LIMIT 1", [ws])).rows[0]!;
       expect(actor.actor_id).toBe(operator);
+    });
+
+    it("CLI export that fails leaves no empty file behind, so the same --out can be retried", async () => {
+      const { u } = await held();
+      const { mkdtemp, access } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const file = `${await mkdtemp(`${tmpdir()}/dsar-`)}/out.json`;
+      const operator = await user();
+      const failing = new Proxy(db, {
+        get(target, prop, receiver) {
+          if (prop !== "query") return Reflect.get(target, prop, receiver) as unknown;
+          return (text: unknown, ...rest: unknown[]) => {
+            if (typeof text === "string" && text.includes("email_verified_at")) return Promise.reject(new Error("boom"));
+            return (target.query as (...a: unknown[]) => Promise<unknown>)(text, ...rest);
+          };
+        },
+      });
+      const s = sink();
+      expect(await runSubjectCommand(failing, ["export", "--user", u, "--requested-by", operator, "--out", file], s.io)).toBe(1);
+      expect(s.lines.join("\n")).toContain("request failed");
+      await expect(access(file)).rejects.toThrow();
+      expect(await runSubjectCommand(db, ["export", "--user", u, "--requested-by", operator, "--out", file], sink().io)).toBe(0);
     });
 
     it("CLI erase needs --confirm equal to the user id: without it, or with a different one, nothing changes", async () => {

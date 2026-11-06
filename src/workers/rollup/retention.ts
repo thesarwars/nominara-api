@@ -510,9 +510,23 @@ export async function executeWorkspaceHardDelete(
 export const SOLE_OWNER_ERASURE_BLOCK_REASON =
   "You are the sole owner of at least one workspace. Transfer ownership, or delete the workspace, before an erasure request can be completed.";
 
-export type ErasureResult = { readonly blocked: true; readonly reason: string } | { readonly blocked: false };
+export type ErasureResult =
+  | { readonly blocked: true; readonly reason: string; readonly held?: undefined }
+  | { readonly blocked: false; readonly held?: undefined }
+  /** Only when `holdCheckAt` was given: a legal hold covers a workspace of the subject (STORY-111, decision 68b). Nothing was changed. */
+  | { readonly blocked: false; readonly held: readonly string[] };
 
-export async function requestIndividualErasure(privilegedClient: ClientBase, userId: string): Promise<ErasureResult> {
+export interface IndividualErasureOptions {
+  /**
+   * When set, the erasure takes the legal-hold register lock of EVERY workspace the subject has a membership row in (removed ones included,
+   * in sorted id order so two erasures cannot deadlock) and re-reads the holds at this instant INSIDE its own transaction. A hold placed after
+   * the caller's earlier read is caught here, exactly as the purge's cascade catches it (the erasure rewrites audit and ledger actor ids, which
+   * is an alteration of held evidence).
+   */
+  readonly holdCheckAt?: Date;
+}
+
+export async function requestIndividualErasure(privilegedClient: ClientBase, userId: string, options: IndividualErasureOptions = {}): Promise<ErasureResult> {
   // audit_log and credit_ledger both carry the append-only
   // `reject_update_delete` trigger (migrations 0002/0004) — it raises on
   // ANY UPDATE unconditionally, so pseudonymising actor_id on either table
@@ -534,6 +548,21 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
   // separate re-enable step needed.
   await privilegedClient.query("BEGIN");
   try {
+    if (options.holdCheckAt !== undefined) {
+      const memberships = await privilegedClient.query<{ workspace_id: string }>(
+        "SELECT DISTINCT workspace_id FROM workspace_members WHERE user_id = $1 ORDER BY workspace_id",
+        [userId],
+      );
+      const heldWorkspaces: string[] = [];
+      for (const { workspace_id: workspaceId } of memberships.rows) {
+        await lockHoldRegister(privilegedClient, workspaceId);
+        if (await workspaceHasActiveHold(privilegedClient, workspaceId, options.holdCheckAt)) heldWorkspaces.push(workspaceId);
+      }
+      if (heldWorkspaces.length > 0) {
+        await privilegedClient.query("ROLLBACK");
+        return { blocked: false, held: heldWorkspaces };
+      }
+    }
     const soleOwner = await privilegedClient.query<{ exists: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM workspace_members WHERE user_id = $1 AND role = 'owner' AND status = 'active' FOR UPDATE

@@ -1,4 +1,4 @@
-import { open } from "node:fs/promises";
+import { open, unlink } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import { z } from "zod";
@@ -93,12 +93,17 @@ export async function runSubjectCommand(client: ClientBase, argv: readonly strin
         io.err("cannot create the output file (it exists, or the path is not writable); nothing was exported.");
         return 1;
       }
+      let written = false;
       try {
         const document = await processAccessRequest(client, args.user, ctx);
         await handle.writeFile(JSON.stringify(document, null, 2));
+        written = true;
         io.out(`request_id=${document.request_id} kind=access status=completed tables=${String(document.tables.length)} rows=${String(document.tables.reduce((n, t) => n + t.row_count, 0))} file=${args.out}`);
       } finally {
         await handle.close();
+        // This command created the file a moment ago (exclusive create), so removing it is safe; a failed export must not leave an empty file
+        // that makes the retry look like a path problem.
+        if (!written) await unlink(args.out).catch(() => undefined);
       }
       return 0;
     }

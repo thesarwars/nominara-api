@@ -250,8 +250,49 @@ export const LEGAL_HOLD_DELAY_REASON =
   "A legal hold covers a workspace this person belongs to, so the erasure is delayed for a legal reason. It is queued and runs automatically when the hold is released or expires.";
 
 export interface ErasureRequestContext extends SubjectRequestContext {
-  /** Set only by the queue runner: the request was already received and deferred, so `received` is not written a second time. */
+  /**
+   * Set only by the queue runner: the request was already received and deferred, so `received` is not written a second time, and a request
+   * that is still held is reported as `deferred` without a second deferral being audited or counted.
+   */
   readonly resume?: boolean;
+  /** Test seam: runs between the hold read and the erasure, where a hold placed by someone else would otherwise slip through. */
+  readonly afterHoldsRead?: () => Promise<void>;
+}
+
+/** An operator-supplied request id that a queue row already carries. Named so the operator is told what was wrong, not "request failed". */
+export class RequestIdInUseError extends Error {
+  override readonly name = "RequestIdInUseError";
+  constructor() {
+    super("that request id is already on a queued erasure");
+  }
+}
+
+/** Queues the erasure (one pending row per subject) and writes the one `deferred` audit row; returns the id the operator already holds. */
+async function deferErasure(
+  client: ClientBase,
+  userId: string,
+  workspaceIds: readonly string[],
+  heldWorkspaces: readonly string[],
+  requestId: string,
+  requestedBy: string | null,
+  resume: boolean,
+): Promise<ErasureOutcome> {
+  if (resume) return { requestId, status: "deferred", reason: LEGAL_HOLD_DELAY_REASON, heldWorkspaces };
+  const queued = await client.query<{ request_id: string }>(
+    `INSERT INTO subject_erasure_queue (request_id, user_id, requested_by, held_workspace_count) VALUES ($1, $2, $3, $4)
+     ON CONFLICT DO NOTHING RETURNING request_id`,
+    [requestId, userId, requestedBy, heldWorkspaces.length],
+  );
+  let effectiveId = requestId;
+  if (queued.rows[0] === undefined) {
+    // Either this subject already has a pending row (a repeat request returns the queued one), or the request id belongs to someone else's row.
+    const existing = await client.query<{ request_id: string }>("SELECT request_id FROM subject_erasure_queue WHERE user_id = $1 AND status = 'pending'", [userId]);
+    if (existing.rows[0] === undefined) throw new RequestIdInUseError();
+    effectiveId = existing.rows[0].request_id;
+  }
+  await audit(client, workspaceIds, "subject_request.deferred", "erasure", { requestId: effectiveId, requestedBy }, { legal_hold_workspaces: heldWorkspaces.length });
+  incrementCounter("nominara_compliance_erasure_deferred_total");
+  return { requestId: effectiveId, status: "deferred", reason: LEGAL_HOLD_DELAY_REASON, heldWorkspaces };
 }
 
 export async function processErasureRequest(client: ClientBase, userId: string, ctx: ErasureRequestContext): Promise<ErasureOutcome> {
@@ -264,23 +305,15 @@ export async function processErasureRequest(client: ClientBase, userId: string, 
   if (ctx.resume !== true) await audit(client, workspaceIds, "subject_request.received", "erasure", audited);
   try {
     // Owner decision 68b: a legal hold BLOCKS individual erasure inside the held workspace. Queue it (one pending row per subject; a repeat
-    // request returns the queued one) and tell the requester why. Nothing about the subject is changed.
-    if (heldWorkspaces.length > 0) {
-      const queued = await client.query<{ request_id: string }>(
-        `INSERT INTO subject_erasure_queue (request_id, user_id, requested_by, held_workspace_count) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id) WHERE status = 'pending' DO NOTHING RETURNING request_id`,
-        [requestId, userId, ctx.requestedBy, heldWorkspaces.length],
-      );
-      const existing =
-        queued.rows[0] === undefined
-          ? (await client.query<{ request_id: string }>("SELECT request_id FROM subject_erasure_queue WHERE user_id = $1 AND status = 'pending'", [userId])).rows[0]
-          : undefined;
-      const effectiveId = existing?.request_id ?? requestId;
-      await audit(client, workspaceIds, "subject_request.deferred", "erasure", { requestId: effectiveId, requestedBy: ctx.requestedBy }, { legal_hold_workspaces: heldWorkspaces.length });
-      incrementCounter("nominara_compliance_erasure_deferred_total");
-      return { requestId: effectiveId, status: "deferred", reason: LEGAL_HOLD_DELAY_REASON, heldWorkspaces };
-    }
-    const result = await requestIndividualErasure(client, userId);
+    // request returns the queued one) and tell the requester why. Nothing about the subject is changed. The whole erasure waits, not only the
+    // held workspace's part: the profile and email are global to the person and one erasure is one act.
+    const resume = ctx.resume === true;
+    if (heldWorkspaces.length > 0) return await deferErasure(client, userId, workspaceIds, heldWorkspaces, requestId, ctx.requestedBy, resume);
+    await ctx.afterHoldsRead?.();
+    // The read above is a fast path. The erasure re-reads the holds under the hold-register lock in its own transaction, so a hold placed
+    // after that read cannot slip in (the same check the purge's cascade makes).
+    const result = await requestIndividualErasure(client, userId, { holdCheckAt: ctx.now ?? new Date() });
+    if (result.held !== undefined) return await deferErasure(client, userId, workspaceIds, result.held, requestId, ctx.requestedBy, resume);
     if (result.blocked) {
       const reason = `${result.reason} ${SOLE_OWNER_BLOCK_PATH}`;
       await audit(client, workspaceIds, "subject_request.blocked", "erasure", audited, { blocked_reason: "sole_owner" });
@@ -310,9 +343,22 @@ export interface QueueRunResult {
  * Runs every queued erasure whose workspaces are no longer under an active hold (owner decision 68b). Called by the nightly retention job and
  * after a manual hold release. Idempotent: a finished row is never picked up again. A failure leaves the row pending for the next run.
  */
+/** Session advisory lock key serialising the queue runner (nightly job vs a manual release) so one row is never processed by two runs at once. */
+export const ERASURE_QUEUE_LOCK = "subject-erasure-queue";
+
 export async function executePendingErasures(client: ClientBase, now: Date = new Date()): Promise<QueueRunResult> {
+  // Blocking, so a run that arrives while another is mid-flight waits and then sees only the rows still pending.
+  await client.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [ERASURE_QUEUE_LOCK]);
+  try {
+    return await runQueue(client, now);
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [ERASURE_QUEUE_LOCK]);
+  }
+}
+
+async function runQueue(client: ClientBase, now: Date): Promise<QueueRunResult> {
   const pending = await client.query<{ id: string; request_id: string; user_id: string; requested_by: string | null }>(
-    "SELECT id, request_id, user_id, requested_by FROM subject_erasure_queue WHERE status = 'pending' ORDER BY created_at, id",
+    "SELECT id, request_id, user_id, requested_by FROM subject_erasure_queue WHERE status = 'pending' AND user_id IS NOT NULL ORDER BY created_at, id",
   );
   let executed = 0;
   let blocked = 0;
@@ -324,11 +370,15 @@ export async function executePendingErasures(client: ClientBase, now: Date = new
         stillHeld += 1;
         continue;
       }
-      await client.query("UPDATE subject_erasure_queue SET status = $2, finished_at = $3 WHERE id = $1 AND status = 'pending'", [
-        row.id,
-        outcome.status === "completed" ? "executed" : "blocked",
-        now.toISOString(),
-      ]);
+      // An executed row drops the subject's id and the requester's (who may be the subject): the audit rows keep the request id only.
+      await client.query(
+        `UPDATE subject_erasure_queue
+            SET status = $2, finished_at = $3,
+                user_id = CASE WHEN $2 = 'executed' THEN NULL ELSE user_id END,
+                requested_by = CASE WHEN $2 = 'executed' THEN NULL ELSE requested_by END
+          WHERE id = $1 AND status = 'pending'`,
+        [row.id, outcome.status === "completed" ? "executed" : "blocked", now.toISOString()],
+      );
       if (outcome.status === "completed") executed += 1;
       else blocked += 1;
     } catch (error) {

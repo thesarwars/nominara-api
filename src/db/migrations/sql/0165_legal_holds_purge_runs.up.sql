@@ -53,13 +53,16 @@ CREATE INDEX ix_purge_runs_started ON purge_runs (started_at DESC);
 CREATE TABLE subject_erasure_queue (
   id                   uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   request_id           uuid        NOT NULL UNIQUE,
-  user_id              uuid        NOT NULL REFERENCES users(id),
+  user_id              uuid        REFERENCES users(id),
   requested_by         uuid        REFERENCES users(id),
   held_workspace_count integer     NOT NULL CHECK (held_workspace_count > 0),
   status               text        NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'executed', 'blocked')),
   created_at           timestamptz NOT NULL DEFAULT now(),
   finished_at          timestamptz,
-  CONSTRAINT ck_subject_erasure_queue_finished CHECK ((status = 'pending') = (finished_at IS NULL))
+  CONSTRAINT ck_subject_erasure_queue_finished CHECK ((status = 'pending') = (finished_at IS NULL)),
+  -- An executed row has erased its subject: it keeps the request id and the outcome, never the subject's (or the requester's) id, so the
+  -- request id on the surviving audit rows cannot be joined back to an erased user.
+  CONSTRAINT ck_subject_erasure_queue_subject CHECK (user_id IS NOT NULL OR status = 'executed')
 );
 CREATE UNIQUE INDEX ux_subject_erasure_queue_pending ON subject_erasure_queue (user_id) WHERE status = 'pending';
 
