@@ -81,7 +81,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | 400 | `unsupported_engine` | `engine_key` not in the workspace's entitlement, or `engines.status='disabled'` |
 | 401 | `unauthenticated` | — |
 | 401 | `token_expired` | — |
-| 401 | `token_revoked` | — |
+| 401 | `token_revoked` | A revoked session token; and, on the public `GET /report-links/{workspaceId}/{token}`, a report link that was revoked (message "This link was revoked.") |
 | 401 | `step_up_required` | Privileged action; `details.methods` lists acceptable re-auth methods |
 | **402** | **`insufficient_credits`** | The wallet cannot cover the action. Carries the required/available split and purchasable packs |
 | 403 | `forbidden` | `details.required_permission` names the missing permission |
@@ -103,7 +103,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | 451 | `capture_mode_unavailable` | An engine adapter is suspended pending a governance review |
 | **500** | **`internal_error`** | A server-side failure this table does not model. Carries **no `details` and no `detail` drawn from the exception** — an unexpected error's own message is the string most likely to leak a connection string, a row, or customer data. `error.request_id` is what a support ticket resolves against, and it is the whole payload |
 | 502 | `engine_unavailable` | Upstream circuit open; `details.circuit_opened_at` |
-| 503 | `degraded` | Dependency failure with partial results available |
+| 503 | `degraded` | Dependency failure with partial results available. An export that could not be stored, and a download of an export whose file is not stored (pending, failed or purged), also answer it |
 | 507 | `retention_exceeded` | The requested window predates the workspace's retention |
 
 `NFR-API-13`: **`402`, `403 entitlement_exceeded`, `403 feature_not_in_plan`, `429 quota_exceeded`, and `429 daily_limit_reached` are five distinct, non-overlapping conditions.** A client can always tell "buy credits" from "upgrade plan" from "wait for the cycle" from "come back tomorrow" from "slow down". Conflating any two is a specification violation, not a cosmetic issue.
@@ -151,7 +151,8 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `GET` | `/billing/entitlements` | `workspace:read` | **Resolved** effective entitlements (plan + add-ons + overrides) with `entitlement_version`. The client renders every limit and gate from this one payload |
 | `GET` | `/billing/subscription` · `/invoices` · `/usage` | `billing:read` | |
 | `GET` | `/billing/wallet` | `workspace:read` | both buckets, reserved, expiring-soon, cycle window, auto-top-up config |
-| `GET` | `/billing/wallet/ledger` | `billing:read` | cursor over `credit_ledger`; filter by action, project, actor, date; CSV export |
+| `GET` | `/billing/wallet/ledger` | `billing:read` | cursor over `credit_ledger`; filter by action, project, actor, date. Each entry carries `internal_cost_usd` (STORY-073): a decimal string, or `null` when nothing was measured (`null` is not `0`, a measured zero is `"0.000000"`). It is the commit entry's own `internal_cost_usd` column plus the sum of the linked `usage_ledger` rows (`quantity * unit_cost_usd`, rows recorded after the commit and linked to it); `null` only when neither part measured anything |
+| `GET` | `/billing/wallet/ledger/export` | `billing:read` + entitlement `exports.csv` | the ledger as one CSV under the same filters as the list (no cursor, no limit: an unknown key is `400`). Answers in the normal envelope `{filename, content_type: "text/csv", download_url, row_count, truncated}` with the file inline as a `data:text/csv;base64,…` URL. At most 5,000 rows, newest first; `truncated: true` when more matched, so narrow the date range and export again. `403 feature_not_in_plan` (`details.key = exports.csv`) on a plan without it |
 | `GET` | `/billing/credit-packs` | `workspace:read` | catalog filtered to the plan's `min_plan_key` |
 | `POST` | `/billing/credit-packs/{key}/purchase` ✚ | `billing:write` | Stripe PaymentIntent; credits land on `succeeded` |
 | `PUT` | `/billing/wallet/auto-topup` | `billing:write` | `{enabled, pack_key, threshold, max_per_cycle}`; the cap is enforced in the schema |
@@ -225,7 +226,9 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `GET`/`POST` | `/projects/{id}/milestones` | `tracking:read` / `task:create` | manual annotations permitted |
 | `GET`/`POST`/`PATCH` | `/projects/{id}/goals` | `task:create` | **STORY-065.** `POST` body `{title, kind, target: {metric, target_value, engine_key?, prompt_cluster_id?}, target_date?}`; six kinds are creatable, each with **one** metric: `engine_score` and `topic_authority` → `visibility_score`, `citation_presence` → `citation_share`, `rendering_quality` → `rendering_quality`, `sentiment_recovery` → `sentiment_score`, `prompt_recommendation` → `presence_rate`. `custom` is still `400` (no measured source). Every `target_value` is on a 0–100 scale (shares and rates as percentages). `prompt_cluster_id` is required for `topic_authority` and `prompt_recommendation` and refused for the rest; `engine_key` is allowed for every kind except `topic_authority`. `400 validation_failed` naming the field when the metric is not the kind's, the cluster is not this project's, the engine is unknown, or **`target_value` is at or below a baseline measured on a sufficient sample (n ≥ 30)** (owner 2026-10-23). The baseline is captured by the server; the request cannot carry `direction`, which the server sets from the metric and returns in `target.direction` (`up` for every metric today). The rollup refreshes `current` and sets `achieved`/`achieved_at` (inclusive, sufficient sample only, one system-actor `goal.achieved` audit row); `progress_pct` is null while the sample is insufficient or the baseline rested on fewer than 30 cells, until achieved. `PATCH` abandons (no reason) |
 | `GET` | `/workspaces/{id}/summary` · `/action-items` | `project:read` / `task:read` | Command Center matrix (each project carries `paused_by_downgrade_at`, STORY-077); cross-project queue, impact first, read from `ix_tasks_open`. **The queue collapses tasks across projects on the displayed rule code and `affected_url`** (STORY-064): each row is the group's highest-impact task and carries `project_count` (distinct readable projects, counted after the scope predicate) and `projects[]` `{id, name, slug}`; a task with no code or no URL never collapses. On an `open_playbook` row, `primary_action.domain` is `source_domains.domain` of the task's source domain, the key of `GET /projects/{id}/sources/{domain}/playbook`, or `null` when the task names no source domain; no other `primary_action.kind` carries `domain` (STORY-089) |
-| `POST` | `/exports` ✚ ⛨ | `export:data` | async CSV/PDF → `report_artifact_id`. **0 credits**; PDF is tier-capped, CSV is entitlement-gated |
+| `POST` | `/exports` ✚ ⛨ | `export:data` | async CSV/PDF → `report_artifact_id`. **0 credits**; PDF is tier-capped, CSV is entitlement-gated. The export response's `download_url` is the API route `GET /exports/{id}/download` below, not a bucket or `data:` URL; the file is stored before the export answers, and an export that cannot be stored answers `503 degraded` |
+| `GET` | `/exports/{id}/download` | `export:data` | `302` to a presigned URL minted fresh on every fetch from the stored key, valid 15 minutes, `Content-Disposition` naming the file; `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. `503 degraded` when the row's file is not stored (pending, failed or purged). `404` for an unknown, expired or other-workspace id, and for an export outside a scoped manager's projects |
+| `POST` | `/exports/{id}/revoke-link` | `agency:branding` | revokes the emailed report link of that export (`id` is the `export_id`). `200 { export_id, link_revoked_at }`; idempotent, a repeat returns the first revocation's time. Workspace-wide, so a project-scoped manager is `403` naming the permission; `404` for an unknown or other-workspace id. Audited as `report_link.revoked` |
 
 ### AUX
 
@@ -343,8 +346,9 @@ Answering after the sends was rejected: the response cannot outlive the intercep
 | Method | Path | Controls |
 |---|---|---|
 | `GET` | `/public/niche-reports` · `/{slug}` | CDN-cached, `s-maxage=86400`, database-free. **Read-only** |
+| `GET` | `/report-links/{workspaceId}/{token}` | No session. `302` to a presigned URL valid 15 minutes, minted fresh per click (`Cache-Control: no-store`, `Referrer-Policy: no-referrer`). The workspace in the path only selects whose row-level security the lookup runs under; the token is the credential. Every refusal (unknown token, wrong workspace, expired link, file not stored) is the same `404`, **except** a revoked link, which answers `401 token_revoked` "This link was revoked." |
 
-**One public route, and it is a read.** There is **no unauthenticated write path anywhere in the API**, and no public route accepts visitor input for processing or fetches a visitor-nominated host. `nominara-web` renders report pages from a build-time snapshot and does not call this endpoint at request time.
+**The public routes are reads.** There is **no unauthenticated write path anywhere in the API**, and no public route accepts visitor input for processing or fetches a visitor-nominated host. `nominara-web` renders report pages from a build-time snapshot and does not call this endpoint at request time.
 
 ## 4. Project creation
 
