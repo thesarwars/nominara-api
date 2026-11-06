@@ -23,6 +23,9 @@ export const PROMPT_RESEARCH_CREDITS_PER_ANSWER = 5;
 export const PROMPT_RESEARCH_ALSO_MENTIONED_THRESHOLD = 3;
 
 const promptTextSchema = z.string().trim().min(1).max(500);
+/** A repeated prompt (compared trimmed and case-insensitively) is refused: it would be charged again for an answer served from L1. */
+const noDuplicatePrompts = (prompts: readonly string[]): boolean => new Set(prompts.map((p) => p.toLowerCase())).size === prompts.length;
+const DUPLICATE_PROMPTS = { message: "each prompt may appear once (compared ignoring case)" };
 const subjectText = z.string().trim().min(1).max(200);
 
 /** The free generation. A brand, a topic, or both; the optional context supplies the slot vocabulary the generator needs for a full 15. */
@@ -51,7 +54,10 @@ export const discoverPromptsResponseSchema = z
     generated: z.number().int().nonnegative(),
     /** Always 0: generating, and discarding, are free (FR-TL-01a). */
     credits_charged: z.literal(0),
-    keep: z.object({ credits_per_prompt: z.number().int().nonnegative(), max_per_save: z.number().int().positive() }).strict(),
+    /** `credits_per_prompt` is null, with `unavailable_reason`, when the plan publishes no per-prompt price: Discover is free and never depends on it. */
+    keep: z
+      .object({ credits_per_prompt: z.number().int().nonnegative().nullable(), unavailable_reason: z.literal("price_not_agreed").nullable(), max_per_save: z.number().int().positive() })
+      .strict(),
     not_tracked: z.literal(true),
     did_not_check: z.string().min(1),
   })
@@ -59,7 +65,11 @@ export const discoverPromptsResponseSchema = z
 
 export const keepPromptsRequestSchema = z
   .object({
-    prompts: z.array(promptTextSchema).min(1, "keep at least one prompt").max(PROMPT_RESEARCH_MAX_PROMPTS, `at most ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts can be kept in one save`),
+    prompts: z
+      .array(promptTextSchema)
+      .min(1, "keep at least one prompt")
+      .max(PROMPT_RESEARCH_MAX_PROMPTS, `at most ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts can be kept in one save`)
+      .refine(noDuplicatePrompts, DUPLICATE_PROMPTS),
     brand_name: subjectText.optional(),
     topic: subjectText.optional(),
   })
@@ -112,7 +122,8 @@ export const promptResearchRunRequestSchema = z
     prompt_texts: z
       .array(promptTextSchema)
       .min(1, "select at least one prompt")
-      .max(PROMPT_RESEARCH_MAX_PROMPTS, `a run is capped at ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts`),
+      .max(PROMPT_RESEARCH_MAX_PROMPTS, `a run is capped at ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts`)
+      .refine(noDuplicatePrompts, DUPLICATE_PROMPTS),
   })
   .strict();
 

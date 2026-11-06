@@ -57721,9 +57721,27 @@
                           "type": "object",
                           "properties": {
                             "credits_per_prompt": {
-                              "type": "integer",
-                              "minimum": 0,
-                              "maximum": 9007199254740991
+                              "anyOf": [
+                                {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "unavailable_reason": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "const": "price_not_agreed"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             },
                             "max_per_save": {
                               "type": "integer",
@@ -57733,6 +57751,7 @@
                           },
                           "required": [
                             "credits_per_prompt",
+                            "unavailable_reason",
                             "max_per_save"
                           ],
                           "additionalProperties": false
