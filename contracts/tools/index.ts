@@ -4,3 +4,4 @@ export * from "./tool-run-convert.schema.js";
 export * from "./visibility-scan.schema.js";
 export * from "./prompt-research.schema.js";
 export * from "./competitor-finder.schema.js";
+export * from "./aux-audit.schema.js";
