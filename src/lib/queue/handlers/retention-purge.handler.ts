@@ -8,7 +8,7 @@ import { PurgeJournal } from "../../compliance/purge-journal.js";
 import { S3JournalStore, writeComplianceExports } from "../../compliance/storage-adapters.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
-import { deleteWorkspaceReports } from "../../storage/workspace-purge.js";
+import { deleteProjectObjectPrefix, deleteWorkspaceObjectsEverywhere } from "../../storage/workspace-purge.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -71,8 +71,9 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
         return;
       }
 
-      // STORY-180 r5: an erased workspace's stored report files are deleted (every version) AFTER its cascade commits. With object storage
-      // not configured the hook is absent, so the files would be left: say so, loudly, every run.
+      // STORY-180 r5 / STORY-182: an erased workspace's stored files (reports, raw captures, crawl snapshots; every version) are deleted AFTER
+      // its cascade commits, and a purged project's object prefix through `deleteObjectPrefix`. With object storage not configured the hooks
+      // are absent, so the files would be left: say so, loudly, every run.
       const storage = resolveStorageConfig(context.env);
       if (storage === null) logger.warn({ event: "report_objects_not_deleted", reason: "storage_unconfigured" });
       // STORY-111: with no object storage there is NO purge journal and NO compliance export. Said loudly every run; a workspace purge then
@@ -84,10 +85,15 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
           ? {
               journal: new PurgeJournal(new S3JournalStore(adapter), storage.keyEnv),
               exporterFor: (workspaceId: string) => writeComplianceExports(adapter, storage.keyEnv, workspaceId),
+              deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => {
+                const removed = await deleteWorkspaceObjectsEverywhere(adapter, storage.keyEnv, workspaceId);
+                incrementCounter("nominara_retention_workspace_objects_deleted_total");
+                // The count and the workspace ID only: never a key.
+                logger.log({ event: "workspace_objects_deleted", workspace_id: workspaceId, versions_removed: removed });
+              },
+              objectKeyEnv: storage.keyEnv,
+              deleteObjectPrefix: (prefix: string): Promise<void> => deleteProjectObjectPrefix(adapter, storage.keyEnv, prefix),
             }
-          : {}),
-        ...(storage !== null && adapter !== undefined
-          ? { deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => void (await deleteWorkspaceReports(adapter, storage.keyEnv, workspaceId)) }
           : {}),
       });
 

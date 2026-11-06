@@ -1182,6 +1182,8 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
 export interface DailyPurgeCycleOptions {
   readonly referenceDate?: Date;
   readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
+  /** STORY-182: the object-key environment segment (`STORAGE_KEY_ENV`) the project prefix is built with; absent = `hardDeleteProject`'s default. */
+  readonly objectKeyEnv?: string;
   readonly exportComplianceRecords?: (records: readonly ComplianceExportRow[]) => Promise<void>;
   /** STORY-180 r5: deletes an erased workspace's stored report files after its cascade commits. Absent = the objects are not touched. */
   readonly deleteWorkspaceObjects?: (workspaceId: string) => Promise<void>;
@@ -1266,7 +1268,11 @@ export async function runDailyPurgeCycle(
       const outcome = await tryPurgeProject(privilegedClient, project.id, async (tx) => {
         try {
           const hardDeleteOptions: HardDeleteProjectOptions = options.deleteObjectPrefix
-            ? { deleteObjectPrefix: options.deleteObjectPrefix, holdCheckAt: referenceDate }
+            ? {
+                deleteObjectPrefix: options.deleteObjectPrefix,
+                ...(options.objectKeyEnv !== undefined ? { env: options.objectKeyEnv } : {}),
+                holdCheckAt: referenceDate,
+              }
             : { holdCheckAt: referenceDate };
           heldInTransaction = (await hardDeleteProject(tx, project.workspace_id, project.id, hardDeleteOptions)) === "held";
         } catch (error) {
