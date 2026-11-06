@@ -192,21 +192,42 @@ describe("STORY-080 · Prompt Research", () => {
     expect(enqueued).toHaveLength(0);
   });
 
-  it("Free plan: Discover works (the keep price is null with its reason); Keep and the keep estimate fail closed with price_not_agreed (OWNER DECISION OPEN: Keep price on Free); nothing is written", async () => {
+  it("DECISION 67a - Free plan: Keep costs 1 credit per kept prompt from the included credits; Discover and the keep estimate publish the price", async () => {
     const a = await owner("free");
     const before = await available(a);
     const res = await send(a, "POST", "/tools/prompt-research/discover", { body: { brand_name: "Acme CRM", context: RICH } });
     expect(res.statusCode, res.body).toBe(200);
     const out = (res.json() as { data: { generated: number; credits_charged: number; keep: Record<string, unknown> } }).data;
     expect(out.generated).toBeGreaterThan(0);
-    expect(out).toMatchObject({ credits_charged: 0, keep: { credits_per_prompt: null, unavailable_reason: "price_not_agreed" } });
+    expect(out).toMatchObject({ credits_charged: 0, keep: { credits_per_prompt: 1, unavailable_reason: null, max_per_save: 15 } });
     const estimate = await send(a, "GET", "/tools/prompt-research/estimate?mode=keep&prompt_count=3");
-    expect(estimate.statusCode, estimate.body).toBe(422);
-    expect(estimate.json()).toMatchObject({ error: { details: { reason: "price_not_agreed" } } });
+    expect(estimate.statusCode, estimate.body).toBe(200);
+    expect(estimate.json()).toMatchObject({ data: { total_credits: 3, credits_per_unit: 1 } });
     const keep = await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: prompts(2) }, confirmed: 2 });
-    expect(keep.statusCode, keep.body).toBe(422);
-    expect(await available(a)).toBe(before);
-    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(0);
+    expect(keep.statusCode, keep.body).toBe(200);
+    expect(keep.json()).toMatchObject({ data: { kept_count: 2, credits_charged: 2 } });
+    expect(await available(a)).toBe(before - 2);
+  });
+
+  it("DECISION 67f - a keep of 15 is stored (ck_tr_shape allows 15), a keep of 16 is a 400 and the database refuses a 16th prompt even past the service", async () => {
+    const a = await owner("starter");
+    const before = await available(a);
+    const fifteen = await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: prompts(15) }, confirmed: 15 });
+    expect(fifteen.statusCode, fifteen.body).toBe(200);
+    expect(fifteen.json()).toMatchObject({ data: { kept_count: 15, credits_charged: 15 } });
+    expect(await available(a)).toBe(before - 15);
+    const sixteen = await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: prompts(16) }, confirmed: 16 });
+    expect(sixteen.statusCode).toBe(400);
+    expect(sixteen.body).toMatch(/15 prompts/u);
+    const client = await pool.connect();
+    try {
+      const insert = (tx: { query: (sql: string, values: unknown[]) => Promise<unknown> }, n: number) =>
+        tx.query(`INSERT INTO tool_runs (id, workspace_id, created_by, tool_key, prompt_texts, input_hash, engine_keys, credits_charged, status, expires_at) VALUES ($3::uuid, $1, $4, 'prompt_research', $2::text[], decode(md5($3::uuid::text), 'hex'), '{}', 0, 'running', now() + interval '1 day')`, [a.workspaceId, prompts(n), uuidV7(), SYSTEM_ACTOR_ID]);
+      await expect(withTenantContext(client, { workspaceId: a.workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => insert(tx, 16))).rejects.toMatchObject({ code: "23514", constraint: "ck_tr_shape" });
+      await expect(withTenantContext(client, { workspaceId: a.workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => { await insert(tx, 15); throw new Error("rollback"); })).rejects.toThrow("rollback");
+    } finally {
+      client.release();
+    }
   });
 
   it("a viewer is refused 403 naming the permission on Discover (prompt:write), Keep (prompt:write) and Run (lookup:execute); nothing is charged or started", async () => {
@@ -271,7 +292,6 @@ describe("STORY-080 · Prompt Research", () => {
     const wrong = await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: prompts(2) }, confirmed: 1 });
     expect(wrong.statusCode).toBe(409);
     expect(wrong.json()).toMatchObject({ error: { code: "price_changed", details: { shown: 1, recomputed: 2 } } });
-    expect((await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: prompts(11) }, confirmed: 11 })).statusCode).toBe(400);
     expect(await available(a)).toBe(before);
     expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(0);
   });
@@ -393,6 +413,19 @@ describe("STORY-080 · Prompt Research", () => {
     const run = await detail(a, id);
     expect(run).toMatchObject({ status: "partial", credits_charged: 20, engines_succeeded: ["perplexity"], engines_failed: ["chatgpt"] });
     expect(run.result.engine_failures).toEqual([expect.objectContaining({ engine: "chatgpt", code: "timeout" }), expect.objectContaining({ engine: "chatgpt", code: "timeout" })]);
+    expect(await available(a)).toBe(before - 20);
+  });
+
+  it("DECISION 67g - every engine answered something but one cell failed: the run is partial, charged in full, no engine named failed", async () => {
+    const a = await owner("starter");
+    adapters = { perplexity: async () => raw(), chatgpt: async (_c, p) => { if (p.includes("variant 0")) throw new CaptureFailureError("timeout", "chatgpt" as never); return raw(); } };
+    const before = await available(a);
+    const res = await send(a, "POST", "/tools/prompt-research/run", { body: { prompt_texts: prompts(2) }, confirmed: 20 });
+    const id = (res.json() as { data: { tool_run_id: string } }).data.tool_run_id;
+    await settle();
+    const run = await detail(a, id);
+    expect(run).toMatchObject({ status: "partial", credits_charged: 20, engines_succeeded: ["perplexity", "chatgpt"], engines_failed: [] });
+    expect(run.result.answers).toMatchObject({ asked: 4, answered: 3, failed: 1 });
     expect(await available(a)).toBe(before - 20);
   });
 

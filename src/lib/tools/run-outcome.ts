@@ -17,6 +17,11 @@ export interface ToolRunOutcomeInput {
   readonly enginesFailed: readonly string[];
   /** Only read for a tool with no engine set. */
   readonly failed?: boolean;
+  /**
+   * OWNER DECISION 67g: some cell (one prompt asked of one engine) failed even though every engine answered something. A run that would be `completed` is then
+   * `partial`. Charging is unchanged: partial is charged in full, and a run that captured nothing is still `failed` and refunded.
+   */
+  readonly cellsFailed?: boolean;
 }
 
 export interface ToolRunOutcome {
@@ -43,5 +48,6 @@ export function deriveToolRunOutcome(input: ToolRunOutcomeInput): ToolRunOutcome
   const enginesFailed = [...new Set(input.engineKeys)].filter((engine) => !succeeded.has(engine));
   if (succeeded.size === 0) return { status: "failed", refund: true, enginesFailed };
   if (enginesFailed.length > 0) return { status: "partial", refund: false, enginesFailed };
+  if (input.cellsFailed === true) return { status: "partial", refund: false, enginesFailed: [] };
   return { status: "completed", refund: false, enginesFailed: [] };
 }

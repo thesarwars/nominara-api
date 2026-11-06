@@ -4,6 +4,7 @@ import type { Pool } from "pg";
 import {
   PROMPT_RESEARCH_CREDITS_PER_ANSWER,
   PROMPT_RESEARCH_DISCOVER_COUNT,
+  PROMPT_RESEARCH_MAX_KEPT_PER_SAVE,
   PROMPT_RESEARCH_MAX_PROMPTS,
   type DiscoverPromptsRequest,
   type DiscoverPromptsResponse,
@@ -132,7 +133,7 @@ export class PromptResearchService {
           requested: PROMPT_RESEARCH_DISCOVER_COUNT,
           generated: pass.candidates.length,
           credits_charged: 0 as const,
-          keep: { credits_per_prompt: keepPrice, unavailable_reason: keepPrice === null ? ("price_not_agreed" as const) : null, max_per_save: PROMPT_RESEARCH_MAX_PROMPTS },
+          keep: { credits_per_prompt: keepPrice, unavailable_reason: keepPrice === null ? ("price_not_agreed" as const) : null, max_per_save: PROMPT_RESEARCH_MAX_KEPT_PER_SAVE },
           not_tracked: true as const,
           did_not_check: DID_NOT_CHECK.prompt_research,
         };
@@ -155,13 +156,15 @@ export class PromptResearchService {
     const perUnit = query.mode === "run" ? PROMPT_RESEARCH_CREDITS_PER_ANSWER : generatedPromptPrice(resolved.entitlements);
     const units = query.mode === "run" ? query.prompt_count * engines.length : query.prompt_count;
     const total = units * perUnit;
+    // A keep saves up to the 15 Discover generates; a run asks at most 10 (decision 67f).
+    const cap = query.mode === "run" ? PROMPT_RESEARCH_MAX_PROMPTS : PROMPT_RESEARCH_MAX_KEPT_PER_SAVE;
     const available = await this.available();
     incrementCounter("nominara_tools_prompt_research_estimates_total", { mode: query.mode });
     return {
       mode: query.mode,
       prompt_count: query.prompt_count,
-      max_prompts: PROMPT_RESEARCH_MAX_PROMPTS,
-      within_cap: query.prompt_count <= PROMPT_RESEARCH_MAX_PROMPTS,
+      max_prompts: cap,
+      within_cap: query.prompt_count <= cap,
       engines,
       unit: query.mode === "run" ? "answer" : "prompt_kept",
       credits_per_unit: perUnit,
@@ -236,10 +239,11 @@ export class PromptResearchService {
     if (prompts.length === 0) {
       throw new ValidationFailedError({ message: `select at least one prompt to ${what}`, details: { issues: [{ path: ["prompts"], message: "at least one prompt" }] } });
     }
-    if (prompts.length > PROMPT_RESEARCH_MAX_PROMPTS) {
+    const cap = what === "run" ? PROMPT_RESEARCH_MAX_PROMPTS : PROMPT_RESEARCH_MAX_KEPT_PER_SAVE;
+    if (prompts.length > cap) {
       throw new ValidationFailedError({
-        message: `${what === "run" ? "a run is" : "a save is"} capped at ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts`,
-        details: { issues: [{ path: ["prompts"], message: `at most ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts` }] },
+        message: `${what === "run" ? "a run is" : "a save is"} capped at ${String(cap)} prompts`,
+        details: { issues: [{ path: ["prompts"], message: `at most ${String(cap)} prompts` }] },
       });
     }
   }

@@ -465,6 +465,8 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     await (await tools()).finishRun(payload.toolRunId, {
       enginesSucceeded: aggregate.enginesSucceeded,
       enginesFailed: aggregate.enginesFailed,
+      // DECISION 67g: any failed cell makes the run `partial`, even when every engine answered something.
+      cellsFailed: fetched.outcome.failures.length > 0,
       result: aggregate.result,
       // `null` entitiesFound = nothing answered, so nothing was measured; 0 is a measured zero (answers that named nothing).
       headline: aggregate.entitiesFound === null ? {} : { entities_found: aggregate.entitiesFound },

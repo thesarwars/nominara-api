@@ -93,6 +93,8 @@ export interface FinishToolRun {
   readonly enginesFailed?: readonly string[];
   /** Only read for a tool with no engine set, which has no per-engine evidence of its own. */
   readonly failed?: boolean;
+  /** Some cell failed though every engine answered something: the run is `partial` (decision 67g), charged in full. */
+  readonly cellsFailed?: boolean;
   /** Replaces the stored result when given. */
   readonly result?: ToolRunResult | null;
   readonly headline?: Partial<ToolRunHeadline>;
@@ -318,7 +320,7 @@ export class ToolsService {
         if (row.status !== "running") return toRun(row);
 
         const succeeded = [...(finish.enginesSucceeded ?? [])];
-        const outcome = deriveToolRunOutcome({ engineKeys: row.engine_keys, enginesSucceeded: succeeded, enginesFailed: [...(finish.enginesFailed ?? [])], ...(finish.failed === undefined ? {} : { failed: finish.failed }) });
+        const outcome = deriveToolRunOutcome({ engineKeys: row.engine_keys, enginesSucceeded: succeeded, enginesFailed: [...(finish.enginesFailed ?? [])], ...(finish.failed === undefined ? {} : { failed: finish.failed }), ...(finish.cellsFailed === undefined ? {} : { cellsFailed: finish.cellsFailed }) });
         const failed = [...outcome.enginesFailed];
         let creditsCharged = row.credits_charged;
         if (outcome.refund && creditsCharged > 0) {

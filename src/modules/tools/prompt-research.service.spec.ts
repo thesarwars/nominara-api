@@ -31,6 +31,11 @@ function build(over: { price?: number | null } = {}) {
 }
 
 describe("STORY-080 Discover", () => {
+  it("DECISION 67e - Discover reports the keep cap of 15 per save beside requested and generated", async () => {
+    const { service, inTenant } = build();
+    const out = await inTenant(() => service.discover({ brand_name: "Acme CRM", context: RICH }));
+    expect(out).toMatchObject({ requested: 15, generated: 15, keep: { max_per_save: 15 } });
+  });
   it("scenario 1 - a brand with its context, and a topic with its context, each return the documented 15, archetype-aligned", async () => {
     const { service, inTenant } = build();
     for (const body of [{ brand_name: "Acme CRM", context: RICH }, { topic: "crm software", context: RICH }]) {
@@ -112,16 +117,22 @@ describe("STORY-080 Keep", () => {
     await expect(ctx.inTenant(() => ctx.service.keep({ prompts: ["a", "b"] }, "1"))).rejects.toBeInstanceOf(PriceChangedError);
     expect(ctx.startRun).not.toHaveBeenCalled();
   });
-  it("a keep above the run shape's ten prompts is refused with the limit named, and an empty keep is refused", async () => {
-    const eleven = Array.from({ length: 11 }, (_, i) => `p${String(i)}`);
-    await expect(ctx.inTenant(() => ctx.service.keep({ prompts: eleven }, "11"))).rejects.toThrow(/10/u);
+  it("DECISION 67f - a keep of the full fifteen is accepted; a sixteenth is refused with the limit named; an empty keep is refused", async () => {
+    const fifteen = Array.from({ length: 15 }, (_, i) => `p${String(i)}`);
+    const sixteen = Array.from({ length: 16 }, (_, i) => `p${String(i)}`);
+    expect(keepPromptsRequestSchema.safeParse({ prompts: fifteen }).success).toBe(true);
+    expect(keepPromptsRequestSchema.safeParse({ prompts: sixteen }).success).toBe(false);
+    const kept = await ctx.inTenant(() => ctx.service.keep({ prompts: fifteen }, "15"));
+    expect(kept).toMatchObject({ kept_count: 15, credits_charged: 15 });
+    ctx.startRun.mockClear();
+    await expect(ctx.inTenant(() => ctx.service.keep({ prompts: sixteen }, "16"))).rejects.toThrow(/15/u);
     await expect(ctx.inTenant(() => ctx.service.keep({ prompts: [] }, "0"))).rejects.toBeInstanceOf(ValidationFailedError);
     expect(ctx.startRun).not.toHaveBeenCalled();
   });
 });
 
-describe("STORY-080 Free plan keep price (OWNER DECISION OPEN: what Keep costs on Free)", () => {
-  it("keep and the keep estimate fail closed with price_not_agreed while Free publishes no price; nothing is written", async () => {
+describe("STORY-080 a plan that publishes no keep price (DECISION 67a: Free now publishes 1, so only a misconfigured plan lands here)", () => {
+  it("keep and the keep estimate fail closed with price_not_agreed when no price resolves; nothing is written", async () => {
     const { service, inTenant, startRun } = build({ price: null });
     await expect(inTenant(() => service.keep({ prompts: ["a"] }, "1"))).rejects.toBeInstanceOf(PreconditionUnmetError);
     await expect(inTenant(() => service.estimate({ mode: "keep", prompt_count: 2 }))).rejects.toBeInstanceOf(PreconditionUnmetError);
@@ -142,12 +153,14 @@ describe("STORY-080 estimate", () => {
   it("scenario 7 - the estimate recomputes for every selection size and states the total the control restates", async () => {
     const { service, inTenant } = build();
     const totals: number[] = [];
-    for (let n = 0; n <= 10; n += 1) {
+    for (let n = 0; n <= 15; n += 1) {
       const e = await inTenant(() => service.estimate({ mode: "keep", prompt_count: n }));
       expect(e.total_credits).toBe(n * 1);
+      expect(e).toMatchObject({ max_prompts: 15, within_cap: true });
       totals.push(e.total_credits);
     }
-    expect(new Set(totals).size).toBe(11);
+    expect(new Set(totals).size).toBe(16);
+    expect(await inTenant(() => service.estimate({ mode: "keep", prompt_count: 16 }))).toMatchObject({ within_cap: false, max_prompts: 15 });
   });
   it("scenario 7 - a run estimate is prompts x engines x 5, names the engines, and flags the eleventh prompt", async () => {
     const { service, inTenant } = build();
