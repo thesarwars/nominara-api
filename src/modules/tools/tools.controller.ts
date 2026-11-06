@@ -1,6 +1,8 @@
 import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Req, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import {
+  competitorFinderAcceptedSchema,
+  competitorFinderRequestSchema,
   convertToolRunRequestSchema,
   discoverPromptsRequestSchema,
   discoverPromptsResponseSchema,
@@ -21,6 +23,8 @@ import {
   updateToolRunRequestSchema,
   visibilityScanEstimateResponseSchema,
   visibilityScanRequestSchema,
+  type CompetitorFinderAccepted,
+  type CompetitorFinderRequest,
   type ConvertToolRunRequest,
   type ConvertToolRunResponse,
   type DiscoverPromptsRequest,
@@ -53,6 +57,7 @@ import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { openSseReply } from "../../api/streaming/sse-reply.js";
+import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { ToolsService } from "./tools.service.js";
 import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
@@ -70,6 +75,7 @@ export class ToolsController {
     private readonly service: ToolsService,
     private readonly scans: VisibilityScanService,
     private readonly research: PromptResearchService,
+    private readonly finder: CompetitorFinderService,
   ) {}
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
@@ -159,6 +165,27 @@ export class ToolsController {
     @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
   ): Promise<PromptResearchRunAccepted> {
     return this.research.run(body, confirmedCredits);
+  }
+
+  // STORY-081 - api-specification.md section 3 "Tools". One capture, every result evidenced. Asynchronous (KAD-06): 202 with the run; the page fetch and the
+  // capture run in the worker, and the result is read from GET /tools/runs/{id}. 422 unsafe_target for an internal address, before anything is charged.
+  @Post("competitor-finder")
+  @HttpCode(202)
+  @Idempotent()
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @DailyCap("lookup")
+  @RateLimitClass("capture_backed_tools")
+  @Audit({ action: "tool_run.competitor_finder_started", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ credits: (body as CompetitorFinderAccepted).credits_charged }) })
+  @ApiContract({ operationId: "startCompetitorFinder", requestSchema: competitorFinderRequestSchema, responseSchema: competitorFinderAcceptedSchema })
+  findCompetitors(
+    @Body(new ZodValidationPipe(competitorFinderRequestSchema)) body: CompetitorFinderRequest,
+    @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
+    @Req() request: AuditableRequest,
+  ): Promise<CompetitorFinderAccepted> {
+    const tenant = request.tenant;
+    if (tenant === undefined) throw new Error("the competitor-finder route has no tenant context: WorkspaceGuard did not run");
+    return this.finder.start(tenant, body, confirmedCredits);
   }
 
   @Get("runs")

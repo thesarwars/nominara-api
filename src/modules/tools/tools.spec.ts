@@ -48,3 +48,13 @@ describe("STORY-079 · the scan route declares its guards", () => {
     expect(Reflect.getMetadata(STREAMING_KEY, handler("estimateScan") as object)).toBeUndefined();
   });
 });
+
+// STORY-081 - the Competitor Finder route shares the one `lookup` daily counter (an account cannot alternate tools to defeat it) and the capture-backed rate class.
+describe("STORY-081 · the Competitor Finder route declares its guards", () => {
+  const handler = (ToolsController.prototype as unknown as Record<string, object>)["findCompetitors"]!;
+  it("is a capture-backed tool on the shared daily counter, and not a stream", () => {
+    expect(Reflect.getMetadata(RATE_LIMIT_CLASS_KEY, handler)).toBe("capture_backed_tools");
+    expect(Reflect.getMetadata(DAILY_CAP_KEY, handler)).toBe("lookup");
+    expect(Reflect.getMetadata(STREAMING_KEY, handler)).toBeUndefined();
+  });
+});

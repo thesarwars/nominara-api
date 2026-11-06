@@ -34,7 +34,8 @@ import { runVisibilityScan, ScanCaptureError, type CachedAnswer, type LiveAnswer
 import { aggregateScan } from "../../visibility-scan/scan-result.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { buildCaptureEngineGate, buildSpendMeter } from "./capture-execute.handler.js";
-import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, type JobPhases, type JobProcessor } from "../worker-factory.js";
+import { createCompetitorFindPhases, type CompetitorFindDeps } from "./competitor-find.handler.js";
 import { commitEntryIdFor } from "../../credits/internal-cost.js";
 import { aggregateResearch } from "../../prompt-research/aggregate.js";
 import { runPromptResearch, type ResearchPorts, type ResearchRunOutcome } from "../../prompt-research/run-research.js";
@@ -77,6 +78,8 @@ export interface LookupExecuteDeps {
   readonly deadlineMs?: number;
   readonly lateCostGraceMs?: number;
   readonly now?: () => Date;
+  /** STORY-081: test seams for the Competitor Finder half (the page fetch). The cache, meter, gate and adapter seams above are shared with it. */
+  readonly competitorFinder?: Pick<CompetitorFindDeps, "fetchPage">;
 }
 
 interface EngineWindow {
@@ -117,7 +120,6 @@ interface ResearchFetched {
   readonly durationMs: number;
 }
 
-const isResearchState = (state: unknown): state is ResearchPrepared | ResearchFetched => (state as { kind?: unknown }).kind === "research";
 const isResearchJob = (job: Job): boolean => ((job.data as { payload?: { kind?: unknown } }).payload ?? {}).kind === "prompt_research";
 
 interface Fetched {
@@ -495,11 +497,37 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     return true;
   };
 
-  // ONE queue, two kinds of job: the signed payload's `kind` says which. A scan's payload carries no `kind`.
-  return phasedProcessor<Prepared | ResearchPrepared, Fetched | ResearchFetched>({
-    prepare: (tx, job) => (isResearchJob(job) ? researchPrepare(tx, job) : prepare(tx, job)),
-    run: (prepared) => (isResearchState(prepared) ? researchRun(prepared as ResearchPrepared) : run(prepared as Prepared)),
-    commit: (tx, prepared, fetched) => (isResearchState(prepared) ? researchCommit(tx, prepared as ResearchPrepared, fetched as ResearchFetched) : commit(tx, prepared as Prepared, fetched as Fetched)),
-    recover: (tx, job) => (isResearchJob(job) ? researchRecover(job) : recover(tx, job)),
+  // ONE queue, three kinds of job. A STORY-081 job is told apart by the signed payload's `tool` ("competitor_finder"), a STORY-080 job by its `kind`
+  // ("prompt_research"); a scan's payload carries neither (absent = the Visibility Scan, as every older job is). Each keeps its own phases; the
+  // wrapper only remembers which one prepared the job.
+  const research: JobPhases<ResearchPrepared, ResearchFetched> = { prepare: researchPrepare, run: researchRun, commit: researchCommit, recover: researchRecover };
+  const scan: JobPhases<Prepared, Fetched> = { prepare, run, commit, recover };
+  const finder = createCompetitorFindPhases(context, {
+    ...(deps.cache !== undefined ? { cache: deps.cache } : {}),
+    ...(deps.spendMeter !== undefined ? { spendMeter: deps.spendMeter } : {}),
+    ...(deps.engineGate !== undefined ? { engineGate: deps.engineGate } : {}),
+    ...(deps.resolveAdapter !== undefined ? { resolveAdapter: deps.resolveAdapter } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+    ...deps.competitorFinder,
+  });
+  type Any = JobPhases<unknown, unknown>;
+  const isFinder = (job: Job): boolean => (job.data as { payload?: { tool?: unknown } }).payload?.tool === "competitor_finder";
+  const phasesFor = (job: Job): Any => (isFinder(job) ? (finder as Any) : isResearchJob(job) ? (research as Any) : (scan as Any));
+  interface Tagged {
+    readonly phases: Any;
+    readonly state: unknown;
+  }
+  return phasedProcessor<Tagged, { fetched: unknown }>({
+    prepare: async (tx, job) => {
+      const phases = phasesFor(job);
+      const state = await phases.prepare(tx, job);
+      return state === PHASES_DONE ? PHASES_DONE : { phases, state };
+    },
+    run: async (tagged, job) => ({ fetched: await tagged.phases.run(tagged.state, job) }),
+    commit: async (tx, tagged, result, job) => await tagged.phases.commit(tx, tagged.state, result.fetched, job),
+    recover: async (tx, job, failure) => {
+      const phases = phasesFor(job);
+      return (await phases.recover?.(tx, job, { error: failure.error, phase: failure.phase, ...(failure.prepared !== undefined ? { prepared: failure.prepared.state } : {}), ...(failure.fetched !== undefined ? { fetched: failure.fetched.fetched } : {}) })) ?? false;
+    },
   });
 }
