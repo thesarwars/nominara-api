@@ -145,6 +145,39 @@ export class S3Adapter implements ObjectStoragePort, PrefixDeletingPort, KeyList
     }
   }
 
+  /** Deletes every version and delete marker of each exact key. A per-object error fails the call; idempotent (an absent key removes nothing). */
+  async deleteKeys(bucket: StorageBucketName, keys: readonly string[]): Promise<number> {
+    for (const key of keys) {
+      if (key.length < 2 || key.endsWith("/")) throw new Error("deleteKeys needs non-empty object keys that do not end in /");
+    }
+    const Bucket = this.bucketName(bucket);
+    let removed = 0;
+    for (const key of new Set(keys)) {
+      let keyMarker: string | undefined;
+      let versionIdMarker: string | undefined;
+      for (;;) {
+        // Prefix = the key lists the key and anything longer; only the exact key is deleted.
+        const page = await this.send(() =>
+          this.client.send(new ListObjectVersionsCommand({ Bucket, Prefix: key, ...(keyMarker !== undefined ? { KeyMarker: keyMarker } : {}), ...(versionIdMarker !== undefined ? { VersionIdMarker: versionIdMarker } : {}) })),
+        );
+        const targets = [...(page.Versions ?? []), ...(page.DeleteMarkers ?? [])].flatMap((v) => (v.Key === key ? [{ Key: key, ...(v.VersionId !== undefined ? { VersionId: v.VersionId } : {}) }] : []));
+        for (let i = 0; i < targets.length; i += 1000) {
+          const batch = targets.slice(i, i + 1000);
+          const out = await this.send(() => this.client.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: batch, Quiet: true } })));
+          if ((out.Errors?.length ?? 0) > 0) {
+            logger.error({ span: "storage.s3_error", error: "DeleteObjectsPartial", failed: out.Errors?.length });
+            throw new DegradedError({ message: "object storage is unavailable" });
+          }
+          removed += batch.length;
+        }
+        if (page.IsTruncated !== true) break;
+        keyMarker = page.NextKeyMarker;
+        versionIdMarker = page.NextVersionIdMarker;
+      }
+    }
+    return removed;
+  }
+
   async presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number, downloadFilename?: string): Promise<string> {
     const disposition = downloadFilename === undefined ? undefined : `attachment; filename="${downloadFilename.replace(/[^A-Za-z0-9._-]/g, "_")}"`;
     return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: key, ResponseContentDisposition: disposition }), { expiresIn: expiresInSeconds });

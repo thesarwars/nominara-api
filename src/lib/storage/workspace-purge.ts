@@ -1,4 +1,4 @@
-import { workspacePrefix } from "./storage-keys.js";
+import { relativeKeyFromStored, workspacePrefix } from "./storage-keys.js";
 import type { PrefixDeletingPort } from "./storage.port.js";
 
 // STORY-180 r5 (owner decision 60 (b)) - the purge-side wrapper for workspace erasure. It takes the purged workspace id EXPLICITLY (the purge
@@ -37,5 +37,32 @@ export async function deleteWorkspaceObjectsEverywhere(port: PrefixDeletingPort,
     }
   }
   if (failure !== undefined) throw failure.error;
+  return removed;
+}
+
+/**
+ * STORY-182 (decision 69(b)): deletes, in the raw bucket, every version of the given `answer_captures.raw_object_key` values of a purged
+ * PROJECT. The caller collected them before the cascade (the rows that held them are gone). Each key must lie inside THIS workspace's own
+ * raw prefix (`relativeKeyFromStored`); a key that does not (another workspace, another environment, a traversal) is never deleted, the valid
+ * keys still are, and the call then fails so the gap is recorded. Returns how many versions and markers were removed.
+ */
+export async function deleteProjectRawObjects(port: PrefixDeletingPort, keyEnv: string, workspaceId: string, keys: readonly string[]): Promise<number> {
+  if (keys.length === 0) return 0;
+  const valid: string[] = [];
+  let invalid: unknown;
+  let invalidCount = 0;
+  for (const key of new Set(keys)) {
+    try {
+      relativeKeyFromStored(keyEnv, workspaceId, "raw", key);
+      valid.push(key);
+    } catch (error) {
+      invalid ??= error;
+      invalidCount += 1;
+    }
+  }
+  // A malformed workspace id or environment invalidates every key: nothing is deleted.
+  if (valid.length === 0 && invalid !== undefined) throw invalid;
+  const removed = await port.deleteKeys("raw", valid);
+  if (invalid !== undefined) throw new Error(`${String(invalidCount)} stored raw object key(s) lie outside the workspace prefix and were not deleted`);
   return removed;
 }

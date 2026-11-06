@@ -6,5 +6,5 @@ export function unconfiguredStoragePort(): ObjectStoragePort & PrefixDeletingPor
   const refuse = (): never => {
     throw new DegradedError({ message: "object storage is not configured" });
   };
-  return { put: async () => refuse(), get: async () => refuse(), head: async () => refuse(), delete: async () => refuse(), presignGet: async () => refuse(), deletePrefix: async () => refuse() };
+  return { put: async () => refuse(), get: async () => refuse(), head: async () => refuse(), delete: async () => refuse(), presignGet: async () => refuse(), deletePrefix: async () => refuse(), deleteKeys: async () => refuse() };
 }

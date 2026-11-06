@@ -9,7 +9,7 @@ import { PurgeJournal } from "../../compliance/purge-journal.js";
 import { S3JournalStore, writeComplianceExports } from "../../compliance/storage-adapters.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
-import { deleteWorkspaceObjectsEverywhere } from "../../storage/workspace-purge.js";
+import { deleteProjectRawObjects, deleteWorkspaceObjectsEverywhere } from "../../storage/workspace-purge.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -74,9 +74,9 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
       }
 
       // STORY-180 r5 / STORY-182: an erased workspace's stored files (reports, raw captures, crawl snapshots; every version) are deleted AFTER
-      // its cascade commits. A PROJECT's raw objects are NOT deleted here: no writer keys raw objects by project (they are
-      // `{env}/{ws}/YYYY/MM/{id}.json.gz`), so `deleteObjectPrefix` is deliberately left unwired and `hardDeleteProject` keeps recording the gap in
-      // `purge_failures` (owner decision pending, see docs/plans/evidence/STORY-182-183.md). With object storage not configured the hook
+      // its cascade commits. A PROJECT's raw objects are deleted BY KEY (decision 69(b)): raw keys are `{env}/{ws}/YYYY/MM/{id}.json.gz`, with no project
+      // segment, so `hardDeleteProject` collects each capture's `raw_object_key` before its cascade and `deleteProjectObjectKeys` removes them after
+      // the commit; `deleteObjectPrefix` stays unwired on purpose. With object storage not configured the hook
       // is absent, so the files would be left: say so, loudly, every run.
       const storage = resolveStorageConfig(context.env);
       if (storage === null) logger.warn({ event: "report_objects_not_deleted", reason: "storage_unconfigured" });
@@ -89,6 +89,22 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
           ? {
               journal: new PurgeJournal(new S3JournalStore(adapter), storage.keyEnv),
               exporterFor: (workspaceId: string) => writeComplianceExports(adapter, storage.keyEnv, workspaceId),
+              deleteProjectObjectKeys: async (workspaceId: string, keys: readonly string[]): Promise<void> => {
+                await tracer.startActiveSpan("retention.project_objects_delete", async (span) => {
+                  try {
+                    const removed = await deleteProjectRawObjects(adapter, storage.keyEnv, workspaceId, keys);
+                    incrementCounter("nominara_retention_project_objects_deleted_total", { outcome: "deleted" });
+                    // Counts and the workspace ID only: never a key.
+                    logger.log({ event: "project_objects_deleted", workspace_id: workspaceId, keys: keys.length, versions_removed: removed });
+                  } catch (error) {
+                    span.setStatus({ code: SpanStatusCode.ERROR });
+                    incrementCounter("nominara_retention_project_objects_deleted_total", { outcome: "failed" });
+                    throw error;
+                  } finally {
+                    span.end();
+                  }
+                });
+              },
               deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => {
                 await tracer.startActiveSpan("retention.workspace_objects_delete", async (span) => {
                   try {

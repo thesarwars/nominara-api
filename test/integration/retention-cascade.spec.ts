@@ -822,6 +822,52 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     expect(milestones.rowCount).toBe(0); // cascaded via ON DELETE CASCADE, not deleted by this function directly
   });
 
+  it("[STORY-182 decision 69(b)] project hard delete collects each capture's raw_object_key BEFORE the cascade and deletes those objects by key AFTER it commits", async () => {
+    const workspaceId = await createWorkspace();
+    const projectId = await createProject(workspaceId);
+    const otherProject = await createProject(workspaceId);
+    await insertCapture(workspaceId, projectId, new Date(), { rawObjectKey: `test/${workspaceId}/2026/10/a.json.gz` });
+    await insertCapture(workspaceId, projectId, new Date(), { rawObjectKey: `test/${workspaceId}/2026/10/b.json.gz` });
+    await insertCapture(workspaceId, projectId, new Date(), { rawObjectKey: null });
+    await insertCapture(workspaceId, otherProject, new Date(), { rawObjectKey: `test/${workspaceId}/2026/10/other.json.gz` });
+
+    let received: readonly string[] = [];
+    let projectRowsWhenCalled = -1;
+    let capturesWhenCalled = -1;
+    await hardDeleteProject(workerClient, workspaceId, projectId, {
+      deleteObjectKeys: async (keys) => {
+        received = keys;
+        // On a DIFFERENT connection: only a committed delete is visible there.
+        projectRowsWhenCalled = (await client.query("SELECT 1 FROM projects WHERE id = $1", [projectId])).rowCount ?? -1;
+        capturesWhenCalled = (await client.query("SELECT 1 FROM answer_captures WHERE project_id = $1", [projectId])).rowCount ?? -1;
+      },
+    });
+
+    expect([...received].sort()).toEqual([`test/${workspaceId}/2026/10/a.json.gz`, `test/${workspaceId}/2026/10/b.json.gz`]);
+    expect(projectRowsWhenCalled).toBe(0);
+    expect(capturesWhenCalled).toBe(0);
+    expect((await client.query("SELECT 1 FROM projects WHERE id = $1", [otherProject])).rowCount).toBe(1);
+  });
+
+  it("[STORY-182 decision 69(b)] a project with no raw objects makes no key delete; a failing key delete is raised after the cascade has committed", async () => {
+    const workspaceId = await createWorkspace();
+    const empty = await createProject(workspaceId);
+    let calls = 0;
+    await hardDeleteProject(workerClient, workspaceId, empty, { deleteObjectKeys: async () => void (calls += 1) });
+    expect(calls).toBe(0);
+
+    const failing = await createProject(workspaceId);
+    await insertCapture(workspaceId, failing, new Date(), { rawObjectKey: `test/${workspaceId}/2026/10/f.json.gz` });
+    await expect(
+      hardDeleteProject(workerClient, workspaceId, failing, {
+        deleteObjectKeys: async () => {
+          throw new Error("s3 down");
+        },
+      }),
+    ).rejects.toThrow("s3 down");
+    expect((await client.query("SELECT 1 FROM projects WHERE id = $1", [failing])).rowCount).toBe(0);
+  });
+
   it("hardDeleteProject throws when no deleteObjectPrefix callback is supplied — discloses the missing object-storage client rather than silently skipping it", async () => {
     const workspaceId = await createWorkspace();
     const projectId = await createProject(workspaceId);

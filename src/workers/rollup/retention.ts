@@ -190,6 +190,13 @@ export interface HardDeleteProjectOptions {
   readonly env?: string;
   readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
   /**
+   * STORY-182 (decision 69(b)). Raw keys carry no project segment, so a project's objects are named by the `raw_object_key` of each of its
+   * captures. They are collected BEFORE the cascade (which deletes the rows) and handed here AFTER it commits, outside any transaction.
+   * Not called when the project has none. Its failure is raised after the cascade: the project IS erased, its objects may remain (the
+   * workspace erasure sweeps them).
+   */
+  readonly deleteObjectKeys?: (keys: readonly string[]) => Promise<void>;
+  /**
    * STORY-111 / NFR-CMP-10: when present, the purge re-checks for an ACTIVE legal hold (at this instant) INSIDE its own transaction, under the
    * lock `placeLegalHold` also takes, and deletes nothing if one exists. The caller's earlier read of the holds is not enough: a hold can be placed
    * between that read and this delete. Owner connection only (`legal_holds` is granted to no runtime role).
@@ -248,16 +255,28 @@ export async function hardDeleteProject(
   projectId: string,
   options: HardDeleteProjectOptions = {},
 ): Promise<"deleted" | "held"> {
+  let objectKeys: string[] = [];
   const outcome = await withTenantContext(client, { workspaceId, actorId: options.actorId ?? SYSTEM_ACTOR_ID }, async (tx) => {
     if (options.holdCheckAt !== undefined) {
       await lockHoldRegister(tx, workspaceId);
       if (await projectHasActiveHold(tx, workspaceId, projectId, options.holdCheckAt)) return "held" as const;
+    }
+    if (options.deleteObjectKeys) {
+      const keys = await tx.query<{ raw_object_key: string }>(
+        "SELECT DISTINCT raw_object_key FROM answer_captures WHERE project_id = $1 AND raw_object_key IS NOT NULL",
+        [projectId],
+      );
+      objectKeys = keys.rows.map((row) => row.raw_object_key);
     }
     await deleteProjectRows(tx, projectId);
     return "deleted" as const;
   });
   if (outcome === "held") return "held";
 
+  if (options.deleteObjectKeys) {
+    if (objectKeys.length > 0) await options.deleteObjectKeys(objectKeys);
+    if (!options.deleteObjectPrefix) return "deleted";
+  }
   if (!options.deleteObjectPrefix) {
     throw new Error(
       "hardDeleteProject: no deleteObjectPrefix callback supplied — no object-storage client exists in this repo yet (disclosed gap, see README.md)",
@@ -1182,6 +1201,8 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
 export interface DailyPurgeCycleOptions {
   readonly referenceDate?: Date;
   readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
+  /** STORY-182 decision 69(b): deletes (by key, every version) the raw objects a purged project's captures pointed at; called after the cascade commits. */
+  readonly deleteProjectObjectKeys?: (workspaceId: string, keys: readonly string[]) => Promise<void>;
   /** STORY-182: the object-key environment segment (`STORAGE_KEY_ENV`) the project prefix is built with; absent = `hardDeleteProject`'s default. */
   readonly objectKeyEnv?: string;
   readonly exportComplianceRecords?: (records: readonly ComplianceExportRow[]) => Promise<void>;
@@ -1267,13 +1288,12 @@ export async function runDailyPurgeCycle(
       let heldInTransaction = false;
       const outcome = await tryPurgeProject(privilegedClient, project.id, async (tx) => {
         try {
-          const hardDeleteOptions: HardDeleteProjectOptions = options.deleteObjectPrefix
-            ? {
-                deleteObjectPrefix: options.deleteObjectPrefix,
-                ...(options.objectKeyEnv !== undefined ? { env: options.objectKeyEnv } : {}),
-                holdCheckAt: referenceDate,
-              }
-            : { holdCheckAt: referenceDate };
+          const projectObjectKeysHook = options.deleteProjectObjectKeys;
+          const hardDeleteOptions: HardDeleteProjectOptions = {
+            ...(options.deleteObjectPrefix ? { deleteObjectPrefix: options.deleteObjectPrefix, ...(options.objectKeyEnv !== undefined ? { env: options.objectKeyEnv } : {}) } : {}),
+            ...(projectObjectKeysHook ? { deleteObjectKeys: (keys: readonly string[]) => projectObjectKeysHook(project.workspace_id, keys) } : {}),
+            holdCheckAt: referenceDate,
+          };
           heldInTransaction = (await hardDeleteProject(tx, project.workspace_id, project.id, hardDeleteOptions)) === "held";
         } catch (error) {
           await recordPurgeFailure(tx, { scope: "project", scopeId: project.id, reason: (error as Error).message });

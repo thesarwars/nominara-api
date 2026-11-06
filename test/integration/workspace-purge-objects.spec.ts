@@ -2,7 +2,7 @@ import { ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { S3Adapter } from "../../src/lib/storage/s3.adapter.js";
 import { resolveStorageConfig, type StorageConfig } from "../../src/lib/storage/storage-config.js";
-import { deleteWorkspaceObjectsEverywhere } from "../../src/lib/storage/workspace-purge.js";
+import { deleteProjectRawObjects, deleteWorkspaceObjectsEverywhere } from "../../src/lib/storage/workspace-purge.js";
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
 
 // STORY-182 - the purge-side wrapper against LocalStack with versioning ON (docker/localstack/init-buckets.sh). Run under the docker lock.
@@ -66,5 +66,29 @@ describe("STORY-182 · purge deletes object prefixes in a versioned bucket", () 
 
   it("[STORY-182 AC3] a re-run after the job is done finishes cleanly and removes nothing", async () => {
     await expect(deleteWorkspaceObjectsEverywhere(adapter, "inttest", WS_A)).resolves.toBe(0);
+  });
+
+  it("[STORY-182 decision 69(b)] deleting a project's raw objects by key removes every version of those keys only: a sibling key, a longer key and another workspace are untouched", async () => {
+    const gone = `inttest/${WS_A}/2026/10/p1.json.gz`;
+    const longer = `inttest/${WS_A}/2026/10/p1.json.gz.keep`;
+    const sibling = `inttest/${WS_A}/2026/10/p2.json.gz`;
+    const foreign = `inttest/${WS_B}/2026/10/p1.json.gz`;
+    await put("raw", gone, 3);
+    await adapter.delete("raw", gone);
+    await put("raw", longer);
+    await put("raw", sibling, 2);
+    await put("raw", foreign);
+
+    const removed = await deleteProjectRawObjects(adapter, "inttest", WS_A, [gone]);
+    expect(removed).toBe(4);
+    expect((await versions("nominara-raw", gone)).filter((v) => v.startsWith(`${gone}@`))).toEqual([]);
+    expect((await versions("nominara-raw", longer))).toHaveLength(1);
+    expect((await versions("nominara-raw", sibling))).toHaveLength(2);
+    expect((await versions("nominara-raw", foreign))).toHaveLength(1);
+    // A foreign key in the list is refused, never deleted.
+    await expect(deleteProjectRawObjects(adapter, "inttest", WS_A, [foreign])).rejects.toThrow();
+    expect(await versions("nominara-raw", foreign)).toHaveLength(1);
+    // Idempotent re-run.
+    await expect(deleteProjectRawObjects(adapter, "inttest", WS_A, [gone])).resolves.toBe(0);
   });
 });

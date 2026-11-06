@@ -42,6 +42,11 @@ export interface ObjectHead {
 export interface PrefixDeletingPort {
   /** Returns how many versions and delete markers were removed. Refuses a prefix that is empty or does not end in `/`. */
   deletePrefix(bucket: StorageBucketName, prefix: string): Promise<number>;
+  /**
+   * STORY-182 (decision 69(b)). Deletes EVERY version and delete marker of each EXACT key (never a longer key that starts with it).
+   * For a project purge, whose raw keys carry no project segment and so cannot be named by prefix. Returns how many were removed.
+   */
+  deleteKeys(bucket: StorageBucketName, keys: readonly string[]): Promise<number>;
 }
 
 /**

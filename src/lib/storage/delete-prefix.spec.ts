@@ -90,7 +90,7 @@ describe("S3Adapter.deletePrefix", () => {
 });
 
 describe("deleteWorkspaceReports (the purge-side wrapper)", () => {
-  const port = () => ({ deletePrefix: vi.fn(async () => 4) }) satisfies PrefixDeletingPort;
+  const port = () => ({ deletePrefix: vi.fn(async () => 4), deleteKeys: vi.fn(async () => 0) }) satisfies PrefixDeletingPort;
 
   it("deletes exactly the workspace's reports prefix {env}/{workspace}/ in the reports bucket, and nothing else", async () => {
     const p = port();
@@ -110,5 +110,54 @@ describe("deleteWorkspaceReports (the purge-side wrapper)", () => {
     await expect(deleteWorkspaceReports(p, "", WS)).rejects.toThrow();
     await expect(deleteWorkspaceReports(p, "a/b", WS)).rejects.toThrow();
     expect(p.deletePrefix).not.toHaveBeenCalled();
+  });
+});
+
+describe("S3Adapter.deleteKeys (STORY-182, decision 69(b): a project's raw objects by exact key)", () => {
+  const KEY = `inttest/${WS}/2026/10/a.json.gz`;
+
+  it("deletes every version and marker of the exact key, and never a longer key that merely starts with it", async () => {
+    const sent: Sent[] = [];
+    vi.spyOn(S3Client.prototype, "send").mockImplementation((async (command: unknown) => {
+      if (command instanceof ListObjectVersionsCommand) {
+        sent.push({ name: "list", input: command.input as unknown as Record<string, unknown> });
+        return {
+          Versions: [{ Key: KEY, VersionId: "v1" }, { Key: KEY, VersionId: "v2" }, { Key: `${KEY}.bak`, VersionId: "v9" }],
+          DeleteMarkers: [{ Key: KEY, VersionId: "d1" }],
+          IsTruncated: false,
+        };
+      }
+      if (command instanceof DeleteObjectsCommand) {
+        sent.push({ name: "delete", input: command.input as unknown as Record<string, unknown> });
+        return {};
+      }
+      return {};
+    }) as never);
+    expect(await adapter().deleteKeys("raw", [KEY])).toBe(3);
+    expect(sent[0]).toMatchObject({ name: "list", input: { Bucket: "raw-b", Prefix: KEY } });
+    const del = sent.find((s) => s.name === "delete")!.input as { Delete: { Objects: Array<{ Key: string; VersionId: string }> } };
+    expect(del.Delete.Objects.map((o) => `${o.Key}@${o.VersionId}`)).toEqual([`${KEY}@v1`, `${KEY}@v2`, `${KEY}@d1`]);
+  });
+
+  it("an empty key list makes no storage call, and an absent key removes nothing", async () => {
+    const sent = fakeS3([{}]);
+    expect(await adapter().deleteKeys("raw", [])).toBe(0);
+    expect(sent).toHaveLength(0);
+    expect(await adapter().deleteKeys("raw", [KEY])).toBe(0);
+    expect(sent.filter((s) => s.name === "delete")).toHaveLength(0);
+  });
+
+  it("a per-object delete error fails the call (503)", async () => {
+    vi.spyOn(S3Client.prototype, "send").mockImplementation((async (command: unknown) => {
+      if (command instanceof ListObjectVersionsCommand) return { Versions: [{ Key: KEY, VersionId: "v1" }], IsTruncated: false };
+      return { Errors: [{ Key: KEY, Code: "AccessDenied" }] };
+    }) as never);
+    await expect(adapter().deleteKeys("raw", [KEY])).rejects.toBeInstanceOf(DegradedError);
+  });
+
+  it.each(["", "/"])("refuses the key %j", async (key) => {
+    const sent = fakeS3([{ versions: 1 }]);
+    await expect(adapter().deleteKeys("raw", [key])).rejects.toThrow();
+    expect(sent).toHaveLength(0);
   });
 });
