@@ -2,7 +2,8 @@ import { Body, Controller, Get, HttpCode, Put, Query } from "@nestjs/common";
 import {
   agencyThemeListQuerySchema,
   agencyThemeListResponseSchema,
-  agencyThemeAdminSchema,
+  saveAgencyThemeResponseSchema,
+  type SaveAgencyThemeResponse,
   updateAgencyThemeRequestSchema,
   type AgencyThemeAdmin,
   type AgencyThemeListQuery,
@@ -38,9 +39,9 @@ export class AgencyController {
   @ApiContract({
     operationId: "saveAgencyTheme",
     requestSchema: updateAgencyThemeRequestSchema,
-    responseSchema: agencyThemeAdminSchema,
+    responseSchema: saveAgencyThemeResponseSchema,
   })
-  save(@Body(new ZodValidationPipe(updateAgencyThemeRequestSchema)) body: UpdateAgencyThemeRequest): Promise<AgencyThemeAdmin> {
+  save(@Body(new ZodValidationPipe(updateAgencyThemeRequestSchema)) body: UpdateAgencyThemeRequest): Promise<SaveAgencyThemeResponse> {
     return this.service.saveTheme(body);
   }
 }

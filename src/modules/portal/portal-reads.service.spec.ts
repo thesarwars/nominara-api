@@ -8,7 +8,7 @@ import { PortalReadsService } from "./portal-reads.service.js";
 // stubs deliberately emit keys the cost-key scan does NOT know, so only the allow-list can stop them.
 const WS = "0198f6a0-0000-7000-8000-000000000001";
 const P1 = "0198f6a0-0000-7000-8000-0000000000b1";
-const THEME = { theme_id: "0198f6a0-0000-7000-8000-0000000000aa", name: "Default", is_default: true, color_primary: null, color_accent: null, color_bg: null, color_fg: null, font_family: "Inter", logo_url: null, hide_nominara_brand: false };
+const THEME = { theme_id: "0198f6a0-0000-7000-8000-0000000000aa", name: "Default", is_default: true, color_primary: null, color_accent: null, color_bg: null, color_fg: null, font_family: "Inter", logo_url: null, hide_nominara_brand: false, custom_css: null };
 
 function session(hideCosts: boolean, tokenId = "0198f6a0-0000-7000-8000-0000000000a1"): PortalSessionContext {
   return {

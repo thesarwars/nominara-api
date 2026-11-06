@@ -113,6 +113,29 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(res.body).not.toContain("email_reply_to");
   });
 
+  it("STORY-097 · the pinned theme's stored style override reaches the portal; the email footer never does", async () => {
+    const w = await world();
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:#112233}', email_footer_html = '<p>Footer only for mail</p>' WHERE id = $1", [w.theme]);
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const res = await get(t.cookie, "/portal/overview");
+    expect(res.statusCode, res.body).toBe(200);
+    expect(portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.custom_css).toBe(".nm-card{color:#112233}");
+    expect(res.body).not.toContain("Footer only for mail");
+    expect(res.body).not.toContain("email_footer_html");
+  });
+
+  it("STORY-097 scenario 5 (content scan) · with hide_nominara_brand on, the portal overview carries no platform name, asset or link", async () => {
+    const w = await world();
+    await harness.db().query("UPDATE brand_themes SET hide_nominara_brand = true WHERE id = $1", [w.theme]);
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const res = await get(t.cookie, "/portal/overview");
+    expect(res.statusCode, res.body).toBe(200);
+    const data = (res.json() as { data: unknown }).data;
+    expect(portalOverviewResponseSchema.parse(data).theme.hide_nominara_brand).toBe(true);
+    // The contract's own key `hide_nominara_brand` is machine vocabulary, not content a viewer sees; every VALUE is scanned.
+    expect(JSON.stringify(data).replaceAll('"hide_nominara_brand"', '"flag"')).not.toMatch(/nominara/i);
+  });
+
   it("STORY-099 s8 · a workspace with no stored theme gets the platform default (null colours), not an error", async () => {
     const w = await world();
     await harness.db().query("DELETE FROM brand_themes WHERE workspace_id = $1", [w.ws]);

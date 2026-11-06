@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { MAX_CUSTOM_CSS_LENGTH, MAX_EMAIL_FOOTER_LENGTH } from "../../../contracts/agency/theme.schema.js";
+import { MAX_EMAIL_FOOTER_CHARS } from "./email-footer.js";
 import { MAX_CUSTOM_CSS_CHARS, sanitiseCustomCss } from "./custom-css.js";
 
 // STORY-097 AC "style override" · FR-AGY-01 integrations-and-sharing.md §2 `custom_css`: a property allow-list, selectors
@@ -101,5 +103,12 @@ describe("STORY-097 · custom_css allow-list and re-serialisation", () => {
     const r = ok(".nm-card{color:#111} .nm-kpi{color:#222");
     expect(r.css).toBe(".nm-card{color:#111}");
     expect(ok(r.css).css).toBe(r.css);
+  });
+});
+
+describe("STORY-097 · the published limits are the enforced limits", () => {
+  it("the contract's maximum lengths equal the sanitisers'", () => {
+    expect(MAX_CUSTOM_CSS_LENGTH).toBe(MAX_CUSTOM_CSS_CHARS);
+    expect(MAX_EMAIL_FOOTER_LENGTH).toBe(MAX_EMAIL_FOOTER_CHARS);
   });
 });

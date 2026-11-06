@@ -410,7 +410,9 @@
           "logo_url",
           "hide_nominara_brand",
           "email_from_name",
-          "email_reply_to"
+          "email_reply_to",
+          "custom_css",
+          "email_footer_html"
         ]
       }
     },
