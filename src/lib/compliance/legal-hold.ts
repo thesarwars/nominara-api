@@ -29,6 +29,8 @@ export interface PlaceLegalHoldInput {
   readonly approvedBy: string;
   readonly expiresAt: Date;
   readonly now?: Date;
+  /** The operator's request id (decision 70e): carried onto the audit row so the placing is traceable to the command that made it. */
+  readonly requestId?: string;
 }
 
 export const MIN_HOLD_REASON_CHARS = 10;
@@ -67,6 +69,7 @@ export async function placeLegalHold(client: ClientBase, input: PlaceLegalHoldIn
       // The reason is operator-written text about a legal matter: it stays in legal_holds, not in the audit chain.
       afterState: { scope: input.scope, scope_id: input.scopeId, approved_by: input.approvedBy, expires_at: input.expiresAt.toISOString() },
       severity: "critical",
+      ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
     });
     await client.query("COMMIT");
     incrementCounter("nominara_retention_legal_holds_placed_total", { scope: input.scope });
@@ -112,7 +115,7 @@ async function resolveWorkspace(client: ClientBase, scope: "project" | "workspac
 }
 
 /** Ends a hold before its expiry. Audited. */
-export async function releaseLegalHold(client: ClientBase, holdId: string, releasedBy: string, now: Date = new Date()): Promise<void> {
+export async function releaseLegalHold(client: ClientBase, holdId: string, releasedBy: string, now: Date = new Date(), requestId?: string): Promise<void> {
   await client.query("BEGIN");
   try {
     const released = await client.query<{ workspace_id: string }>(
@@ -131,6 +134,7 @@ export async function releaseLegalHold(client: ClientBase, holdId: string, relea
       resourceId: holdId,
       afterState: { release_reason: "manual" },
       severity: "critical",
+      ...(requestId !== undefined ? { requestId } : {}),
     });
     await client.query("COMMIT");
   } catch (error) {

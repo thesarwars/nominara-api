@@ -45,6 +45,8 @@
     "db:purge-check": "tsx src/db/purge-check.ts",
     "db:subject:export": "tsx src/db/subject-cli.ts export",
     "db:subject:erase": "tsx src/db/subject-cli.ts erase",
+    "db:hold:place": "tsx src/db/hold-cli.ts place",
+    "db:hold:release": "tsx src/db/hold-cli.ts release",
     "email:unsuppress": "tsx src/lib/email/unsuppress-email.ts",
     "contracts:generate": "tsx src/contracts/generate.ts",
     "contracts:check": "tsx src/contracts/check.ts",

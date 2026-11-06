@@ -83,7 +83,7 @@ export function createCrawlGate(options: CrawlGateOptions = {}): FetchLike {
     let value: ParsedRobots | null | "unavailable";
     try {
       await state.budget.acquire("site_file");
-      const response = await inner(`${origin}/robots.txt`, { headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/plain,*/*;q=0.1" } });
+      const response = await inner(new URL("/robots.txt", origin).href, { headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/plain,*/*;q=0.1" } });
       if (response.status >= 200 && response.status < 300) value = parseRobots(response.body.toString("utf8"));
       else if (response.status >= 400 && response.status < 500) value = null; // RFC 9309 §2.3.1.3: unavailable (4xx) = no rules
       else value = "unavailable";

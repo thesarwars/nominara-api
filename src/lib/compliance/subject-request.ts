@@ -295,8 +295,20 @@ async function deferErasure(
   return { requestId: effectiveId, status: "deferred", reason: LEGAL_HOLD_DELAY_REASON, heldWorkspaces };
 }
 
+/**
+ * A request id the operator supplied that already names a queue row (other than this subject's own pending one, which a repeat request
+ * returns). Checked BEFORE `received` is audited: a request that is refused for its id must leave no trail on the workspaces of a subject
+ * whose request never ran, and must not show another subject's request id on them.
+ */
+async function assertRequestIdFree(client: ClientBase, userId: string, requestId: string): Promise<void> {
+  const row = await client.query<{ user_id: string | null; status: string }>("SELECT user_id, status FROM subject_erasure_queue WHERE request_id = $1", [requestId]);
+  const existing = row.rows[0];
+  if (existing !== undefined && !(existing.user_id === userId && existing.status === "pending")) throw new RequestIdInUseError();
+}
+
 export async function processErasureRequest(client: ClientBase, userId: string, ctx: ErasureRequestContext): Promise<ErasureOutcome> {
   const requestId = ctx.requestId ?? randomUUID();
+  if (ctx.resume !== true && ctx.requestId !== undefined) await assertRequestIdFree(client, userId, requestId);
   const audited = { requestId, requestedBy: ctx.requestedBy };
   // Captured BEFORE the erasure: it marks memberships removed, and these are the chains the trail is written to.
   const workspaceIds = await workspacesOf(client, userId);
@@ -391,7 +403,7 @@ async function runQueue(client: ClientBase, now: Date): Promise<QueueRunResult> 
 }
 
 /** Manual hold release, then the queue: the erasure a hold was delaying runs as soon as the hold ends. */
-export async function releaseLegalHoldAndRunQueue(client: ClientBase, holdId: string, releasedBy: string, now: Date = new Date()): Promise<QueueRunResult> {
-  await releaseLegalHold(client, holdId, releasedBy, now);
+export async function releaseLegalHoldAndRunQueue(client: ClientBase, holdId: string, releasedBy: string, now: Date = new Date(), requestId?: string): Promise<QueueRunResult> {
+  await releaseLegalHold(client, holdId, releasedBy, now, requestId);
   return executePendingErasures(client, now);
 }

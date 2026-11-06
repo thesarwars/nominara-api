@@ -13,6 +13,8 @@ import { COMPLIANCE_EXPORT_CLASSES, writeComplianceExports } from "../../src/lib
 import { SUBJECT_INVENTORY } from "../../src/lib/compliance/subject-inventory.js";
 import { ERASURE_QUEUE_LOCK, executePendingErasures, processAccessRequest, processErasureRequest, releaseLegalHoldAndRunQueue, subjectColumnsFor } from "../../src/lib/compliance/subject-request.js";
 import type { ObjectStoragePort, PutObjectRequest } from "../../src/lib/storage/storage.port.js";
+import { runHoldCommand } from "../../src/db/hold-cli.js";
+import { LEGAL_DELAY_NOTICE_DRAFT } from "../../src/lib/compliance/legal-delay-notice.js";
 import { runSubjectCommand } from "../../src/db/subject-cli.js";
 import { executeWorkspaceHardDelete, runDailyPurgeCycle, runNightlySweep } from "../../src/workers/rollup/retention.js";
 
@@ -780,6 +782,11 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       await hold("workspace", second.ws, second.a, second.b);
       await expect(processErasureRequest(db, second.u, { requestedBy: second.u, requestId: queued.requestId })).rejects.toMatchObject({ name: "RequestIdInUseError" });
       expect(await queue(second.u)).toEqual([]);
+      // The collision is found BEFORE anything is audited: the other subject's request id must not appear on this workspace's chain at all
+      // (not as `received`, and not as `failed`), or the trail would show a request that never ran.
+      const onSecond = await db.query("SELECT action FROM audit_log WHERE workspace_id = $1 AND action LIKE 'subject_request.%' AND after_state->>'request_id' = $2", [second.ws, queued.requestId]);
+      expect(onSecond.rows).toEqual([]);
+      expect((await auditActions(second.ws)).filter((x) => x.startsWith("subject_request."))).toEqual([]);
     });
 
     it("S23 D9 the queue runner is serialised: a second run waits for the first instead of processing the same row twice", async () => {
@@ -797,6 +804,112 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       } finally {
         await other.end();
       }
+    });
+
+    it("S23 D9b two queue runs over the SAME pending row (one per connection) execute it once: one processed and one completed audit row", async () => {
+      const { ws, a, b, u } = await held();
+      const h = await hold("workspace", ws, a, b);
+      const out = await processErasureRequest(db, u, { requestedBy: u });
+      await releaseLegalHold(db, h.id, b); // the hold ends; nobody has run the queue yet
+      const other = new Client({ connectionString: container.getConnectionUri() });
+      await other.connect();
+      try {
+        const [r1, r2] = await Promise.all([executePendingErasures(db), executePendingErasures(other)]);
+        expect(await queueById(out.requestId)).toEqual([{ status: "executed", user_id: null, requested_by: null }]);
+        // Whichever run won executed this subject's row; the other found nothing pending for it. (Other cases' rows may add to either count.)
+        expect(r1.executed + r2.executed).toBeGreaterThanOrEqual(1);
+        const actions = (await auditActions(ws)).filter((x) => x.startsWith("subject_request."));
+        expect(actions.filter((x) => x === "subject_request.processed")).toHaveLength(1);
+        expect(actions.filter((x) => x === "subject_request.completed")).toHaveLength(1);
+      } finally {
+        await other.end();
+      }
+    });
+
+    // -------- hold CLI (decision 70 e, f)
+    const holdRows = async (scopeId: string) => (await db.query<{ released_at: Date | null; release_reason: string | null }>("SELECT released_at, release_reason FROM legal_holds WHERE scope_id = $1", [scopeId])).rows;
+    const futureIso = () => new Date(Date.now() + 30 * DAY).toISOString();
+    const holdAudit = async (ws: string, action: string) =>
+      (await db.query<{ request_id: string }>("SELECT request_id FROM audit_log WHERE workspace_id = $1 AND action = $2 ORDER BY seq", [ws, action])).rows.map((r) => r.request_id);
+    const placeArgs = (ws: string, a: string, b: string, extra: string[] = []) => ["place", "--scope", "workspace", "--id", ws, "--reason", "Litigation hold, matter 91", "--requested-by", a, "--approved-by", b, "--expires", futureIso(), ...extra];
+
+    it("70e place needs --confirm equal to the scope id: without it, or with a different one, no hold is created", async () => {
+      const { ws, a, b } = await held();
+      for (const extra of [[], ["--confirm", randomUUID()]]) {
+        const s = sink();
+        expect(await runHoldCommand(db, placeArgs(ws, a, b, extra), s.io)).toBe(2);
+        expect(s.lines.join("\n")).toContain("--confirm");
+      }
+      expect(await holdRows(ws)).toEqual([]);
+    });
+
+    it("70e/70f place with the confirmation creates the hold, audits it under the printed request id, and prints the DRAFT subject notice; the reason text is not echoed", async () => {
+      const { ws, a, b } = await held();
+      const requestId = randomUUID();
+      const s = sink();
+      expect(await runHoldCommand(db, placeArgs(ws, a, b, ["--confirm", ws, "--request-id", requestId]), s.io)).toBe(0);
+      const printed = s.lines.join("\n");
+      expect(printed).toContain(`request_id=${requestId}`);
+      expect(printed).toContain("Draft — pending legal review");
+      expect(printed).toContain(LEGAL_DELAY_NOTICE_DRAFT);
+      expect(printed).not.toContain("matter 91");
+      expect((await holdRows(ws)).length).toBe(1);
+      expect(await holdAudit(ws, "legal_hold.placed")).toEqual([requestId]);
+    });
+
+    it("70e place without --request-id generates one and prints it; an invalid request is refused before any change (same person, past expiry)", async () => {
+      const { ws, a, b } = await held();
+      const s = sink();
+      expect(await runHoldCommand(db, placeArgs(ws, a, b, ["--confirm", ws]), s.io)).toBe(0);
+      const id = /request_id=([0-9a-f-]{36})/.exec(s.lines.join("\n"))?.[1];
+      expect(id).toBeDefined();
+      expect(await holdAudit(ws, "legal_hold.placed")).toEqual([id]);
+      const w2 = await held();
+      const same = sink();
+      expect(await runHoldCommand(db, placeArgs(w2.ws, w2.a, w2.a, ["--confirm", w2.ws]), same.io)).toBe(2);
+      expect(same.lines.join("\n")).toContain("same_person");
+      const past = placeArgs(w2.ws, w2.a, w2.b, ["--confirm", w2.ws]);
+      past[past.indexOf("--expires") + 1] = new Date(Date.now() - DAY).toISOString();
+      expect(await runHoldCommand(db, past, sink().io)).toBe(2);
+      expect(await holdRows(w2.ws)).toEqual([]);
+    });
+
+    it("70e release needs --confirm equal to the hold id; with it the hold ends, the queued erasure RUNS (releaseLegalHoldAndRunQueue), and both are audited under the request id", async () => {
+      const { ws, a, b, u } = await held();
+      const placed = await hold("workspace", ws, a, b);
+      const queued = await processErasureRequest(db, u, { requestedBy: u });
+      const s0 = sink();
+      expect(await runHoldCommand(db, ["release", "--hold", placed.id, "--released-by", b], s0.io)).toBe(2);
+      expect((await holdRows(ws))[0]!.released_at).toBeNull();
+      const requestId = randomUUID();
+      const s = sink();
+      expect(await runHoldCommand(db, ["release", "--hold", placed.id, "--released-by", b, "--confirm", placed.id, "--request-id", requestId], s.io)).toBe(0);
+      expect(s.lines.join("\n")).toContain(`request_id=${requestId}`);
+      expect(s.lines.join("\n")).toMatch(/executed=\d+/);
+      expect((await holdRows(ws))[0]!.release_reason).toBe("manual");
+      expect(await holdAudit(ws, "legal_hold.released")).toEqual([requestId]);
+      expect(await queueById(queued.requestId)).toEqual([{ status: "executed", user_id: null, requested_by: null }]);
+      expect(await email(u)).toContain("deleted+");
+    });
+
+    it("70e release of a hold that is not active (unknown, or already released) exits 2 and changes nothing", async () => {
+      const { ws, a, b } = await held();
+      const placed = await hold("workspace", ws, a, b);
+      await releaseLegalHold(db, placed.id, b);
+      const s = sink();
+      expect(await runHoldCommand(db, ["release", "--hold", placed.id, "--released-by", b, "--confirm", placed.id], s.io)).toBe(2);
+      expect(s.lines.join("\n")).toContain("not_active");
+      const ghost = randomUUID();
+      expect(await runHoldCommand(db, ["release", "--hold", ghost, "--released-by", b, "--confirm", ghost], sink().io)).toBe(2);
+    });
+
+    it("70f the erasure CLI prints the same DRAFT notice when it defers for a legal hold", async () => {
+      const h = await held();
+      await hold("workspace", h.ws, h.a, h.b);
+      const operator = await user();
+      const s = sink();
+      expect(await runSubjectCommand(db, ["erase", "--user", h.u, "--requested-by", operator, "--confirm", h.u], s.io)).toBe(0);
+      expect(s.lines.join("\n")).toContain("Draft — pending legal review");
     });
 
     // -------- CLI

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import { connect, requireDatabaseUrl } from "./client.js";
+import { renderLegalDelayNotice } from "../lib/compliance/legal-delay-notice.js";
 import { processAccessRequest, processErasureRequest } from "../lib/compliance/subject-request.js";
 
 // STORY-111 / owner decision 68 (a) - the operator-run subject request commands:
@@ -109,6 +110,8 @@ export async function runSubjectCommand(client: ClientBase, argv: readonly strin
     }
     const outcome = await processErasureRequest(client, args.user, ctx);
     io.out(`request_id=${outcome.requestId} kind=erasure status=${outcome.status}${outcome.reason !== null ? ` reason="${outcome.reason}"` : ""}`);
+    // Decision 70(f): a deferral is told to the subject in reviewed wording; this is the DRAFT of it, until legal signs it off.
+    if (outcome.status === "deferred") io.out(renderLegalDelayNotice(outcome.requestId));
     return outcome.status === "blocked" ? 3 : 0;
   } catch (error) {
     io.err(`request failed (${error instanceof Error ? error.name : "unknown"}); see the audit trail for the request id.`);
