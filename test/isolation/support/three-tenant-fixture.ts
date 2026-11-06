@@ -459,6 +459,14 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO task_events (workspace_id, task_id, event) VALUES ($1, $2, 'created')", [workspaceId, taskIds[i]]);
   }
+  // STORY-067 (migration 0163) — a pending verification per row, on the project's milestone (one per (milestone, horizon)).
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      `INSERT INTO task_verifications (workspace_id, project_id, task_id, milestone_id, horizon, due_at)
+       SELECT $1, $2, $3, id, 'short', now() + interval '48 hours' FROM milestones WHERE project_id = $2 ORDER BY created_at LIMIT 1`,
+      [workspaceId, projectIds[i], taskIds[i]],
+    );
+  }
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO ref_counters (workspace_id, prefix) VALUES ($1, $2)", [workspaceId, `P${label}${i}`]);
   }
