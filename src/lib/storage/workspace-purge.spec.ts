@@ -34,7 +34,7 @@ describe("STORY-182 · deleteWorkspaceObjectsEverywhere", () => {
   });
 
   it("[STORY-182 AC2] a malformed workspace id or environment forms no prefix and deletes nothing", async () => {
-    for (const [env, ws] of [["prod", "*"], ["prod", ""], ["prod", `${WS}/../x`], ["../", WS], ["crawl", WS]] as const) {
+    for (const [env, ws] of [["prod", "*"], ["prod", ""], ["prod", WS.concat("/../x")], ["../", WS], ["crawl", WS]] as const) {
       const p = port();
       await expect(deleteWorkspaceObjectsEverywhere(p, env, ws)).rejects.toBeInstanceOf(StorageKeyError);
       expect(p.calls).toEqual([]);

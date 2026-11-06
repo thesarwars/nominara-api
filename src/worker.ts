@@ -18,6 +18,7 @@ import { RollupSweepRuntime } from "./lib/rollup/rollup-sweep.js";
 import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
 import { poolTenantWrite, runSuppressionFanout } from "./lib/email/suppression-fanout.js";
 import { ReportSweepRuntime } from "./lib/reports/report-sweep.js";
+import { sweepStaleSendingDeliveries } from "./lib/reports/stale-delivery-sweep.js";
 import { runTopicClusterSweepIsolated } from "./lib/topics/sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
@@ -567,7 +568,19 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
           fanoutFailure = error;
         }
         await runTopicClusterSweepIsolated(client, (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options), new Date());
+        // STORY-183 - and the stale `sending` delivery sweep: a delivery whose sending process died is rewritten to `failed` (reads already show it so).
+        // Independent of the other two: it runs even if the fan-out failed, and its own failure is raised only after both have run.
+        let staleFailure: unknown;
+        let staleFailed = false;
+        try {
+          const stale = await sweepStaleSendingDeliveries({ discovery: client, work: pool });
+          if (stale.failures.length > 0) throw new Error(`stale delivery sweep: ${String(stale.failures.length)} workspace(s) failed`);
+        } catch (error) {
+          staleFailed = true;
+          staleFailure = error;
+        }
         if (fanoutFailed) throw fanoutFailure;
+        if (staleFailed) throw staleFailure;
       },
     });
     reportSweep.start();
