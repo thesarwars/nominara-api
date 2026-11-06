@@ -46,6 +46,7 @@ export const MEASURED_IMPACT_CAVEAT = "Observational; concurrent changes are not
  *   window_days                               the length of EACH window (they are equal: aligned)
  *   confidence                                high | medium | low - accounts for OTHER milestones nearby, whatever the delta looks like
  *   method                                    names how it was measured, so a later method is distinguishable
+ *   scoring_version                           the scoring version of every day in both windows
  *   n_before / n_after                        measured cells behind each mean
  *   other_milestones_nearby                   how many other milestones fell inside the window (the reason for a lowered confidence)
  */
@@ -55,8 +56,10 @@ export const measuredImpactSchema = z
     visibility_after_14d: z.number(),
     delta: z.number(),
     window_days: z.number().int().positive(),
-    confidence: z.enum(["high", "medium", "low"]),
+    confidence: z.enum(["low", "medium", "high"]),
     method: z.string().min(1),
+    /** The scoring-model version BOTH windows were read at. Windows are never mixed across versions (a formula change is not an impact). */
+    scoring_version: z.string().min(1),
     caveat: z.literal(MEASURED_IMPACT_CAVEAT),
     n_before: z.number().int().nonnegative(),
     n_after: z.number().int().nonnegative(),
