@@ -179,7 +179,13 @@ describe("STORY-098 d.71 (a) · the portal shows the agency logo", () => {
     const down = await world();
     await storeLogo(down, png(100, 30, 100));
     port.failGets = true;
-    expect((await overview(await session(down))).theme.logo_url).toBeNull();
+    const downCookie = await session(down);
+    expect((await overview(downCookie)).theme.logo_url).toBeNull();
+    // During the backoff the portal does not ask storage again, even once it is back: an outage adds no timeout to every request.
+    port.failGets = false;
+    const getsAfterFailure = port.gets;
+    expect((await overview(downCookie)).theme.logo_url).toBeNull();
+    expect(port.gets).toBe(getsAfterFailure);
     const missing = await world();
     await storeLogo(missing, png(100, 30, 100));
     port.objects.clear();

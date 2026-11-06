@@ -34,6 +34,8 @@ import { AgencyService, themeAssetPath } from "./agency.service.js";
 export const THEME_ASSET_URL_SECONDS = 60;
 /** The portal's logo cache: how many distinct stored logos are kept in memory (each at most 256 KB as bytes, a third more as a data URL). */
 export const PORTAL_LOGO_CACHE_ENTRIES = 64;
+/** After a storage failure the portal serves no logo for this long without asking storage again, so an outage does not add a timeout to every request. */
+export const PORTAL_LOGO_FAILURE_BACKOFF_MS = 30_000;
 const logger = new Logger("ThemeAssets");
 const EXTENSION: Readonly<Record<ThemeAssetType, string>> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
 
@@ -46,6 +48,7 @@ export class ThemeAssetsService {
   ) {}
 
   private readonly portalLogos = new Map<string, string | null>();
+  private readonly portalLogoFailedUntil = new Map<string, number>();
 
   /** Owner decision 71 (a). Call INSIDE the tenant context (it only reads the workspace id); use the result after the transaction. */
   bindForPortal(): BoundObjectStore {
@@ -61,7 +64,7 @@ export class ThemeAssetsService {
    * Null is never an error to the visitor, but it is never silent: every outcome is counted and logged with the workspace ID.
    * The memory cache is keyed by workspace AND stored key (unique per upload), so a re-upload is a new entry and a logo can never be
    * served under another tenant's session, even if a forged row names its key. Only DEFINITE outcomes are cached (a logo, or a refusal of its bytes); a
-   * storage failure is retried on the next request.
+   * storage failure is not, but it is not retried for 30 seconds either (PORTAL_LOGO_FAILURE_BACKOFF_MS).
    */
   async portalLogo(bound: BoundObjectStore, stored: string, workspaceId: string): Promise<string | null> {
     // The workspace is PART of the cache key: a forged row naming another tenant's key must miss, and meet the bound store's refusal.
@@ -70,6 +73,10 @@ export class ThemeAssetsService {
     if (hit !== undefined) {
       incrementCounter("nominara_portal_logo_total", { outcome: hit === null ? "refused_cached" : "cache_hit" });
       return hit;
+    }
+    if ((this.portalLogoFailedUntil.get(cacheKey) ?? 0) > Date.now()) {
+      incrementCounter("nominara_portal_logo_total", { outcome: "storage_backoff" });
+      return null;
     }
     let dataUrl: string | null = null;
     let outcome: string;
@@ -91,6 +98,10 @@ export class ThemeAssetsService {
       // Includes StorageTenancyError (a key outside the workspace) and a storage outage. A foreign key is definite; an outage is not.
       outcome = error instanceof Error && error.name === "StorageTenancyError" ? "foreign_key" : "storage_error";
       definite = outcome === "foreign_key";
+    }
+    if (!definite) {
+      if (this.portalLogoFailedUntil.size >= PORTAL_LOGO_CACHE_ENTRIES) this.portalLogoFailedUntil.delete(this.portalLogoFailedUntil.keys().next().value as string);
+      this.portalLogoFailedUntil.set(cacheKey, Date.now() + PORTAL_LOGO_FAILURE_BACKOFF_MS);
     }
     if (definite) {
       if (this.portalLogos.size >= PORTAL_LOGO_CACHE_ENTRIES) this.portalLogos.delete(this.portalLogos.keys().next().value as string);

@@ -56,7 +56,7 @@ export class PortalTelemetryService {
       }
     } finally {
       incrementCounter("nominara_portal_telemetry_beats_total", { outcome });
-      // Workspace, token and view IDs only: no address, no agent, no tab content.
+      // Workspace and token IDs only: no address, no agent, no tab content.
       this.logger.log({ span: "portal.telemetry", workspace_id: session.workspaceId, token_id: session.tokenId, outcome, duration_ms: Math.round(performance.now() - started) });
     }
   }

@@ -126,21 +126,23 @@ describe("STORY-098 part B · the share-token gate under RLS", () => {
     const b = await seed();
     const svc = service();
     const client = await appPool.connect();
+    let mine: string | null;
     try {
-      const mine = await withTenantContext(client, { workspaceId: a.ws, actorId: SYSTEM_ACTOR_ID }, () =>
+      mine = await withTenantContext(client, { workspaceId: a.ws, actorId: SYSTEM_ACTOR_ID }, () =>
         svc.consumeView(a.tokenId, { ip: "203.0.113.9", userAgent: "UA", authenticated: true }),
       );
-      expect(mine).toBe(true);
+      expect(mine, "the new view row's id (owner decision 71 c)").toMatch(/^[0-9a-f-]{36}$/);
       const theirs = await withTenantContext(client, { workspaceId: a.ws, actorId: SYSTEM_ACTOR_ID }, () =>
         svc.consumeView(b.tokenId, { ip: "203.0.113.9", userAgent: "UA", authenticated: true }),
       );
-      expect(theirs).toBe(false);
+      expect(theirs).toBeNull();
     } finally {
       client.release();
     }
     const counts = await admin.query<{ id: string; view_count: number }>("SELECT id, view_count FROM share_tokens");
     expect(new Map(counts.rows.map((r) => [r.id, r.view_count])).get(b.tokenId)).toBe(0);
-    expect((await admin.query("SELECT 1 FROM share_token_views WHERE share_token_id = $1", [a.tokenId])).rowCount).toBe(1);
+    const written = await admin.query<{ id: string }>("SELECT id FROM share_token_views WHERE share_token_id = $1", [a.tokenId]);
+    expect(written.rows.map((r) => r.id)).toEqual([mine]);
     expect((await admin.query("SELECT 1 FROM share_token_views WHERE share_token_id = $1", [b.tokenId])).rowCount).toBe(0);
   });
 
