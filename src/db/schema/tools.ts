@@ -202,6 +202,21 @@ export const scheduledReports = pgTable("scheduled_reports", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const shareTokenEmailCodes = pgTable("share_token_email_codes", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  shareTokenId: uuid("share_token_id").notNull(),
+  emailHash: bytea("email_hash").notNull(),
+  codeHash: text("code_hash").notNull(),
+  attempts: smallint("attempts").notNull().default(sql`0`),
+  maxAttempts: smallint("max_attempts").notNull().default(sql`5`),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
+  invalidatedReason: text("invalidated_reason"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
 export const shareTokenViews = pgTable("share_token_views", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),
