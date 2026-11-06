@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import type { ExportRequest, ScheduledReport } from "../../../contracts/reports/index.js";
+import { REPORT_LINK_TTL_DAYS, type ExportRequest, type ScheduledReport } from "../../../contracts/reports/index.js";
 import { DomainError } from "../../api/errors/domain-errors.js";
 import { EmailSuppressedError, type EmailSender } from "../../modules/identity/ports/email-sender.js";
 import { isFeatureGranted, type FeatureFlagKey } from "../entitlements/classification.js";
@@ -12,8 +12,10 @@ import { buildIdempotencyKey } from "../queue/idempotency.js";
 import { writeNotification } from "../notifications/writer.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { resolveBillingPeriod } from "../usage/billing-period.js";
+import { storedKeySql } from "./artifact-key.js";
 import { commitTierCap, provisionUsageCounters, readCounter, releaseTierCap, reserveTierCap, UNLIMITED_LIMIT } from "../usage/tier-caps.js";
 import { advanceNextSendAt, type ScheduleCadence } from "./next-send-at.js";
+import { planArtifactMail, resolveMailParts, type ArtifactMailDeps, type ArtifactMailPlan } from "./report-artifact-mail.js";
 
 // STORY-100 — the DI-free core of running a scheduled report, shared by two callers: ScheduledReportsService (the request
 // path, send-now) and the `report.build` queue handler (the cadence path, AC5). Nothing here knows about Nest: everything it
@@ -49,12 +51,6 @@ const logger = new Logger("reports.scheduled");
 export const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
 export const CSV_ENTITLEMENT = "exports.csv";
 
-/**
- * The app origin an emailed artifact link is resolved against. A link is a URL, not an object-storage key (no
- * bucket key is built here; artifacts are inline this week). The download route is the signed-link story (scenario 11).
- */
-export const ARTIFACT_LINK_ORIGIN = "https://app.nominara.com";
-
 export interface ScheduledReportRow {
   id: string;
   name: string;
@@ -77,12 +73,16 @@ export const SCHEDULED_REPORT_COLUMNS = `id, name, project_ids, cadence, day_of_
 /** What the report build needs from the export service (a structural type, so this module stays DI-free). */
 export interface ReportExporter {
   export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined): Promise<{ export_id: string }>;
+  /** STORY-180: resolves when these artifacts' post-commit uploads have finished (immediately for ones this process did not upload). */
+  uploaded(ids: readonly string[]): Promise<void>;
 }
 
 export interface ReportRunDeps {
   readonly resolver: Pick<EntitlementResolver, "resolveForWorkspace">;
   readonly usage: Pick<StructuralUsage, "minimumPlanFor">;
   readonly exports: ReportExporter;
+  /** STORY-180 AC3: how the built files reach the recipients (attach or link). Required to prepare a run. */
+  readonly mail?: Omit<ArtifactMailDeps, "uploaded">;
   readonly now?: () => Date;
 }
 
@@ -147,17 +147,17 @@ export async function buildReportArtifacts(exporter: ReportExporter, report: Sch
  * the artifacts and the delivery row at the same `now()`, so the earliest artifact at or after the delivery's `attempted_at` is
  * that prepare's. Reusing them keeps a retried email byte-identical, which the provider's idempotency key requires.
  */
-async function recordedArtifacts(tx: ClientBase, report: ScheduledReportRow, deliveryId: string): Promise<string[] | undefined> {
+async function recordedArtifacts(tx: ClientBase, workspaceId: string, report: ScheduledReportRow, deliveryId: string): Promise<string[] | undefined> {
   const formats = report.format === "both" ? (["pdf", "csv"] as const) : ([report.format] as const);
   const ids: string[] = [];
   for (const projectId of report.project_ids) {
     for (const format of formats) {
       const found = await tx.query<{ id: string }>(
         `SELECT a.id FROM report_artifacts a
-           JOIN scheduled_report_deliveries d ON d.id = $1
-          WHERE a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now()
+           JOIN scheduled_report_deliveries d ON d.id = $1 AND d.workspace_id = $4
+          WHERE a.workspace_id = $4 AND a.project_ids = ARRAY[$2]::uuid[] AND a.format = $3 AND a.created_at >= d.attempted_at AND a.expires_at > now() AND a.quarantined_at IS NULL AND ${storedKeySql("a.object_key")}
           ORDER BY a.created_at, a.id LIMIT 1`,
-        [deliveryId, projectId, format],
+        [deliveryId, projectId, format, workspaceId],
       );
       const id = found.rows[0]?.id;
       if (id === undefined) return undefined;
@@ -184,11 +184,27 @@ export interface SendReportEmailsResult {
 export async function sendReportEmails(
   email: EmailSender,
   report: { readonly name: string; readonly recipients: readonly string[] },
-  artifacts: readonly string[],
+  plan: ArtifactMailPlan,
   sender: ReportSender,
   idempotencyBase?: string,
 ): Promise<SendReportEmailsResult> {
-  const links = artifacts.map((a) => new URL(`/report-artifacts/${encodeURIComponent(a)}`, ARTIFACT_LINK_ORIGIN).href).join("\n");
+  // STORY-180 AC3: the files are resolved ONCE, before the first recipient. A file that never reached storage fails the whole
+  // delivery (every recipient counts as failed and nothing is sent) rather than mailing a report with a file missing.
+  let parts: Awaited<ReturnType<typeof resolveMailParts>>;
+  try {
+    parts = await resolveMailParts(plan);
+  } catch (error) {
+    incrementCounter("nominara_reports_mail_artifacts_total", { outcome: "unavailable" });
+    logger.warn({ span: "reports.scheduled.mail_artifacts", outcome: "unavailable", error: error instanceof Error ? error.name : "unknown" });
+    return { sent: 0, failed: report.recipients.length, suppressed: 0 };
+  }
+  incrementCounter("nominara_reports_mail_artifacts_total", { outcome: "ready" });
+  const lines = [`Your report "${report.name}" is ready.`];
+  if (parts.attachments.length > 0) lines.push("", "Attached:", ...parts.attachments.map((a) => `- ${a.filename}`));
+  if (parts.links.length > 0) {
+    lines.push("", `Too large to attach. Download (each link is valid for ${String(REPORT_LINK_TTL_DAYS)} days):`, ...parts.links.map((l) => `- ${l.filename}: ${l.url}`));
+  }
+  const textBody = `${lines.join("\n")}\n`;
   let failed = 0;
   let suppressed = 0;
   for (const to of report.recipients) {
@@ -196,7 +212,8 @@ export async function sendReportEmails(
       await email.send({
         to,
         subject: "Your scheduled Nominara report is ready",
-        textBody: `Your report "${report.name}" is ready:\n${links}\n`,
+        textBody,
+        ...(parts.attachments.length > 0 ? { attachments: parts.attachments } : {}),
         ...(sender.fromName !== undefined ? { fromName: sender.fromName } : {}),
         ...(sender.replyTo !== undefined ? { replyTo: sender.replyTo } : {}),
         ...(idempotencyBase !== undefined ? { idempotencyKey: `${idempotencyBase}:${recipientDigest(to)}` } : {}),
@@ -296,6 +313,8 @@ export interface PreparedRun {
   readonly deliveryId: string;
   readonly recipients: readonly string[];
   readonly artifacts: readonly string[];
+  /** STORY-180: what each artifact travels as (attached or linked). Set by prepare; the run phase refuses a prepared run without it. */
+  readonly mail?: ArtifactMailPlan;
   readonly sender: ReportSender;
   readonly finalAttempt: boolean;
 }
@@ -369,7 +388,7 @@ export async function prepareScheduledRun(tx: ClientBase, deps: ReportRunDeps, i
   await tx.query("SAVEPOINT scheduled_report_build");
   let artifacts: string[];
   try {
-    artifacts = (resuming ? await recordedArtifacts(tx, report, deliveryId) : undefined) ?? (await buildReportArtifacts(deps.exports, report));
+    artifacts = (resuming ? await recordedArtifacts(tx, workspaceId, report, deliveryId) : undefined) ?? (await buildReportArtifacts(deps.exports, report));
     await tx.query("RELEASE SAVEPOINT scheduled_report_build");
   } catch (error) {
     await tx.query("ROLLBACK TO SAVEPOINT scheduled_report_build");
@@ -391,9 +410,12 @@ export async function prepareScheduledRun(tx: ClientBase, deps: ReportRunDeps, i
        WHERE scheduled_report_deliveries.status = 'sending'`,
     [deliveryId, workspaceId, reportId, artifacts[0] ?? null],
   );
+  if (deps.mail === undefined) throw new Error("a scheduled run needs its artifact mail dependencies");
+  const mail = await planArtifactMail(tx, { ...deps.mail, uploaded: (ids) => deps.exports.uploaded(ids) }, workspaceId, artifacts);
   return {
     kind: "send",
     prepared: {
+      mail,
       workspaceId,
       reportId,
       reportName: report.name,
@@ -430,7 +452,8 @@ export interface RunOutcome {
  * outcome is returned and the commit phase settles the period as failed.
  */
 export async function sendPreparedRun(email: EmailSender, prepared: PreparedRun): Promise<RunOutcome> {
-  const result = await sendReportEmails(email, { name: prepared.reportName, recipients: prepared.recipients }, prepared.artifacts, prepared.sender, `scheduled-report/${prepared.deliveryId}`);
+  if (prepared.mail === undefined) throw new Error("a prepared scheduled run carries no artifact plan");
+  const result = await sendReportEmails(email, { name: prepared.reportName, recipients: prepared.recipients }, prepared.mail, prepared.sender, `scheduled-report/${prepared.deliveryId}`);
   if (result.failed > 0 && !prepared.finalAttempt) {
     incrementCounter("nominara_reports_build_attempts_total", { outcome: "retry" });
     throw new ReportSendError(result.failed, prepared.recipients.length);

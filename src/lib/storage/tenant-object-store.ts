@@ -35,6 +35,8 @@ export const MAX_PRESIGN_SECONDS = 604_800;
 
 export interface PresignOptions {
   readonly expiresInSeconds?: number;
+  /** The store answers the GET with `Content-Disposition: attachment` under this name (letters, digits, `.`, `_`, `-` only survive). */
+  readonly downloadFilename?: string;
 }
 
 export interface PutOptions {
@@ -43,6 +45,9 @@ export interface PutOptions {
 }
 
 const logger = new Logger("object-storage");
+
+/** The key `assertReady` signs. It names no workspace and is never read or written. */
+const READINESS_PROBE_KEY = "readiness-probe";
 
 /** A store fixed to ONE workspace at capture time. Obtain it with `TenantObjectStore.bind()` inside the tenant context. */
 export class BoundObjectStore {
@@ -89,7 +94,11 @@ export class BoundObjectStore {
       throw new StorageKeyError("presign lifetime must be a whole number of seconds from 1 to 604800");
     }
     const location = buildObjectLocation(this.keyEnv, workspaceId, namespace, relative);
-    return this.observe("presign", workspaceId, namespace, () => this.port.presignGet(location.bucket, location.key, expiresInSeconds));
+    return this.observe("presign", workspaceId, namespace, () =>
+      options.downloadFilename === undefined
+        ? this.port.presignGet(location.bucket, location.key, expiresInSeconds)
+        : this.port.presignGet(location.bucket, location.key, expiresInSeconds, options.downloadFilename),
+    );
   }
 
   async getStored(namespace: StorageNamespace, stored: string): Promise<Buffer> {
@@ -144,6 +153,15 @@ export class TenantObjectStore {
     private readonly port: ObjectStoragePort,
     private readonly keyEnv: string,
   ) {}
+
+  /**
+   * Readiness: can this process presign at all? Mints a 1-second URL for a fixed key of NO workspace and discards it, so it needs no
+   * tenant context and can run BEFORE a request transaction opens (credential resolution is the only thing that can block). Throws
+   * the port's error (503 `degraded` when storage is not configured).
+   */
+  async assertReady(): Promise<void> {
+    await this.port.presignGet("reports", READINESS_PROBE_KEY, 1);
+  }
 
   /** Captures the CURRENT tenant context's workspace. Call it inside the context; use the result anywhere, later. */
   bind(): BoundObjectStore {

@@ -104,6 +104,19 @@ describe("Resend adapter · request shape", () => {
     expect(f.calls[0]!.body).toMatchObject({ html: "<p>hi</p>", text: MESSAGE.textBody });
   });
 
+  it("STORY-180 AC3 · attachments go as base64 with their content type, and are absent when the message has none", async () => {
+    const fetchFake = fakeFetch([jsonResponse(200, { id: "e1" })]);
+    const { adapter } = make(fetchFake.impl);
+    await adapter.send({ ...MESSAGE, attachments: [{ filename: "r.pdf", content: Buffer.from([0, 255, 37]), contentType: "application/pdf" }] });
+    expect(fetchFake.calls[0]!.body.attachments).toEqual([{ filename: "r.pdf", content: Buffer.from([0, 255, 37]).toString("base64"), content_type: "application/pdf" }]);
+    const plain = fakeFetch([jsonResponse(200, { id: "e2" })]);
+    await make(plain.impl).adapter.send(MESSAGE);
+    expect(plain.calls[0]!.body).not.toHaveProperty("attachments");
+    const empty = fakeFetch([jsonResponse(200, { id: "e3" })]);
+    await make(empty.impl).adapter.send({ ...MESSAGE, attachments: [] });
+    expect(empty.calls[0]!.body).not.toHaveProperty("attachments");
+  });
+
   it("sends an Idempotency-Key header and an X-Entity-Ref-ID body header carrying the same key", async () => {
     const f = fakeFetch([jsonResponse(200, { id: "msg_1" })]);
     await make(f.impl).adapter.send(MESSAGE);

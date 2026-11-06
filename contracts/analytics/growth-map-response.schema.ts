@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { measuredImpactSchema as writtenMeasuredImpactSchema } from "../tasks/task-verification.schema.js";
 import { dataSourceSchema, engineDataSourceSchema } from "./data-source.schema.js";
 
 // STORY-137 — `GET /v1/projects/{id}/growth-map`, `api-specification.md` §7.
@@ -115,16 +116,10 @@ export const growthMapSeriesSchema = z
  * cannot reach a tooltip carrying a delta and no disclaimer, whatever the
  * stored jsonb happens to contain.
  */
-export const measuredImpactSchema = z
-  .object({
-    visibility_before: z.number(),
-    visibility_after_14d: z.number(),
-    delta: z.number(),
-    window_days: z.number().int().positive(),
-    confidence: z.enum(["low", "medium", "high"]),
-    method: z.string().min(1),
-    caveat: z.string().min(1),
-  })
+export const measuredImpactSchema = writtenMeasuredImpactSchema
+  .pick({ visibility_before: true, visibility_after_14d: true, delta: true, window_days: true, confidence: true, method: true })
+  // The READER accepts any non-empty caveat (a future method may say something more specific); the WRITER's is the one constant.
+  .extend({ caveat: z.string().min(1) })
   .strict();
 
 export const milestoneSchema = z

@@ -44,7 +44,7 @@ describe("STORY-178 · sendReportEmails counts a suppression apart from a failur
         if (error !== undefined) throw error;
       },
     };
-    const result = await sendReportEmails(sender, { name: "R", recipients: Object.keys(outcomes) }, ["a1"], {});
+    const result = await sendReportEmails(sender, { name: "R", recipients: Object.keys(outcomes) }, { items: [], store: { get: async () => Buffer.alloc(0), head: async () => ({ contentLength: 0, contentType: null, etag: null, serverSideEncryption: null }) }, uploaded: async () => undefined }, {});
     expect(result).toEqual({ sent: 1, failed: 1, suppressed: 1 });
   });
 });

@@ -108,6 +108,12 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // rebuilds nothing, so it does not widen the destructive/operator-invoked split `maintenance.partition` documents. The owner can move it.
   { queue: "maintenance.integrity", cron: "10 3 * * *", statedAs: "STORY-013 AC6 / AC14 / AC16: nightly orphan scan, purge-failure check, vector-recall check (read-only)" },
 
+  // ⚠ NOT FROM §4 - STORY-180 r5, owner decision 60 (b): stored report files are deleted once their 7-day life has ended, and half-uploaded
+  // ones after a day. THE HOUR IS A CHOICE, NOT A TRANSCRIPTION: 03:30 UTC, between the partition tick (03:20) and the retention purge
+  // (03:40) in the same quiet window, :30 and not :00 for the reason §6.1 gives `capture.plan` :05. The job is network-bound (S3 deletes),
+  // idempotent, and cheap when nothing is due, so a missed night costs a night's delay on a date measured in days. The owner can move it.
+  { queue: "report.cleanup", cron: "30 3 * * *", statedAs: "STORY-180 r5 (owner decision 60 (b)): delete expired and half-uploaded report files daily" },
+
   // ⚠ PERIOD STATED, TIME NOT. Scheduling these needs an hour of the day (and
   // for weekly, a day) that no reference gives. Left null deliberately — see
   // this file's header. `maintenance.partition` was here until STORY-142; it

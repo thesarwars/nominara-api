@@ -56,6 +56,14 @@ function prefixFor(keyEnv: string, workspaceId: string, namespace: StorageNamesp
   return namespace === "crawl" ? `crawl/${keyEnv}/${workspaceId}/` : `${keyEnv}/${workspaceId}/`;
 }
 
+/**
+ * `{env}/{workspace_id}/` (or `crawl/{env}/{workspace_id}/`): the whole of one workspace's namespace. For the PURGE path only
+ * (workspace-purge.ts); a feature builds object keys through `buildObjectLocation`, which always appends a validated relative part.
+ */
+export function workspacePrefix(keyEnv: string, workspaceId: string, namespace: StorageNamespace): string {
+  return prefixFor(keyEnv, workspaceId, namespace);
+}
+
 function bucketFor(namespace: StorageNamespace): StorageBucketName {
   return namespace === "reports" ? "reports" : "raw";
 }

@@ -53,6 +53,8 @@ export interface PlanRunContext {
   readonly planKey: string;
   /** `all` for a scheduled run, or the priority subset. */
   readonly scope: PromptScope;
+  /** STORY-067: the prompt cluster a `cluster` scope covers. */
+  readonly clusterId?: string;
   /** Narrows the engine set; can never widen it past the entitlement. */
   readonly engineKeys?: readonly string[];
   /**

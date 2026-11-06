@@ -74,6 +74,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "subscriptions",
   "support_grants",
   "task_events",
+  "task_verifications",
   "tasks",
   "tool_runs",
   "topic_clusters",

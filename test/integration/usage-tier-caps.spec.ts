@@ -320,6 +320,61 @@ describe("STORY-070 · the non-credit tier-cap lifecycle", () => {
     expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(10);
   });
 
+  it("STORY-180 r6 · a RELEASED reservation is re-taken by a retry under the same job id (capped and counted again), and a committed one is still a replay", async () => {
+    await setCounter("pdf_exports", 1);
+    const take = () => reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 1, jobId: "j1" });
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: false });
+    expect(await releaseTierCap(db, workspaceId, "pdf_exports", "j1")).toBe(true);
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: false });
+    expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(1);
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: true });
+    expect(await commitTierCap(db, workspaceId, "pdf_exports", "j1")).toBe(true);
+    expect(await take()).toMatchObject({ ok: true, alreadyHeld: true });
+    expect(await readCounter(db, workspaceId, "pdf_exports", PERIOD)).toEqual({ limitValue: 1, usedValue: 1, reservedValue: 0 });
+  });
+
+  it("STORY-180 r7 · 20 concurrent callers re-taking ONE released job id add exactly one unit and leave one reservation row (reserveTierCap takes the lock itself, no provisioning first)", async () => {
+    await setCounter("pdf_exports", 25);
+    const first = await reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 1, jobId: "same" });
+    expect(first).toMatchObject({ ok: true, alreadyHeld: false });
+    expect(await releaseTierCap(db, workspaceId, "pdf_exports", "same")).toBe(true);
+    expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(0);
+
+    // Each caller is a request: its own transaction, so the row lock taken by reserveTierCap is held until that caller commits.
+    const outcomes = await Promise.all(
+      Array.from({ length: 20 }, async () => {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const outcome = await reserveTierCap(client, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 1, jobId: "same" });
+          await client.query("COMMIT");
+          return outcome;
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      }),
+    );
+
+    expect(outcomes.filter((o) => o.ok && !o.alreadyHeld)).toHaveLength(1);
+    expect(outcomes.filter((o) => o.ok && o.alreadyHeld)).toHaveLength(19);
+    expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(1);
+    const rows = await db.query("SELECT state FROM usage_reservations WHERE workspace_id = $1 AND job_id = 'same'", [workspaceId]);
+    expect(rows.rows).toEqual([{ state: "reserved" }]);
+  });
+
+  it("STORY-180 r6 · a released reservation retried at an exhausted ceiling is REFUSED, not waved through as a replay", async () => {
+    await setCounter("pdf_exports", 1);
+    const take = (jobId: string) => reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 1, jobId });
+    await take("j1");
+    await releaseTierCap(db, workspaceId, "pdf_exports", "j1");
+    await take("j2");
+    expect(await take("j1")).toEqual({ ok: false });
+    expect((await readCounter(db, workspaceId, "pdf_exports", PERIOD))!.reservedValue).toBe(1);
+  });
+
   it("a committed reservation cannot then be released", async () => {
     await setCounter("pdf_exports", 25);
     await reserveTierCap(db, { workspaceId, metric: "pdf_exports", periodStart: PERIOD, quantity: 3, jobId: "j1" });

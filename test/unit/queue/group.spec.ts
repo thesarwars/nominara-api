@@ -41,6 +41,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "task.resurface",
     // STORY-013 AC6 / AC14 / AC16 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "maintenance.integrity",
+    // STORY-180 r5 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "report.cleanup",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],

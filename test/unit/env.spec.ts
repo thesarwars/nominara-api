@@ -128,6 +128,14 @@ describe("STORY-022 · env validation — refuses to start on missing/malformed 
     expect(() => loadEnv(rest)).toThrow(/DATABASE_URL/);
   });
 
+  it("STORY-067 AC12 · a long verification horizon that is not after the short one refuses the boot, naming the key", () => {
+    expect(() => loadEnv({ ...VALID, TASK_VERIFICATION_SHORT_HOURS: "400", TASK_VERIFICATION_LONG_DAYS: "14" })).toThrow(/TASK_VERIFICATION_LONG_DAYS/);
+    expect(() => loadEnv({ ...VALID, TASK_VERIFICATION_SHORT_HOURS: "24", TASK_VERIFICATION_LONG_DAYS: "7" })).not.toThrow();
+    // Only one set: it is compared with the documented default of the other.
+    expect(() => loadEnv({ ...VALID, TASK_VERIFICATION_LONG_DAYS: "1" })).toThrow(/TASK_VERIFICATION_LONG_DAYS/);
+    expect(() => loadEnv({ ...VALID })).not.toThrow();
+  });
+
   it("an EMPTY STRING required var throws, naming that exact key", () => {
     expect(() => loadEnv({ ...VALID, DATABASE_URL_POOLED: "" })).toThrow(/DATABASE_URL_POOLED/);
   });

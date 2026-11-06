@@ -91,7 +91,8 @@ describe("STORY-064-D · complete / realtime publish — real SQL", () => {
     const t = await create(CTX(ws, actor), p, { title: "Ship FAQ" });
     const out = await complete(CTX(ws, actor), t.id);
     expect(completeTaskResponseSchema.parse(out)).toEqual(out);
-    expect(out.verification).toBeNull();
+    // STORY-067: completing schedules the +48h / +14d re-measurements (the scheduler's own spec asserts the rows).
+    expect(out.verification).toEqual({ at_48h: expect.any(String), at_14d: expect.any(String) });
     expect(out.task).toMatchObject({ id: t.id, status: "done" });
     expect(out.task.completed_at).not.toBeNull();
     const row = (await client.query(`SELECT status, completed_at, completed_by, milestone_id FROM tasks WHERE id = $1`, [t.id])).rows[0]!;

@@ -45,6 +45,29 @@ function firstHeaderValue(value: string | string[] | undefined): string | null {
   return value ?? null;
 }
 
+/** Who made the request, as an audit row records it. */
+export interface RequestAuditActor {
+  readonly actorType: "user" | "api_key" | "support";
+  readonly supportGrantId: string | null;
+  readonly requestId: string;
+  readonly ip: string | null;
+  readonly ua: string | null;
+}
+
+/**
+ * The ONE mapping from a request to its audit actor. `writeAuditRow` uses it, and so does any later row written for the same request
+ * after the interceptor's own (STORY-180 r7: ExportService's outcome row), so the two can never name different actors.
+ */
+export function requestAuditActorOf(req: AuditableRequest): RequestAuditActor {
+  return {
+    actorType: req.supportGrant ? "support" : req.authMethod === "apiKey" ? "api_key" : "user",
+    supportGrantId: req.supportGrant?.id ?? null,
+    requestId: req.id !== undefined ? String(req.id) : "",
+    ip: req.ip ?? null,
+    ua: firstHeaderValue(req.headers["user-agent"]),
+  };
+}
+
 // qa-reviewer blocking finding 2: resource_id is a `uuid` column
 // (audit_log.resource_id). Any string that reaches AuditChainService.append
 // as resourceId is bound straight into that column — a non-UUID value
@@ -224,20 +247,21 @@ export class AuditInterceptor implements NestInterceptor {
     }
 
     const resourceId = resolveResourceId(req, options, responseBody);
+    const actor = requestAuditActorOf(req);
 
     await this.auditChain.append(store.client, {
       workspaceId: store.context.workspaceId,
-      actorType: req.supportGrant ? "support" : req.authMethod === "apiKey" ? "api_key" : "user",
+      actorType: actor.actorType,
       actorId: store.context.actorId,
-      actorIp: req.ip ?? null,
-      actorUa: firstHeaderValue(req.headers["user-agent"]),
+      actorIp: actor.ip,
+      actorUa: actor.ua,
       action: resolveAction(options, responseBody),
       resourceType: options.resourceType,
       resourceId,
       beforeState: req.auditBeforeState ?? null,
       afterState: (options.afterState !== undefined ? options.afterState(responseBody) : responseBody) ?? null,
-      requestId: req.id !== undefined ? String(req.id) : "",
-      supportGrantId: req.supportGrant?.id ?? null,
+      requestId: actor.requestId,
+      supportGrantId: actor.supportGrantId,
       severity: options.severity ?? "info",
     });
   }

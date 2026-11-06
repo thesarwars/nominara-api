@@ -135,6 +135,7 @@ export interface TaskEvidenceRefresh {
 
 /** schemas/tasks-and-goals.md: a dismissed task re-surfaces after 180 days. */
 export const TASK_RESURFACE_DAYS = 180;
+import { scheduleTaskVerifications } from "../../lib/impact/verification-schedule.js";
 import { afterCommit, currentTenantStore } from "../../tenancy/tenant-context.js";
 import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 
@@ -825,9 +826,10 @@ export class TasksService {
    * the loser sees `done` and gets the 409 — one milestone, never two.
    *
    * `baseline_metrics` is NOT written: it was captured at CREATION (the before
-   * must predate the work). Nothing here re-measures — `verification` is null
-   * until STORY-067's scheduler exists, rather than a promise this code
-   * cannot keep.
+   * must predate the work). Nothing here re-measures: STORY-067 SCHEDULES the
+   * +48h / +14d verifications in this transaction (`verification` carries their
+   * due times) and the capture sweep runs them. A seeding task is scheduled when
+   * its URL verifies (lib/sources/verify-submission.ts).
    *
    * A `done` or `dismissed` task is a 409 carrying `current_state`.
    *
@@ -902,6 +904,8 @@ export class TasksService {
        VALUES (app.current_workspace(), $1, $2, 'user', 'completed', $3, 'done', clock_timestamp())`,
       [taskId, actorId, current.status],
     );
+    // STORY-067 AC1 - the two re-measurements are scheduled in THIS transaction, so a completion and its schedule commit together.
+    const verification = await scheduleTaskVerifications(client, { taskId, milestoneId: pinned.id, completedAt: pinned.occurred_at });
     await refreshProjectTaskCounts(client, current.project_id);
 
     incrementCounter("nominara_tasks_events_written_total", { event: "completed" });
@@ -913,7 +917,7 @@ export class TasksService {
     return {
       task: await this.readTask(client, taskId),
       milestone: { id: pinned.id, kind: "task_completed", occurred_at: pinned.occurred_at.toISOString() },
-      verification: null,
+      verification,
     };
   }
 

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { engineKeySchema } from "../lib/engines/contract.js";
 import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS, REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS } from "../lib/auth/refresh-token.js";
+import { DEFAULT_VERIFICATION_LONG_DAYS, DEFAULT_VERIFICATION_SHORT_HOURS } from "../../contracts/tasks/task-verification.schema.js";
 
 // STORY-022-E-4 — configuration validation lives here, as zod (already a
 // dependency), NOT Joi/class-validator/@nestjs/config. coding-standards.md
@@ -440,6 +441,9 @@ export const envSchema = z
     // Which embedding provider this process runs. `auto` (default) = OPENAI_API_KEY ? OpenAI : stand-in (refusing in production). `openrouter`
     // = the free nvidia/nemotron-3.5-embed-1b:free at 1536 dimensions, DEVELOPMENT ONLY. Having an OPENROUTER_API_KEY never selects it by itself.
     EMBEDDING_PROVIDER: z.enum(["auto", "stand-in", "openrouter", "openai"]).default("auto"),
+    // STORY-067 - the two verification horizons after a task completes. UNSET = the documented defaults (+48 h, +14 d).
+    TASK_VERIFICATION_SHORT_HOURS: z.coerce.number().int().positive().optional(),
+    TASK_VERIFICATION_LONG_DAYS: z.coerce.number().int().positive().optional(),
     // Conservative pace for the OpenRouter free embedding tier (the vendor allows 20 a minute, and a daily cap on an account with no credit).
     OPENROUTER_EMBED_REQUESTS_PER_MINUTE: z.coerce.number().positive().default(10),
     // Owner decision 42 - the pace the capture dispatcher holds EACH of chatgpt / claude / perplexity to (a one-token bucket per engine,
@@ -545,6 +549,17 @@ export const envSchema = z
             "DATABASE_URL must be the direct Postgres connection, not the pgBouncer pooler (a session advisory lock cannot survive transaction pooling); the pooler belongs in DATABASE_URL_POOLED.",
         });
       }
+    }
+    // STORY-067 AC12 - the long verification horizon must come AFTER the short one. Checked here so a misconfiguration stops the boot,
+    // rather than failing every task completion later. An unset one is compared as its documented default.
+    const shortHours = env.TASK_VERIFICATION_SHORT_HOURS ?? DEFAULT_VERIFICATION_SHORT_HOURS;
+    const longDays = env.TASK_VERIFICATION_LONG_DAYS ?? DEFAULT_VERIFICATION_LONG_DAYS;
+    if (longDays * 24 <= shortHours) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["TASK_VERIFICATION_LONG_DAYS"],
+        message: "TASK_VERIFICATION_LONG_DAYS must be later than TASK_VERIFICATION_SHORT_HOURS (the +14 d re-measurement must follow the +48 h one).",
+      });
     }
     if (env.NODE_ENV === "production" && env.ENGINE_SIMULATION === "openrouter-free") {
       ctx.addIssue({

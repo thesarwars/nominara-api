@@ -1,7 +1,9 @@
 import {
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectVersionsCommand,
   PutObjectCommand,
   S3Client,
   S3ServiceException,
@@ -10,7 +12,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Logger } from "@nestjs/common";
 import { DegradedError, NotFoundError } from "../../api/errors/domain-errors.js";
 import type { StorageConfig } from "./storage-config.js";
-import type { ObjectHead, ObjectStoragePort, PutObjectRequest, StorageBucketName } from "./storage.port.js";
+import type { ObjectHead, ObjectStoragePort, PrefixDeletingPort, PutObjectRequest, StorageBucketName } from "./storage.port.js";
 
 // Group C item 3 - the S3 adapter. One adapter for AWS S3 and LocalStack alike: the difference is `endpoint`,
 // `forcePathStyle` and the credentials, all from StorageConfig.
@@ -38,7 +40,7 @@ function isMissing(error: unknown): boolean {
 export const S3_REQUEST_TIMEOUT_MS = 20_000;
 export const S3_CONNECTION_TIMEOUT_MS = 3_000;
 
-export class S3Adapter implements ObjectStoragePort {
+export class S3Adapter implements ObjectStoragePort, PrefixDeletingPort {
   private readonly client: S3Client;
 
   constructor(
@@ -96,8 +98,41 @@ export class S3Adapter implements ObjectStoragePort {
     await this.send(() => this.client.send(new DeleteObjectCommand({ Bucket: this.bucketName(bucket), Key: key })));
   }
 
-  async presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number): Promise<string> {
-    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: key }), { expiresIn: expiresInSeconds });
+  /**
+   * Deletes every version and delete marker under `prefix` (STORY-182's AC1: a purge leaves no recoverable copy in a versioned bucket).
+   * Lists versions page by page and deletes each page in batches of at most 1000 (the DeleteObjects limit). A per-object error fails the
+   * call: a purge must never be reported complete over objects that remain. Idempotent: a re-run after a partial failure finishes the job.
+   */
+  async deletePrefix(bucket: StorageBucketName, prefix: string): Promise<number> {
+    // Never a whole bucket, and never a partial path segment ("inttest/ws1" would also match "inttest/ws10/...").
+    if (prefix.length < 2 || !prefix.endsWith("/")) throw new Error("deletePrefix needs a non-empty prefix ending in /");
+    const Bucket = this.bucketName(bucket);
+    let removed = 0;
+    let keyMarker: string | undefined;
+    let versionIdMarker: string | undefined;
+    for (;;) {
+      const page = await this.send(() =>
+        this.client.send(new ListObjectVersionsCommand({ Bucket, Prefix: prefix, ...(keyMarker !== undefined ? { KeyMarker: keyMarker } : {}), ...(versionIdMarker !== undefined ? { VersionIdMarker: versionIdMarker } : {}) })),
+      );
+      const targets = [...(page.Versions ?? []), ...(page.DeleteMarkers ?? [])].flatMap((v) => (v.Key === undefined ? [] : [{ Key: v.Key, ...(v.VersionId !== undefined ? { VersionId: v.VersionId } : {}) }]));
+      for (let i = 0; i < targets.length; i += 1000) {
+        const batch = targets.slice(i, i + 1000);
+        const out = await this.send(() => this.client.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: batch, Quiet: true } })));
+        if ((out.Errors?.length ?? 0) > 0) {
+          logger.error({ span: "storage.s3_error", error: "DeleteObjectsPartial", failed: out.Errors?.length });
+          throw new DegradedError({ message: "object storage is unavailable" });
+        }
+        removed += batch.length;
+      }
+      if (page.IsTruncated !== true) return removed;
+      keyMarker = page.NextKeyMarker;
+      versionIdMarker = page.NextVersionIdMarker;
+    }
+  }
+
+  async presignGet(bucket: StorageBucketName, key: string, expiresInSeconds: number, downloadFilename?: string): Promise<string> {
+    const disposition = downloadFilename === undefined ? undefined : `attachment; filename="${downloadFilename.replace(/[^A-Za-z0-9._-]/g, "_")}"`;
+    return getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.bucketName(bucket), Key: key, ResponseContentDisposition: disposition }), { expiresIn: expiresInSeconds });
   }
 
   private bucketName(bucket: StorageBucketName): string {

@@ -144,6 +144,10 @@ export type ReservationOutcome =
  * quantity under an id it already used is asking for something this shape
  * cannot give, and should find that out.
  *
+ * A RELEASED reservation is not a held one (STORY-180 r6). A release gives the capacity back, so a retry under the same job id must
+ * take it again - capped and counted - rather than be waved through as a replay that holds nothing. The ON CONFLICT re-opens the
+ * settled row (only a released row can conflict here: the `bumped` predicate already excludes reserved and committed ones).
+ *
  * An UNLIMITED ceiling still takes this path and still increments. It is a
  * ceiling that never binds, not a counter that stops counting — and the
  * internal-cost view exists precisely for the accounts too large to cap.
@@ -175,6 +179,16 @@ export async function reserveTierCap(tx: ClientBase, request: ReservationRequest
     return row === undefined ? { ok: false } : { ok: true, remaining: numberOrNull(row.remaining), alreadyHeld: false };
   }
 
+  // THE LOCK IS TAKEN HERE, as its own statement, and the CTE below starts only after it is held (STORY-180 r7). Without it the CTE's
+  // `NOT EXISTS` reads the reservation row from the snapshot taken when the statement STARTED; a caller that waited on the counter row's
+  // lock still sees the row as `released`, so N concurrent callers re-taking one released job id would all bump the counter. A second
+  // statement in READ COMMITTED takes a fresh snapshot after the lock is granted, so it sees what the previous holder committed.
+  // The lock lasts to the end of the CALLER'S transaction: call this inside one (a request's, a job's), never in autocommit.
+  await tx.query(
+    "SELECT 1 FROM usage_counters WHERE workspace_id = $1 AND metric = $2 AND period_start = $3 FOR UPDATE",
+    [workspaceId, metric, periodStart],
+  );
+
   const result = await tx.query<{ remaining: string | null; already_held: boolean }>(
     `WITH bumped AS (
        UPDATE usage_counters
@@ -182,12 +196,15 @@ export async function reserveTierCap(tx: ClientBase, request: ReservationRequest
         WHERE workspace_id = $1 AND metric = $2 AND period_start = $3
           AND (limit_value = $5 OR used_value + reserved_value + $4 <= limit_value)
           AND NOT EXISTS (SELECT 1 FROM usage_reservations r
-                           WHERE r.workspace_id = $1 AND r.metric = $2 AND r.job_id = $6)
+                           WHERE r.workspace_id = $1 AND r.metric = $2 AND r.job_id = $6 AND r.state <> 'released')
       RETURNING CASE WHEN limit_value = $5 THEN NULL
                      ELSE limit_value - (used_value + reserved_value) END AS remaining
      ), claimed AS (
        INSERT INTO usage_reservations (workspace_id, metric, job_id, period_start, quantity)
        SELECT $1, $2, $6, $3, $4 FROM bumped
+       ON CONFLICT (workspace_id, metric, job_id)
+       DO UPDATE SET state = 'reserved', settled_at = NULL, period_start = EXCLUDED.period_start, quantity = EXCLUDED.quantity, created_at = now()
+       WHERE usage_reservations.state = 'released'
        RETURNING job_id
      )
      SELECT (SELECT remaining FROM bumped) AS remaining,
@@ -207,7 +224,7 @@ export async function reserveTierCap(tx: ClientBase, request: ReservationRequest
   // apart by whether the row exists, not by guessing — a refusal reported as a
   // replay would let a run proceed past an exhausted cap.
   const held = await tx.query(
-    "SELECT 1 FROM usage_reservations WHERE workspace_id = $1 AND metric = $2 AND job_id = $3",
+    "SELECT 1 FROM usage_reservations WHERE workspace_id = $1 AND metric = $2 AND job_id = $3 AND state <> 'released'",
     [workspaceId, metric, jobId],
   );
   return (held.rowCount ?? 0) > 0 ? { ok: true, remaining: null, alreadyHeld: true } : { ok: false };

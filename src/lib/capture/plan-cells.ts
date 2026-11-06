@@ -9,7 +9,7 @@ import { captureReadyEngineKeys } from "../engines/registry.js";
 // and what survives is dispatched.
 
 /** §5: a run covers all active prompts, or the priority subset. */
-export type PromptScope = "all" | "priority";
+export type PromptScope = "all" | "priority" | "cluster";
 
 export interface PlannedCell {
   readonly promptId: string;
@@ -137,6 +137,8 @@ export async function selectPrompts(
   tx: ClientBase,
   projectId: string,
   scope: PromptScope,
+  /** STORY-067: required by (and only read for) the `cluster` scope - a verification run covers the task's cluster, not the project. */
+  clusterId: string | null = null,
 ): Promise<{ id: string; text: string }[]> {
   const result = await tx.query<{ id: string; text: string }>(
     `
@@ -144,13 +146,15 @@ export async function selectPrompts(
       FROM tracked_prompts
      WHERE project_id = $1
        AND status = 'active'
-       AND ($2 = 'all' OR is_priority)
+       AND CASE $2 WHEN 'priority' THEN is_priority
+                   WHEN 'cluster' THEN cluster_id = $3::uuid
+                   ELSE true END
      ORDER BY is_priority DESC, created_at ASC, id ASC
      LIMIT CASE WHEN $2 = 'priority'
                 THEN (SELECT priority_prompt_limit FROM projects WHERE id = $1)
                 ELSE NULL END
     `,
-    [projectId, scope],
+    [projectId, scope, clusterId],
   );
   return result.rows;
 }

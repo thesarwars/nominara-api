@@ -45,6 +45,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "task.resurface",
     // STORY-013 AC6 / AC14 / AC16 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "maintenance.integrity",
+    // STORY-180 r5 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "report.cleanup",
   ],
   report: ["report.build"],
   deploy: ["deploy.cms"],
@@ -298,6 +300,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
   it.each([
     ["credit.housekeeping", "30 2 * * *", 2, 30],
     ["retention.purge", "40 3 * * *", 3, 40],
+    ["report.cleanup", "30 3 * * *", 3, 30],
   ] as const)("⚠ WORKER_GROUP=rollup schedules %s at %s UTC", async (queue, pattern, hour, minute) => {
     // STORY-076 AC4 / STORY-071 AC10 / STORY-077 R4: a handler and a cron are worth nothing if the boot does not
     // register the repeatable. `retention.purge` is SCHEDULED and a no-op until RETENTION_PURGE_ENABLED=true.

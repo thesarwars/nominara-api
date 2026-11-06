@@ -32,6 +32,7 @@ import { assertIso29MaintenanceExecuteEffective, iso29Breaker } from "./iso-29-m
 import { assertIso30MaintenanceExecuteAdminOnly, iso30Breaker } from "./iso-30-maintenance-execute-admin-only.js";
 import { assertIso28DefinerOwnerHoldsNoRoles, iso28Breaker } from "./iso-28-definer-owner-holds-no-roles.js";
 import { assertIso27MaintenanceDefinerShape, iso27Breaker } from "./iso-27-maintenance-definer-shape.js";
+import { assertIso31ReportLinkTokenIsolation, iso31Breaker } from "./iso-31-report-link-token-isolation.js";
 
 // STORY-012 — the single place every registered assertion AND its paired
 // breaker are aggregated. test/isolation/meta/breaker-matrix.spec.ts (T27)
@@ -216,6 +217,9 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   { id: "ISO-29", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso29MaintenanceExecuteEffective, assertUnderBreaker: assertIso29MaintenanceExecuteEffective, breaker: iso29Breaker },
   // STORY-013 r5 — the same effective-EXECUTE check, broken by an ADMIN-only membership (no INHERIT, no SET).
   { id: "ISO-30", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso30MaintenanceExecuteAdminOnly, assertUnderBreaker: assertIso30MaintenanceExecuteAdminOnly, breaker: iso30Breaker },
+  // STORY-180 r5 (owner decision 60) - a report-link token never serves another workspace's object; a foreign, expired or revoked token is
+  // refused. readOnly: false - it inserts probe rows (removed in finally) with the superuser, so it is outside the staging read-only subset.
+  { id: "ISO-31", needsDatabase: true, readOnly: false, needsFixture: true, assert: assertIso31ReportLinkTokenIsolation, assertUnderBreaker: assertIso31ReportLinkTokenIsolation, breaker: iso31Breaker },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,

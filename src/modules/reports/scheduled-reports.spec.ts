@@ -4,6 +4,7 @@ import { createScheduledReportRequestSchema } from "../../../contracts/reports/i
 import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
 import { AUDIT_METADATA_KEY } from "../../api/decorators/audit.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../../api/decorators/require-permission.decorator.js";
+import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import * as tierCaps from "../../lib/usage/tier-caps.js";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { ScheduledReportsController } from "./scheduled-reports.controller.js";
@@ -23,6 +24,8 @@ vi.mock("../../lib/usage/tier-caps.js", async (orig) => ({
   readCounter: vi.fn(async () => ({ limitValue: 10, usedValue: 10, reservedValue: 0 })),
 }));
 
+applyFakeApiEnv();
+
 const WS = "0190aaaa-0000-7000-8000-000000000001";
 const P1 = "0190aaaa-0000-7000-8000-0000000000a1";
 const P2 = "0190aaaa-0000-7000-8000-0000000000a2";
@@ -40,7 +43,7 @@ interface Harness {
   service: ScheduledReportsService;
   sql: Array<{ text: string; params: unknown[] }>;
   exportCalls: Array<{ projectId: string; body: Record<string, unknown>; key: unknown }>;
-  sent: Array<{ to: string; subject: string; textBody: string }>;
+  sent: Array<{ to: string; subject: string; textBody: string; attachments?: Array<{ filename: string; content: Buffer }> }>;
   /** Runs the afterCommit tasks the request registered (i.e. "the transaction committed") and waits for the delivery to finish. */
   commit(): Promise<void>;
   /** The registered afterCommit tasks (for a test that drives timing itself). */
@@ -50,7 +53,7 @@ interface Harness {
   email: { send: ReturnType<typeof vi.fn>; delivers?: boolean };
 }
 
-function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>>; delivers?: boolean; failFor?: string[]; replay?: boolean; poolFails?: boolean; poolHangs?: boolean; finalizeThrows?: Error } = {}): Harness {
+function harness(opts: { artifactBytes?: number; pdfCap?: unknown; row?: Record<string, unknown>; exportFails?: boolean; projects?: string[]; deliveries?: Array<Record<string, unknown>>; delivers?: boolean; failFor?: string[]; replay?: boolean; poolFails?: boolean; poolHangs?: boolean; finalizeThrows?: Error } = {}): Harness {
   const sql: Harness["sql"] = [];
   const exportCalls: Harness["exportCalls"] = [];
   const sent: Harness["sent"] = [];
@@ -59,6 +62,9 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
     if (text.includes("FROM workspaces")) return { rows: [{ timezone: "UTC" }] };
     if (text.includes("FROM projects")) return { rows: (opts.projects ?? [P1, P2]).map((id) => ({ id })) };
     if (text.includes("FROM brand_themes")) return { rows: [] };
+    if (text.includes("FROM report_artifacts")) {
+      return { rows: (params[0] as string[]).map((id) => ({ id, format: "pdf", bytes: opts.artifactBytes ?? 1000, period_end: "2026-10-31" })) };
+    }
     if (text.includes("FROM scheduled_report_deliveries")) return { rows: opts.deliveries ?? [] };
     if (text.includes("FROM scheduled_reports")) return { rows: [opts.row ?? reportRow()] };
     return { rows: [], rowCount: 1 };
@@ -77,10 +83,12 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
       if (opts.exportFails) throw new Error("render exploded");
       return { export_id: `0190aaaa-0000-7000-8000-00000000c${exportCalls.length}0`, format: body.format };
     }),
+    uploaded: vi.fn(async () => undefined),
   };
+  const objects = { bind: () => ({ get: async (_ns: string, relative: string) => Buffer.from(`file:${relative}`), head: async () => ({ contentLength: 1 }) }) };
   const email: Harness["email"] = {
     ...(opts.delivers === undefined ? {} : { delivers: opts.delivers }),
-    send: vi.fn(async (m: { to: string; subject: string; textBody: string }) => {
+    send: vi.fn(async (m: Harness["sent"][number]) => {
       if (opts.failFor?.includes(m.to)) throw new Error("provider down");
       sent.push(m);
     }),
@@ -101,7 +109,7 @@ function harness(opts: { pdfCap?: unknown; row?: Record<string, unknown>; export
       return Promise.resolve(finalClient);
     }),
   };
-  const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never, pool as never);
+  const service = new ScheduledReportsService(resolver as never, usage as never, exports as never, email as never, pool as never, objects as never);
   return {
     service, sql, exportCalls, sent, email, tasks: afterCommitTasks, release: finalClient.release, arriveLate: () => arrive(finalClient),
     async commit() {
@@ -163,18 +171,39 @@ describe("NEW-E-100c · STORY-100 send-now", () => {
     expect(tierCaps.commitTierCap).not.toHaveBeenCalled();
   });
 
-  it("AC3 · delivery goes through the EmailSender port with a link to the artifact, and is recorded 'logged', never 'delivered', for a sender that delivers to nobody", async () => {
+  it("AC3 · delivery goes through the EmailSender port with the file ATTACHED (8 MiB or less), and is recorded 'logged', never 'delivered', for a sender that delivers to nobody", async () => {
     const h = harness();
     const out = await h.service.sendNow(REPORT_ID);
     expect(h.sent).toHaveLength(0); // nothing is sent until the transaction has committed
     await h.commit();
     expect(h.sent.map((m) => m.to)).toEqual(["a@example.test", "b@example.test"]);
-    expect(h.sent[0]!.textBody).toContain("0190aaaa-0000-7000-8000-00000000c10");
-    // The link is a URL, not a storage key: pinned whole so a restructure cannot change what recipients receive.
-    expect(h.sent[0]!.textBody).toContain("https://app.nominara.com/report-artifacts/0190aaaa-0000-7000-8000-00000000c10\n");
+    // STORY-180: the bytes come from the reports bucket; there is no link for a small file and no app-origin link at all.
+    expect(h.sent[0]!.attachments!.map((a) => a.content.toString())).toEqual(["file:0190aaaa-0000-7000-8000-00000000c10.pdf", "file:0190aaaa-0000-7000-8000-00000000c20.pdf"]);
+    expect(h.sent[0]!.textBody).not.toContain("report-artifacts");
+    expect(h.sent[0]!.textBody).not.toContain("report-links");
+    expect(h.sql.some((s) => /UPDATE report_artifacts SET link_token_hash/.test(s.text))).toBe(false);
     expect(out.status).toBe("sending");
     const final = h.sql.find((s) => /UPDATE scheduled_report_deliveries SET status/.test(s.text))!;
     expect(final.params.slice(1)).toEqual(["logged", null, 2]);
+  });
+
+  it("STORY-180 AC3 · a file over 8 MiB is a 7-day link whose token hash is stored in the request transaction, and is not attached", async () => {
+    const h = harness({ artifactBytes: 8_388_609 });
+    await h.service.sendNow(REPORT_ID);
+    // Stored BEFORE the commit (it is in the request's transaction), one per artifact.
+    expect(h.sql.filter((s) => /UPDATE report_artifacts SET link_token_hash/.test(s.text))).toHaveLength(2);
+    await h.commit();
+    expect(h.sent[0]!.attachments ?? []).toHaveLength(0);
+    expect(h.sent[0]!.textBody).toContain(`/v1/report-links/${WS}/`);
+    expect(h.sent[0]!.textBody).toContain("7 days");
+  });
+
+  it("STORY-180 AC3 · files totalling exactly 8 MiB are still attached (two of 4 MiB)", async () => {
+    const h = harness({ artifactBytes: 4_194_304 });
+    await h.service.sendNow(REPORT_ID);
+    await h.commit();
+    expect(h.sent[0]!.attachments).toHaveLength(2);
+    expect(h.sent[0]!.textBody).not.toContain("report-links");
   });
 
   it("a sender that really delivers (Resend) finishes `delivered`", async () => {

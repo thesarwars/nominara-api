@@ -21,6 +21,12 @@ import { hashEmailKey, normalizeEmail } from "../../src/lib/auth/email-otp.js";
 import type { SuppressionKind, SuppressionStore } from "../../src/lib/email/suppression-store.js";
 import { SuppressingEmailSender } from "../../src/modules/identity/adapters/suppressing-email-sender.js";
 import type { EmailMessage, EmailSender } from "../../src/modules/identity/ports/email-sender.js";
+import { S3Adapter } from "../../src/lib/storage/s3.adapter.js";
+import { resolveStorageConfig } from "../../src/lib/storage/storage-config.js";
+import { TenantObjectStore } from "../../src/lib/storage/tenant-object-store.js";
+import { mailDepsFromEnv } from "../../src/lib/reports/report-artifact-mail.js";
+import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
+import { reportStorageEnv } from "../support/report-storage-env.js";
 import { TEST_SIGNING_KEYS } from "../support/queue-test-harness.js";
 
 // STORY-100 AC5 / AC8 / AC9 / AC10 / AC12 — the CADENCE path of a scheduled report: the sweep that finds a due report, and
@@ -39,6 +45,19 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
   let appDb: Client;
   let appPool: Pool;
   let sweepDb: Client;
+  let localstack: LocalstackFixture;
+  /** STORY-180: the worker's environment - the reports bucket on LocalStack, and the two values a report link is built from. */
+  const workerEnv = (): Record<string, string> => ({
+    NODE_ENV: "test",
+    ...reportStorageEnv(localstack.endpoint),
+    OAUTH_REDIRECT_BASE_URL: "http://localhost:3000",
+    QUEUE_JOB_SIGNING_KEY: Buffer.alloc(32, 1).toString("base64"),
+  });
+  const objectStore = (): TenantObjectStore => {
+    const config = resolveStorageConfig(workerEnv() as never);
+    if (config === null) throw new Error("storage config unexpectedly null");
+    return new TenantObjectStore(new S3Adapter(config), config.keyEnv);
+  };
 
   const connect = async (user = "nominara", password = "nominara"): Promise<Client> => {
     const client = new Client({ host: container.getHost(), port: container.getMappedPort(5432), database: container.getDatabase(), user, password });
@@ -47,7 +66,10 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
   };
 
   beforeAll(async () => {
-    container = await new PostgreSqlContainer("pgvector/pgvector:pg18").withDatabase("nominara_test").withUsername("nominara").withPassword("nominara").start();
+    [container, localstack] = await Promise.all([
+      new PostgreSqlContainer("pgvector/pgvector:pg18").withDatabase("nominara_test").withUsername("nominara").withPassword("nominara").start(),
+      startLocalstack(),
+    ]);
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
     await migrateUp(db);
@@ -62,6 +84,7 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
     await appPool.end();
     await Promise.all([appDb.end(), sweepDb.end(), db.end()]);
     await container.stop();
+    await localstack.stop();
   });
 
   beforeEach(async () => {
@@ -140,7 +163,7 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
     return createJobProcessor(ENTRY, {
       keys: TEST_SIGNING_KEYS,
       getClient: () => appDb,
-      process: createReportBuildHandler({ pool: appPool, env: {} } as unknown as QueueHandlerContext, { sender, ...(run !== undefined ? { run } : {}) }),
+      process: createReportBuildHandler({ pool: appPool, env: workerEnv() } as unknown as QueueHandlerContext, { sender, ...(run !== undefined ? { run } : {}) }),
     });
   }
 
@@ -153,7 +176,8 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
   function realRun(): ReportRunDeps {
     const resolver = new EntitlementResolver(new InMemoryCacheAdapter(), appPool);
     const usage = new StructuralUsage(appPool);
-    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool) };
+    const objects = objectStore();
+    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool, objects, "http://localhost:3000"), mail: mailDepsFromEnv(objects, workerEnv() as never) };
   }
 
   /** Real services over the app pool, but a build that always throws (a stand-in for a renderer fault). */
@@ -162,7 +186,8 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
     return {
       resolver,
       usage: new StructuralUsage(appPool),
-      exports: { export: () => Promise.reject(new Error("renderer exploded while drawing client@example.test")) },
+      exports: { export: () => Promise.reject(new Error("renderer exploded while drawing client@example.test")), uploaded: async () => undefined },
+      mail: mailDepsFromEnv(objectStore(), workerEnv() as never),
     };
   }
 
@@ -263,7 +288,10 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
 
       expect(sender.sent).toHaveLength(1);
       expect(sender.sent[0]!.to).toBe("client@example.test");
-      expect(sender.sent[0]!.textBody).toContain("/report-artifacts/");
+      // STORY-180 AC3: the PDF is ATTACHED (read back from the reports bucket), not linked.
+      expect(sender.sent[0]!.attachments).toHaveLength(1);
+      expect(sender.sent[0]!.attachments![0]!.content.subarray(0, 5).toString()).toBe("%PDF-");
+      expect(sender.sent[0]!.textBody).not.toContain("report-artifacts");
       expect(await deliveries(r.id)).toMatchObject([{ status: "delivered", recipient_count: 1, reason: null }]);
       const after = await state(r.id);
       expect(after.next_send_at!.getTime()).toBeGreaterThan(Date.now());
@@ -626,7 +654,10 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
       await db.query("DELETE FROM report_artifacts");
       await process(jobFor(ws, r.id, r.due, 1));
       expect(sender.sent).toHaveLength(1);
-      expect(sender.sent[0]!.textBody).toContain("/report-artifacts/");
+      // STORY-180 AC3: the PDF is ATTACHED (read back from the reports bucket), not linked.
+      expect(sender.sent[0]!.attachments).toHaveLength(1);
+      expect(sender.sent[0]!.attachments![0]!.content.subarray(0, 5).toString()).toBe("%PDF-");
+      expect(sender.sent[0]!.textBody).not.toContain("report-artifacts");
       expect(await artifactRows()).toBe(1);
     }, 90_000);
 

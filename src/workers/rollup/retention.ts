@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { cancelTaskVerifications } from "../../lib/impact/verification-schedule.js";
 import { Logger } from "@nestjs/common";
 import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
@@ -165,6 +166,8 @@ export async function softDeleteProject(
     ]);
     await tx.query("UPDATE tracked_prompts SET status = 'paused' WHERE project_id = $1 AND status = 'active'", [projectId]);
     await tx.query("UPDATE capture_runs SET status = 'canceled' WHERE project_id = $1 AND status = 'queued'", [projectId]);
+    // STORY-067 AC10 - a deleted project is not re-measured: its pending verifications are cancelled, not orphaned.
+    await cancelTaskVerifications(tx, { projectId }, "project_deleted");
   });
 }
 
@@ -266,6 +269,23 @@ export async function collectComplianceExport(client: ClientBase, workspaceId: s
 
 export interface ExecuteWorkspaceHardDeleteOptions {
   readonly exportComplianceRecords: (records: readonly ComplianceExportRow[]) => Promise<void>;
+  /**
+   * STORY-180 r5. Deletes the workspace's stored report files (every version). Runs AFTER the cascade has COMMITTED and never inside
+   * it (ADR-0003: no storage I/O in a transaction); not called if the export or the cascade failed (the workspace still exists).
+   * Its failure is a `WorkspaceObjectsLeftBehindError`: the workspace IS erased, its objects are not.
+   */
+  readonly deleteWorkspaceObjects?: (workspaceId: string) => Promise<void>;
+}
+
+/** The cascade committed but the workspace's stored objects could not be deleted. The row is gone, so no later run rediscovers them: an operator must. */
+export class WorkspaceObjectsLeftBehindError extends Error {
+  constructor(
+    readonly workspaceId: string,
+    cause: unknown,
+  ) {
+    super(`workspace ${workspaceId} was erased but its stored objects could not be deleted`, { cause });
+    this.name = "WorkspaceObjectsLeftBehindError";
+  }
 }
 
 export async function executeWorkspaceHardDelete(
@@ -322,6 +342,14 @@ export async function executeWorkspaceHardDelete(
   } catch (error) {
     await privilegedClient.query("ROLLBACK");
     throw error;
+  }
+  // AFTER the commit, with no transaction open: the objects of an erased workspace.
+  if (options.deleteWorkspaceObjects !== undefined) {
+    try {
+      await options.deleteWorkspaceObjects(workspaceId);
+    } catch (error) {
+      throw new WorkspaceObjectsLeftBehindError(workspaceId, error);
+    }
   }
 }
 
@@ -935,6 +963,8 @@ export interface DailyPurgeCycleOptions {
   readonly referenceDate?: Date;
   readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
   readonly exportComplianceRecords?: (records: readonly ComplianceExportRow[]) => Promise<void>;
+  /** STORY-180 r5: deletes an erased workspace's stored report files after its cascade commits. Absent = the objects are not touched. */
+  readonly deleteWorkspaceObjects?: (workspaceId: string) => Promise<void>;
 }
 
 export interface DailyPurgeCycleResult {
@@ -1007,9 +1037,12 @@ export async function runDailyPurgeCycle(
               "executeWorkspaceHardDelete: no exportComplianceRecords callback supplied — no object-storage client exists in this repo yet (disclosed gap)",
             );
           }),
+        ...(options.deleteWorkspaceObjects !== undefined ? { deleteWorkspaceObjects: options.deleteWorkspaceObjects } : {}),
       });
       workspacesPurged.push(workspace.id);
     } catch (error) {
+      // The cascade committed: the workspace IS purged, and the leftover objects are an unresolved failure the operator must clear.
+      if (error instanceof WorkspaceObjectsLeftBehindError) workspacesPurged.push(workspace.id);
       await recordPurgeFailure(privilegedClient, { scope: "workspace", scopeId: workspace.id, reason: (error as Error).message });
     }
   }

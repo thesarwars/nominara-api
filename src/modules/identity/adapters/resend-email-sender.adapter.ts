@@ -150,6 +150,9 @@ export class ResendEmailSenderAdapter implements EmailSender {
       subject: message.subject,
       text: message.textBody,
       ...(message.htmlBody !== undefined ? { html: message.htmlBody } : {}),
+      ...(message.attachments !== undefined && message.attachments.length > 0
+        ? { attachments: message.attachments.map((a) => ({ filename: a.filename, content: a.content.toString("base64"), ...(a.contentType !== undefined ? { content_type: a.contentType } : {}) })) }
+        : {}),
       ...(replyTo !== undefined ? { reply_to: replyTo } : {}),
       headers: { "X-Entity-Ref-ID": idempotencyKey },
     });

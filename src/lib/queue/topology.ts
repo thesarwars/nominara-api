@@ -487,6 +487,21 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "integrity:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // ⚠ AN ADDED QUEUE §4 DOES NOT CONTAIN. STORY-180 r5 (owner decision 60 (b)): the nightly deletion of stored report files whose 7-day
+  // life has ended and of half-uploaded ones (`reports/artifact-cleanup.ts`: object first, then the row, never storage I/O in a transaction).
+  // Rollup group, with the other owner-connection ticks. NOT tenant-scoped: the tick has no workspace to name, so discovery runs cross-tenant
+  // on the owner connection and each workspace is cleaned in ONE tenant's context as the runtime role. Advisory-locked single-flight; a second
+  // run finds nothing due, which is the idempotency.
+  {
+    name: "report.cleanup",
+    producer: "cron daily (STORY-180 r5, owner decision 60; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "reportclean:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

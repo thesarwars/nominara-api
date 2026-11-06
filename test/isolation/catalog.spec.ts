@@ -12,11 +12,12 @@ import { assertIso30MaintenanceExecuteAdminOnly } from "./assertions/iso-30-main
 import { assertIso28DefinerOwnerHoldsNoRoles } from "./assertions/iso-28-definer-owner-holds-no-roles.js";
 import { assertIso27MaintenanceDefinerShape } from "./assertions/iso-27-maintenance-definer-shape.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
+import { assertIso31ReportLinkTokenIsolation } from "./assertions/iso-31-report-link-token-isolation.js";
 import { getAssertionContext } from "./support/context.js";
 
 // STORY-012 Phase 1 (catalog) — order matters, ISO-06 first: the census is
 // the guard on every other assertion's table-set assumption.
-describe("ISO-06 · census — 66 tenant / 19 global / 85 total, independently derived", () => {
+describe("ISO-06 · census — 67 tenant / 20 global / 87 total, independently derived", () => {
   it("matches the fixed numbers and cross-checks against src/db/conventions.ts", async () => {
     await expect(assertIso06Census(getAssertionContext())).resolves.toBeUndefined();
   });
@@ -96,5 +97,11 @@ describe("ISO-29 · no runtime, share-lookup or non-BYPASSRLS break-glass role c
 describe("ISO-30 · no refused role is a member (of any kind, ADMIN-only included) of a role that can EXECUTE a maintenance function", () => {
   it("holds for every membership route", async () => {
     await expect(assertIso30MaintenanceExecuteAdminOnly(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-31 · a report-link token never serves another workspace's object; a foreign, expired or revoked token is refused", () => {
+  it("holds in row-level security alone, through the service for every (token, path workspace) pair, and in the unique token hash", async () => {
+    await expect(assertIso31ReportLinkTokenIsolation(getAssertionContext())).resolves.toBeUndefined();
   });
 });
