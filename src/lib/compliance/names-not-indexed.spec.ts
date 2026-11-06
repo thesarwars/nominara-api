@@ -53,7 +53,7 @@ describe("STORY-111 no index or search path over personal names (scenario 10)", 
       new RegExp(`to_tsvector\\([^)]*${column}`, "i"),
       new RegExp(`similarity\\([^)]*${column}`, "i"),
       new RegExp(`${column}\\s+%\\s`, "i"),
-      new RegExp(`${column}\\s*(?:->>|#>>)\\s*'text'\\s*(?:~|~\\*|ILIKE|LIKE)`, "i"),
+      new RegExp(column + "\\s*(?:->>|#>>)\\s*'text'\\s*(?:~|~\\*|ILIKE|LIKE)", "i"),
     ];
     for (const f of sources) {
       if (f.path.startsWith("lib/compliance/")) continue;
