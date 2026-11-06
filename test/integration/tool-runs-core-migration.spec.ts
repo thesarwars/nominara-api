@@ -99,7 +99,9 @@ describe("migration 0153 - tool_runs core guards", () => {
     await expect(insert({ tool_key: "visibility_scan", engine_keys: [] })).rejects.toThrow(/ck_tr_shape/);
     await expect(insert({ tool_key: "prompt_research", engine_keys: ["perplexity"], prompt_texts: [] })).rejects.toThrow(/ck_tr_shape/);
     await expect(insert({ tool_key: "visibility_scan", engine_keys: ["a", "b", "c", "d", "e"] })).rejects.toThrow(/ck_tr_shape/);
-    await expect(insert({ tool_key: "prompt_research", prompt_texts: Array.from({ length: 11 }, (_, i) => `p${String(i)}?`) })).rejects.toThrow(/ck_tr_shape/);
+    await expect(insert({ tool_key: "prompt_research", prompt_texts: Array.from({ length: 16 }, (_, i) => `p${String(i)}?`) })).rejects.toThrow(/ck_tr_shape/);
+    // Owner decision 67 (f), migration 0167: a Keep saves up to the 15 Discover generates, so 15 is the new ceiling (the per-run cap of 10 lives in the contract).
+    await expect(insert({ tool_key: "prompt_research", prompt_texts: Array.from({ length: 15 }, (_, i) => `p${String(i)}?`) })).resolves.toBeDefined();
     await expect(insert({ tool_key: "visibility_scan", engine_keys: ["a", "b", "c", "d"] })).resolves.toBeDefined();
     await expect(insert({ tool_key: "prompt_research", prompt_texts: Array.from({ length: 10 }, (_, i) => `p${String(i)}?`) })).resolves.toBeDefined();
   });
@@ -163,6 +165,8 @@ describe("migration 0153 - tool_runs core guards", () => {
 
   it("down restores the original constraints (gemini barred again) and removes the trigger; up again restores them", async () => {
     await client.query("DELETE FROM tool_runs WHERE engine_keys && ARRAY['gemini']");
+    // 0167 raised the prompt_research ceiling to 15; the 0153 rollback restores 10, so a kept set of 11-15 prompts must be cleared first.
+    await client.query("DELETE FROM tool_runs WHERE tool_key = 'prompt_research' AND array_length(prompt_texts, 1) > 10");
     // The rollback restores the strict schema_builder shape, so an expired (payload-removed) Schema Builder run must be cleared first, loudly by design.
     await expect(client.query(await readFile(path.join(MIGRATIONS_DIR, `${NAME}.down.sql`), "utf8"))).rejects.toThrow(/ck_tr_shape/);
     await client.query("DELETE FROM tool_runs WHERE tool_key = 'schema_builder' AND result_json IS NULL");
