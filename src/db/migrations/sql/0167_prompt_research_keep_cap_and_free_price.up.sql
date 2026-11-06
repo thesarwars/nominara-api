@@ -4,7 +4,7 @@
 --     tool_runs.prompt_texts, so the upper bound is now 15 (the lower bound and every other branch are unchanged). The per-RUN cap of 10 is held by the
 --     request contract and the service, not by this constraint. Loosening a bound cannot fail on existing rows.
 -- (a) Free publishes prompts.credits_per_generated = 1 (was null), so a Free workspace can Keep prompts at 1 credit each from its included credits. Only a
---     still-null value is rewritten, so re-running changes nothing; the free workspaces' entitlement_version is bumped so a cached resolution is not served stale.
+--     still-null value is rewritten, so re-running changes nothing. entitlement_version is not bumped: the 60 s entitlement memo covers a cached resolution (owner decision 69d).
 ALTER TABLE tool_runs DROP CONSTRAINT ck_tr_shape;
 ALTER TABLE tool_runs ADD CONSTRAINT ck_tr_shape CHECK (
   CASE tool_key
@@ -20,5 +20,3 @@ ALTER TABLE tool_runs ADD CONSTRAINT ck_tr_shape CHECK (
 UPDATE plans
    SET entitlements = jsonb_set(entitlements, ARRAY['prompts.credits_per_generated', 'value'], '1'::jsonb)
  WHERE key = 'free' AND entitlements -> 'prompts.credits_per_generated' -> 'value' = 'null'::jsonb;
-
-UPDATE workspaces SET entitlement_version = entitlement_version + 1 WHERE plan_key = 'free';

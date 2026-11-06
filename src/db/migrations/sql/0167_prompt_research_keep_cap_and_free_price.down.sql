@@ -15,5 +15,3 @@ ALTER TABLE tool_runs ADD CONSTRAINT ck_tr_shape CHECK (
 UPDATE plans
    SET entitlements = jsonb_set(entitlements, ARRAY['prompts.credits_per_generated', 'value'], 'null'::jsonb)
  WHERE key = 'free' AND entitlements -> 'prompts.credits_per_generated' -> 'value' = '1'::jsonb;
-
-UPDATE workspaces SET entitlement_version = entitlement_version + 1 WHERE plan_key = 'free';
