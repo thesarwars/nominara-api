@@ -9,6 +9,7 @@ import { reapStaleManualAudits } from "../aux/stale-audit-reaper.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
 import { reapStuckRuns } from "./stuck-run-reaper.js";
 import { sweepEngineSkipRefunds } from "./engine-skip-refund-sweep.js";
+import { runVerificationSweep, type EnqueueVerification } from "../impact/verification-sweep.js";
 
 // NEW-A-13 — the scheduler sweep: the producer `capture.plan` has always
 // declared and nothing ran. OWNER DECISION 2026-10-08, "Option A".
@@ -273,6 +274,11 @@ export interface SweepRuntimeOptions {
    * The relay rides this tick because it needs the same thing: an owner connection that sees across tenants, hourly.
    */
   readonly enqueueDowngradeNotice?: EnqueueDowngradeNotice;
+  /**
+   * STORY-067 - enqueues the signed `capture.plan` verification job for a due task verification. Without it nothing is enqueued, but
+   * finished verifications are still settled (and their impact written).
+   */
+  readonly enqueueVerification?: EnqueueVerification;
   readonly clock?: () => Date;
   /** Overrides for DEFAULT_RUNTIME_LIMITS. */
   readonly limits?: Partial<RuntimeLimits>;
@@ -369,6 +375,11 @@ export class SchedulerSweepRuntime {
       // reaper just finalised as partial is settled on this same tick. Best-effort, the same discipline.
       await sweepEngineSkipRefunds(client, this.clock()).catch((error: unknown) => {
         logger.error({ event: "capture.scheduler.engine_skip_refund_failed", error: error instanceof Error ? error.name : "unknown" });
+      });
+      // STORY-067 - the task-verification scheduler: enqueue what is due, settle what ran. Best-effort and after the claim, the same
+      // discipline: it must never hold up, or fail, the sweep.
+      await runVerificationSweep(client, this.options.enqueueVerification, this.clock()).catch((error: unknown) => {
+        logger.error({ event: "capture.scheduler.verification_sweep_failed", error: error instanceof Error ? error.name : "unknown" });
       });
       // STORY-077 review round 2 - the downgrade-notice relay (lib/billing/downgrade-notice-relay.ts), best-effort and
       // after the claim has committed, the same discipline: it must never hold up, or fail, the sweep.
