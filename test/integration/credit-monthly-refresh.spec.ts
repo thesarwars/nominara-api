@@ -184,10 +184,86 @@ describe("STORY-177 · monthly included-credit refresh", () => {
   it("[STORY-177 AC1] a free wallet whose paid subscription ended (reconciled to free) refreshes from this trigger", async () => {
     const id = await seed({
       plan: "free", cycle: { start: "2026-10-01", end: "2026-11-01" }, grant: FREE_GRANT,
-      sub: { interval: "monthly", status: "canceled", start: "2026-09-01T00:00:00Z", end: "2026-10-01T00:00:00Z" },
+      sub: { interval: "annual", status: "active", start: "2025-10-01T00:00:00Z", end: "2026-10-01T00:00:00Z" },
     });
     expect((await sweep(at("2026-11-06"))).workspacesRolled).toBe(1);
     expect((await wallet(id)).cycle_start).toBe("2026-11-01");
+  });
+
+  // subscription-state.ts ENDED writes plan_key free + status active and KEEPS billing_interval.
+  it("[STORY-177 AC1] an annual subscription that ended in its first month does not leave the wallet waiting a year", async () => {
+    const id = await seed({
+      plan: "free", cycle: YEAR_CYCLE, grant: GROWTH_GRANT,
+      sub: { interval: "annual", status: "active", start: "2026-01-15T00:00:00Z", end: "2027-01-15T00:00:00Z" },
+    });
+
+    expect((await sweep(at("2026-01-25"))).workspacesRolled).toBe(0); // same calendar month as the cycle start
+    expect((await sweep(at("2026-02-03"))).workspacesRolled).toBe(1);
+    expect(await wallet(id)).toMatchObject({ included_balance: FREE_GRANT, cycle_start: "2026-02-01", cycle_end: "2026-03-01" });
+    expect(await verifyWorkspaceWallet(db, id)).toBeNull();
+  });
+
+  it("[STORY-177 AC1] a free workspace provisioned on its signup anniversary (real free subscription row) rolls to the calendar month", async () => {
+    const id = await seed({
+      plan: "free", cycle: { start: "2026-11-20", end: "2026-12-20" }, grant: FREE_GRANT,
+      sub: { interval: "monthly", status: "active", start: "2026-11-20T00:00:00Z", end: "2026-12-20T00:00:00Z" },
+    });
+    expect((await sweep(at("2026-11-30"))).workspacesRolled).toBe(0);
+    expect((await sweep(at("2026-12-02"))).workspacesRolled).toBe(1);
+    expect(await wallet(id)).toMatchObject({ included_balance: FREE_GRANT, cycle_start: "2026-12-01", cycle_end: "2027-01-01" });
+    expect((await sweep(at("2026-12-21"))).workspacesRolled).toBe(0); // the old cycle_end is not a second refresh
+    expect(await verifyWorkspaceWallet(db, id)).toBeNull();
+  });
+
+  it("[STORY-177 AC1] documented gap: a cycle that began and ended inside one calendar month waits for the next month", async () => {
+    const id = await seed({
+      plan: "free", cycle: { start: "2026-11-05", end: "2026-11-19" }, grant: FREE_GRANT,
+      sub: { interval: "monthly", status: "active", start: "2026-11-05T00:00:00Z", end: "2026-11-19T00:00:00Z" },
+    });
+    expect((await sweep(at("2026-11-19"))).workspacesRolled).toBe(0);
+    expect((await sweep(at("2026-12-01"))).workspacesRolled).toBe(1);
+    expect((await wallet(id)).cycle_start).toBe("2026-12-01");
+  });
+
+  it("[STORY-177 AC2] twenty sweeps at once, and a sweep racing the webhook's own roll, write each roll exactly once", async () => {
+    const id = await seed({ plan: "growth", cycle: YEAR_CYCLE, grant: GROWTH_GRANT, sub: annualSub() });
+    const now = at("2026-02-20");
+    const results = await Promise.all(Array.from({ length: 20 }, () => sweep(now)));
+    expect(results.reduce((n, r) => n + r.workspacesRolled, 0)).toBe(1);
+    expect(results.flatMap((r) => r.failures)).toEqual([]);
+    expect(await rollEntries(id, "cycle_roll:2026-02-15")).toHaveLength(2);
+
+    const race = await seed({ plan: "growth", cycle: { start: "2026-12-15", end: "2027-01-15" }, grant: GROWTH_GRANT, sub: annualSub() });
+    await db.query("UPDATE subscriptions SET current_period_start = '2026-12-15', current_period_end = '2027-12-15' WHERE workspace_id = $1", [race]);
+    await Promise.all([
+      sweep(at("2027-01-16")), sweep(at("2027-01-16")),
+      inCtx(race, (tx) => rollIncludedCycle(tx, { workspaceId: race, grant: GROWTH_GRANT, cycleStart: "2027-01-15", cycleEnd: "2028-01-15" })),
+      sweep(at("2027-01-16")),
+    ]);
+    expect(await rollEntries(race, "cycle_roll:2027-01-15")).toHaveLength(2);
+    expect(await verifyWorkspaceWallet(db, race)).toBeNull();
+  });
+
+  it("[STORY-177 AC1] the decision reads the subscription after the wallet lock: a plan change committed while the sweep waits is seen", async () => {
+    const id = await seed({ plan: "growth", cycle: YEAR_CYCLE, grant: GROWTH_GRANT, sub: annualSub() });
+    const holder = new Client({ connectionString: container.getConnectionUri() });
+    await holder.connect();
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE", [id]);
+      const running = sweep(at("2026-02-20"));
+      for (let i = 0; i < 100; i += 1) {
+        const w = await db.query("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()");
+        if (w.rowCount) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      await holder.query("UPDATE subscriptions SET plan_key = 'free' WHERE workspace_id = $1", [id]);
+      await holder.query("COMMIT");
+      expect((await running).workspacesRolled).toBe(1);
+    } finally {
+      await holder.end();
+    }
+    expect((await wallet(id)).included_balance).toBe(FREE_GRANT);
   });
 
   it("[STORY-177 #4 AC2] a replay of the job does nothing; two instances at once roll exactly once", async () => {

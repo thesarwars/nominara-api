@@ -3,7 +3,6 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase, Pool, PoolClient } from "pg";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
-import { incrementCounter } from "../telemetry/metrics.js";
 import { rollIncludedCycle } from "./cycle-roll.js";
 
 // STORY-177 — the monthly included-credit refresh for the two kinds of wallet no Stripe event ever rolls monthly.
@@ -27,11 +26,17 @@ import { rollIncludedCycle } from "./cycle-roll.js";
 // the twelfth, and the job's next run finds the subscription's NEW period and nothing to do.
 //
 // ⚠ NOT A PAYMENT-OUTSTANDING ROLL. Only a subscription that is `active` rolls. `past_due` waits for the payment (the
-// webhook's recovery roll, or the next run after the status returns to `active`); `trialing`/`soft_capped` annual
-// subscriptions are left to the webhook. A monthly-billed paid wallet is never this job's.
+// webhook's recovery roll, or the next run after the status returns to `active`); a `trialing` annual
+// subscription is left to the webhook (OPEN OWNER QUESTION: should it get the monthly refresh?). A monthly-billed paid wallet is never this job's.
 //
-// The decision is made INSIDE each workspace's tenant transaction, from the rows as they are under the lock, never from
-// the discovery scan: discovery is a loose, cross-tenant "worth looking at" list.
+// The decision is made INSIDE each workspace's tenant transaction, AFTER taking the wallet's row lock and reading the
+// subscription in a later statement (a fresh READ COMMITTED snapshot, so a webhook that committed while we waited is
+// seen). The lock order is the webhook's (subscription, then wallet) because this job never locks the subscription.
+// Discovery is a loose, cross-tenant "worth looking at" list, never the decision.
+//
+// FREE: a wallet rolls when its cycle began before the current calendar month, not when `cycle_end` passes, so a free
+// wallet left on a year-long annual cycle by a subscription that ended is refreshed the next month. A free workspace
+// provisioned on its signup anniversary therefore gets one extra grant on the first of the next month (once).
 
 const logger = new Logger("monthly-refresh");
 const tracer = trace.getTracer("nominara.credits");
@@ -87,6 +92,7 @@ export interface MonthlyRefreshConnections {
   readonly discovery: ClientBase;
   /** The runtime pool; each roll runs in its own tenant transaction on it. */
   readonly work: Pool;
+  /** Tests only: production reads the database's UTC date, as `cycleHasLapsed` does. */
   readonly now?: Date;
 }
 
@@ -126,15 +132,21 @@ export async function refreshMonthlyWallets(connections: MonthlyRefreshConnectio
   });
 }
 
-async function sweep({ discovery, work, now = new Date() }: MonthlyRefreshConnections): Promise<MonthlyRefreshOutcome> {
-  const today = now.toISOString().slice(0, 10);
+async function sweep({ discovery, work, now }: MonthlyRefreshConnections): Promise<MonthlyRefreshOutcome> {
+  const today =
+    now !== undefined
+      ? now.toISOString().slice(0, 10)
+      : (await discovery.query<{ today: string }>("SELECT (now() AT TIME ZONE 'UTC')::date::text AS today")).rows[0]!.today;
 
-  // Loose on purpose: a wallet whose cycle has ended (free), or one that belongs to an annual subscription and whose
-  // cycle began before today (its `cycle_end` can be a year away). `decide` is the real test, under the lock.
+  // Loose on purpose: a wallet whose cycle has ended, a wallet with no paid subscription whose cycle began before this
+  // calendar month (free), or one that belongs to an annual subscription and whose cycle began before today (its
+  // `cycle_end` can be a year away). `refreshOne` is the real test, under the lock.
   const candidates = await discovery.query<{ workspace_id: string }>(
     `SELECT w.workspace_id
        FROM credit_wallets w
       WHERE w.cycle_end <= $1::date
+         OR (w.cycle_start < date_trunc('month', $1::date)::date
+             AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.workspace_id = w.workspace_id AND s.plan_key <> 'free'))
          OR (w.cycle_start < $1::date
              AND EXISTS (SELECT 1 FROM subscriptions s
                           WHERE s.workspace_id = w.workspace_id AND s.billing_interval = 'annual' AND s.status = 'active'))
@@ -153,8 +165,12 @@ async function sweep({ discovery, work, now = new Date() }: MonthlyRefreshConnec
       );
       if (rolled) workspacesRolled += 1;
     } catch (error) {
-      incrementCounter("nominara_credits_monthly_refresh_failed_total");
-      failures.push({ workspaceId, reason: error instanceof Error ? error.message : String(error) });
+      // Class or pg code only: a database message can carry constraint detail or values.
+      const code = (error as { code?: unknown } | null)?.code;
+      failures.push({
+        workspaceId,
+        reason: typeof code === "string" ? code : error instanceof Error ? error.name : "unknown",
+      });
     } finally {
       client?.release();
     }
@@ -163,6 +179,9 @@ async function sweep({ discovery, work, now = new Date() }: MonthlyRefreshConnec
 }
 
 async function refreshOne(tx: ClientBase, workspaceId: string, today: string): Promise<boolean> {
+  // The wallet lock FIRST; the reads below are later statements, so they see whatever a webhook committed meanwhile.
+  const locked = await tx.query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1 FOR UPDATE", [workspaceId]);
+  if (locked.rowCount === 0) return false;
   const view = await tx.query<WalletView>(
     `SELECT w.cycle_start::text, w.cycle_end::text,
             s.plan_key, s.billing_interval, s.status, s.period_start,
@@ -182,10 +201,9 @@ async function refreshOne(tx: ClientBase, workspaceId: string, today: string): P
 
   let window: MonthWindow;
   let grant: number;
+  // `canceled` is defensive only: production reconciles an ended subscription to plan free + status active.
   const isFree = row.plan_key === null || row.plan_key === "free" || row.status === "canceled";
   if (isFree) {
-    // Only when the month has ended: a free wallet mid-cycle is left alone.
-    if (row.cycle_end > today) return false;
     window = calendarMonthWindow(today);
     grant = row.grant_free;
   } else if (row.billing_interval === "annual" && row.status === "active" && row.period_start !== null && row.grant_plan !== null) {

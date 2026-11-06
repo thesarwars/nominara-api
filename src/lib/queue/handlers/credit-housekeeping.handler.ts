@@ -19,8 +19,9 @@ import type { JobProcessor } from "../worker-factory.js";
 //      (`plans-and-entitlements.md` §5: "12 months from purchase, FIFO by expiry. Expiry writes an `expire` ledger
 //      entry"). Before this, a purchased credit never expired.
 //   2. `purgeDailyCounters` — `schemas/billing-and-credits.md`: "Rows older than 35 days are purged nightly."
+//   3. `refreshMonthlyWallets` — STORY-177: the monthly included-credit refresh for annual and free wallets.
 //
-// ⚠ ONE QUEUE FOR BOTH, AND THE REASON IS THE CONNECTION, NOT TIDINESS. Both need the same privileged, direct,
+// ⚠ ONE QUEUE FOR ALL THREE, AND THE REASON IS THE CONNECTION, NOT TIDINESS. All need the same privileged, direct,
 // non-pooled connection (`credit_purchases`, `credit_wallets` and `credit_daily_counters` carry FORCE ROW LEVEL
 // SECURITY, so a cross-tenant scan on the runtime role sees nothing and reports a clean run). Two queues would be two
 // of those per night for jobs that are each a few statements. They stay INDEPENDENT STEPS: one throwing never skips
@@ -38,7 +39,7 @@ import type { JobProcessor } from "../worker-factory.js";
 //
 // ⚠ A FAILURE DOES FAIL THE JOB here, unlike the reconciler. The reconciler runs every ten minutes, so a failed
 // reservation is retried without ceremony; this runs once a day, so the retry ladder is the only prompt second try,
-// and both steps are idempotent, so re-running the one that already succeeded costs nothing.
+// and all three steps are idempotent, so re-running the one that already succeeded costs nothing.
 export function createCreditHousekeepingHandler(context: QueueHandlerContext): JobProcessor {
   const logger = new Logger("credit.housekeeping");
 
