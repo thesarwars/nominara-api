@@ -116,6 +116,10 @@ export const GLOBAL_TABLES = [
   // of the address and the sending reputation it protects is shared. Holds the peppered hash only, no address and no
   // workspace; the Resend webhook that writes it resolves no tenant. Migration 0141_email_suppressions.up.sql.
   "email_suppressions",
+  // STORY-111 - the legal-hold register and the per-cycle purge outcome record. Platform state written by the retention job's owner
+  // connection; GRANT-protected with NO privilege for any runtime role (see expectedTablePrivileges). Migration 0165_legal_holds_purge_runs.up.sql.
+  "legal_holds",
+  "purge_runs",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -457,6 +461,8 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
   // STORY-143 AC7 — owner-only: not even SELECT. A mark readable by the
   // application is a mark the application can learn how to forge around.
   if (table === "audit_chain_marks") return NO_PRIVILEGES;
+  // STORY-111 - owner-only, like the chain marks: a hold the application could write is a hold a request handler could place or lift.
+  if (table === "legal_holds" || table === "purge_runs") return NO_PRIVILEGES;
   // STORY-178 — the webhook route (nominara_app) appends and every sender reads; a worker only reads (it sends reports and
   // alerts); the report and portal roles send nothing. Lifting a suppression is the operator's, on the owner connection.
   if (table === "email_suppressions") {
