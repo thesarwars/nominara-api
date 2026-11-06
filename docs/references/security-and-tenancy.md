@@ -45,6 +45,12 @@ CREATE ROLE nominara_worker  LOGIN NOINHERIT CONNECTION LIMIT 300;  -- src/worke
 CREATE ROLE nominara_report  LOGIN NOINHERIT CONNECTION LIMIT 40;   -- read-only, replica only
 CREATE ROLE nominara_portal  LOGIN NOINHERIT CONNECTION LIMIT 60;   -- share-token portal, read-only
 
+-- Definer owners. NOLOGIN, so nobody connects as them; NOBYPASSRLS (ISO-07); no role is a member of them (ISO-24, ISO-28).
+-- nominara_share_lookup owns app.share_token_by_hash (ADR-0002, migration 0112).
+-- nominara_maintenance owns the three count-only app.maintenance_* functions (ADR-0004, migration 0160).
+CREATE ROLE nominara_share_lookup NOLOGIN NOINHERIT NOBYPASSRLS;
+CREATE ROLE nominara_maintenance  NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+
 -- Break-glass. Dual approval + a 60-minute TTL credential from Secrets Manager.
 CREATE ROLE nominara_breakglass LOGIN NOINHERIT BYPASSRLS CONNECTION LIMIT 2;
 
@@ -59,6 +65,7 @@ REVOKE ALL ON user_credentials FROM nominara_worker, nominara_report, nominara_p
 ```
 
 - **No service role has `BYPASSRLS`.** `nominara_breakglass` exists solely for incident response; its use emits an **alert email to `ALERT_EMAIL_TO`** and an immutable audit record, and its credential is time-boxed. (Owner decision 2026-10-15: operational alerts are email through Resend; there is no separate paging service. **Not built:** nothing in code emits the break-glass alert yet — [STORY-010](../stories/data/STORY-010-database-roles-and-pgbouncer.md).)
+- **`nominara_maintenance`** exists so the nightly integrity checks (orphan scan, default-partition row count, vector-recall check) can count rows across every workspace without any identity holding `BYPASSRLS`. It is `NOLOGIN NOINHERIT NOBYPASSRLS` and owns `app.maintenance_default_partition_rows()`, `app.maintenance_orphan_counts()` and `app.maintenance_recall_overlap(text, halfvec, int)`: `SECURITY DEFINER`, `search_path = pg_catalog, pg_temp`, every output column text (a table or partition name), bigint or integer. Its reach is column-level `SELECT` on key columns of seven tables (§3). `EXECUTE` is revoked from `PUBLIC` and granted to `nominara_owner` only, never to a runtime role (ISO-27, ISO-29, ISO-30). Migration 0160, ADR-0004 (`docs/adr/` in the api repository).
 - `nominara_portal` and `nominara_report` hold `SELECT` only, so the read-only portal cannot mutate state even if a route were mis-registered.
 
 ## 3. Forced row-level security
@@ -118,6 +125,18 @@ CREATE POLICY portal_scope_answer_captures ON answer_captures
 ```
 
 **Why `WITH CHECK` is mandatory.** `USING` filters reads. Without `WITH CHECK`, a defect or a crafted payload could `INSERT` — or `UPDATE … SET workspace_id = <other tenant>` — writing into a tenant it could never read. Every `FOR ALL` policy specifies both, and CI asserts that `pg_policies` contains a non-null `with_check` for every one of them.
+
+**Maintenance count policies (migration 0160, ADR-0004).** `nominara_maintenance` (§2) is admitted to exactly seven tables by one role-targeted policy each, and to nothing else. Each is `FOR SELECT TO nominara_maintenance USING (true)`; permissive policies combine per role, so none contributes anything to any other role. The grant behind them is column-level `SELECT` on key columns only (no table grant, no write, no content column). The functions read the partitioned parents, so no per-partition policy is needed as months are added.
+
+| Policy | Table |
+|---|---|
+| `maintenance_count_answer_captures` | `answer_captures` |
+| `maintenance_count_mention_facts` | `mention_facts` |
+| `maintenance_count_citation_facts` | `citation_facts` |
+| `maintenance_count_tracked_prompts` | `tracked_prompts` |
+| `maintenance_count_topic_clusters` | `topic_clusters` |
+| `maintenance_count_content_chunks` | `content_chunks` |
+| `maintenance_count_corpus_passages` | `corpus_passages` |
 
 **Fail-closed default.** `app.current_workspace()` returns `NULL` when the setting is unset. Because `workspace_id = NULL` evaluates to `NULL` rather than true, an un-contextualised query returns **zero rows** and every write is rejected. There is no configuration in which "forgot to set the tenant" means "see everything".
 
@@ -205,18 +224,20 @@ AuthGuard          verify JWT signature and expiry, load the session, reject a r
    → RbacGuard     @RequirePermission('project:write') evaluated against the §6 matrix
      → EntitlementGuard  @RequireEntitlement('projects.max') | @RequireFeature('integrations.gsc')
                          → 403 entitlement_exceeded | 403 feature_not_in_plan
-       → QuotaGuard      @Meter('pdf_exports', n) — non-credit TIER CAPS only → 429 quota_exceeded
-         → DailyCapGuard @DailyCap('lookup') → 429 daily_limit_reached, debits nothing
-           → RateLimitGuard  Valkey token bucket keyed (route class, workspace, user, ip)
-             → CreditGuard @Credits('manual_scan', estimator) — reserve from credit_wallets; verify
-                           X-Nominara-Confirmed-Credits → 402 insufficient_credits | 409 price_changed
-               → TenantContextInterceptor   open the TX, SET LOCAL context
-                 → handler
-                   → CreditInterceptor  commit the actual debit (≤ reservation) or release on failure
-                   → AuditInterceptor   append a hash-chained audit_log row on a mutating route
+       → RateLimitGuard  Valkey token bucket keyed (route class, workspace, user, ip)
+         → StorageReadyGuard  acts only on @RequireStorage(): unconfigured object storage → 503 degraded
+                              before anything is reserved
+           → QuotaGuard      @Meter('pdf_exports', n) — non-credit TIER CAPS only → 429 quota_exceeded
+             → DailyCapGuard @DailyCap('lookup') → 429 daily_limit_reached, debits nothing
+               → CreditGuard @Credits('manual_scan', estimator) — reserve from credit_wallets; verify
+                             X-Nominara-Confirmed-Credits → 402 insufficient_credits | 409 price_changed
+                 → TenantContextInterceptor   open the TX, SET LOCAL context
+                   → handler
+                     → CreditInterceptor  commit the actual debit (≤ reservation) or release on failure
+                     → AuditInterceptor   append a hash-chained audit_log row on a mutating route
 ```
 
-The order matters and is asserted by test. A rate-limited request must never reach `CreditGuard`, so no reservation is created; a permission failure must be a `403` distinct from a `402` for insufficient balance.
+The order matters and is asserted by test (`api.module.spec.ts`). `CanonicalParamsGuard` runs before `AuthGuard` so every guard reads the same path parameters the database will store. A rate-limited request must never reach `StorageReadyGuard`, `QuotaGuard`, `DailyCapGuard` or `CreditGuard` (STORY-180), so nothing is reserved for a `429`, and `StorageReadyGuard` precedes `QuotaGuard` so unconfigured storage is refused before a tier-cap unit is reserved. A rate-limited request must never reach `CreditGuard`, so no reservation is created; a permission failure must be a `403` distinct from a `402` for insufficient balance.
 
 **STORY-022-E-1.** This ordering — `RateLimitGuard` before `CreditGuard` — is what the diagram above shows, and this prose was always correct; [`system-architecture.md`](./system-architecture.md#2-logical-architecture) and [`EPIC-03`](../epics/EPIC-03-api-platform-and-contracts.md#the-global-chain) previously diagrammed the reverse order and are corrected to match this prose, never the other way around.
 
@@ -266,6 +287,7 @@ Roles are workspace-scoped. `manager` may additionally be restricted to an expli
 - **`credits:spend` is separable from `billing:write` on purpose.** An `analyst` may run tools without any ability to buy credits, and a finance-focused `admin` may buy credits without spending them. This is the separation of duties agencies and finance teams ask for.
 - Every credit-debiting route additionally passes `CreditGuard`, so lacking balance is a `402`, distinct from lacking permission (`403`).
 - A permission denial returns `403 forbidden` naming the required permission — **never `404`**, since the resource's existence within the tenant is already known to the caller.
+- **`POST /exports/{id}/revoke-link` requires `agency:branding`** (owner decision 60 (d), STORY-180), so `owner` and `admin` only. It is workspace-wide, not `@ScopedByQuery`: a project-scoped `manager` is refused `403` naming `agency:branding`. The public link route it disables, `GET /report-links/{workspaceId}/{token}`, takes no permission (the recipient has no session).
 - **`POST /results/{id}/reparse` additionally requires the `owner` or `admin` role** (owner decision 2026-10-23, STORY-034). A scoped `manager` holds `tracking:trigger` and is refused with `403` naming `tracking:trigger`; an API key has no membership and is refused. The check is a route guard (`ReparseGuard`) on the live membership role, not a row of the table above.
 
 ## 7. Revocation and freshness
@@ -336,6 +358,11 @@ Access tokens are short-lived but not instantly revocable, which is unacceptable
 | `ISO-14` | S3 object keys are prefixed `{env}/{workspace_id}/`; an IAM policy evaluation confirms a task role restricted by prefix cannot read another prefix. **As built (Group C):** keys are composed only in `src/lib/storage/`. `raw` is `{env}/{workspace_id}/{relative}` in the raw bucket, `reports` the same in the reports bucket, `crawl` is `crawl/{env}/{workspace_id}/{relative}` in the raw bucket; `{env}` is `STORAGE_KEY_ENV` (required in production when storage is configured; `crawl` is reserved). Feature code reaches storage only through `TenantObjectStore`, which takes the workspace from the tenant context and has no workspace parameter; `bind()` captures it inside the transaction so the I/O can run after commit. A key read back from a row is refused (`StorageTenancyError`) unless it lies inside the current workspace's prefix. Checked today by a source scanner over template literals that begin `${…}/`; the IAM policy evaluation needs the infra repository (STORY-003). **Open (owner):** the crawl shape does not begin `{env}/{workspace_id}/` and the scanner does not see it — amend this row to allow a fixed leading kind segment (`crawl/`), or move crawl snapshots to `{env}/{ws}/crawl/…` |
 | `ISO-15` | Platform aggregates derived from `metric_daily` contain no `workspace_id` and satisfy k ≥ 20 |
 | `ISO-16` | **Materialized views are absent from the schema.** RLS does not apply to matviews, so all pre-aggregation uses ordinary tables maintained incrementally. Migration lint enforces this |
+| `ISO-27` | The three `app.maintenance_*` functions are exactly three, `SECURITY DEFINER`, owned by `nominara_maintenance` (`NOSUPERUSER NOLOGIN NOBYPASSRLS`), pinned to `search_path = pg_catalog, pg_temp` with `TimeZone` and `DateStyle` set, `EXECUTE` not granted to `PUBLIC` and the ACL exactly the owner and `nominara_owner`, and every output column text, bigint or integer (counts only) |
+| `ISO-28` | A definer-owner role is a member of no other role, in `pg_auth_members` and by effective reach (`pg_has_role`) — the converse of `ISO-24`, since PG16+ decides `INHERIT` per grant and a grant could hand a `SECURITY DEFINER` body another role's rights |
+| `ISO-29` | No runtime role, no share-lookup role and no non-`BYPASSRLS` break-glass role can effectively `EXECUTE` a maintenance function: `has_function_privilege` for the role and every role it is a member of, including membership of `nominara_owner` |
+| `ISO-30` | The same effective-`EXECUTE` check as `ISO-29`, registered separately for the `ADMIN`-only membership route (no `INHERIT`, no `SET`, yet the holder can grant itself both) |
+| `ISO-31` | A report-link token never serves another workspace's object. Under row-level security alone, workspace B's context cannot see A's token hash (and no context sees nothing); through `ReportLinksService`, for every (token, path workspace) pair of the three-tenant fixture only the token's own workspace serves it, an expired or foreign token is refused, a revoked token is refused, and a stored key outside the workspace prefix is refused; and the unique index on `link_token_hash` names one artifact in one workspace |
 
 ## 11. Internal access, support and impersonation
 

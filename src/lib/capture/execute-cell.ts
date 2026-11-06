@@ -13,6 +13,7 @@ import { uuidV7 } from "../ids/uuidv7.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { encodeRawObject, rawObjectRelativeKey } from "./raw-object.js";
 import type { BoundRawObjects } from "./raw-object-store.js";
+import { commitEntryIdFor } from "../credits/internal-cost.js";
 
 const logger = new Logger("capture.execute-cell");
 
@@ -113,16 +114,19 @@ function captureContext(signal: AbortSignal, costs: { usd: number }): CaptureCon
  * run's trigger in SQL so the two cannot disagree. Written only for a real,
  * non-zero cost; a zero-cost fixture capture has nothing to attribute.
  */
-async function recordUsageCost(tx: ClientBase, input: CaptureCellInput, usd: number): Promise<void> {
+export async function recordUsageCost(tx: ClientBase, input: CaptureCellInput, usd: number): Promise<void> {
+  // STORY-073 AC9: link the row to the run's COMMIT entry when it has one (a flat-priced run commits at accept, before any
+  // cell). A free scheduled run has none and the link stays NULL. credit_ledger itself is never written.
+  const commitEntryId = await commitEntryIdFor(tx, input.workspaceId, "capture_run", input.runId);
   await tx.query(
     `INSERT INTO usage_ledger
        (workspace_id, project_id, metric, quantity, unit_cost_usd, engine_key, source,
-        credits_charged, reference_type, reference_id, cache_layer)
+        credits_charged, credit_ledger_id, reference_type, reference_id, cache_layer)
      SELECT $1, $2, 'capture', 1, $3::numeric, $4,
             CASE r.trigger WHEN 'manual' THEN 'manual_run' WHEN 'scheduled' THEN 'scheduled_run' ELSE 'system' END,
-            0, 'capture_run', r.id, 'live'
+            0, $6::uuid, 'capture_run', r.id, 'live'
        FROM capture_runs r WHERE r.id = $5`,
-    [input.workspaceId, input.projectId, usd.toFixed(6), input.engineKey, input.runId],
+    [input.workspaceId, input.projectId, usd.toFixed(6), input.engineKey, input.runId, commitEntryId],
   );
 }
 

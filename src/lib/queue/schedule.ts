@@ -96,6 +96,11 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // before the audit walk so the two estate-wide scans do not contend for connections. The owner can move it.
   { queue: "credit.housekeeping", cron: "30 2 * * *", statedAs: "STORY-076 AC4 / STORY-071 AC10: expire purchased credits and purge daily counters, daily" },
 
+  // NOT FROM §4 - STORY-073 AC4 / NFR-CRD-03, "a nightly job asserts equality and pages on mismatch". THE HOUR IS A CHOICE, NOT A
+  // TRANSCRIPTION: 02:45 UTC, after `credit.housekeeping` (02:30) has written the night's expiry entries and five minutes after
+  // `audit.verify` (02:40) so the two estate-wide walks do not contend for connections. The owner can move it.
+  { queue: "credit.verify", cron: "45 2 * * *", statedAs: "STORY-073 AC4 / NFR-CRD-03: replay every wallet against its ledger nightly and page on mismatch" },
+
   // ⚠ NOT FROM §4 — STORY-077 R4 / STORY-013, `data-model.md` §7 ("nightly"). 03:40 UTC: after the partition tick
   // (03:20) so the two do not contend for the same locks, and a chosen hour for the reason above. SCHEDULED IS NOT
   // ENABLED: the handler is a no-op unless `RETENTION_PURGE_ENABLED=true`. See `handlers/retention-purge.handler.ts`.

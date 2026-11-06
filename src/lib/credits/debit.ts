@@ -8,6 +8,7 @@ import { provisionWalletWithGrant } from "./balance.js";
 import { requestAutoTopupIfBelowThreshold, type EnqueueAutoTopup } from "./auto-topup-request.js";
 import { appendLedgerEntry, type LedgerActionCode } from "./ledger.js";
 import { readHoldCarry } from "./hold-carry.js";
+import { measuredInternalCostUsd } from "./internal-cost.js";
 import { commitCredits, lockWallet, purchasableOptions, readWallet, reserveCredits } from "./wallet.js";
 
 // STORY-046 AC3 — a debit whose amount is known only INSIDE the handler.
@@ -167,11 +168,15 @@ export async function debitInTransaction(tx: ClientBase, debit: InlineDebit): Pr
     throw new Error(`credit commit matched no wallet row for workspace ${debit.workspaceId} (${debit.idempotencyKey})`);
   }
 
+  // AC9: what `usage_ledger` already holds for this reference (null when nothing is measured yet).
+  const internalCostUsd = await measuredInternalCostUsd(tx, debit.workspaceId, debit.referenceType, debit.referenceId);
+
   if (
     !(await appendLedgerEntry(tx, {
       ...common,
       entryType: "commit",
       after: committed,
+      ...(internalCostUsd === null ? {} : { internalCostUsd }),
       ...(debit.unitDetail === undefined ? {} : { unitDetail: debit.unitDetail }),
     }))
   ) {

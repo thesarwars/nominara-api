@@ -61,7 +61,9 @@ export type Confidence = MeasuredImpact["confidence"];
  *
  * ONE DEVIATION FROM THE LETTER, in the conservative direction: two or more others anywhere in the window is `low`. The reference as
  * written would call a milestone high with five others at day 8 to 14 (none within 7 days), which is not "several changes nearby is
- * low" (the story's AC5). This label is never higher than the reference's, only ever equal or lower. OWNER DECISION PENDING.
+ * low" (the story's AC5). This label is never higher than the reference's, only ever equal or lower.
+ * OWNER DECISION 65a/b: confidence is low with 2 or more nearby milestones, and clear separation is a Welch test at 1.96 SE with at least
+ * 2 days per window.
  */
 export function impactConfidence(input: {
   readonly clearSeparation: boolean;

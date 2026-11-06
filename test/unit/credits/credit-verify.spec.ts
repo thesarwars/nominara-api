@@ -44,6 +44,7 @@ function fakeClient(
 ): ClientBase {
   const query = async (sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number }> => {
     const rows = ((): unknown[] => {
+      if (/^\s*(BEGIN|COMMIT|ROLLBACK)\b/iu.test(sql)) return [];
       if (sql.includes("information_schema.columns")) {
         return options.seqColumn === false ? [] : [{ exists: 1 }];
       }
@@ -233,6 +234,8 @@ describe("STORY-073 scenario 7 · an automatic correction is not possible", () =
   function recordingClient(): { client: ClientBase; writes: string[] } {
     const writes: string[] = [];
     const query = async (sql: string): Promise<{ rows: unknown[]; rowCount: number }> => {
+      // Snapshot control (BEGIN ... READ ONLY / COMMIT) is not a write; every other non-SELECT still is.
+      if (/^\s*(BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY|COMMIT|ROLLBACK)\s*$/iu.test(sql)) return { rows: [], rowCount: 0 };
       if (!/^\s*(SELECT|WITH)\b/iu.test(sql)) {
         writes.push(sql.trim().slice(0, 80));
         throw new Error("this client is read-only");

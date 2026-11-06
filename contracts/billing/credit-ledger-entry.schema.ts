@@ -77,6 +77,14 @@ export const creditLedgerEntrySchema = z
     /** Required on an `adjustment` and null everywhere else — `ck_credit_ledger_adjustment_reason`. */
     reason: z.string().nullable(),
     occurred_at: z.string(),
+    /**
+     * STORY-073 AC9 - what serving this entry cost US, in USD, as a decimal string (`numeric(10,6)`, never a float).
+     * Set on a `commit` entry only; null everywhere else.
+     *
+     * ⚠ NULL IS "NOT MEASURED" AND "0.000000" IS "MEASURED, AND IT COST NOTHING". They are different statements and
+     * the field never turns one into the other: a commit whose run has no costed usage row reads null.
+     */
+    internal_cost_usd: z.string().nullable(),
   })
   .strict();
 

@@ -1,6 +1,6 @@
 # ADR-0004 — Count-only SECURITY DEFINER functions, owned by a dedicated NOBYPASSRLS role, for the nightly integrity checks
 
-**Status:** Proposed (implements owner decision 58(a) of 2026-11-05; needs the auditor's sign-off before it is Accepted)
+**Status:** Accepted (2026-11-06; implements owner decision 58(a) of 2026-11-05; approved by the second-engineer audit in round 5)
 
 ## Context
 

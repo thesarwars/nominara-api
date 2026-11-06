@@ -26,6 +26,7 @@ function entry(over: Partial<CreditLedgerEntry> = {}): CreditLedgerEntry {
     unit_detail: { prompts: 15, engines: 2, cells_charged: 22, cells_cached: 8 },
     reason: null,
     occurred_at: "2026-09-16T10:00:00.000Z",
+    internal_cost_usd: null,
     ...over,
   };
 }
@@ -35,6 +36,17 @@ function rows(csv: string): string[] {
 }
 
 describe("STORY-073 · the ledger CSV export", () => {
+  it("STORY-073 AC9 · carries internal_cost_usd as its own column: the figure when measured, EMPTY (never 0) when not", () => {
+    const column = (e: CreditLedgerEntry): string => {
+      const [header, row] = rows(toLedgerCsv([e]));
+      const names = header!.split(",").map((c) => c.replaceAll('"', ""));
+      return row!.split(",").map((c) => c.replaceAll('"', ""))[names.indexOf("internal_cost_usd")]!;
+    };
+    expect(column(entry({ internal_cost_usd: "0.022500" }))).toBe("0.022500");
+    expect(column(entry({ internal_cost_usd: "0.000000" }))).toBe("0.000000");
+    expect(column(entry({ internal_cost_usd: null }))).toBe("");
+  });
+
   it("writes a header even when there is nothing to export", () => {
     // An empty file is indistinguishable from a failed download. A header
     // alone says "we looked, and there was nothing".

@@ -33,6 +33,7 @@ import { aggregateScan } from "../../visibility-scan/scan-result.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { buildCaptureEngineGate, buildSpendMeter } from "./capture-execute.handler.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
+import { commitEntryIdFor } from "../../credits/internal-cost.js";
 
 // STORY-079 - `lookup.execute`: one Visibility Scan, on the DEDICATED interactive pool (system-architecture.md section 6.2).
 //
@@ -297,12 +298,14 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     });
     // WHAT THE SCAN COST US, per workspace (usage_ledger, source 'lookup'): one row per live capture with a real cost, written once per (run, engine) so a
     // redelivered commit adds nothing. A cached answer cost nothing and has no row. The customer's own charge is the run's credit_ledger entry.
+    // STORY-073 AC9: each row is linked to the tool run's commit entry (the debit committed at accept, before any cost existed).
+    const commitEntryId = fetched.costs.size === 0 ? null : await commitEntryIdFor(tx, payload.workspaceId, "tool_run", payload.toolRunId);
     for (const [engine, usd] of fetched.costs) {
       await tx.query(
-        `INSERT INTO usage_ledger (workspace_id, metric, quantity, unit_cost_usd, engine_key, source, credits_charged, reference_type, reference_id, cache_layer)
-         SELECT app.current_workspace(), 'capture', 1, $1::numeric, $2, 'lookup', 0, 'tool_run', $3::uuid, 'live'
+        `INSERT INTO usage_ledger (workspace_id, metric, quantity, unit_cost_usd, engine_key, source, credits_charged, credit_ledger_id, reference_type, reference_id, cache_layer)
+         SELECT app.current_workspace(), 'capture', 1, $1::numeric, $2, 'lookup', 0, $4::uuid, 'tool_run', $3::uuid, 'live'
           WHERE NOT EXISTS (SELECT 1 FROM usage_ledger WHERE workspace_id = app.current_workspace() AND reference_type = 'tool_run' AND reference_id = $3::uuid AND engine_key = $2)`,
-        [usd.toFixed(6), engine, payload.toolRunId],
+        [usd.toFixed(6), engine, payload.toolRunId, commitEntryId],
       );
     }
     await (await tools()).finishRun(payload.toolRunId, {

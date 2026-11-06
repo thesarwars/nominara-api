@@ -3,6 +3,7 @@ import type { CreditLedgerEntry, CreditLedgerQuery } from "../../../contracts/bi
 import { ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
+import { REALISED_INTERNAL_COST_JOIN, REALISED_INTERNAL_COST_SQL } from "../../lib/credits/internal-cost.js";
 
 // STORY-073 AC12 — reading the ledger back.
 //
@@ -37,6 +38,7 @@ interface LedgerRow {
   reference_id: string | null;
   unit_detail: CreditLedgerEntry["unit_detail"];
   reason: string | null;
+  internal_cost_usd: string | null;
   /** What the contract publishes — millisecond precision, which is what a person reads. */
   occurred_at: string;
   /**
@@ -80,6 +82,7 @@ function toEntry(row: LedgerRow): CreditLedgerEntry {
     unit_detail: row.unit_detail,
     reason: row.reason,
     occurred_at: row.occurred_at,
+    internal_cost_usd: row.internal_cost_usd,
   };
 }
 
@@ -127,23 +130,25 @@ export async function readLedgerPage(
   const after = query.cursor === undefined ? undefined : cursorKeyOf(query.cursor);
 
   const result = await tx.query<LedgerRow>(
-    `SELECT id, entry_type, action_code, credits::text, bucket,
-            included_after::text, purchased_after::text, reserved_after::text,
-            actor_id, actor_pseudonym, actor_type, project_id, reference_type, reference_id,
-            unit_detail, reason,
-            to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at,
-            to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_at_key,
-            seq::text AS seq_key
-       FROM credit_ledger
-      WHERE ($1::text IS NULL OR action_code = $1)
-        AND ($2::uuid IS NULL OR project_id = $2)
-        AND ($3::uuid IS NULL OR actor_id = $3)
-        AND ($4::text IS NULL OR entry_type = $4)
-        AND ($5::date IS NULL OR occurred_at >= $5::date)
-        AND ($6::date IS NULL OR occurred_at < ($6::date + 1))
+    `SELECT e.id, e.entry_type, e.action_code, e.credits::text, e.bucket,
+            e.included_after::text, e.purchased_after::text, e.reserved_after::text,
+            e.actor_id, e.actor_pseudonym, e.actor_type, e.project_id, e.reference_type, e.reference_id,
+            e.unit_detail, e.reason,
+            ${REALISED_INTERNAL_COST_SQL} AS internal_cost_usd,
+            to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at,
+            to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS occurred_at_key,
+            e.seq::text AS seq_key
+       FROM credit_ledger e
+       ${REALISED_INTERNAL_COST_JOIN}
+      WHERE ($1::text IS NULL OR e.action_code = $1)
+        AND ($2::uuid IS NULL OR e.project_id = $2)
+        AND ($3::uuid IS NULL OR e.actor_id = $3)
+        AND ($4::text IS NULL OR e.entry_type = $4)
+        AND ($5::date IS NULL OR e.occurred_at >= $5::date)
+        AND ($6::date IS NULL OR e.occurred_at < ($6::date + 1))
         AND ($7::timestamptz IS NULL
-             OR (occurred_at, seq) < ($7::timestamptz, $8::bigint))
-      ORDER BY occurred_at DESC, seq DESC
+             OR (e.occurred_at, e.seq) < ($7::timestamptz, $8::bigint))
+      ORDER BY e.occurred_at DESC, e.seq DESC
       LIMIT $9`,
     [
       query.action ?? null,
@@ -166,15 +171,9 @@ export async function readLedgerPage(
 /**
  * A page of entries, as CSV.
  *
- * ⚠ NO ROUTE CALLS THIS YET, and that is a decision rather than an oversight.
- * A synchronous `ledger.csv` route was built and removed: it required
- * `@NoEnvelope()`, which an architectural gate reserves for the health
- * probes, and it carried no `exports.csv` entitlement check though CSV
- * export is a plan feature Free and Starter do not have. The export belongs
- * in `POST /exports`'s async pipeline (api-specification.md §3), which has
- * both the gate and the artifact store. This is the serialiser that pipeline
- * will call, landed with the story that knows the ledger's shape rather than
- * left for the one that knows the worker's.
+ * STORY-073 AC10: `BillingService.ledgerExport` calls this for `GET /billing/wallet/ledger/export`, which carries the
+ * `exports.csv` entitlement check and the normal response envelope. The earlier synchronous `ledger.csv` route needed
+ * `@NoEnvelope()` and had neither.
  *
  * ⚠ EVERY FIELD IS QUOTED AND EVERY QUOTE IS DOUBLED, including the ones
  * that "cannot" contain a comma. `reason` is free text a human wrote, so it
@@ -214,6 +213,7 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
     "cells_charged",
     "cells_cached",
     "reason",
+    "internal_cost_usd",
   ];
 
   // Which columns hold something a person wrote, or an identifier that could
@@ -241,6 +241,7 @@ export function toLedgerCsv(entries: readonly CreditLedgerEntry[]): string {
     entry.unit_detail === null ? "" : String(entry.unit_detail.cells_charged),
     entry.unit_detail === null ? "" : String(entry.unit_detail.cells_cached),
     entry.reason ?? "",
+    entry.internal_cost_usd ?? "",
   ]);
 
   // CRLF, because RFC 4180 says so and because Excel on Windows treats a

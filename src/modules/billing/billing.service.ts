@@ -1,9 +1,12 @@
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
+import { LEDGER_EXPORT_MAX_ROWS } from "../../../contracts/billing/index.js";
 import type {
   AutoTopupConfig,
   AutoTopupRequest,
   CreditLedgerEntry,
+  CreditLedgerExportQuery,
+  CreditLedgerExportResponse,
   CreditLedgerQuery,
   UsageResponse,
   WalletResponse,
@@ -19,11 +22,17 @@ import { METRIC_SPECS } from "../../lib/usage/metrics.js";
 import { limitValueFor, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
 import type { Page } from "../../api/pagination/page.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
-import { readLedgerPage } from "./credit-ledger.reader.js";
+import { isFeatureGranted } from "../../lib/entitlements/classification.js";
+import { readLedgerPage, toLedgerCsv } from "./credit-ledger.reader.js";
 
 // STORY-073 AC12 — api-specification.md §3: `GET /billing/wallet/ledger`,
 // "cursor over credit_ledger; filter by action, project, actor, date; CSV
 // export".
+
+/** The plan from which CSV export is available (plans-and-entitlements.md section 2: `exports.csv`). */
+const EXPORTS_CSV_MIN_PLAN = "growth";
+
+const logger = new Logger("BillingService");
 
 /** The plan from which auto top-up is available (plans-and-entitlements.md: "Growth+"). */
 export const AUTO_TOPUP_MIN_PLAN = "growth";
@@ -267,6 +276,48 @@ export class BillingService {
 
   async ledger(query: CreditLedgerQuery): Promise<Page<CreditLedgerEntry>> {
     return readLedgerPage(this.client(), query);
+  }
+
+  /**
+   * STORY-073 AC10 - the ledger as one CSV, under the same filters as `ledger()`.
+   *
+   * Reads inside the request's tenant transaction, so RLS is what keeps it to the caller's workspace (no `workspace_id`
+   * predicate, as in `readLedgerPage`). Pure computation over a bounded read: at most LEDGER_EXPORT_MAX_ROWS rows, newest
+   * first, with `truncated` saying so when more matched. `exports.csv` is checked here because the route is not metered.
+   */
+  async ledgerExport(query: CreditLedgerExportQuery): Promise<CreditLedgerExportResponse> {
+    const started = Date.now();
+    const client = this.client();
+    const workspaceId = currentTenantStore()!.context.workspaceId;
+
+    const resolved = await resolveEntitlements(client, workspaceId);
+    if (!isFeatureGranted(resolved.entitlements["exports.csv"]?.value ?? null)) {
+      incrementCounter("nominara_billing_ledger_exports_total", { outcome: "feature_not_in_plan" });
+      throw new FeatureNotInPlanError({ details: { key: "exports.csv", min_plan: EXPORTS_CSV_MIN_PLAN } });
+    }
+
+    const page = await readLedgerPage(client, { ...query, limit: LEDGER_EXPORT_MAX_ROWS });
+    const file = Buffer.from(toLedgerCsv(page.items), "utf8");
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    incrementCounter("nominara_billing_ledger_exports_total", { outcome: "ok" });
+    // The workspace ID, never its name; a count and a size, never a row.
+    logger.log({
+      span: "billing.ledger.export",
+      workspace_id: workspaceId,
+      rows: page.items.length,
+      truncated: page.pagination.has_more,
+      bytes: file.length,
+      duration_ms: Date.now() - started,
+    });
+
+    return {
+      filename: `nominara-credit-ledger-${stamp}.csv`,
+      content_type: "text/csv",
+      download_url: `data:text/csv;base64,${file.toString("base64")}`,
+      row_count: page.items.length,
+      truncated: page.pagination.has_more,
+    };
   }
 
   private client() {

@@ -71,6 +71,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "crawl.discover",
       "credit.housekeeping",
       "credit.reconcile",
+      "credit.verify",
       "domain.reverify",
       "embed.batch",
       "identity.sweep_unverified",
@@ -137,6 +138,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "maintenance.integrity",
       // STORY-180 r5 — declared after task.resurface in topology.ts.
       "report.cleanup",
+      // STORY-073 AC4 — declared after task.resurface in topology.ts.
+      "credit.verify",
     ]);
   });
 
