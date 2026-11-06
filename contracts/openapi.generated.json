@@ -93,6 +93,16 @@
                           "hide_nominara_brand": {
                             "type": "boolean"
                           },
+                          "custom_css": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "email_from_name": {
                             "anyOf": [
                               {
@@ -118,6 +128,16 @@
                                 "type": "null"
                               }
                             ]
+                          },
+                          "email_footer_html": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
@@ -131,8 +151,10 @@
                           "font_family",
                           "logo_url",
                           "hide_nominara_brand",
+                          "custom_css",
                           "email_from_name",
-                          "email_reply_to"
+                          "email_reply_to",
+                          "email_footer_html"
                         ],
                         "additionalProperties": false
                       }
@@ -529,6 +551,16 @@
                         "hide_nominara_brand": {
                           "type": "boolean"
                         },
+                        "custom_css": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "email_from_name": {
                           "anyOf": [
                             {
@@ -554,6 +586,75 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "email_footer_html": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "dropped": {
+                          "type": "object",
+                          "properties": {
+                            "custom_css": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "construct": {
+                                    "type": "string"
+                                  },
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "property",
+                                      "value",
+                                      "selector",
+                                      "at_rule",
+                                      "rule"
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "construct",
+                                  "reason",
+                                  "kind"
+                                ],
+                                "additionalProperties": false
+                              }
+                            },
+                            "email_footer_html": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "construct": {
+                                    "type": "string"
+                                  },
+                                  "reason": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "construct",
+                                  "reason"
+                                ],
+                                "additionalProperties": false
+                              }
+                            }
+                          },
+                          "required": [
+                            "custom_css",
+                            "email_footer_html"
+                          ],
+                          "additionalProperties": false
                         }
                       },
                       "required": [
@@ -567,8 +668,11 @@
                         "font_family",
                         "logo_url",
                         "hide_nominara_brand",
+                        "custom_css",
                         "email_from_name",
-                        "email_reply_to"
+                        "email_reply_to",
+                        "email_footer_html",
+                        "dropped"
                       ],
                       "additionalProperties": false
                     },
@@ -916,6 +1020,28 @@
                         "maxLength": 254,
                         "format": "email",
                         "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "custom_css": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 20000
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "email_footer_html": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 2000
                       },
                       {
                         "type": "null"
@@ -26080,6 +26206,16 @@
                             },
                             "hide_nominara_brand": {
                               "type": "boolean"
+                            },
+                            "custom_css": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             }
                           },
                           "required": [
@@ -26092,7 +26228,8 @@
                             "color_fg",
                             "font_family",
                             "logo_url",
-                            "hide_nominara_brand"
+                            "hide_nominara_brand",
+                            "custom_css"
                           ],
                           "additionalProperties": false
                         },
