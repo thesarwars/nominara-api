@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { Pool } from "pg";
 import type { Job } from "bullmq";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +17,10 @@ import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { UrlGuard } from "../../src/lib/net/url-guard.service.js";
 import { createLookupExecuteHandler, type LookupExecuteDeps } from "../../src/lib/queue/handlers/lookup-execute.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
+import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
+import { TEST_SIGNING_KEYS } from "../support/queue-test-harness.js";
 import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
@@ -81,6 +86,9 @@ describe("STORY-081 · Competitor Finder", () => {
   let workerDeps: Partial<LookupExecuteDeps>;
   let enqueued: { workspaceId: string; payload: Record<string, unknown>; options: Record<string, unknown> }[];
   let workers: Promise<unknown>[];
+  // Which delivery of the job the worker is on (BullMQ's attemptsMade): 2 of 3 is the last attempt, where a failure must settle and refund the run.
+  let attemptsMade = 0;
+  let viaProcessor = false;
 
   beforeAll(async () => {
     [cacheValkey, queueValkey] = await Promise.all([startValkey(), startValkeyFixture()]);
@@ -97,6 +105,8 @@ describe("STORY-081 · Competitor Finder", () => {
     workerDeps = {};
     enqueued = [];
     workers = [];
+    attemptsMade = 0;
+    viaProcessor = false;
     // The production class lets one user spend 2 scans at once (5/min). Most scenarios here make more calls than that per user, so they run on the widest
     // document the envelope allows (x10). That the route IS in the class is asserted on the handler (src/modules/tools/tools.spec.ts): the guard reads its
     // document through a 15 s memo, so a scenario that swaps documents mid-spec would have to sit out the memo.
@@ -128,7 +138,14 @@ describe("STORY-081 · Competitor Finder", () => {
       resolveAdapter: (key) => adapter(key, adapters[key] ?? (async () => { throw new CaptureFailureError("timeout", key as never); })),
       ...workerDeps,
     });
-    const job = { data: { payload: { ...payload, workspaceId } }, opts: { attempts: 3 }, attemptsMade: 0 } as unknown as Job;
+    // The REAL processor (signature check, two tenant transactions, and the recover hook on a failed attempt) when a scenario is about a failure path.
+    if (viaProcessor) {
+      const entry = QUEUE_TOPOLOGY.find((e) => e.name === "lookup.execute")!;
+      const processor = createJobProcessor(entry, { keys: TEST_SIGNING_KEYS, getClient: () => pool.connect(), releaseClient: (client) => (client as unknown as { release(): void }).release(), process: handler });
+      const envelope = signQueueJobPayload({ ...payload, workspaceId, kid: TEST_SIGNING_KEYS.current.kid } as never, TEST_SIGNING_KEYS.current.key);
+      return processor({ data: envelope, opts: { attempts: 3 }, attemptsMade } as unknown as Job);
+    }
+    const job = { data: { payload: { ...payload, workspaceId } }, opts: { attempts: 3 }, attemptsMade } as unknown as Job;
     return (async () => {
       const client = await pool.connect();
       try {
@@ -270,14 +287,106 @@ describe("STORY-081 · Competitor Finder", () => {
     expect(await available(a)).toBe(before);
   });
 
-  it("scenario 10 - an engine failure after the page was read settles failed and is named (a single capture has no partial: see the story's open question)", async () => {
+  it("scenario 10 - an engine failure after the page was read settles failed, is named, and the charge comes back exactly once (a single capture has no partial)", async () => {
     const a = await owner("starter");
     adapters = { perplexity: async () => { throw new CaptureFailureError("timeout", "perplexity" as never); } };
+    const before = await available(a);
     await post(a);
     await settle();
     const d = (await detail(a, runId())).data;
     expect(d.status).toBe("failed");
     expect(d.error_code).toBe("timeout");
+    expect(d.credits_charged).toBe(0);
+    expect(await available(a)).toBe(before);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 AND entry_type = 'refund'", [a.workspaceId, runId()])).toBe(1);
+  });
+
+  it("at-least-once - the same job delivered again after it settled captures nothing, refunds nothing more and writes no second cost row (completed run)", async () => {
+    const a = await owner("starter");
+    let calls = 0;
+    adapters = { perplexity: async (ctx) => { calls += 1; ctx.recordCost(0.02); return raw(); } };
+    const before = await available(a);
+    await post(a);
+    await settle();
+    await runWorker(a.workspaceId, enqueued[0]!.payload);
+    expect(calls).toBe(1);
+    expect((await detail(a, runId())).data.status).toBe("completed");
+    expect(await available(a)).toBe(before - 1);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 AND entry_type = 'refund'", [a.workspaceId, runId()])).toBe(0);
+    expect(await count("SELECT count(*)::int AS n FROM usage_ledger WHERE workspace_id = $1 AND reference_type = 'tool_run' AND reference_id = $2", [a.workspaceId, runId()])).toBe(1);
+  });
+
+  it("at-least-once - a redelivery after a refunded run (nothing named) refunds once, not twice", async () => {
+    const a = await owner("starter");
+    let calls = 0;
+    adapters = { perplexity: async (ctx) => { calls += 1; ctx.recordCost(0.02); return raw("I could not name specific companies."); } };
+    const before = await available(a);
+    await post(a);
+    await settle();
+    await runWorker(a.workspaceId, enqueued[0]!.payload);
+    expect(calls).toBe(1);
+    expect(await available(a)).toBe(before);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 AND entry_type = 'refund'", [a.workspaceId, runId()])).toBe(1);
+    expect(await count("SELECT count(*)::int AS n FROM usage_ledger WHERE workspace_id = $1 AND reference_type = 'tool_run' AND reference_id = $2", [a.workspaceId, runId()])).toBe(1);
+  });
+
+  it("final attempt - an unexpected (non-engine) error on the last delivery settles the run failed as finder_job_failed and returns the charge exactly once", async () => {
+    const a = await owner("starter");
+    attemptsMade = 2;
+    viaProcessor = true;
+    adapters = { perplexity: async () => { throw new Error("boom"); } };
+    const before = await available(a);
+    await post(a);
+    await settle();
+    const d = (await detail(a, runId())).data;
+    expect(d.status).toBe("failed");
+    expect(d.error_code).toBe("finder_job_failed");
+    expect(d.credits_charged).toBe(0);
+    expect(await available(a)).toBe(before);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 AND entry_type = 'refund'", [a.workspaceId, runId()])).toBe(1);
+  });
+
+  it("an unexpected error on an EARLIER delivery is retried, not settled: the run stays running and charged", async () => {
+    const a = await owner("starter");
+    attemptsMade = 0;
+    viaProcessor = true;
+    adapters = { perplexity: async () => { throw new Error("boom"); } };
+    const before = await available(a);
+    await post(a);
+    await Promise.allSettled(workers);
+    workers = [];
+    expect((await detail(a, runId())).data.status).toBe("running");
+    expect(await available(a)).toBe(before - 1);
+  });
+
+  it("a site that cannot be reached at all (robots.txt transport error) is page_unreachable, not a robots refusal; a robots 5xx is still robots_disallowed", async () => {
+    const a = await owner("starter");
+    pages = async (url) => { throw new Error(`ECONNREFUSED ${url}`); };
+    await post(a);
+    await settle();
+    expect((await detail(a, runId())).data.error_code).toBe("page_unreachable");
+    const b = await owner("starter");
+    enqueued = [];
+    pages = async (url) => ({ status: url.endsWith("/robots.txt") ? 503 : 200, headers: { "content-type": "text/html" }, body: Buffer.from(PAGE), finalUrl: url });
+    await post(b);
+    await settle();
+    expect((await detail(b, runId())).data.error_code).toBe("robots_disallowed");
+  });
+
+  it("observability - the run increments nominara_tools_competitor_finder_runs_total and the finished log line carries the workspace ID and run ID, no answer text, query or URL", async () => {
+    const a = await owner("starter");
+    const lines: unknown[] = [];
+    vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => {
+      lines.push(message);
+    });
+    await post(a);
+    await settle();
+    const metric = lines.find((l) => (l as { metric?: string }).metric === "nominara_tools_competitor_finder_runs_total");
+    expect(metric).toMatchObject({ value: 1, outcome: "named" });
+    const finished = lines.find((l) => (l as { event?: string }).event === "tools.competitor_finder.finished") as Record<string, unknown>;
+    expect(finished).toMatchObject({ workspace_id: a.workspaceId, run_id: runId(), entities: 2 });
+    const text = JSON.stringify(finished);
+    for (const forbidden of ["Billwise", "LedgerLark", "acme-invoicing", "Acme"]) expect(text).not.toContain(forbidden);
   });
 
   it("scenario 11 - after a run the fact tables and capture tables hold zero rows for the workspace", async () => {

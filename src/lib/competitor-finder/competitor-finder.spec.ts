@@ -4,7 +4,7 @@ import { COMPETITOR_FINDER_SCOPE_STATEMENT, competitorFinderRequestSchema, compe
 import { toolConversionPlan } from "../tools/conversion.js";
 import { buildEntityRows } from "./build-rows.js";
 import { deriveCategoryQuery } from "./category-query.js";
-import { DetectedSpan, detectEntitySpans } from "./detect-entities.js";
+import { DetectedSpan, detectEntitySpans, digestOf } from "./detect-entities.js";
 
 // STORY-081 - the pure core of the Competitor Finder. Scenario numbers are the story's Test scenarios table.
 
@@ -86,6 +86,11 @@ describe("STORY-081 scenario 6 - a row without a span is not representable", () 
     const forged = [{ start: 0, end: 8 }] as unknown as readonly DetectedSpan[];
     expect(() => buildEntityRows({ text: "Salesforce is big", spans: forged, citations: [] })).toThrow();
   });
+  it("scenario 6 - a span forged with the real prototype and a real digest is refused (branding is module-private, not instanceof)", () => {
+    const text = "Salesforce is big";
+    const forged = [Object.assign(Object.create(DetectedSpan.prototype) as object, { start: 0, end: 10, sourceDigest: digestOf(text) })] as unknown as readonly DetectedSpan[];
+    expect(() => buildEntityRows({ text, spans: forged, citations: [] })).toThrow();
+  });
   it("scenario 6 - a span detected in one answer cannot build a row from another text", () => {
     const spans = detectEntitySpans("1. **Billwise** — x", { excludeNames: [] });
     expect(() => buildEntityRows({ text: "1. **Salesfor** — x", spans, citations: [] })).toThrow();
@@ -112,8 +117,63 @@ describe("STORY-081 scenario 7 and 12 - the result states its scope and pre-fill
     expect(competitorFinderResultSchema.safeParse({ ...result, entities: [{ name: "X", cited_domain: null }] }).success).toBe(false);
   });
   it("scenario 12 - the shared conversion contract pre-fills the detected entities as candidate competitors", () => {
-    const plan = toolConversionPlan({ tool_key: "competitor_finder", status: "completed", brand_name: null, brand_url: null, target_url: "https://acme.example", query_text: "q", prompt_texts: null, converted_project_id: null, result_json: result });
+    const plan = toolConversionPlan({ tool_key: "competitor_finder", status: "completed", brand_name: null, brand_url: "https://acme.example", target_url: null, query_text: "q", prompt_texts: null, converted_project_id: null, result_json: result });
     expect(plan.prefill.competitors).toEqual(["Billwise"]);
     expect(plan.prefill.root_url).toBe("https://acme.example");
+  });
+});
+
+// The answer shape the one real engine (Gemini) produces: bold section headings, then `**Name:** description` bullets, then a criteria section.
+const GEMINI_ANSWER = [
+  "**Top Invoicing Software**",
+  "",
+  "Here are the leading options for freelancers:",
+  "",
+  "*   **FreshBooks:** Great for freelancers, with simple invoices and time tracking.",
+  "*   **Wave:** Free invoicing for small businesses.",
+  "*   [Zoho Invoice](https://www.zoho.com/invoice/) - free for small teams.",
+  "",
+  "**Key Considerations When Choosing**",
+  "",
+  "*   **Ease of Use:** Look for a clean interface.",
+  "*   **Payment Options:** Accept cards and bank transfer.",
+  "*   Integrations matter for many teams",
+].join("\n");
+
+describe("STORY-081 scenario 4 - headings, labels and sentences are not entities (Gemini-shaped answer)", () => {
+  const spans = detectEntitySpans(GEMINI_ANSWER, { excludeNames: [] });
+  const rows = buildEntityRows({ text: GEMINI_ANSWER, spans, citations: [] });
+  it("scenario 4 - only the vendor names come back", () => {
+    expect(rows.map((r) => r.name)).toEqual(["FreshBooks", "Wave", "Zoho Invoice"]);
+  });
+  it("scenario 12 - the conversion prefill holds only those names", () => {
+    const result = {
+      schema_version: 1 as const,
+      scope: { engine: "gemini", query: "q", captured_at: "2026-11-06T10:00:00.000Z", statement: COMPETITOR_FINDER_SCOPE_STATEMENT },
+      entities: rows,
+      competitors: rows.map((r) => r.name),
+    };
+    const plan = toolConversionPlan({ tool_key: "competitor_finder", status: "completed", brand_name: null, brand_url: "https://acme.example", target_url: null, query_text: "q", prompt_texts: null, converted_project_id: null, result_json: result });
+    expect(plan.prefill.competitors).toEqual(["FreshBooks", "Wave", "Zoho Invoice"]);
+  });
+  it("a bold phrase that is a whole line, a heading with a trailing colon, and a sentence-shaped list lead are not detected", () => {
+    const text = "**Top Picks**\n**Invoicing Software:**\n- Pick tools that fit your team\n- **Billwise:** invoices";
+    expect(detectEntitySpans(text, { excludeNames: [] }).map((s) => text.slice(s.start, s.end))).toEqual(["Billwise"]);
+  });
+});
+
+describe("STORY-081 scenario 4 - a Gemini grounding wrapper citation titled with the entity's domain evidences the row", () => {
+  const text = "*   **FreshBooks:** Great for freelancers.\n*   **LedgerLark:** bookkeeping.";
+  const spans = detectEntitySpans(text, { excludeNames: [] });
+  const wrapper = (title: string, slot: number) => ({ url: `https://vertexaisearch.cloud.google.com/grounding-api-redirect/${slot}`, title, slot });
+  it("scenario 4 - the wrapper's title hostname is the cited domain; the wrapper host is never reported", () => {
+    const rows = buildEntityRows({ text, spans, citations: [wrapper("freshbooks.com", 1), wrapper("unrelated.example", 2)] });
+    expect(rows.find((r) => r.name === "FreshBooks")!.cited_domain).toBe("freshbooks.com");
+    expect(rows.find((r) => r.name === "LedgerLark")!.cited_domain).toBeNull();
+    expect(JSON.stringify(rows)).not.toContain("vertexaisearch");
+  });
+  it("scenario 4 - a title that is not a hostname gives no domain", () => {
+    const rows = buildEntityRows({ text, spans, citations: [wrapper("FreshBooks - invoicing", 1)] });
+    expect(rows.find((r) => r.name === "FreshBooks")!.cited_domain).toBeNull();
   });
 });

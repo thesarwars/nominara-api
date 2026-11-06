@@ -116,7 +116,7 @@ export function createCompetitorFindPhases(context: QueueHandlerContext, deps: C
   };
 
   /** RFC 9309: a robots.txt that errored (5xx / unreachable) means "assume disallow"; a 4xx means "no rules". Our own agent token is the one obeyed. */
-  const robotsFor = async (origin: string, init: GuardedFetchInit): Promise<ParsedRobots | "unavailable" | null> => {
+  const robotsFor = async (origin: string, init: GuardedFetchInit): Promise<ParsedRobots | "unavailable" | "unreachable" | null> => {
     try {
       const response = await fetchPage(new URL("/robots.txt", origin).href, init);
       if (response.status >= 500) return "unavailable";
@@ -124,7 +124,8 @@ export function createCompetitorFindPhases(context: QueueHandlerContext, deps: C
       return parseRobots(response.body.toString("utf8"));
     } catch (error) {
       if (error instanceof GuardedFetchRefusal) throw new FinderFailure("unsafe_target");
-      return "unavailable";
+      // A transport error (DNS, refused connection, timeout) is the site being unreachable - not a robots refusal.
+      return "unreachable";
     }
   };
 
@@ -144,6 +145,7 @@ export function createCompetitorFindPhases(context: QueueHandlerContext, deps: C
     const origin = new URL(targetUrl).origin;
     const robots = await robotsFor(origin, init);
     const target = new URL(targetUrl);
+    if (robots === "unreachable") throw new FinderFailure("page_unreachable");
     if (robots === "unavailable" || (robots !== null && !isAllowed(robots, CRAWL_AGENT, `${target.pathname}${target.search}`))) throw new FinderFailure("robots_disallowed");
     let response: GuardedResponse;
     try {
@@ -250,6 +252,8 @@ export function createCompetitorFindPhases(context: QueueHandlerContext, deps: C
   const commit = async (tx: ClientBase, prepared: Prepared, fetched: Fetched): Promise<void> => {
     const { payload } = prepared;
     if (fetched.costUsd > 0) {
+      // Serialise concurrent commits of one run (a stalled-job redelivery) on the run row, so the NOT EXISTS below cannot pass twice.
+      await tx.query("SELECT 1 FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1 FOR UPDATE", [payload.toolRunId]);
       const commitEntryId = await commitEntryIdFor(tx, payload.workspaceId, "tool_run", payload.toolRunId);
       await tx.query(
         `INSERT INTO usage_ledger (workspace_id, metric, quantity, unit_cost_usd, engine_key, source, credits_charged, credit_ledger_id, reference_type, reference_id, cache_layer)

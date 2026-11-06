@@ -1,13 +1,13 @@
 import type { CompetitorFinderEntity } from "../../../contracts/tools/index.js";
-import { hostOf, REDIRECT_WRAPPER_HOSTS } from "../visibility-scan/scan-result.js";
-import { DetectedSpan, digestOf } from "./detect-entities.js";
+import { extractCitations } from "../parser/citations.js";
+import { hostnameHint, hostOf, REDIRECT_WRAPPER_HOSTS } from "../visibility-scan/scan-result.js";
+import { digestOf, isDetectedSpan, type DetectedSpan } from "./detect-entities.js";
 
 // STORY-081 - the response builder. A row is CONSTRUCTED FROM A DETECTED SPAN: the name is read out of the answer at the span's offsets, never supplied. The
 // parameters below take spans and the answer they were detected in - there is no parameter that carries a name, so a name the capture did not produce
 // cannot be represented, and a future call site cannot skip a check that is not a check at all.
 
 const EXCERPT_CHARS = 280;
-const LINK_URL = /\[[^\]\n]*\]\(([^)\s]+)\)/gu;
 
 export interface AnswerCitation {
   readonly url: string;
@@ -47,12 +47,19 @@ function excerptOf(text: string, line: { start: number; end: number }, spanStart
 function citedDomain(text: string, line: { start: number; end: number }, name: string, citations: readonly AnswerCitation[]): string | null {
   const wanted = stem(name);
   const lineText = text.slice(line.start, line.end);
-  const linked = [...lineText.matchAll(LINK_URL)].map((m) => hostOf(m[1]!)).filter((h) => h !== "");
+  // The STORY-037 extractor reads the entity's own line: markdown links, bare URLs and footnotes, in one definition of "a link".
+  const linked = extractCitations(lineText).map((c) => hostOf(c.rawUrl)).filter((h) => h !== "");
   const own = linked.find((h) => hostStem(h) === wanted);
   if (own !== undefined) return own;
   for (const c of citations) {
     const host = hostOf(c.url);
-    if (host === "" || REDIRECT_WRAPPER_HOSTS.has(host)) continue;
+    if (host === "") continue;
+    // A redirect wrapper (Gemini grounding) is the engine's host, not the source's; the source is the title's hostname, exactly as the Visibility Scan reads it.
+    if (REDIRECT_WRAPPER_HOSTS.has(host)) {
+      const hint = hostnameHint(c.title ?? null);
+      if (hint !== null && hostStem(hint) === wanted) return hint;
+      continue;
+    }
     if (hostStem(host) === wanted) return host;
   }
   // A link on the entity's line whose host is not the entity's own (a review site, say) is still what the answer cited for that line.
@@ -62,7 +69,7 @@ function citedDomain(text: string, line: { start: number; end: number }, name: s
 export function buildEntityRows(input: BuildRowsInput): CompetitorFinderEntity[] {
   const digest = digestOf(input.text);
   return input.spans.map((span) => {
-    if (!(span instanceof DetectedSpan)) throw new Error("an entity row can only be built from a DetectedSpan");
+    if (!isDetectedSpan(span)) throw new Error("an entity row can only be built from a DetectedSpan");
     if (span.sourceDigest !== digest) throw new Error("this span was detected in a different text");
     if (span.start < 0 || span.end > input.text.length || span.end <= span.start) throw new Error("a span outside its text");
     const name = input.text.slice(span.start, span.end);

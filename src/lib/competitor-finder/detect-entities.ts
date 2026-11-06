@@ -15,6 +15,11 @@ import { createHash } from "node:crypto";
 
 const CONSTRUCT = Symbol("nominara.competitor-finder.detected-span");
 let make: (start: number, end: number, sourceDigest: string) => DetectedSpan;
+/** The spans `detectEntitySpans` really produced. Membership, not `instanceof`, is the proof: a look-alike with the right prototype is not in it. */
+const GENUINE = new WeakSet<object>();
+
+/** True only for a span this module produced. */
+export const isDetectedSpan = (value: unknown): value is DetectedSpan => typeof value === "object" && value !== null && GENUINE.has(value);
 
 /** A character range of a source text where the answer presents an entity. Constructible only by `detectEntitySpans`. */
 export class DetectedSpan {
@@ -31,7 +36,11 @@ export class DetectedSpan {
   }
 
   static {
-    make = (start, end, sourceDigest) => new DetectedSpan(CONSTRUCT, start, end, sourceDigest);
+    make = (start, end, sourceDigest) => {
+      const span = new DetectedSpan(CONSTRUCT, start, end, sourceDigest);
+      GENUINE.add(span);
+      return span;
+    };
   }
 }
 
@@ -74,12 +83,29 @@ function plausible(name: string): boolean {
   if (name.split(/\s+/u).length > MAX_WORDS) return false;
   if (/https?:\/\//u.test(name)) return false;
   if (/[.!?]\s/u.test(name)) return false;
-  return !LABELS.has(name.toLowerCase());
+  if (LABELS.has(name.toLowerCase())) return false;
+  // A sentence, not a name: a lowercase word after the first that is not a name's connective ("Integrations matter for many teams").
+  return !name.split(/\s+/u).slice(1).some((w) => /^\p{Ll}/u.test(w) && !CONNECTIVES.has(w));
+}
+
+const CONNECTIVES: ReadonlySet<string> = new Set(["of", "and", "the", "for", "de", "la", "van", "von", "&", "by", "at", "in", "on"]);
+
+// A section the answer opens with a heading about CHOOSING (criteria, tips, features) lists attributes, not vendors. This is context, not a vocabulary of
+// names: it only ever removes candidates, so a gap here costs a missed name, never an invented one.
+const CRITERIA_HEADING = /\b(?:consider\w*|factors?|criteria|choos\w+|features?|tips?|questions?|look(?:ing)? for|how to|what to|why|pros|cons|benefits|steps|checklist|things|summary|conclusion|takeaways?|pricing|comparison)\b/iu;
+const HEADING_LINE = /^[ \t]*(?:#{1,6}[ \t]+(.+?)|(\*\*|__)([^*_\n]+?)\2)[ \t]*:?[ \t]*$/gmu;
+
+interface Heading {
+  readonly lineStart: number;
+  readonly lineEnd: number;
+  readonly text: string;
 }
 
 /** The spans where the answer presents a named entity, in document order, one per distinct name (the first). */
 export function detectEntitySpans(text: string, options: DetectOptions): DetectedSpan[] {
   const raws: Raw[] = [];
+  // A bold phrase that is a whole line (or a # heading) is a HEADING, never an entity; it also opens a section.
+  const headings: Heading[] = [...text.matchAll(HEADING_LINE)].map((m) => ({ lineStart: m.index, lineEnd: m.index + m[0].length, text: (m[1] ?? m[3] ?? "").trim() }));
   for (const m of text.matchAll(BOLD)) {
     const start = m.index + m[1]!.length;
     const t = trimmed(text, start, start + m[2]!.length);
@@ -103,6 +129,9 @@ export function detectEntitySpans(text: string, options: DetectOptions): Detecte
   const out: DetectedSpan[] = [];
   for (const raw of [...raws].sort((a, b) => a.start - b.start || b.end - a.end)) {
     const name = text.slice(raw.start, raw.end);
+    if (headings.some((h) => raw.start >= h.lineStart && raw.end <= h.lineEnd)) continue;
+    const section = [...headings].reverse().find((h) => h.lineStart < raw.start);
+    if (section !== undefined && CRITERIA_HEADING.test(section.text)) continue;
     const key = name.toLowerCase();
     if (!plausible(name) || excluded.has(key) || seen.has(key)) continue;
     seen.add(key);
