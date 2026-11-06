@@ -50,7 +50,7 @@ function jpeg(w: number, h: number): Uint8Array {
 const SVG = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 60"><rect width="1" height="1"/></svg>');
 
 describe("STORY-097 · theme asset limits", () => {
-  it("a PNG logo within 1200x400 and 1 MB is accepted unchanged", () => {
+  it("a PNG logo within 1200x400 and 256 KB is accepted unchanged", () => {
     const r = validateThemeAsset("logo_light", "image/png", png(1200, 400));
     expect(r).toMatchObject({ ok: true, contentType: "image/png", width: 1200, height: 400 });
   });
@@ -60,10 +60,19 @@ describe("STORY-097 · theme asset limits", () => {
     expect(JSON.stringify(wide)).toContain("1200");
     expect(validateThemeAsset("logo_dark", "image/png", png(100, LOGO_MAX_HEIGHT + 1))).toMatchObject({ ok: false });
   });
-  it("owner decision 67 (n) · the logo limit is exactly 1 MiB", () => {
-    expect(LOGO_MAX_BYTES).toBe(1_048_576);
+  it("owner decision 72 · the logo limit is exactly 256 KB (262144), what the portal can serve; it supersedes the 1 MiB of decision 67 (n)", () => {
+    expect(LOGO_MAX_BYTES).toBe(262_144);
   });
-  it("scenario 9 · an oversize logo (1 MB + 1) and an oversize favicon (100 KB + 1) are refused, naming the size limit", () => {
+  it("owner decision 72 · both logo slots accept 256 KB and refuse 256 KB + 1 naming 262144; a 1 MiB logo is refused", () => {
+    for (const slot of ["logo_light", "logo_dark"] as const) {
+      expect(validateThemeAsset(slot, "image/png", png(10, 10, 262_144 - 33))).toMatchObject({ ok: true });
+      const over = validateThemeAsset(slot, "image/png", png(10, 10, 262_144 - 32));
+      expect(over).toMatchObject({ ok: false, refused: [{ construct: "size" }] });
+      expect(JSON.stringify(over)).toContain("262144");
+      expect(validateThemeAsset(slot, "image/png", png(10, 10, 1_048_576 - 33))).toMatchObject({ ok: false, refused: [{ construct: "size" }] });
+    }
+  });
+  it("scenario 9 · an oversize logo (256 KB + 1) and an oversize favicon (100 KB + 1) are refused, naming the size limit", () => {
     expect(validateThemeAsset("logo_light", "image/png", png(10, 10, LOGO_MAX_BYTES))).toMatchObject({ ok: false, refused: [{ construct: "size" }] });
     expect(validateThemeAsset("favicon", "image/png", png(32, 32, FAVICON_MAX_BYTES))).toMatchObject({ ok: false, refused: [{ construct: "size" }] });
     expect(validateThemeAsset("logo_light", "image/png", png(10, 10, LOGO_MAX_BYTES - 33))).toMatchObject({ ok: true });

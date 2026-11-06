@@ -354,6 +354,41 @@ describe("NEW-E-099a · portal read endpoints", () => {
     }
   });
 
+  it("STORY-099 s13 / NFR-AGY-03 · portal time to first byte is within 400 ms at p95, on the cold (uncached) read of each of 20 links and on the warm read", async () => {
+    const w = await world();
+    const p95 = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.ceil(xs.length * 0.95) - 1]!;
+    const cold: number[] = [];
+    const warm: number[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      const t = await token(w, { scope: [w.p1] });
+      for (const [bucket, route] of [[cold, "overview"], [warm, "overview"]] as const) {
+        const started = performance.now();
+        const res = await get(t.cookie, `/portal/${route}`);
+        bucket.push(performance.now() - started);
+        expect(res.statusCode, res.body).toBe(200);
+      }
+    }
+    // In-process inject: no network leg, so this bounds the server's own time to a complete response, which is the TTFB the API controls.
+    expect(p95(cold), `cold p95 ${String(p95(cold))} ms`).toBeLessThanOrEqual(400);
+    expect(p95(warm), `warm p95 ${String(p95(warm))} ms`).toBeLessThanOrEqual(400);
+  }, 120_000);
+
+  it("STORY-099 s11 · every portal refusal discloses nothing about the workspace: no name, label, project name, theme or id in the body", async () => {
+    const w = await world();
+    const t = await token(w, { scope: [w.p1], themeId: w.theme, label: "Q3 client report" });
+    const refusals = [
+      await get(null, "/portal/overview"),
+      await get(t.cookie, `/portal/matrix?project=${w.p2}`),
+      await get(t.cookie, "/portal/overview?timeframe=bogus"),
+      await get(t.cookie, "/portal/overview?scope=all"),
+      await get(t.cookie, "/portal/nonexistent"),
+    ];
+    for (const res of refusals) {
+      expect(res.statusCode).toBeGreaterThanOrEqual(400);
+      for (const secret of ["Agency One", "Client One", "Client Two", "Q3 client report", w.ws, w.theme, w.p1, w.p2]) expect(res.body, `${String(res.statusCode)} ${res.body}`).not.toContain(secret);
+    }
+  });
+
   it("matrix · an engine with nothing measured has null metrics and a null data_source, never 0 or 'demo'; the payload conforms", async () => {
     const w = await world();
     const t = await token(w, { scope: [w.p1] });

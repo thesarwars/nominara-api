@@ -1,11 +1,15 @@
 
 // STORY-097 · integrations-and-sharing.md §2 — what an agency may upload as a logo or favicon.
-//   logo_light / logo_dark   PNG, JPEG or WebP, <= 1 MB, at most 1200x400   (owner decision 67 (n): SVG is refused, so there is nothing to sanitise)
+//   logo_light / logo_dark   PNG, JPEG or WebP, <= 256 KB, at most 1200x400   (owner decision 67 (n): SVG is refused, so there is nothing to sanitise;
+//                            owner decision 72: the logo is capped at what the portal can serve as a data URL, PORTAL_LOGO_MAX_BYTES, down from 1 MB)
 //   favicon                  PNG, JPEG or WebP, <= 100 KB, square   (ICO is not accepted: decision 67 (n) lists PNG/JPEG/WebP)
 // The file's TYPE is decided by its bytes, never by the declared Content-Type: a declared type that disagrees with the bytes is a
 // refusal.
 
-export const LOGO_MAX_BYTES = 1024 * 1024;
+import { PORTAL_LOGO_MAX_BYTES } from "../../../contracts/portal/index.js";
+
+/** Owner decision 72: one definition with the portal's serving cap, so an accepted upload is always servable. */
+export const LOGO_MAX_BYTES = PORTAL_LOGO_MAX_BYTES;
 export const FAVICON_MAX_BYTES = 100 * 1024;
 export const LOGO_MAX_WIDTH = 1200;
 export const LOGO_MAX_HEIGHT = 400;

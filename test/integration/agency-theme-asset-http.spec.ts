@@ -156,13 +156,16 @@ describe("STORY-097 · theme assets over HTTP", () => {
     expect((await harness.db().query(`SELECT logo_light_key FROM brand_themes WHERE id = $1`, [themeId])).rows[0]).toMatchObject({ logo_light_key: null });
   }, 120_000);
 
-  it("STORY-097 s9 · 1 MiB is accepted, 1 MiB + 1 is refused naming the limit; a too-wide logo is refused naming 1200", async () => {
+  it("STORY-097 s9 / owner decision 72 · a logo of 256 KB is accepted, 256 KB + 1 and 1 MiB are refused naming the limit; a too-wide logo is refused naming 1200", async () => {
     const { a, themeId } = await themed();
-    const exact = await upload(a, themeId, { slot: "logo_dark", content_type: "image/png", data_base64: b64(png(10, 10, 1_048_576 - 33)) });
+    const exact = await upload(a, themeId, { slot: "logo_dark", content_type: "image/png", data_base64: b64(png(10, 10, 262_144 - 33)) });
     expect(exact.statusCode, exact.body).toBe(201);
-    const over = await upload(a, themeId, { slot: "logo_dark", content_type: "image/png", data_base64: b64(png(10, 10, 1_048_576 - 32)) });
+    const over = await upload(a, themeId, { slot: "logo_dark", content_type: "image/png", data_base64: b64(png(10, 10, 262_144 - 32)) });
     expect(over.statusCode, over.body).toBe(400);
-    expect(JSON.stringify(over.json())).toContain("1048576");
+    expect(JSON.stringify(over.json())).toContain("262144");
+    const mib = await upload(a, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10, 1_048_576 - 33)) });
+    expect(mib.statusCode, mib.body).toBe(400);
+    expect(JSON.stringify(mib.json())).toContain("262144");
     const wide = await upload(a, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(1201, 100)) });
     expect(wide.statusCode, wide.body).toBe(400);
     expect(JSON.stringify(wide.json())).toContain("1200");

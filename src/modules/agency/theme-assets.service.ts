@@ -21,7 +21,7 @@ import { AgencyService, themeAssetPath } from "./agency.service.js";
 
 // STORY-097 AC "Assets" · owner decision 67 (n). POST /v1/themes/{id}/assets and GET /v1/themes/{id}/assets/{slot}.
 //
-// The upload is validated on its BYTES (asset-limits.ts: PNG/JPEG/WebP, <= 1 MiB, logo <= 1200x400, favicon square <= 100 KB; an SVG is
+// The upload is validated on its BYTES (asset-limits.ts: PNG/JPEG/WebP, logo <= 256 KB (decision 72) and <= 1200x400, favicon square <= 100 KB; an SVG is
 // refused) and the theme is checked against the caller's workspace on the ambient request client (RLS). The STORAGE write and the
 // brand_themes update then run AFTER the request transaction has committed and released its connection (afterTransaction, ADR-0003):
 // no transaction is held across the object-store call (KAD-06). The object is written FIRST and the key recorded second, so a row
