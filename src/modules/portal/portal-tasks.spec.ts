@@ -17,9 +17,11 @@ function session(over: Partial<Omit<PortalSessionContext, "policy">> & { policy?
     scopeProjectIds: [P1],
     scopeTabs: ["overview", "tasks"],
     themeId: null,
+    // Every real session carries its facts (PortalSessionContext.facts is required); the cache key digests the theme.
+    facts: { theme: { theme_id: "0198f6a0-0000-7000-8000-0000000000aa", name: "Default" } },
     policy: { label: "L", hideCompetitors: false, hideCosts: false, timeframeLock: null, ...policy },
     ...rest,
-  } as PortalSessionContext;
+  } as unknown as PortalSessionContext;
 }
 
 const measured = { visibility_before: 40, visibility_after_14d: 44.2, delta: 4.2, window_days: 14, confidence: "medium", method: "before_after", caveat: "Observational; concurrent changes are not controlled for." };

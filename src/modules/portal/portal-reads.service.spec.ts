@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ZodError } from "zod";
 import type { PortalSessionContext } from "../../api/decorators/portal-route.decorator.js";
-import { PortalReadsService } from "./portal-reads.service.js";
+import { PortalReadsService, policyFingerprint } from "./portal-reads.service.js";
 
 // NEW-E-099a — the allow-list is WIRED into the service. portal-view.spec.ts proves parsePortalPayload rejects an unknown
 // key; these prove PortalReadsService actually calls it (and toPortalFooter) before a payload is cached or served. The
@@ -85,5 +85,19 @@ describe("NEW-E-099a · allow-list wiring in PortalReadsService", () => {
     const hidden = await svc.overview(session(true, "0198f6a0-0000-7000-8000-0000000000a3"), {});
     expect(open.projects[0]!.footer.sample_size).toBe(3);
     expect("sample_size" in hidden.projects[0]!.footer).toBe(false);
+  });
+});
+
+describe("owner decision 67 (o) · the portal cache follows a theme update", () => {
+  it("the cache fingerprint changes when the theme's content changes, and not otherwise (so an edit is served on the next request, not after 60 s)", () => {
+    const a = session(false);
+    const same = session(false);
+    const edited = session(false);
+    (edited.facts as { theme: unknown }).theme = { ...THEME, color_primary: "#112233" };
+    const css = session(false);
+    (css.facts as { theme: unknown }).theme = { ...THEME, custom_css: ".nm-card{color:var(--nm-color-fg)}" };
+    expect(policyFingerprint(same)).toBe(policyFingerprint(a));
+    expect(policyFingerprint(edited)).not.toBe(policyFingerprint(a));
+    expect(policyFingerprint(css)).not.toBe(policyFingerprint(a));
   });
 });

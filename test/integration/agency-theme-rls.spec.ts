@@ -16,7 +16,7 @@ import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-
 describe("STORY-097 · AgencyService under RLS, as nominara_app", () => {
   let container: StartedPostgreSqlContainer;
   let admin: Client;
-  const service = new AgencyService();
+  const service = new AgencyService({} as never);
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")

@@ -1,27 +1,29 @@
-import { sanitiseSvg, type SvgConstruct } from "./svg-sanitiser.js";
 
 // STORY-097 · integrations-and-sharing.md §2 — what an agency may upload as a logo or favicon.
-//   logo_light / logo_dark   PNG, SVG or WebP, <= 2 MB, at most 1200x400
+//   logo_light / logo_dark   PNG, JPEG or WebP, <= 1 MB, at most 1200x400   (owner decision 67 (n): SVG is refused, so there is nothing to sanitise)
 //   favicon                  PNG or ICO, <= 100 KB, square
 // The file's TYPE is decided by its bytes, never by the declared Content-Type: a declared type that disagrees with the bytes is a
-// refusal. A vector is sanitised and the bytes returned are the RE-SERIALISED document (svg-sanitiser.ts), not the upload.
+// refusal.
 
-export const LOGO_MAX_BYTES = 2 * 1024 * 1024;
+export const LOGO_MAX_BYTES = 1024 * 1024;
 export const FAVICON_MAX_BYTES = 100 * 1024;
 export const LOGO_MAX_WIDTH = 1200;
 export const LOGO_MAX_HEIGHT = 400;
 
 export type ThemeAssetSlot = "logo_light" | "logo_dark" | "favicon";
-export type ThemeAssetType = "image/png" | "image/svg+xml" | "image/webp" | "image/x-icon";
-export type AssetRefusal = SvgConstruct;
+export type ThemeAssetType = "image/png" | "image/jpeg" | "image/webp" | "image/x-icon";
+export interface AssetRefusal {
+  readonly construct: string;
+  readonly message: string;
+}
 export type ThemeAssetResult =
-  | { readonly ok: true; readonly bytes: Uint8Array; readonly contentType: ThemeAssetType; readonly width: number; readonly height: number; readonly stripped: SvgConstruct[] }
+  | { readonly ok: true; readonly bytes: Uint8Array; readonly contentType: ThemeAssetType; readonly width: number; readonly height: number; }
   | { readonly ok: false; readonly refused: AssetRefusal[] };
 
 const refuse = (construct: string, message: string): ThemeAssetResult => ({ ok: false, refused: [{ construct, message }] });
 const ALLOWED: Readonly<Record<ThemeAssetSlot, readonly ThemeAssetType[]>> = {
-  logo_light: ["image/png", "image/svg+xml", "image/webp"],
-  logo_dark: ["image/png", "image/svg+xml", "image/webp"],
+  logo_light: ["image/png", "image/jpeg", "image/webp"],
+  logo_dark: ["image/png", "image/jpeg", "image/webp"],
   favicon: ["image/png", "image/x-icon"],
 };
 
@@ -39,6 +41,26 @@ function dimensionsOf(type: ThemeAssetType, b: Uint8Array): { width: number; hei
   if (type === "image/png") {
     if (!startsWith(b, PNG_SIG) || b.length < 24 || ascii(b, 12, 4) !== "IHDR") return null;
     return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (type === "image/jpeg") {
+    if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return null;
+    let at = 2;
+    while (at + 4 <= b.length) {
+      if (b[at] !== 0xff) return null;
+      const marker = b[at + 1]!;
+      if (marker === 0xff) {
+        at += 1;
+        continue;
+      }
+      // Start-of-frame markers (SOF0-SOF15 except DHT 0xC4, JPG 0xC8, DAC 0xCC) carry the size: precision(1) height(2) width(2).
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (at + 9 > b.length) return null;
+        return { width: view.getUint16(at + 7), height: view.getUint16(at + 5) };
+      }
+      if (marker === 0xd9 || marker === 0xda) return null;
+      at += 2 + view.getUint16(at + 2);
+    }
+    return null;
   }
   if (type === "image/webp") {
     if (b.length < 30 || ascii(b, 0, 4) !== "RIFF" || ascii(b, 8, 4) !== "WEBP") return null;
@@ -80,15 +102,9 @@ export function validateThemeAsset(slot: ThemeAssetSlot, declaredType: string, b
   if (bytes.length === 0) return refuse("file type", "the file is empty");
   if (bytes.length > maxBytes) return refuse("size", "the file is " + String(bytes.length) + " bytes; the limit for " + slot + " is " + String(maxBytes) + " bytes");
 
-  if (type === "image/svg+xml") {
-    const svg = sanitiseSvg(bytes);
-    if (!svg.ok) return svg;
-    const out = new TextEncoder().encode(svg.svg);
-    return limitDimensions(slot, { ok: true, bytes: out, contentType: type, width: svg.width, height: svg.height, stripped: svg.stripped });
-  }
   const dims = dimensionsOf(type, bytes);
   if (dims === null) return refuse("file type", "the file's bytes are not a valid " + type + " image");
-  return limitDimensions(slot, { ok: true, bytes, contentType: type, width: dims.width, height: dims.height, stripped: [] });
+  return limitDimensions(slot, { ok: true, bytes, contentType: type, width: dims.width, height: dims.height });
 }
 
 function limitDimensions(slot: ThemeAssetSlot, ok: Extract<ThemeAssetResult, { ok: true }>): ThemeAssetResult {

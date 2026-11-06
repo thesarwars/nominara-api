@@ -1,14 +1,16 @@
-import { Injectable, Logger } from "@nestjs/common";
-import type { ClientBase } from "pg";
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import type { ClientBase, Pool } from "pg";
 import {
   contrastRejectionDetailsSchema,
   styleRefusalDetailsSchema,
   type AgencyTheme,
+  type ThemeAssetSlotName,
   type SaveAgencyThemeResponse,
   type AgencyThemeAdmin,
   type AgencyThemeListQuery,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
+import { API_VERSION_PREFIX } from "../../api/configure-app.js";
 import { ConflictError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { pageFrom, Page } from "../../api/pagination/page.js";
@@ -23,7 +25,8 @@ import {
 import { sanitiseCustomCss } from "../../lib/theme/custom-css.js";
 import { sanitiseEmailFooter } from "../../lib/theme/email-footer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { PG_POOL } from "../../db/pg-pool.js";
+import { currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 
 /**
  * GET returns this id for the unsaved platform-default theme (D6, STORY-097).
@@ -51,10 +54,11 @@ interface ThemeRow {
   readonly email_reply_to: string | null;
   readonly custom_css: string | null;
   readonly email_footer_html: string | null;
+  readonly logo_light_key: string | null;
 }
 
 const COLUMNS =
-  "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to, custom_css, email_footer_html";
+  "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to, custom_css, email_footer_html, logo_light_key";
 
 const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -72,6 +76,11 @@ function ratioText(n: number): string {
   return String(n) + ":1";
 }
 
+/** The platform-origin path a stored asset is fetched from. Never the object key, never a bucket host. */
+export function themeAssetPath(themeId: string, slot: ThemeAssetSlotName): string {
+  return "/" + API_VERSION_PREFIX + "/themes/" + themeId + "/assets/" + slot;
+}
+
 function toTheme(row: ThemeRow): AgencyThemeAdmin {
   return {
     theme_id: row.id,
@@ -82,8 +91,8 @@ function toTheme(row: ThemeRow): AgencyThemeAdmin {
     color_bg: row.color_bg,
     color_fg: row.color_fg,
     font_family: row.font_family,
-    // Asset upload is week 2 (STORY-097 scenarios 9-11): no logo is ever stored yet.
-    logo_url: null,
+    // A path on the platform's own origin (scenario 11); the route behind it redirects to a short presign. null = no logo uploaded.
+    logo_url: row.logo_light_key === null ? null : themeAssetPath(row.id, "logo_light"),
     hide_nominara_brand: row.hide_nominara_brand,
     email_from_name: row.email_from_name,
     email_reply_to: row.email_reply_to,
@@ -102,6 +111,46 @@ function toTheme(row: ThemeRow): AgencyThemeAdmin {
 @Injectable()
 export class AgencyService {
   private readonly logger = new Logger(AgencyService.name);
+
+  constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+
+  /** slot -> brand_themes column. A closed switch: the column name in the SQL never comes from input. */
+  private assetColumn(slot: ThemeAssetSlotName): string {
+    switch (slot) {
+      case "logo_light":
+        return "logo_light_key";
+      case "logo_dark":
+        return "logo_dark_key";
+      case "favicon":
+        return "favicon_key";
+    }
+  }
+
+  /** The stored object key for one slot of a theme in the caller's workspace (null = none uploaded). 404 for an unknown or foreign theme. */
+  async assetKey(themeId: string, slot: ThemeAssetSlotName): Promise<string | null> {
+    const { client } = this.store();
+    const result = await client.query<{ key: string | null }>(`SELECT ${this.assetColumn(slot)} AS key FROM brand_themes WHERE id = $1`, [themeId]);
+    if (result.rows[0] === undefined) throw new NotFoundError({ message: "no such theme" });
+    return result.rows[0].key;
+  }
+
+  /**
+   * Points a slot at a freshly stored object, in its OWN short tenant transaction: the caller has already written the object, and no
+   * request transaction is held across that storage call (KAD-06). Returns the previous key for the caller to delete, or null.
+   */
+  async recordAssetKey(context: TenantContext, themeId: string, slot: ThemeAssetSlotName, key: string): Promise<string | null> {
+    const client = await this.pool.connect();
+    try {
+      return await withTenantContext(client, context, async (tx) => {
+        const before = await tx.query<{ key: string | null }>(`SELECT ${this.assetColumn(slot)} AS key FROM brand_themes WHERE id = $1 FOR UPDATE`, [themeId]);
+        if (before.rows[0] === undefined) throw new NotFoundError({ message: "no such theme" });
+        await tx.query(`UPDATE brand_themes SET ${this.assetColumn(slot)} = $2, updated_at = now() WHERE id = $1`, [themeId, key]);
+        return before.rows[0].key;
+      });
+    } finally {
+      client.release();
+    }
+  }
 
   /** All of the workspace's themes, the default first. With none stored, the unsaved platform default. */
   /**

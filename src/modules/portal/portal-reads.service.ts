@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import type { ScorecardEntry } from "../../../contracts/analytics/index.js";
 import type {
@@ -181,9 +182,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function policyFingerprint(session: PortalSessionContext): string {
+/**
+ * Owner decision 67 (o): a theme update takes effect on the next portal request. The theme the session carries is read afresh on
+ * every request, so a digest of its CONTENT (colours, font, logo, custom CSS) in the key makes the edited theme a cache miss.
+ * The superseded entries are never read again and age out of the bounded map.
+ */
+export function policyFingerprint(session: PortalSessionContext): string {
   const { hideCompetitors, hideCosts, timeframeLock } = session.policy;
-  return `hc${hideCompetitors ? "1" : "0"}-hk${hideCosts ? "1" : "0"}-lock${timeframeLock ?? "none"}-theme${session.themeId ?? "none"}`;
+  const theme = createHash("sha256").update(JSON.stringify(session.facts.theme)).digest("hex").slice(0, 16);
+  return `hc${hideCompetitors ? "1" : "0"}-hk${hideCosts ? "1" : "0"}-lock${timeframeLock ?? "none"}-theme${session.themeId ?? "none"}-${theme}`;
 }
 
 function toMatrixEngine(entry: ScorecardEntry): PortalMatrixResponse["engines"][number] {

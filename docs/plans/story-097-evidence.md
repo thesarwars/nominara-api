@@ -45,3 +45,11 @@ client defines yet; the portal serves override text that matches nothing until t
 - Portal overview cache is keyed on `themeId`, not theme content, so an edited `custom_css` (and colours) reach portal viewers
   only after the cache TTL. Fix: add a theme revision to `policyFingerprint` or invalidate on PUT /agency/theme.
 - SVG/asset libraries have no upload or serve route (ACs open, above).
+
+## Round 3 - owner decision 67 (n) and (o)
+
+- (n) `POST /v1/themes/{id}/assets` (agency:branding, audited `agency.theme_asset_uploaded`) takes `{slot, content_type, data_base64}` and accepts PNG, JPEG and WebP only, <= 1 MiB (logo <= 1200x400; favicon <= 100 KB, square). An SVG is refused naming the file type; `svg-sanitiser.ts` is therefore no longer called by anything (kept with its tests, a candidate for removal). The object is written to the `reports` bucket under `{env}/{workspace}/branding/{theme}/{slot}-{uuid}.{ext}` AFTER the request transaction (afterTransaction); the key is recorded in its own short tenant transaction only once the write succeeded. `GET /v1/themes/{id}/assets/{slot}` answers 302 to a 60 s presign; `logo_url` on the theme is that platform path. Tests: `test/integration/agency-theme-asset-http.spec.ts`, `src/lib/theme/asset-limits.spec.ts`.
+- (o) The portal cache key now digests the theme content (`policyFingerprint`), so a theme update is a cache miss on the next request. Test: `portal-reads.service.spec.ts`.
+- The integration harness's app role does not enforce RLS (a PUT naming another workspace's theme id returns 200 there), so cross-workspace isolation for the asset columns rests on `agency-theme-rls.spec.ts` / `test:isolation`, not on an HTTP assertion.
+
+Doc changes needed: api-specification.md section 3 lists `POST /agency/theme/assets` (pre-signed upload, <= 2 MB, PNG/SVG/WebP, SVG sanitised); decision 67 (n) replaced it with `POST /themes/{id}/assets` (JSON base64, <= 1 MiB, PNG/JPEG/WebP, SVG refused). integrations-and-sharing.md section 2 and STORY-097 AC "Assets" (vector sanitised and re-serialised, 2 MB) need the same carry. The story's status check rows for raster limits / assets-from-own-origin move to Met on the API side.
