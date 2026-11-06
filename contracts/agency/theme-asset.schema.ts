@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-097 AC "Assets" · owner decision 67 (n) — POST /v1/themes/{id}/assets and the route that serves the stored file.
 //
@@ -17,10 +18,10 @@ export const THEME_ASSET_CONTENT_TYPES = ["image/png", "image/jpeg", "image/webp
 /** 1 MiB decoded is 1,398,102 base64 characters; the margin is for padding and nothing else. */
 export const MAX_THEME_ASSET_BASE64_LENGTH = 1_400_000;
 
-export const themeAssetParamsSchema = z.object({ id: z.uuid() }).strict();
+export const themeAssetParamsSchema = z.object({ id: lowercaseUuidSchema }).strict();
 export type ThemeAssetParams = z.infer<typeof themeAssetParamsSchema>;
 
-export const themeAssetFetchParamsSchema = z.object({ id: z.uuid(), slot: themeAssetSlotSchema }).strict();
+export const themeAssetFetchParamsSchema = z.object({ id: lowercaseUuidSchema, slot: themeAssetSlotSchema }).strict();
 export type ThemeAssetFetchParams = z.infer<typeof themeAssetFetchParamsSchema>;
 
 export const uploadThemeAssetRequestSchema = z
