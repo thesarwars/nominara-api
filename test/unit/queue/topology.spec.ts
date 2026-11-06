@@ -276,6 +276,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "§4's table never allocated it a queue, so STORY-020 wrote the job (workers/rollup/audit-verify.ts) with nowhere to run it — " +
       "no handler, no schedule, and not even a pnpm script, while two comments in this repo claimed it ran daily. STORY-143.",
   },
+  "maintenance.integrity": {
+    workerGroup: "rollup",
+    because:
+      "STORY-013 AC6 / AC14 / AC16: the nightly orphan scan, the purge-failure check and the vector-recall check are READ-ONLY and were reachable " +
+      "only from a hand-run script. §4 allocates them no queue; folding them into maintenance.partition would put a read-heavy recall check on the " +
+      "DDL tick that STORY-142 deliberately kept cheap. A queue of its own so a DLQ entry names the check that paged.",
+  },
   "identity.sweep_unverified": {
     workerGroup: "rollup",
     because:
@@ -437,6 +444,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
       "credit.reconcile",
       "domain.reverify",
       "identity.sweep_unverified",
+      "maintenance.integrity",
       "maintenance.partition",
       "retention.purge",
       "task.resurface",

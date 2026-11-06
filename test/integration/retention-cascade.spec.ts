@@ -651,7 +651,7 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     await expect(runOrphanScan(client)).rejects.toThrow(/orphan fact row/);
   });
 
-  it("privilege proof (qa-reviewer blocking #4) · nominara_worker sees ZERO rows from scanForOrphans's cross-tenant query where the privileged connection sees the real orphan — proving why this discovery function needs privileged access, not asserting it", async () => {
+  it("privilege proof (qa-reviewer blocking #4) · nominara_worker reads ZERO rows directly where the privileged connection's scanForOrphans sees the real orphan, and scanForOrphans itself is REFUSED (42501) for the worker", async () => {
     const workspaceId = await createWorkspace();
     const projectId = await createProject(workspaceId);
     await insertMentionFactOrphan(workspaceId, projectId, new Date());
@@ -664,8 +664,11 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     // exact same orphan is invisible — this is NOT nominara_worker "working
     // correctly and finding nothing", it is RLS making cross-tenant
     // discovery impossible without a privileged connection.
-    const underWorker = await scanForOrphans(workerClient);
-    expect(underWorker).toEqual([]);
+    const directUnderWorker = await workerClient.query<{ n: string }>("SELECT count(*)::text AS n FROM mention_facts");
+    expect(directUnderWorker.rows[0]!.n).toBe("0");
+    // STORY-013 r2 (ADR-0004): the scan now goes through a count-only definer function whose EXECUTE belongs to the maintenance
+    // identity alone. A tenant runtime role is REFUSED (42501) rather than handed a count.
+    await expect(scanForOrphans(workerClient)).rejects.toMatchObject({ code: "42501" });
   });
 
   // -- Test Scenario 13 — export lock blocks purge ---------------------------

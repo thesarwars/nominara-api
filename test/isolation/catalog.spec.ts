@@ -7,6 +7,10 @@ import { assertIso23ViewsSecurityInvoker } from "./assertions/iso-23-views-secur
 import { assertIso26ShareLookupReturnsOnlyHashedRow } from "./assertions/iso-26-share-lookup-returns-only-hashed-row.js";
 import { assertIso24DefinerOwnerNoMembers } from "./assertions/iso-24-definer-owner-no-members.js";
 import { assertIso25ShareLookupDefinerShape } from "./assertions/iso-25-share-lookup-definer-shape.js";
+import { assertIso29MaintenanceExecuteEffective } from "./assertions/iso-29-maintenance-execute-effective.js";
+import { assertIso30MaintenanceExecuteAdminOnly } from "./assertions/iso-30-maintenance-execute-admin-only.js";
+import { assertIso28DefinerOwnerHoldsNoRoles } from "./assertions/iso-28-definer-owner-holds-no-roles.js";
+import { assertIso27MaintenanceDefinerShape } from "./assertions/iso-27-maintenance-definer-shape.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
 import { getAssertionContext } from "./support/context.js";
 
@@ -68,5 +72,29 @@ describe("ISO-25 · app.share_token_by_hash is a pinned SECURITY DEFINER functio
 describe("ISO-26 · app.share_token_by_hash returns only the hashed token's row", () => {
   it("as nominara_app with no context: one row per own hash, gate columns only, none for an unknown hash, share_tokens unreadable", async () => {
     await expect(assertIso26ShareLookupReturnsOnlyHashedRow(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-27 · the app.maintenance_* functions are pinned, count-only SECURITY DEFINERs executable by nominara_owner and its members alone", () => {
+  it("holds in pg_proc", async () => {
+    await expect(assertIso27MaintenanceDefinerShape(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-28 · a definer-owner role is a member of no other role", () => {
+  it("holds in pg_auth_members", async () => {
+    await expect(assertIso28DefinerOwnerHoldsNoRoles(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-29 · no runtime, share-lookup or non-BYPASSRLS break-glass role can effectively EXECUTE a maintenance function", () => {
+  it("holds for has_function_privilege and for SET ROLE reach", async () => {
+    await expect(assertIso29MaintenanceExecuteEffective(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-30 · no refused role is a member (of any kind, ADMIN-only included) of a role that can EXECUTE a maintenance function", () => {
+  it("holds for every membership route", async () => {
+    await expect(assertIso30MaintenanceExecuteAdminOnly(getAssertionContext())).resolves.toBeUndefined();
   });
 });

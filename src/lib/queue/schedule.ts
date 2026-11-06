@@ -101,6 +101,13 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // ENABLED: the handler is a no-op unless `RETENTION_PURGE_ENABLED=true`. See `handlers/retention-purge.handler.ts`.
   { queue: "retention.purge", cron: "40 3 * * *", statedAs: "STORY-077 R4 / STORY-013, data-model.md §7: retention purge nightly (handler gated by RETENTION_PURGE_ENABLED, default off)" },
 
+  // ⚠ NOT FROM §4 — STORY-013 AC6 / AC14 / AC16: the nightly orphan scan, purge-failure check and vector-recall check
+  // (`handlers/maintenance-integrity.handler.ts`). The references say "nightly" and give no hour. THE HOUR IS A CHOICE, NOT A
+  // TRANSCRIPTION: 03:10 UTC, ahead of the 03:20 partition tick and the 03:40 retention purge so the read-only scans see the estate
+  // before either of them changes it; :10 and not :00 for the reason §6.1 gives `capture.plan` :05. The tick takes no DDL lock and
+  // rebuilds nothing, so it does not widen the destructive/operator-invoked split `maintenance.partition` documents. The owner can move it.
+  { queue: "maintenance.integrity", cron: "10 3 * * *", statedAs: "STORY-013 AC6 / AC14 / AC16: nightly orphan scan, purge-failure check, vector-recall check (read-only)" },
+
   // ⚠ PERIOD STATED, TIME NOT. Scheduling these needs an hour of the day (and
   // for weekly, a day) that no reference gives. Left null deliberately — see
   // this file's header. `maintenance.partition` was here until STORY-142; it

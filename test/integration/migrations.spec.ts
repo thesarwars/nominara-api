@@ -532,6 +532,22 @@ describe("STORY-006 · extensions, conventions & migration tooling", () => {
     }
   });
 
+  // STORY-013 r4 — the CONVERSE (ISO-28): a definer OWNER that is itself a member of another role can inherit that role's rights inside
+  // its SECURITY DEFINER bodies. DEF-D1 only looked at members OF the owner.
+  it("DEF-D3 · a definer-owner role that is a MEMBER of another role is caught by checkDrift, naming the owner and the role it holds", async () => {
+    await migrateUp(client);
+    await client.query("GRANT nominara_worker TO nominara_maintenance WITH INHERIT TRUE");
+    try {
+      const result = await checkDrift(client);
+      expect(isClean(result)).toBe(false);
+      expect(
+        result.roleAttributeMismatches.some((m) => m.includes("nominara_maintenance") && /member of/i.test(m) && m.includes("nominara_worker")),
+        JSON.stringify(result.roleAttributeMismatches),
+      ).toBe(true);
+    } finally {
+      await client.query("REVOKE nominara_worker FROM nominara_maintenance");
+    }
+  });
   it("DEF-D2 · a hand-altered BYPASSRLS on nominara_share_lookup is caught by checkDrift as a roleAttributeMismatch", async () => {
     await migrateUp(client);
     await client.query("ALTER ROLE nominara_share_lookup BYPASSRLS");

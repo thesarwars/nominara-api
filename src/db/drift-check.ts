@@ -99,6 +99,18 @@ export async function checkDrift(client: Client, migrationsDir: string = MIGRATI
     roleAttributeMismatches.push(`${row.role}: expected no members, got member ${row.member}`);
   }
 
+  // The converse (ISO-28): a definer OWNER that is itself a member of another role. PG16+ decides INHERIT per GRANT, so even a NOINHERIT owner
+  // can hold the rights of a role it was granted WITH INHERIT TRUE, inside its own SECURITY DEFINER bodies.
+  const held = await client.query<{ role: string; member: string }>(
+    `SELECT r.rolname AS role, m.rolname AS member
+       FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles m ON m.oid = am.member
+      WHERE m.rolname = ANY($1::text[])`,
+    [Object.keys(DEFINER_OWNER_ROLES)],
+  );
+  for (const row of held.rows) {
+    roleAttributeMismatches.push(`${row.member}: expected to be a member of no role, got member of ${row.role}`);
+  }
+
   return { missingExtensions, missingFunctions, missingRoles, roleAttributeMismatches };
 }
 

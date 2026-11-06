@@ -406,10 +406,23 @@ describe("STORY-021 · src/db/rls/generate.ts — generateActorSelfScopedRlsSql 
 // ---- CP2 decision 1 · ADR-0002 — computeDefinerOwnerPolicies --------------------------------------
 
 describe("CP2 decision 1 · src/db/rls/generate.ts — computeDefinerOwnerPolicies (ADR-0002)", () => {
-  it("DEF-U1 · returns exactly one policy: share_tokens, FOR SELECT, TO nominara_share_lookup only, USING (true), no WITH CHECK", () => {
-    expect(computeDefinerOwnerPolicies(REAL_SCHEMA_TABLES)).toEqual([
+  it("DEF-U1 · the share-token policy is share_tokens, FOR SELECT, TO nominara_share_lookup only, USING (true), no WITH CHECK", () => {
+    expect(computeDefinerOwnerPolicies(REAL_SCHEMA_TABLES).filter((p) => p.roles.includes("nominara_share_lookup"))).toEqual([
       { table: "share_tokens", policyName: "share_token_gate_lookup", cmd: "SELECT", roles: ["nominara_share_lookup"], using: "true", withCheck: null },
     ]);
+  });
+
+  it("DEF-U4 · ADR-0004: exactly one policy per table nominara_maintenance reads, FOR SELECT, TO that role only, USING (true), no WITH CHECK", () => {
+    const maintenance = computeDefinerOwnerPolicies(REAL_SCHEMA_TABLES).filter((p) => p.roles.includes("nominara_maintenance"));
+    expect(maintenance.map((p) => p.table).sort()).toEqual(["answer_captures", "citation_facts", "content_chunks", "corpus_passages", "mention_facts", "topic_clusters", "tracked_prompts"]);
+    for (const p of maintenance) {
+      expect([p.cmd, p.roles, p.using, p.withCheck]).toEqual(["SELECT", ["nominara_maintenance"], "true", null]);
+    }
+  });
+
+  it("DEF-U5 · ADR-0004: fails loud when a table the maintenance role reads is absent from the introspected schema", () => {
+    const without = REAL_SCHEMA_TABLES.filter((x) => x.name !== "corpus_passages");
+    expect(() => computeDefinerOwnerPolicies(without)).toThrow(/corpus_passages/);
   });
 
   it("DEF-U2 · fails loud when share_tokens is absent from the introspected schema, rather than expecting a policy on nothing", () => {
@@ -419,6 +432,7 @@ describe("CP2 decision 1 · src/db/rls/generate.ts — computeDefinerOwnerPolici
 
   it("DEF-U3 · the owner role is not one of the runtime roles and appears in no other policy bucket", () => {
     expect(RUNTIME_ROLES as readonly string[]).not.toContain("nominara_share_lookup");
+    expect(RUNTIME_ROLES as readonly string[]).not.toContain("nominara_maintenance");
     for (const bucket of [RLS_POLICY_ROLES.forAll, RLS_POLICY_ROLES.actorSelfScoped] as readonly (readonly string[])[]) {
       expect(bucket).not.toContain("nominara_share_lookup");
     }

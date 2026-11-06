@@ -5,7 +5,7 @@ import type { Job } from "bullmq";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createMaintenancePartitionHandler } from "../../src/lib/queue/handlers/maintenance-partition.handler.js";
 import type { Env } from "../../src/config/env.schema.js";
-import { PARTITION_LEAD_MONTHS } from "../../src/db/conventions.js";
+import { PARTITION_LEAD_MONTHS, PARTITIONED_FACT_TABLES } from "../../src/db/conventions.js";
 
 // STORY-142 — the tick for `maintenance.partition`.
 //
@@ -24,10 +24,15 @@ import { PARTITION_LEAD_MONTHS } from "../../src/db/conventions.js";
 
 const connectedUrls: string[] = [];
 const counters: { name: string; labels: Record<string, string> }[] = [];
+const observations: { name: string; value: number; labels: Record<string, unknown> }[] = [];
 vi.mock("../../src/lib/telemetry/metrics.js", async () => {
   const actual = await vi.importActual<typeof import("../../src/lib/telemetry/metrics.js")>("../../src/lib/telemetry/metrics.js");
   return {
     ...actual,
+    observeValue: (name: string, value: number, labels: Record<string, string | number> = {}) => {
+      observations.push({ name, value, labels });
+      actual.observeValue(name, value, labels);
+    },
     incrementCounter: (name: string, labels: Record<string, string> = {}) => {
       counters.push({ name, labels });
       actual.incrementCounter(name, labels);
@@ -258,6 +263,118 @@ describe("STORY-142 · maintenance.partition handler", () => {
     expect(alerted).toHaveLength(1);
     expect(alerted[0]!.labels.table).toBe("answer_captures");
   }, 60_000);
+
+  it("STORY-013 AC3 · rows stranded in a DEFAULT partition raise the alert hook: a gauge observation per table and an alert email, still without failing the job", async () => {
+    const { setAlertEmailerForTests } = await import("../../src/lib/alerts/alerts.js");
+    const sent: { message: string; context: Record<string, unknown> }[] = [];
+    setAlertEmailerForTests({
+      page: (message: string, context: Record<string, unknown>) => void sent.push({ message, context }),
+      notify: (message: string, context: Record<string, unknown>) => {
+        sent.push({ message, context });
+        return Promise.resolve();
+      },
+      drain: () => Promise.resolve(),
+    } as never);
+    try {
+      // The previous test left a 2030 row in the default partition; the case does not depend on that.
+      await insertCapture(new Date(Date.UTC(2030, 0, 16)).toISOString());
+      observations.length = 0;
+
+      await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).resolves.toBeUndefined();
+
+      const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
+      expect(gauge).toHaveLength(1);
+      expect(gauge[0]!.value).toBeGreaterThanOrEqual(1);
+      // 0 is an observation, not absence: EVERY fact table reports exactly once, and the clean ones report 0.
+      for (const table of PARTITIONED_FACT_TABLES) {
+        const perTable = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === table);
+        expect(perTable, table).toHaveLength(1);
+        if (table !== "answer_captures") expect(perTable[0]!.value, table).toBe(0);
+      }
+      const alert = sent.find((a) => a.context.alertName === "partition_default_rows");
+      expect(alert).toBeDefined();
+      expect(alert!.context.table).toBe("answer_captures");
+    } finally {
+      setAlertEmailerForTests(undefined);
+    }
+  }, 60_000);
+
+  it("STORY-013 r2 AC3 · under a NOSUPERUSER NOBYPASSRLS role the default-partition count is the REAL count (owner decision 58a)", async () => {
+    await db.query("CREATE ROLE partition_prod_like LOGIN PASSWORD 'pl' NOSUPERUSER NOBYPASSRLS");
+    await db.query("GRANT nominara_owner TO partition_prod_like WITH INHERIT TRUE");
+    // The runway is already complete from earlier cases, so the role needs no DDL right to get as far as the reading.
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    await insertCapture(new Date(Date.UTC(2031, 5, 15)).toISOString());
+    const url = new URL(container.getConnectionUri());
+    url.username = "partition_prod_like";
+    url.password = "pl";
+    observations.length = 0;
+    counters.length = 0;
+
+    await expect(createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick())).resolves.toBeUndefined();
+
+    const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
+    expect(gauge.length).toBeGreaterThan(0);
+    expect(gauge.at(-1)!.value).toBeGreaterThanOrEqual(1);
+    expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total")).toBe(false);
+  }, 60_000);
+
+  it("STORY-013 r2 AC3 · a connection that cannot EXECUTE the definer function FAILS the job and emits no false 0 gauge", async () => {
+    await db.query("CREATE ROLE partition_no_execute LOGIN PASSWORD 'nd' NOSUPERUSER NOBYPASSRLS");
+    await db.query("GRANT SELECT ON ALL TABLES IN SCHEMA public TO partition_no_execute");
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    const url = new URL(container.getConnectionUri());
+    url.username = "partition_no_execute";
+    url.password = "nd";
+    observations.length = 0;
+    counters.length = 0;
+
+    await expect(
+      createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick()),
+    ).rejects.toThrow(/definer/);
+
+    expect(observations.some((o) => o.name === "nominara_partition_default_rows")).toBe(false);
+    expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "definer_function")).toBe(true);
+  }, 60_000);
+
+  it("STORY-013 r3 · the runway is extended EVEN WHEN the default-partition count fails, and the job then rejects with check=definer_function", async () => {
+    const inWindow = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + PARTITION_LEAD_MONTHS, 15));
+    const suffix = `${String(inWindow.getUTCFullYear())}_${String(inWindow.getUTCMonth() + 1).padStart(2, "0")}`;
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    await db.query(`DROP TABLE IF EXISTS answer_captures_${suffix}`);
+    await db.query("ALTER FUNCTION app.maintenance_default_partition_rows() RENAME TO maintenance_default_partition_rows_off");
+    counters.length = 0;
+    try {
+      await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).rejects.toThrow(/definer/);
+      expect((await monthsFor("answer_captures")).some((n) => n.endsWith(suffix)), "the runway was not extended").toBe(true);
+      expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "definer_function")).toBe(true);
+    } finally {
+      await db.query("ALTER FUNCTION app.maintenance_default_partition_rows_off() RENAME TO maintenance_default_partition_rows");
+    }
+  }, 60_000);
+
+  it("STORY-013 · partition DDL behind a long reader of the parent FAILS FAST (lock_timeout) instead of queueing writers behind it", async () => {
+    const inWindow = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + PARTITION_LEAD_MONTHS, 15));
+    const suffix = `${String(inWindow.getUTCFullYear())}_${String(inWindow.getUTCMonth() + 1).padStart(2, "0")}`;
+    await db.query(`DROP TABLE IF EXISTS mention_facts_${suffix}`);
+    const reader = new Client({ connectionString: container.getConnectionUri() });
+    await reader.connect();
+    counters.length = 0;
+    try {
+      await reader.query("BEGIN");
+      await reader.query("LOCK TABLE mention_facts IN ACCESS SHARE MODE");
+      const started = Date.now();
+      await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).resolves.toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(30_000);
+      expect(counters.some((c) => c.name === "partition_create_failed" && c.labels.partition === `mention_facts_${suffix}`)).toBe(true);
+    } finally {
+      await reader.query("ROLLBACK");
+      await reader.end();
+    }
+    // Once the reader is gone, tomorrow's tick creates it.
+    await createMaintenancePartitionHandler({ pool: noPool, env })(db, tick());
+    expect((await monthsFor("mention_facts")).some((n) => n.endsWith(suffix))).toBe(true);
+  }, 90_000);
 
   async function insertCapture(capturedAt: string): Promise<void> {
     await db.query(

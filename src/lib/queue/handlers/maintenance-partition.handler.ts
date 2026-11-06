@@ -2,8 +2,10 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
-import { runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
-import { incrementCounter } from "../../telemetry/metrics.js";
+import { assertMaintenanceDefinerAvailable, runPartitionRunwayMaintenance } from "../../../workers/rollup/maintenance.js";
+import { PARTITIONED_FACT_TABLES } from "../../../db/conventions.js";
+import { drainAlertEmails, emailAlert } from "../../alerts/alerts.js";
+import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
@@ -84,6 +86,23 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
         logger.error(`could not create ${failure.partition}: ${failure.reason}`);
       }
 
+      // ⚠ FAIL CLOSED, AFTER the runway (the DDL needs no tenant visibility, so a connection that cannot count must not stop the runway
+      // being extended): the default-partition count goes through the count-only definer function (migration 0160, ADR-0004). If the
+      // connection cannot execute it, or the count failed, there is no false-clean gauge and no alert logic on an unknown: the job fails
+      // and the check error is counted.
+      if (result.defaultPartitionCheckError !== undefined) {
+        incrementCounter("nominara_maintenance_integrity_check_errors_total", { check: "definer_function" });
+        try {
+          await assertMaintenanceDefinerAvailable(client);
+        } catch (unavailable) {
+          logger.error("default-partition check could not run: the connection cannot execute the maintenance definer functions (FORCE ROW LEVEL SECURITY)");
+          throw unavailable;
+        }
+        // The functions are callable, so the count itself failed. The error CLASS only: a database message can carry row values.
+        logger.error({ message: "default-partition check could not run", error: result.defaultPartitionCheckError.name });
+        throw result.defaultPartitionCheckError;
+      }
+
       // ⚠ AN ALERT DOES NOT FAIL THE JOB, and the distinction matters. Rows in
       // the default partition are a fact about the estate that this run has
       // just reported — throwing would send the tick down the retry ladder and
@@ -97,9 +116,26 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
           `rows are sitting in ${alert.table}'s DEFAULT partition (${String(alert.rowCount)}) — ` +
             `a partition covering their range can no longer be attached until they are moved`,
         );
+        // STORY-013 AC3 — the page hook. No pager exists (decision 45), so this is the email leg of the Pager contract
+        // (a no-op until ALERT_EMAIL_TO is set): table name and count only, never row content. The recovery is operator-run
+        // (`pnpm db:maintenance:catch-up`), deliberately not scheduled: it takes ACCESS EXCLUSIVE-class locks on live tables.
+        emailAlert(`rows are sitting in ${alert.table}'s default partition`, {
+          alertName: "partition_default_rows",
+          table: alert.table,
+          rowCount: alert.rowCount,
+        });
+      }
+      // ⚠ 0 IS AN OBSERVATION, NOT ABSENCE: every fact table reports each run, so a dashboard can tell "clean" from "did not run".
+      for (const table of PARTITIONED_FACT_TABLES) {
+        const stranded = result.defaultPartitionAlerts.find((alert) => alert.table === table);
+        observeValue("nominara_partition_default_rows", stranded?.rowCount ?? 0, { table });
       }
     } finally {
-      await client.end();
+      try {
+        await client.end();
+      } finally {
+        await drainAlertEmails();
+      }
     }
   };
 }

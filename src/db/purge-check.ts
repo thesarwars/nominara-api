@@ -39,6 +39,34 @@ export async function findBlockingPurgeFailures(client: Client): Promise<Unresol
   }));
 }
 
+export interface UnresolvedPurgeFailureStatus extends UnresolvedPurgeFailure {
+  /** True once unresolved past the grace window, i.e. exactly the rows `findBlockingPurgeFailures` returns. */
+  readonly blocking: boolean;
+}
+
+/**
+ * Every unresolved `purge_failures` row, inside the grace window or past it. `findBlockingPurgeFailures` is the deploy gate; this is the
+ * alerting half (STORY-013 AC16: "a purge failure alerts"), which must see a failure the day it happens, not on day eight.
+ */
+export async function findUnresolvedPurgeFailures(client: Client): Promise<UnresolvedPurgeFailureStatus[]> {
+  const result = await client.query<{ id: string; scope: string; scope_id: string; reason: string; failed_at: Date; blocking: boolean }>(
+    `SELECT id, scope, scope_id, reason, failed_at,
+            failed_at < now() - ($1 || ' days')::interval AS blocking
+       FROM purge_failures
+      WHERE resolved_at IS NULL
+      ORDER BY failed_at ASC`,
+    [PURGE_FAILURE_GRACE_DAYS],
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    scope: row.scope,
+    scopeId: row.scope_id,
+    reason: row.reason,
+    failedAt: row.failed_at,
+    blocking: row.blocking,
+  }));
+}
+
 async function main(): Promise<void> {
   const client = await connect(requireDatabaseUrl());
   try {

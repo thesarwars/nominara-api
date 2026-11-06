@@ -142,6 +142,8 @@ async function createPartitionStatements(
   }
 }
 
+export const PARTITION_DDL_LOCK_TIMEOUT_MS = 5_000;
+
 /**
  * Creates one partition, atomically. `CREATE TABLE ... PARTITION OF` and
  * `apply_tenant_rls` used to run as two separate autocommitted statements —
@@ -156,6 +158,9 @@ async function createPartitionStatements(
 async function createPartition(client: ClientBase, table: string, name: string, start: Date, end: Date): Promise<void> {
   await client.query("BEGIN");
   try {
+    // Bounded wait for the ACCESS EXCLUSIVE lock on the parent: a long reader (the nightly integrity scan) must make this DDL fail and
+    // retry tomorrow, never queue every capture INSERT behind a pending exclusive lock. Transaction-local.
+    await client.query(`SET LOCAL lock_timeout = '${String(PARTITION_DDL_LOCK_TIMEOUT_MS)}ms'`);
     await createPartitionStatements(client, table, name, start, end);
     await client.query("COMMIT");
   } catch (error) {
@@ -253,6 +258,12 @@ export interface RunwayMaintenanceResult {
   readonly defaultPartitionAlerts: readonly DefaultPartitionAlert[];
   readonly partitionsCreated: readonly string[];
   readonly partitionFailures: readonly { partition: string; reason: string }[];
+  /**
+   * Set when the default-partition COUNT could not run (the maintenance definer is not executable on this connection, or the statement
+   * failed). The runway is extended regardless: the DDL needs no tenant visibility, so a connection that cannot count must not stop it.
+   * `defaultPartitionAlerts` is then empty and means "unknown", never "clean"; the caller must fail the job on this.
+   */
+  readonly defaultPartitionCheckError?: Error;
 }
 
 export async function runPartitionRunwayMaintenance(
@@ -261,9 +272,20 @@ export async function runPartitionRunwayMaintenance(
 ): Promise<RunwayMaintenanceResult> {
   return withAdvisoryLock(client, MAINTENANCE_LOCK_KEY, async () => {
     const referenceDate = options.referenceDate ?? new Date();
-    const defaultPartitionAlerts = await detectDefaultPartitionRows(client);
+    let defaultPartitionAlerts: readonly DefaultPartitionAlert[] = [];
+    let defaultPartitionCheckError: Error | undefined;
+    try {
+      defaultPartitionAlerts = await detectDefaultPartitionRows(client);
+    } catch (error) {
+      defaultPartitionCheckError = error instanceof Error ? error : new Error(String(error));
+    }
     const { created, failures } = await ensureAllPartitions(client, referenceDate);
-    return { defaultPartitionAlerts, partitionsCreated: created, partitionFailures: failures };
+    return {
+      defaultPartitionAlerts,
+      partitionsCreated: created,
+      partitionFailures: failures,
+      ...(defaultPartitionCheckError === undefined ? {} : { defaultPartitionCheckError }),
+    };
   });
 }
 
@@ -279,14 +301,90 @@ export interface DefaultPartitionAlert {
   readonly rowCount: number;
 }
 
-export async function detectDefaultPartitionRows(client: ClientBase): Promise<DefaultPartitionAlert[]> {
+/**
+ * ⚠ THE CROSS-TENANT READS GO THROUGH THREE COUNT-ONLY SECURITY DEFINER FUNCTIONS (migration 0160, docs/adr/ADR-0004). Every tenant table
+ * carries FORCE ROW LEVEL SECURITY, and the documented maintenance identity (`nominara_owner`) is NOSUPERUSER NOBYPASSRLS, so a direct
+ * read of them reads ZERO rows with no error and reports a clean estate. `app.maintenance_default_partition_rows()`,
+ * `app.maintenance_orphan_counts()` and `app.maintenance_recall_overlap()` are owned by `nominara_maintenance`, admitted by one
+ * role-targeted SELECT policy per table, and return counts only.
+ *
+ * FAIL CLOSED: if this connection cannot call them (missing, or no EXECUTE), NOTHING is checked and nothing is observed: no 0 and no
+ * skip. The check is on the function's existence and on EXECUTE, never on a row count (a blind role also sees an empty `workspaces`).
+ */
+export const MAINTENANCE_DEFINER_UNAVAILABLE_MESSAGE = "cannot execute the maintenance definer functions";
+
+const MAINTENANCE_DEFINER_SIGNATURES = [
+  "app.maintenance_default_partition_rows()",
+  "app.maintenance_orphan_counts()",
+  "app.maintenance_recall_overlap(text, halfvec, integer)",
+] as const;
+
+export async function assertMaintenanceDefinerAvailable(client: ClientBase): Promise<void> {
+  const unavailable = (detail: string): Error =>
+    new Error(`this connection ${MAINTENANCE_DEFINER_UNAVAILABLE_MESSAGE} (${detail}): a direct read of the FORCE-RLS tables would count 0 whatever the data holds`);
+  // Schema USAGE first and on its own: resolving `app.<name>` in a schema the role cannot use RAISES instead of returning null.
+  const schema = await client.query<{ ok: boolean }>("SELECT has_schema_privilege('app', 'USAGE') AS ok");
+  if (schema.rows[0]?.ok !== true) throw unavailable("no USAGE on schema app");
+  const result = await client.query<{ signature: string; ok: boolean }>(
+    `SELECT s AS signature,
+            (to_regprocedure(s) IS NOT NULL AND has_function_privilege(to_regprocedure(s), 'EXECUTE')) AS ok
+       FROM unnest($1::text[]) AS s`,
+    [MAINTENANCE_DEFINER_SIGNATURES],
+  );
+  const missing = result.rows.filter((row) => !row.ok).map((row) => row.signature);
+  if (result.rows.length !== MAINTENANCE_DEFINER_SIGNATURES.length || missing.length > 0) {
+    throw unavailable(missing.join(", ") || "none found");
+  }
+}
+
+/** Upper bound on the default-partition count. It runs in autocommit on the maintenance connection, so nothing else would stop it. */
+export const DEFAULT_PARTITION_COUNT_TIMEOUT_MS = 60_000;
+
+export async function detectDefaultPartitionRows(
+  client: ClientBase,
+  timeoutMs: number = DEFAULT_PARTITION_COUNT_TIMEOUT_MS,
+): Promise<DefaultPartitionAlert[]> {
+  // A non-positive (or truncated-to-zero, or non-finite) timeout would mean "no bound" to Postgres. Refuse before sending anything.
+  if (!Number.isFinite(timeoutMs) || Math.trunc(timeoutMs) < 1) {
+    throw new Error(`detectDefaultPartitionRows: timeoutMs must be a finite number >= 1 (got ${String(timeoutMs)})`);
+  }
+  // ⚠ The bound is set HERE, on the call, in its own short transaction: a statement_timeout in the function's own SET clause is not
+  // re-armed for the statement already running, so it would bound nothing (ADR-0004). SET LOCAL ends with the transaction.
+  // The callers are autocommit (runMonthlyMaintenance holds a session advisory lock, not a transaction).
+  let result: { rows: { parent_table: PartitionedFactTable; default_partition: string; row_count: string }[] };
+  // It owns its transaction, so it must not be called inside one: COMMIT would commit the caller's work and SET LOCAL would outlive this call.
+  // The probe does not depend on notices (client_min_messages can hide them): SAVEPOINT is legal only inside a transaction block. Outside one it
+  // fails with 25P01 (no_active_sql_transaction), which means "proceed"; any other error (an aborted transaction, 25P02, included) propagates.
+  let inTransaction = false;
+  try {
+    await client.query("SAVEPOINT dpr_probe");
+    inTransaction = true;
+  } catch (error) {
+    if ((error as { code?: string }).code !== "25P01") throw error;
+  }
+  if (inTransaction) {
+    await client.query("RELEASE SAVEPOINT dpr_probe");
+    throw new Error("detectDefaultPartitionRows must not run inside an existing transaction (it opens, and commits, its own)");
+  }
+  await client.query("BEGIN");
+  try {
+    await client.query(`SET LOCAL statement_timeout = '${String(Math.trunc(timeoutMs))}ms'`);
+    result = await client.query<{ parent_table: PartitionedFactTable; default_partition: string; row_count: string }>(
+      "SELECT parent_table, default_partition, row_count::text AS row_count FROM app.maintenance_default_partition_rows()",
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
   const alerts: DefaultPartitionAlert[] = [];
   for (const table of PARTITIONED_FACT_TABLES) {
-    const defaultPartition = `${table}_default`;
-    const result = await client.query<{ count: string }>(`SELECT count(*)::text AS count FROM ${quoteIdent(defaultPartition)}`);
-    const rowCount = Number(result.rows[0]!.count);
+    const row = result.rows.find((r) => r.parent_table === table);
+    // The function returns one row per table, zero included. A missing row is an error, never a clean 0.
+    if (row === undefined) throw new Error(`app.maintenance_default_partition_rows() returned no row for ${table}`);
+    const rowCount = Number(row.row_count);
     if (rowCount > 0) {
-      alerts.push({ table, defaultPartition, rowCount });
+      alerts.push({ table, defaultPartition: row.default_partition, rowCount });
     }
   }
   return alerts;
@@ -547,51 +645,23 @@ export async function computeRecallAtK(
   k = 10,
   queries: readonly number[][] = GOLDEN_QUERY_VECTORS,
 ): Promise<number | null> {
-  const countResult = await client.query<{ count: string }>(
-    `SELECT count(*)::text AS count FROM ${quoteIdent(table)} WHERE ${quoteIdent(column)} IS NOT NULL`,
-  );
-  if (Number(countResult.rows[0]!.count) < k) {
-    return null;
+  // The column comes from the fixed registry, never from the caller: the definer function looks it up by table and rejects any other.
+  if (!HNSW_INDEXED_TABLES.some((entry) => entry.table === table && entry.column === column)) {
+    throw new Error(`computeRecallAtK: ${table}.${column} is not an HNSW-indexed column`);
   }
-
   let totalRecall = 0;
-  await client.query("BEGIN");
-  try {
-    for (const vector of queries) {
-      const literal = `[${vector.join(",")}]`;
-      // `<=>` (cosine distance), NOT `<->` (L2) — every HNSW index this
-      // module checks (migrations 0003/0004) is built with `..._cosine_ops`.
-      // The distance operator in an ORDER BY must match the index's opclass
-      // for Postgres to consider the index at all; `<->` against a cosine
-      // opclass index is never a candidate plan, so the "ANN" query below
-      // silently fell back to a full sort every time, in production too —
-      // discovered live via EXPLAIN while fixing qa-reviewer finding #5 (a
-      // real-threshold recall test could never observe genuine degradation
-      // because the index was never actually being queried).
-      const ann = await client.query<{ id: string }>(
-        `SELECT id FROM ${quoteIdent(table)} WHERE ${quoteIdent(column)} IS NOT NULL ORDER BY ${quoteIdent(column)} <=> $1 LIMIT $2`,
-        [literal, k],
-      );
-
-      await client.query("SET LOCAL enable_indexscan = off");
-      await client.query("SET LOCAL enable_bitmapscan = off");
-      const exact = await client.query<{ id: string }>(
-        `SELECT id FROM ${quoteIdent(table)} WHERE ${quoteIdent(column)} IS NOT NULL ORDER BY ${quoteIdent(column)} <=> $1 LIMIT $2`,
-        [literal, k],
-      );
-      await client.query("RESET enable_indexscan");
-      await client.query("RESET enable_bitmapscan");
-
-      const annIds = new Set(ann.rows.map((r) => r.id));
-      const exactIds = new Set(exact.rows.map((r) => r.id));
-      let hits = 0;
-      for (const id of annIds) if (exactIds.has(id)) hits += 1;
-      totalRecall += hits / k;
-    }
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
+  for (const vector of queries) {
+    // `<=>` (cosine distance), NOT `<->` (L2) — every HNSW index checked here (migrations 0003/0004) is built with `..._cosine_ops`; the
+    // operator in the ORDER BY must match the opclass or the planner never considers the index. That comparison now runs INSIDE
+    // app.maintenance_recall_overlap (migration 0160), which returns only how many rows the index's top-k and the exact top-k share.
+    const result = await client.query<{ candidate_rows: string; overlap: number | null }>(
+      "SELECT candidate_rows::text AS candidate_rows, overlap FROM app.maintenance_recall_overlap($1, $2::halfvec, $3)",
+      [table, `[${vector.join(",")}]`, k],
+    );
+    const row = result.rows[0];
+    // Too few vectors to measure: null, NOT 0. The count is the same for every query vector.
+    if (row === undefined || row.overlap === null) return null;
+    totalRecall += row.overlap / k;
   }
   return totalRecall / queries.length;
 }
