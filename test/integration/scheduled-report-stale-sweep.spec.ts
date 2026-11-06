@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { scheduledRunDeliveryId } from "../../src/lib/reports/run-scheduled-report.js";
 import { STALE_SENDING_REASON, sweepStaleSendingDeliveries } from "../../src/lib/reports/stale-delivery-sweep.js";
 import { STALE_SENDING_MS, ScheduledReportsService } from "../../src/modules/reports/scheduled-reports.service.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
@@ -134,6 +135,21 @@ describe("STORY-183 · stale `sending` scheduled-report delivery sweep", () => {
     expect(await sweep()).toMatchObject({ workspacesChecked: 2, swept: 2 });
     expect([(await row(d1)).status, (await row(d2)).status]).toEqual(["failed", "failed"]);
     expect([await lastError(r1), await lastError(r2)]).toEqual([STALE_SENDING_REASON, STALE_SENDING_REASON]);
+  });
+
+  it("[STORY-183 AC2] a stale CADENCE row (id = scheduledRunDeliveryId) is left to the report.build ladder: not swept, no last_error, no metric", async () => {
+    const ws = await workspace();
+    const rep = await report(ws);
+    const id = scheduledRunDeliveryId(rep, new Date("2026-10-01T09:00:00Z"));
+    await db.query(
+      `INSERT INTO scheduled_report_deliveries (id, workspace_id, scheduled_report_id, status, attempted_at) VALUES ($1,$2,$3,'sending', now() - $4 * interval '1 millisecond')`,
+      [id, ws, rep, STALE],
+    );
+    const sendNow = await delivery(ws, rep, "sending", STALE);
+    expect(await sweep()).toMatchObject({ swept: 1, failures: [] });
+    expect((await row(id)).status).toBe("sending");
+    expect((await row(sendNow)).status).toBe("failed");
+    expect(failedCount()).toBe(1);
   });
 
   it("[STORY-183 AC2] the sweep racing a finaliser leaves exactly one outcome: the finaliser commits first and stands", async () => {

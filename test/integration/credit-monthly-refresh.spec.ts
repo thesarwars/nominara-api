@@ -293,11 +293,32 @@ describe("STORY-177 · monthly included-credit refresh", () => {
     expect((await wallet(id)).cycle_start).toBe("2026-02-15");
   });
 
-  it("[STORY-177 AC1] a trialing annual subscription gets the monthly refresh too (decision 67(d))", async () => {
-    const id = await seed({ plan: "growth", cycle: YEAR_CYCLE, grant: GROWTH_GRANT, sub: annualSub("trialing") });
+  const trial = (end: string) => ({ interval: "annual" as const, status: "trialing", start: "2026-01-15T00:00:00Z", end });
+
+  it("[STORY-177 AC1] a trialing annual subscription gets the monthly refresh inside its trial (decision 67(d)), and not on or after the trial's end", async () => {
+    const id = await seed({ plan: "growth", cycle: { start: "2026-01-15", end: "2026-02-15" }, grant: GROWTH_GRANT, sub: trial("2026-03-16T00:00:00Z") });
     expect((await sweep(at("2026-02-20"))).workspacesRolled).toBe(1);
     expect((await wallet(id)).cycle_start).toBe("2026-02-15");
     expect((await sweep(at("2026-02-21"))).workspacesRolled).toBe(0);
+    // Still `trialing` on the trial's end (the conversion event is late or failed): payment undecided, the job does not roll.
+    expect((await sweep(at("2026-03-16"))).workspacesRolled).toBe(0);
+    expect((await sweep(at("2026-03-17"))).workspacesRolled).toBe(0);
+    expect((await wallet(id)).cycle_start).toBe("2026-02-15");
+  });
+
+  it("[STORY-177 AC1] a 30-day trial never gets a job roll: the first month boundary is after the trial's end", async () => {
+    const id = await seed({ plan: "growth", cycle: { start: "2026-01-15", end: "2026-02-15" }, grant: GROWTH_GRANT, sub: trial("2026-02-14T00:00:00Z") });
+    expect((await sweep(at("2026-02-14"))).workspacesRolled).toBe(0);
+    expect((await sweep(at("2026-02-20"))).workspacesRolled).toBe(0);
+    expect((await wallet(id)).cycle_start).toBe("2026-01-15");
+  });
+
+  it("[STORY-177 AC1] trial to active: after a job roll inside the trial, the conversion webhook's period advance still rolls (one grant each)", async () => {
+    const id = await seed({ plan: "growth", cycle: { start: "2026-01-15", end: "2026-02-15" }, grant: GROWTH_GRANT, sub: trial("2026-03-16T00:00:00Z") });
+    await sweep(at("2026-02-20"));
+    const converted = await inCtx(id, (tx) => rollIncludedCycle(tx, { workspaceId: id, grant: GROWTH_GRANT, cycleStart: "2026-03-16", cycleEnd: "2027-03-16" }));
+    expect(converted.rolled).toBe(true);
+    expect((await wallet(id)).cycle_start).toBe("2026-03-16");
   });
 
   it("[STORY-177 AC1] a monthly-billed paid wallet is never this job's: the webhook owns it", async () => {

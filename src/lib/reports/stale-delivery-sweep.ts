@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase, Pool, PoolClient } from "pg";
+import { scheduledRunDeliveryId } from "./run-scheduled-report.js";
 import { STALE_SENDING_MS } from "../../modules/reports/scheduled-reports.service.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -17,6 +18,11 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // WHERE IT RUNS. In the report group's elected 5-minute tick (`ReportSweepRuntime.after`, the STORY-178 precedent), so it is single-flight
 // across replicas by the advisory lock, and idempotent besides (a second run finds nothing). Discovery reads workspace ids across tenants on the
 // owner connection; each workspace is then rewritten in its OWN tenant transaction on the runtime pool, so RLS applies to the writes.
+//
+// CADENCE ROWS ARE NOT SWEPT. A scheduled (cadence) run also holds its row `sending` while it sends and retries on the `report.build` ladder, and
+// that ladder settles the row itself (`settleRun`, and its `recover` hook after the last attempt). Rewriting it here would make the retried job see
+// a `failed` row, reserve the tier cap again and mail the period twice. A cadence row is recognised by its id: `scheduledRunDeliveryId` is a
+// deterministic function of (report, period) and carries the period in its timestamp, so it can be recomputed from the row alone.
 //
 // LAST_ERROR IS NOT CLOBBERED. If the report already has a NEWER delivery that settled (delivered, logged, failed, skipped), that delivery owns
 // `last_error` (a success clears it); the swept row is still rewritten, but it does not overwrite a newer outcome.
@@ -95,13 +101,27 @@ async function run({ discovery, work }: StaleSweepConnections): Promise<StaleSwe
   return { workspacesChecked: found.rows.length, swept, failures };
 }
 
-/** ONE statement: rewrite the stale rows (guarded by `status = 'sending'`) and set `last_error` on their reports. Returns how many rows it rewrote. */
+/** True when `id` is the deterministic id of a cadence run: the period is its UUIDv7 timestamp, so it can be recomputed. */
+function isCadenceRunId(id: string, reportId: string): boolean {
+  const period = new Date(Number.parseInt(id.replace(/-/g, "").slice(0, 12), 16));
+  return !Number.isNaN(period.getTime()) && scheduledRunDeliveryId(reportId, period) === id;
+}
+
+/** Rewrites the stale send-now rows (guarded by `status = 'sending'`) and sets `last_error` on their reports. Returns how many rows it rewrote. */
 async function rewriteWorkspace(tx: ClientBase): Promise<number> {
+  const candidates = await tx.query<{ id: string; scheduled_report_id: string }>(
+    `SELECT id, scheduled_report_id FROM scheduled_report_deliveries
+      WHERE status = 'sending' AND now() - attempted_at > $1 * interval '1 millisecond'`,
+    [STALE_SENDING_MS],
+  );
+  const ids = candidates.rows.filter((r) => !isCadenceRunId(r.id, r.scheduled_report_id)).map((r) => r.id);
+  if (ids.length === 0) return 0;
+  // ONE statement; the predicate is re-checked under the row lock, so a finaliser that won in between leaves nothing to match.
   const result = await tx.query<{ swept: number }>(
     `WITH swept AS (
        UPDATE scheduled_report_deliveries
           SET status = 'failed', reason = $2
-        WHERE status = 'sending' AND now() - attempted_at > $1 * interval '1 millisecond'
+        WHERE id = ANY($3::uuid[]) AND status = 'sending' AND now() - attempted_at > $1 * interval '1 millisecond'
         RETURNING scheduled_report_id, attempted_at
      ),
      latest AS (SELECT scheduled_report_id, max(attempted_at) AS at FROM swept GROUP BY scheduled_report_id),
@@ -114,7 +134,7 @@ async function rewriteWorkspace(tx: ClientBase): Promise<number> {
         RETURNING r.id
      )
      SELECT (SELECT count(*) FROM swept)::int AS swept, (SELECT count(*) FROM marked)::int AS marked`,
-    [STALE_SENDING_MS, STALE_SENDING_REASON],
+    [STALE_SENDING_MS, STALE_SENDING_REASON, ids],
   );
   return result.rows[0]?.swept ?? 0;
 }

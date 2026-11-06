@@ -154,10 +154,9 @@ describe("retention.purge - STORY-180 r5: workspace erasure deletes the workspac
     expect(typeof state.cycleOptions?.deleteWorkspaceObjects).toBe("function");
   });
 
-  it("[STORY-182 AC3] hands the purge cycle the deleteObjectPrefix callback and the key environment it validates against", async () => {
+  it("[STORY-182 AC3] leaves deleteObjectPrefix unwired: no writer keys raw objects by project, so the gap stays recorded, not reported as done", async () => {
     await createRetentionPurgeHandler(withStorage(storageEnv))({} as never, tick);
-    expect(typeof state.cycleOptions?.deleteObjectPrefix).toBe("function");
-    expect(state.cycleOptions?.objectKeyEnv).toBe("prod");
+    expect(state.cycleOptions?.deleteObjectPrefix).toBeUndefined();
   });
 
   it("with object storage NOT configured the cycle runs without the hook, and says so", async () => {

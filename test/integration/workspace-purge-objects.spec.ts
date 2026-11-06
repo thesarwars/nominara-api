@@ -2,14 +2,13 @@ import { ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { S3Adapter } from "../../src/lib/storage/s3.adapter.js";
 import { resolveStorageConfig, type StorageConfig } from "../../src/lib/storage/storage-config.js";
-import { deleteProjectObjectPrefix, deleteWorkspaceObjectsEverywhere } from "../../src/lib/storage/workspace-purge.js";
+import { deleteWorkspaceObjectsEverywhere } from "../../src/lib/storage/workspace-purge.js";
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
 
 // STORY-182 - the purge-side wrapper against LocalStack with versioning ON (docker/localstack/init-buckets.sh). Run under the docker lock.
 
 const WS_A = "0197a000-0000-7000-8000-00000000000a";
 const WS_B = "0197a000-0000-7000-8000-00000000000b";
-const PROJECT = "0197a000-0000-7000-8000-0000000000c1";
 
 let localstack: LocalstackFixture;
 let config: StorageConfig;
@@ -67,13 +66,5 @@ describe("STORY-182 · purge deletes object prefixes in a versioned bucket", () 
 
   it("[STORY-182 AC3] a re-run after the job is done finishes cleanly and removes nothing", async () => {
     await expect(deleteWorkspaceObjectsEverywhere(adapter, "inttest", WS_A)).resolves.toBe(0);
-  });
-
-  it("[STORY-182 AC3] the project-prefix callback deletes every version under that project only", async () => {
-    await put("raw", `inttest/${WS_A}/projects/${PROJECT}/x.gz`, 2);
-    await put("raw", `inttest/${WS_A}/projects/${PROJECT}0/sibling.gz`);
-    await deleteProjectObjectPrefix(adapter, "inttest", `inttest/${WS_A}/projects/${PROJECT}/`);
-    expect(await versions("nominara-raw", `inttest/${WS_A}/projects/${PROJECT}/`)).toEqual([]);
-    expect(await versions("nominara-raw", `inttest/${WS_A}/projects/${PROJECT}0/`)).toHaveLength(1);
   });
 });

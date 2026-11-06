@@ -27,7 +27,8 @@ import { rollIncludedCycle } from "./cycle-roll.js";
 //
 // ⚠ NOT A PAYMENT-OUTSTANDING ROLL. Only a subscription that is `active` rolls. `past_due` waits for the payment (the
 // webhook's recovery roll, or the next run after the status returns to `active`). A `trialing` annual
-// subscription ROLLS like an active one (owner decision 67(d), 2026-11-06). A monthly-billed paid wallet is never this job's.
+// subscription ROLLS like an active one (owner decision 67(d), 2026-11-06) but only INSIDE the trial: its period is the trial window, so on or
+// after current_period_end the conversion payment is undecided and the webhook owns the roll. A monthly-billed paid wallet is never this job's.
 //
 // The decision is made INSIDE each workspace's tenant transaction, AFTER taking the wallet's row lock and reading the
 // subscription in a later statement (a fresh READ COMMITTED snapshot, so a webhook that committed while we waited is
@@ -103,6 +104,7 @@ interface WalletView {
   readonly billing_interval: string | null;
   readonly status: string | null;
   readonly period_start: string | null;
+  readonly period_end: string | null;
   readonly grant_free: number;
   readonly grant_plan: number | null;
 }
@@ -184,12 +186,13 @@ async function refreshOne(tx: ClientBase, workspaceId: string, today: string): P
   if (locked.rowCount === 0) return false;
   const view = await tx.query<WalletView>(
     `SELECT w.cycle_start::text, w.cycle_end::text,
-            s.plan_key, s.billing_interval, s.status, s.period_start,
+            s.plan_key, s.billing_interval, s.status, s.period_start, s.period_end,
             (SELECT credits_per_cycle FROM plans WHERE key = 'free') AS grant_free,
             (SELECT credits_per_cycle FROM plans WHERE key = s.plan_key) AS grant_plan
        FROM credit_wallets w
        LEFT JOIN LATERAL (
-         SELECT plan_key, billing_interval, status, (current_period_start AT TIME ZONE 'UTC')::date::text AS period_start
+         SELECT plan_key, billing_interval, status, (current_period_start AT TIME ZONE 'UTC')::date::text AS period_start,
+                (current_period_end AT TIME ZONE 'UTC')::date::text AS period_end
            FROM subscriptions WHERE workspace_id = w.workspace_id
           ORDER BY current_period_start DESC LIMIT 1
        ) s ON true
@@ -206,6 +209,9 @@ async function refreshOne(tx: ClientBase, workspaceId: string, today: string): P
   if (isFree) {
     window = calendarMonthWindow(today);
     grant = row.grant_free;
+  } else if (row.billing_interval === "annual" && row.status === "trialing" && (row.period_end === null || today >= row.period_end)) {
+    // A trial's current_period_* is the TRIAL window (not a year). On or after its end the payment is being decided: the webhook's.
+    return false;
   } else if (row.billing_interval === "annual" && (row.status === "active" || row.status === "trialing") && row.period_start !== null && row.grant_plan !== null) {
     window = annualWindow(row.period_start, today);
     grant = row.grant_plan;
