@@ -15,6 +15,7 @@ import {
   type Milestone,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { MEASURED_IMPACT_CAVEAT } from "../../../contracts/tasks/task-verification.schema.js";
 import { currentTenantStore, type TenantContextStore } from "../../tenancy/tenant-context.js";
 import {
   baselinePoints,
@@ -74,9 +75,11 @@ const HOUR_MS = 3_600_000;
  * impact or publishing it bare. The caveat is a fixed disclaimer about the
  * METHOD — pre/post observation cannot control for concurrent changes — not
  * a measurement, so supplying it invents nothing. A stored caveat wins,
- * because a future method may need to say something more specific.
+ * because a future method may need to say something more specific. The
+ * default is the contract's ONE constant (STORY-067's settler writes the same
+ * string), so the writer and this reader cannot drift.
  */
-export const MILESTONE_IMPACT_CAVEAT = "Observational; concurrent changes are not controlled for.";
+export const MILESTONE_IMPACT_CAVEAT = MEASURED_IMPACT_CAVEAT;
 
 export interface GrowthMapOptions {
   readonly days?: number;

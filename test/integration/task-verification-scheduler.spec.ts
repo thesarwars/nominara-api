@@ -10,13 +10,15 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import type { ScheduledRun } from "../../src/lib/capture/scheduler.js";
-import { cancelTaskVerifications, verificationHorizons } from "../../src/lib/impact/verification-schedule.js";
+import { cancelTaskVerifications, findDueVerifications, verificationHorizons } from "../../src/lib/impact/verification-schedule.js";
 import { runVerificationSweep } from "../../src/lib/impact/verification-sweep.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
 import { createCapturePlanHandler } from "../../src/lib/queue/handlers/capture-plan.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
+import { reconcileDowngradePause } from "../../src/lib/billing/downgrade-pause.js";
+import { softDeleteProject } from "../../src/workers/rollup/retention.js";
 import { GrowthMapService } from "../../src/modules/analytics/growth-map.service.js";
 import { TasksService } from "../../src/modules/tasks/tasks.service.js";
 import { withTenantContext, type TenantContext } from "../../src/tenancy/tenant-context.js";
@@ -120,12 +122,12 @@ describe("STORY-067 · verification scheduler and measured impact", () => {
 
   const dayOf = (instant: Date, offset: number) => new Date(instant.getTime() + offset * DAY).toISOString().slice(0, 10);
   /** One metric_daily row per day in [from, to] (offsets from the completion day), `cells` cells and a wobbling score around `centre`. */
-  async function scores(project: string, ws: string, completedAt: Date, from: number, to: number, centre: number, cells: number) {
+  async function scores(project: string, ws: string, completedAt: Date, from: number, to: number, centre: number, cells: number, version = "v1") {
     for (let offset = from; offset <= to; offset += 1) {
       await db.query(
         `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, visibility_score, scoring_version)
-         VALUES ($1,$2,'all','brand',$2,$3,$4,$5,'v1')`,
-        [ws, project, dayOf(completedAt, offset), cells, centre + (offset % 2 === 0 ? 1 : -1)],
+         VALUES ($1,$2,'all','brand',$2,$3,$4,$5,$6)`,
+        [ws, project, dayOf(completedAt, offset), cells, centre + (offset % 2 === 0 ? 1 : -1), version],
       );
     }
   }
@@ -147,6 +149,104 @@ describe("STORY-067 · verification scheduler and measured impact", () => {
     expect(rows[0]!.due_at.getTime()).toBe(completedAt.getTime() + 48 * 3_600_000);
     expect(rows[1]!.due_at.getTime()).toBe(completedAt.getTime() + 14 * DAY);
     expect(out.verification).toEqual({ at_48h: rows[0]!.due_at.toISOString(), at_14d: rows[1]!.due_at.toISOString() });
+  });
+
+  it("[STORY-067 review] a due row in a workspace that cannot capture does not block another tenant's row from the head of the list", async () => {
+    const stuck = await seed();
+    const ok = await seed();
+    await db.query("UPDATE workspaces SET status = 'past_due' WHERE id = $1", [stuck.ws]);
+    const t1 = await completedTask(stuck, stuck.cluster);
+    const t2 = await completedTask(ok, ok.cluster);
+    // The stuck tenant's two rows are the OLDEST due rows, so with LIMIT 2 they are the whole batch unless they are filtered out.
+    for (const v of await verifications(t1.taskId)) await db.query("UPDATE task_verifications SET due_at = now() - interval '10 days' WHERE id = $1", [v.id]);
+    const okShort = (await verifications(t2.taskId))[0]!;
+    await makeDue(okShort.id);
+    const refs = await findDueVerifications(db, new Date(), 2);
+    expect(refs.map((r) => r.id)).toEqual([okShort.id]);
+  });
+
+  it("[STORY-067 review] a fair-use refusal settles the row instead of leaving it pending to dead-letter every hour", async () => {
+    const s = await seed();
+    const first = await completedTask(s, s.cluster);
+    const second = await completedTask(s, s.cluster);
+    const firstShort = (await verifications(first.taskId))[0]!;
+    await makeDue(firstShort.id);
+    await runHandler(s, firstShort.id); // provisions the fair-use counter
+    await db.query("UPDATE usage_counters SET used_value = limit_value, reserved_value = 0 WHERE workspace_id = $1 AND metric = 'fair_use_captures'", [s.ws]);
+    const secondShort = (await verifications(second.taskId))[0]!;
+    await makeDue(secondShort.id);
+    await runHandler(s, secondShort.id);
+    expect((await verifications(second.taskId))[0]).toMatchObject({ status: "done", outcome: "no_capture", run_id: null });
+    expect((await db.query("SELECT 1 FROM capture_runs WHERE project_id = $1", [s.project])).rowCount).toBe(1);
+  });
+
+  it("[STORY-067 review] the run row records the cluster it measured (scope_ref)", async () => {
+    const s = await seed();
+    const { taskId } = await completedTask(s, s.cluster);
+    const short = (await verifications(taskId))[0]!;
+    await makeDue(short.id);
+    await runHandler(s, short.id);
+    expect((await db.query("SELECT scope_ref FROM capture_runs WHERE project_id = $1", [s.project])).rows).toEqual([{ scope_ref: s.cluster }]);
+  });
+
+  it("[STORY-067 review] windows that mix scoring versions yield NO delta rather than a formula change reported as impact", async () => {
+    const s = await seed();
+    const { taskId, milestoneId, completedAt } = await completedTask(s, null);
+    await scores(s.project, s.ws, completedAt, -14, -1, 20, 40, "v0");
+    await scores(s.project, s.ws, completedAt, 1, 14, 40, 40, "v1");
+    await readyToSettle(taskId);
+    await settleAt(completedAt);
+    expect(await impactOf(milestoneId)).toBeNull();
+    expect((await verifications(taskId)).find((v) => v.horizon === "long")).toMatchObject({ status: "done", outcome: "insufficient_sample" });
+  });
+
+  it("[STORY-067 review] the last window day is not frozen from a partial day: it waits for the closed-day rollup (00:20 local)", async () => {
+    const s = await seed();
+    const { taskId, milestoneId, completedAt } = await completedTask(s, null);
+    await scores(s.project, s.ws, completedAt, -14, -1, 10, 40);
+    await scores(s.project, s.ws, completedAt, 1, 14, 70, 40);
+    await readyToSettle(taskId);
+    const nextDay = dayOf(completedAt, 15);
+    await runVerificationSweep(db, undefined, new Date(`${nextDay}T00:10:00Z`));
+    expect(await impactOf(milestoneId)).toBeNull();
+    expect((await verifications(taskId)).find((v) => v.horizon === "long")!.status).toBe("running");
+    // The closed-day rollup rewrites the last day at 00:20; a sweep after it may settle, one before it may not.
+    await db.query("UPDATE metric_daily SET computed_at = $2 WHERE project_id = $1 AND metric_date = $3", [s.project, new Date(`${nextDay}T00:25:00Z`), dayOf(completedAt, 14)]);
+    await runVerificationSweep(db, undefined, new Date(`${nextDay}T00:30:00Z`));
+    expect(await impactOf(milestoneId)).not.toBeNull();
+  });
+
+  it("[STORY-067 review] a different milestone at the very same instant still counts as nearby; only the seeded sibling is excluded", async () => {
+    const s = await seed();
+    const { taskId, milestoneId, completedAt } = await completedTask(s, null);
+    await scores(s.project, s.ws, completedAt, -14, -1, 10, 40);
+    await scores(s.project, s.ws, completedAt, 1, 14, 70, 40);
+    for (let i = 0; i < 2; i += 1) await db.query(`INSERT INTO milestones (workspace_id, project_id, occurred_at, kind, title) VALUES ($1,$2,$3,'deployment','Deploy')`, [s.ws, s.project, completedAt]);
+    await readyToSettle(taskId);
+    await settleAt(completedAt);
+    const impact = measuredImpactSchema.parse(await impactOf(milestoneId));
+    expect(impact.other_milestones_nearby).toBe(2);
+    expect(impact.confidence).toBe("low");
+  });
+
+  it("[STORY-067 AC10 review] a downgrade pause cancels the paused project's pending rows at once, and only that project's", async () => {
+    const s = await seed();
+    await db.query("UPDATE workspaces SET plan_key = 'starter' WHERE id = $1", [s.ws]);
+    const other = randomUUID();
+    await db.query(`INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain, priority_prompt_limit, created_at) VALUES ($1,$2,'Newer',$3,'https://n.test','n.test',10, now() + interval '1 hour')`, [other, s.ws, `p-${randomUUID().slice(0, 8)}`]);
+    const kept = await completedTask(s, s.cluster);
+    const created = await inTenant(ctx(s.ws, s.actor), () => tasks.createTask(other, createTaskRequestSchema.parse({ title: "Other" })));
+    await inTenant(ctx(s.ws, s.actor), () => tasks.completeTask(created.id));
+    await inTenant(ctx(s.ws, s.actor), () => reconcileDowngradePause(appDb, s.ws));
+    expect((await verifications(created.id)).map((v) => [v.status, v.cancel_reason])).toEqual([["canceled", "project_paused"], ["canceled", "project_paused"]]);
+    expect((await verifications(kept.taskId)).map((v) => v.status)).toEqual(["pending", "pending"]);
+  });
+
+  it("[STORY-067 AC10 review] deleting a project cancels its pending rows at once", async () => {
+    const s = await seed();
+    const { taskId } = await completedTask(s, s.cluster);
+    await softDeleteProject(appDb, s.ws, s.project, s.actor);
+    expect((await verifications(taskId)).map((v) => [v.status, v.cancel_reason])).toEqual([["canceled", "project_deleted"], ["canceled", "project_deleted"]]);
   });
 
   it("[STORY-067 #12][AC11] the completion event is on the timeline with the actor", async () => {
@@ -215,7 +315,7 @@ describe("STORY-067 · verification scheduler and measured impact", () => {
     await readyToSettle(taskId);
     await settleAt(completedAt);
     const impact = measuredImpactSchema.parse(await impactOf(milestoneId));
-    expect(impact).toMatchObject({ window_days: 14, visibility_before: 20, visibility_after_14d: 40, delta: 20, n_before: 560, n_after: 560 });
+    expect(impact).toMatchObject({ window_days: 14, visibility_before: 20, visibility_after_14d: 40, delta: 20, n_before: 560, n_after: 560, scoring_version: "v1" });
     expect((await verifications(taskId)).find((v) => v.horizon === "long")).toMatchObject({ status: "done", outcome: "measured" });
   });
 

@@ -9,7 +9,8 @@ import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
-import { computeImpact, impactWindowDates, type DayPoint } from "./impact-attribution.js";
+import { sourceSeededSourceId } from "../sources/verify-presence.js";
+import { computeImpact, impactWindowDates, shiftDay, type DayPoint } from "./impact-attribution.js";
 
 // STORY-067 - settling a verification: the step after its capture run, and where the impact is computed and WRITTEN.
 //
@@ -17,7 +18,8 @@ import { computeImpact, impactWindowDates, type DayPoint } from "./impact-attrib
 // Nothing here makes a network call, so no transaction is held across an external await (ADR-0003).
 //
 //   short horizon  - settled `captured` once its run is terminal, or `no_capture` when it had nothing to capture.
-//   long horizon   - once its run is terminal AND the after-window has closed (the workspace-local day after the window's last day),
+//   long horizon   - once its run is terminal AND the after-window has closed AND its last day has had its closed-day rollup
+//                    (past the workspace-local day after the window's last day, or that day's row computed after 00:20),
 //                    the impact is computed from `metric_daily` and written onto the MILESTONE (`milestones.measured_impact`), so the
 //                    growth map and the task list read one figure (AC8). A thin sample writes NOTHING (AC7).
 //
@@ -89,6 +91,7 @@ interface SettleRow {
   readonly occurred_at: Date;
   readonly completion_day: string;
   readonly today: string;
+  readonly tz: string;
 }
 
 /** Settles ONE `running` verification inside the caller's tenant transaction. */
@@ -114,7 +117,7 @@ async function settle(tx: ClientBase, verificationId: string, now: Date): Promis
             t.status AS task_status, (t.deleted_at IS NOT NULL) AS task_deleted,
             m.occurred_at,
             to_char((m.occurred_at AT TIME ZONE z.tz)::date, 'YYYY-MM-DD') AS completion_day,
-            to_char(($2::timestamptz AT TIME ZONE z.tz)::date, 'YYYY-MM-DD') AS today
+            to_char(($2::timestamptz AT TIME ZONE z.tz)::date, 'YYYY-MM-DD') AS today, z.tz
        FROM task_verifications v
        JOIN milestones m ON m.id = v.milestone_id
        JOIN workspaces w ON w.id = v.workspace_id
@@ -122,7 +125,7 @@ async function settle(tx: ClientBase, verificationId: string, now: Date): Promis
        LEFT JOIN projects p ON p.id = v.project_id
        LEFT JOIN tasks t ON t.id = v.task_id
        LEFT JOIN capture_runs r ON r.id = v.run_id
-      WHERE v.id = $1 AND v.status = 'running'
+      WHERE v.id = $1 AND v.status = 'running' AND v.workspace_id = app.current_workspace()
         FOR UPDATE OF v`,
     [verificationId, now],
   );
@@ -156,22 +159,36 @@ async function settle(tx: ClientBase, verificationId: string, now: Date): Promis
   // The after-window must have CLOSED: today (workspace-local) is past its last day. Until then the mean would be of a partial window.
   if (row.today <= windows.after.to) return "waiting";
 
-  const series = await tx.query<{ metric_date: string; visibility_score: string; cells_total: number }>(
-    `SELECT DISTINCT ON (metric_date) to_char(metric_date, 'YYYY-MM-DD') AS metric_date, visibility_score::text, cells_total
+  // ONE scoring version across both windows: a day scored under another version is a GAP, not a stand-in, so a cut-over inside the
+  // span can never put a formula change into the delta (it would read as insufficient_sample instead). `rolled` says whether the
+  // day's row was computed after that day closed (the 00:20 closed-day rollup), not from the intra-day refreshes of the open day.
+  const series = await tx.query<{ metric_date: string; visibility_score: string; cells_total: number; rolled: boolean }>(
+    `SELECT to_char(metric_date, 'YYYY-MM-DD') AS metric_date, visibility_score::text, cells_total,
+            (computed_at >= ((metric_date + 1)::timestamp + interval '20 minutes') AT TIME ZONE $6) AS rolled
        FROM metric_daily
-      WHERE project_id = $1 AND engine_key = $2 AND entity_type = 'brand' AND entity_id = $1
-        AND metric_date BETWEEN $3::date AND $4::date
-      ORDER BY metric_date, (scoring_version = $5) DESC, computed_at DESC`,
-    [row.project_id, CROSS_ENGINE_KEY, windows.before.from, windows.after.to, SCORING_VERSION],
+      WHERE workspace_id = app.current_workspace()
+        AND project_id = $1 AND engine_key = $2 AND entity_type = 'brand' AND entity_id = $1
+        AND metric_date BETWEEN $3::date AND $4::date AND scoring_version = $5
+      ORDER BY metric_date`,
+    [row.project_id, CROSS_ENGINE_KEY, windows.before.from, windows.after.to, SCORING_VERSION, row.tz],
   );
+  // The day after the window's last: until the closed-day rollup has rewritten that last day, its row may be a partial one that
+  // would then be frozen into the milestone for good. Past that day, the rollup (or the dirty-date sweep) has had its chance.
+  if (row.today <= shiftDay(windows.after.to, 1)) {
+    const last = series.rows.find((r) => r.metric_date === windows.after.to);
+    if (last === undefined || !last.rolled) return "waiting";
+  }
   const points: DayPoint[] = series.rows.map((r) => ({ date: r.metric_date, score: Number(r.visibility_score), cells: r.cells_total }));
+  // Other milestones nearby. The task's own milestone is excluded by id, and so is the `source_seeded` one a seeding task pins at the
+  // SAME instant (by its deterministic source id, not by timestamp: an unrelated milestone at the same instant still counts).
   const others = await tx.query<{ within_7d: string; in_window: string }>(
     `SELECT count(*) FILTER (WHERE abs(extract(epoch FROM occurred_at - $3::timestamptz)) <= 7 * 86400)::text AS within_7d,
             count(*)::text AS in_window
        FROM milestones
-      WHERE project_id = $1 AND id <> $2 AND occurred_at <> $3::timestamptz
+      WHERE workspace_id = app.current_workspace()
+        AND project_id = $1 AND id <> $2 AND (source_type = 'system' AND source_id = $5::uuid) IS NOT TRUE
         AND occurred_at BETWEEN $3::timestamptz - make_interval(days => $4) AND $3::timestamptz + make_interval(days => $4)`,
-    [row.project_id, row.milestone_id, row.occurred_at, windowDays],
+    [row.project_id, row.milestone_id, row.occurred_at, windowDays, sourceSeededSourceId(row.project_id, row.task_id)],
   );
   const result = computeImpact({
     before: points.filter((p) => p.date >= windows.before.from && p.date <= windows.before.to),

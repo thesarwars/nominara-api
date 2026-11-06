@@ -4,6 +4,7 @@ import {
   DEFAULT_VERIFICATION_SHORT_HOURS,
   type TaskVerificationCancelReason,
 } from "../../../contracts/tasks/task-verification.schema.js";
+import { CAPTURABLE_WORKSPACE_STATUSES } from "../capture/scheduler.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
 // STORY-067 - the verification schedule: WHEN a completed task is re-measured, and when that is called off.
@@ -91,12 +92,20 @@ export interface DueVerificationRef {
   readonly dueAt: Date;
 }
 
-/** The sweep's owner-connection read: ids of verifications whose time has come. No tenant content. */
+/**
+ * The sweep's owner-connection read: ids of verifications whose time has come. No tenant content.
+ *
+ * ONLY WORKSPACES THAT CAN CAPTURE (the scheduler's own allow-list). A due row in a past_due, canceled or suspended workspace is
+ * neither measured nor cancelled - it waits for the workspace to recover - so it must not sit at the head of the oldest-first list
+ * and fill the batch: that would stop every other tenant's verification, platform-wide and silently.
+ */
 export async function findDueVerifications(client: ClientBase, now: Date, limit = 200): Promise<DueVerificationRef[]> {
   const result = await client.query<{ id: string; workspace_id: string; project_id: string; due_at: Date }>(
-    `SELECT id, workspace_id, project_id, due_at FROM task_verifications
-      WHERE status = 'pending' AND due_at <= $1 ORDER BY due_at, id LIMIT $2`,
-    [now, limit],
+    `SELECT v.id, v.workspace_id, v.project_id, v.due_at FROM task_verifications v
+       JOIN workspaces w ON w.id = v.workspace_id
+      WHERE v.status = 'pending' AND v.due_at <= $1 AND w.status = ANY($3::text[])
+      ORDER BY v.due_at, v.id LIMIT $2`,
+    [now, limit, [...CAPTURABLE_WORKSPACE_STATUSES]],
   );
   return result.rows.map((r) => ({ id: r.id, workspaceId: r.workspace_id, projectId: r.project_id, dueAt: r.due_at }));
 }

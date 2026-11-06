@@ -267,6 +267,9 @@ describe("STORY-055 · seeding-task completion with a URL and its verification",
       expect(await openCount()).toBe(0);
       // AC8: the flag flipped and the recompute carries the gap closed
       expect(await gap()).toEqual({ gap_severity: "none", brand_present_on_domain: true });
+      // STORY-067 AC1 - a task verified through seeding gets the same two re-measurements a directly completed one does.
+      const scheduled = await db.query("SELECT horizon, status FROM task_verifications WHERE task_id = $1 ORDER BY due_at", [id]);
+      expect(scheduled.rows).toEqual([{ horizon: "short", status: "pending" }, { horizon: "long", status: "pending" }]);
     });
 
     it("review r3 - the in_review -> done transition is AUDITED (system actor) and publishes task.moved from the worker, after commit", async () => {

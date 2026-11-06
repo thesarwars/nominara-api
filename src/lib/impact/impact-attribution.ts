@@ -1,4 +1,5 @@
 import { MEASURED_IMPACT_CAVEAT, type MeasuredImpact } from "../../../contracts/tasks/task-verification.schema.js";
+import { SCORING_VERSION } from "../scoring/index.js";
 import { visibilityDelta } from "../scoring/visibility.js";
 
 // STORY-067 - impact attribution (`scoring-models.md` section 13). PURE: no I/O, no clock. The rows it reads and the milestone counts
@@ -34,7 +35,7 @@ export interface WindowDates {
 
 const DAY_MS = 86_400_000;
 
-function shiftDay(day: string, by: number): string {
+export function shiftDay(day: string, by: number): string {
   return new Date(Date.parse(day) + by * DAY_MS).toISOString().slice(0, 10);
 }
 
@@ -134,6 +135,7 @@ export function computeImpact(input: {
         otherMilestonesInWindow: input.otherMilestonesInWindow,
       }),
       method: IMPACT_METHOD,
+      scoring_version: SCORING_VERSION,
       caveat: MEASURED_IMPACT_CAVEAT,
       n_before: nBefore,
       n_after: nAfter,

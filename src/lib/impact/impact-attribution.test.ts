@@ -45,6 +45,7 @@ describe("STORY-067 computeImpact", () => {
     expect(out.impact.window_days).toBe(14);
     expect(out.impact.n_before).toBe(140);
     expect(out.impact.n_after).toBe(140);
+    expect(out.impact.scoring_version).toBe("v1");
   });
 
   it("[STORY-067 #9] every computed impact carries the mandatory observational caveat, and parses against the contract", () => {

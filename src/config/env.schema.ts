@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { engineKeySchema } from "../lib/engines/contract.js";
 import { REFRESH_TOKEN_GRACE_WINDOW_DEFAULT_MS, REFRESH_TOKEN_GRACE_WINDOW_HARD_MAX_MS } from "../lib/auth/refresh-token.js";
+import { DEFAULT_VERIFICATION_LONG_DAYS, DEFAULT_VERIFICATION_SHORT_HOURS } from "../../contracts/tasks/task-verification.schema.js";
 
 // STORY-022-E-4 — configuration validation lives here, as zod (already a
 // dependency), NOT Joi/class-validator/@nestjs/config. coding-standards.md
@@ -548,6 +549,17 @@ export const envSchema = z
             "DATABASE_URL must be the direct Postgres connection, not the pgBouncer pooler (a session advisory lock cannot survive transaction pooling); the pooler belongs in DATABASE_URL_POOLED.",
         });
       }
+    }
+    // STORY-067 AC12 - the long verification horizon must come AFTER the short one. Checked here so a misconfiguration stops the boot,
+    // rather than failing every task completion later. An unset one is compared as its documented default.
+    const shortHours = env.TASK_VERIFICATION_SHORT_HOURS ?? DEFAULT_VERIFICATION_SHORT_HOURS;
+    const longDays = env.TASK_VERIFICATION_LONG_DAYS ?? DEFAULT_VERIFICATION_LONG_DAYS;
+    if (longDays * 24 <= shortHours) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["TASK_VERIFICATION_LONG_DAYS"],
+        message: "TASK_VERIFICATION_LONG_DAYS must be later than TASK_VERIFICATION_SHORT_HOURS (the +14 d re-measurement must follow the +48 h one).",
+      });
     }
     if (env.NODE_ENV === "production" && env.ENGINE_SIMULATION === "openrouter-free") {
       ctx.addIssue({

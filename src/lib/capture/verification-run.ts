@@ -1,4 +1,7 @@
+import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
+import { QuotaExceededError } from "../../api/errors/domain-errors.js";
+import { incrementCounter } from "../telemetry/metrics.js";
 import type { Cache } from "../cache/cache.port.js";
 import type { TaskVerificationCancelReason } from "../../../contracts/tasks/task-verification.schema.js";
 import { CAPTURABLE_WORKSPACE_STATUSES, type DueProject, type ScheduleContext, type ScheduledRun } from "./scheduler.js";
@@ -19,6 +22,8 @@ import { resolveRunCells } from "./probe-run.js";
 //
 //   RE-DERIVED, NEVER TRUSTED. The job names a verification id and nothing else; the cluster, the engines and the project's state
 //   are read here, inside the job's tenant context.
+
+const logger = new Logger("task.verification.run");
 
 export type VerificationPlanOutcome =
   | { readonly kind: "planned"; readonly scheduled: ScheduledRun; readonly periodStart: string }
@@ -102,46 +107,69 @@ export async function planVerificationRun(
   // settled at once; a long one is left `running` with no run, so the sweep still computes its impact from the rollups.
   const scope = { projectId: state.project_id, scope: "cluster" as const, ...(state.prompt_cluster_id === null ? {} : { clusterId: state.prompt_cluster_id }), ...(context.captureReadyEngineKeys === undefined ? {} : { captureReadyEngineKeys: context.captureReadyEngineKeys }) };
   const { engines, cells } = state.prompt_cluster_id === null ? { engines: [], cells: [] } : await resolveRunCells(tx, scope);
-  if (cells.length === 0) {
-    await tx.query(
-      state.horizon === "short"
-        ? "UPDATE task_verifications SET status = 'done', outcome = 'no_capture', settled_at = $2 WHERE id = $1"
-        : "UPDATE task_verifications SET status = 'running' WHERE id = $1",
-      [state.id, input.now],
-    );
-    return { kind: "no_capture" };
-  }
+  // Nothing capturable: the row is settled, not retried. (See `settleWithoutCapture`.)
+  if (cells.length === 0) return settleWithoutCapture(tx, state, input.now);
 
   const engineKeys = engines.map((engine) => engine.engineKey);
-  await tx.query(
-    `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, prompt_scope, status)
-     VALUES ($1, $2, $3, 'verification', $4::text[], 'cluster', 'queued')`,
-    [input.runId, state.workspace_id, state.project_id, engineKeys],
-  );
-  const plan = await planRun(tx, cache, {
-    workspaceId: state.workspace_id,
-    projectId: state.project_id,
-    runId: input.runId,
-    trigger: "verification",
-    cadence: project.cadence,
-    planKey: project.planKey,
-    scope: "cluster",
-    clusterId: state.prompt_cluster_id!,
-    engineKeys,
-    periodStart: context.periodStart,
-    locale: project.locale,
-    personaHint: context.personaHint ?? null,
-    normalizerVersion: context.normalizerVersion,
-    captureMode: context.captureMode,
-    env: context.env,
-    sharedCacheEnabled: context.sharedCacheEnabled,
-    nowMs: input.now.getTime(),
-    ...(context.captureReadyEngineKeys === undefined ? {} : { captureReadyEngineKeys: context.captureReadyEngineKeys }),
-  });
+  // The run row and its plan are one unit under a savepoint: a refusal (the fair-use ceiling counts verification cells even though
+  // they charge nothing) must leave neither a queued run nor a reservation behind.
+  await tx.query("SAVEPOINT verification_plan");
+  let plan: Awaited<ReturnType<typeof planRun>>;
+  try {
+    await tx.query(
+      `INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys, prompt_scope, scope_ref, status)
+       VALUES ($1, $2, $3, 'verification', $4::text[], 'cluster', $5, 'queued')`,
+      [input.runId, state.workspace_id, state.project_id, engineKeys, state.prompt_cluster_id],
+    );
+    plan = await planRun(tx, cache, {
+      workspaceId: state.workspace_id,
+      projectId: state.project_id,
+      runId: input.runId,
+      trigger: "verification",
+      cadence: project.cadence,
+      planKey: project.planKey,
+      scope: "cluster",
+      clusterId: state.prompt_cluster_id!,
+      engineKeys,
+      periodStart: context.periodStart,
+      locale: project.locale,
+      personaHint: context.personaHint ?? null,
+      normalizerVersion: context.normalizerVersion,
+      captureMode: context.captureMode,
+      env: context.env,
+      sharedCacheEnabled: context.sharedCacheEnabled,
+      nowMs: input.now.getTime(),
+      ...(context.captureReadyEngineKeys === undefined ? {} : { captureReadyEngineKeys: context.captureReadyEngineKeys }),
+    });
+    await tx.query("RELEASE SAVEPOINT verification_plan");
+  } catch (error) {
+    await tx.query("ROLLBACK TO SAVEPOINT verification_plan");
+    if (!(error instanceof QuotaExceededError)) throw error;
+    // The customer's fair-use ceiling is reached. Retrying hourly until the period rolls would only dead-letter, so the row is
+    // settled as having captured nothing; the long horizon still computes from the regular rollups.
+    incrementCounter("nominara_tasks_verification_fair_use_refused_total", {});
+    logger.warn({ event: "task.verification.fair_use_refused", workspace_id: state.workspace_id, verification_id: state.id, horizon: state.horizon });
+    return settleWithoutCapture(tx, state, input.now);
+  }
   await tx.query("UPDATE task_verifications SET status = 'running', run_id = $2 WHERE id = $1", [state.id, input.runId]);
   return {
     kind: "planned",
     periodStart: context.periodStart,
     scheduled: { projectId: state.project_id, runId: input.runId, trigger: "verification", engineKeys, plan },
   };
+}
+
+/**
+ * A verification with nothing to capture (no cluster, no entitled engine, no active prompt in the cluster, or a refused fair-use
+ * reservation). A short horizon is settled at once; a long one is left `running` with no run, so the sweep still computes its
+ * impact from the rollups.
+ */
+async function settleWithoutCapture(tx: ClientBase, state: Pick<VerificationState, "id" | "horizon">, now: Date): Promise<VerificationPlanOutcome> {
+  await tx.query(
+    state.horizon === "short"
+      ? "UPDATE task_verifications SET status = 'done', outcome = 'no_capture', settled_at = $2 WHERE id = $1"
+      : "UPDATE task_verifications SET status = 'running' WHERE id = $1",
+    state.horizon === "short" ? [state.id, now] : [state.id],
+  );
+  return { kind: "no_capture" };
 }
