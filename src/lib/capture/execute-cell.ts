@@ -13,6 +13,7 @@ import { uuidV7 } from "../ids/uuidv7.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { encodeRawObject, rawObjectRelativeKey } from "./raw-object.js";
 import type { BoundRawObjects } from "./raw-object-store.js";
+import { minimiseExcerpt } from "../compliance/minimise.js";
 import { commitEntryIdFor } from "../credits/internal-cost.js";
 
 const logger = new Logger("capture.execute-cell");
@@ -457,7 +458,8 @@ async function insertCell(
       captured ? write.raw.responseTokensEst : null,
       captured ? write.raw.truncated : false,
       contentHash(text),
-      captured ? text.slice(0, EXCERPT_CHARS) : null,
+      // STORY-111 NFR-CMP-01: contact identifiers become typed placeholders BEFORE the excerpt is persisted. The payload and the raw object keep the verbatim text.
+      captured ? minimiseExcerpt(text, EXCERPT_CHARS) : null,
       // THE PARSER DOCUMENT IS NOT BUILT HERE. §6's `answer_capture.v3` is
       // EPIC-05's output; this stores the raw shape the parser will read, and
       // an empty object for a cell that produced nothing.
@@ -524,7 +526,7 @@ export async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw
       v: L1_ENVELOPE_VERSION,
       contentHash: contentHash(raw.text).toString("hex"),
       payload: rawPayload(raw),
-      excerpt: raw.text.slice(0, EXCERPT_CHARS),
+      excerpt: minimiseExcerpt(raw.text, EXCERPT_CHARS),
       // STORY-079 - the answer's own capture time, so a Tools scan serving it can state its true age.
       capturedAt: now.toISOString(),
     }),
