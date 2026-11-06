@@ -11,7 +11,7 @@ import {
 } from "../../../../contracts/tools/index.js";
 import type { ProjectsService } from "../../../modules/projects/projects.service.js";
 import type { ToolsService } from "../../../modules/tools/tools.service.js";
-import { CRAWL_AGENT, isAllowed, parseRobots, type ParsedRobots } from "../../aux/robots.js";
+import { CRAWL_AGENT, isAllowed, parseRobots, type ParsedRobots } from "../../net/robots.js";
 import { buildEntityRows } from "../../competitor-finder/build-rows.js";
 import { deriveCategoryQuery, ownBrandNames } from "../../competitor-finder/category-query.js";
 import { detectEntitySpans } from "../../competitor-finder/detect-entities.js";

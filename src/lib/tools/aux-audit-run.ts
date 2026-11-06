@@ -20,7 +20,7 @@ import { PatchRejectedError, type PatchDraft } from "../aux/patches/types.js";
 import { pageCapForPlan, selectPages, type SelectionScope } from "../aux/page-selection.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../aux/politeness.js";
 import { unavailableRenderer, type Renderer } from "../aux/renderer.js";
-import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../aux/robots.js";
+import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../net/robots.js";
 import { sanitiseText } from "../aux/sanitise.js";
 import { AUX_RULES, AUX_RULES_NOT_EVALUATED } from "../aux/rules/index.js";
 import { AI_CRAWLER_AGENTS, evaluateSiteFiles, type SiteFile } from "../aux/site-files.js";

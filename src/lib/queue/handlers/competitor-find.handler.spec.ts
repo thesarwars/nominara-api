@@ -74,7 +74,7 @@ describe("STORY-081 · the Competitor Finder worker", () => {
     const source = readFileSync(new URL("./competitor-find.handler.ts", import.meta.url), "utf8");
     expect(source).toMatch(/from "\.\.\/\.\.\/net\/guarded-fetch\.js"/u);
     expect(source).not.toMatch(/node:https?|undici|\bfetch\(|axios|got\(/u);
-    expect(source).toMatch(/from "\.\.\/\.\.\/aux\/robots\.js"/u);
+    expect(source).toMatch(/from "\.\.\/\.\.\/net\/robots\.js"/u);
   });
 
   it("scenario 3 - robots.txt is requested before the page, with the identified user agent", async () => {

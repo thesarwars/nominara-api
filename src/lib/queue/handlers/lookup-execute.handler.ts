@@ -503,7 +503,7 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
   // ONE queue, four kinds of job. A STORY-081/082 job is told apart by the signed payload's `tool` ("competitor_finder", "aux_audit"), a STORY-080 job by
   // its `kind` ("prompt_research"); a scan's payload carries neither (absent = the Visibility Scan, as every older job is). Each keeps its own phases; the
   // wrapper only remembers which one prepared the job.
-  const research: JobPhases<ResearchPrepared, ResearchFetched> = { prepare: researchPrepare, run: researchRun, commit: researchCommit, recover: researchRecover };
+  const research: JobPhases<ResearchPrepared, ResearchFetched> = { prepare: researchPrepare, run: researchRun, commit: researchCommit, recover: (_tx, job) => researchRecover(job) };
   const scan: JobPhases<Prepared, Fetched> = { prepare, run, commit, recover };
   const finder = createCompetitorFindPhases(context, {
     ...(deps.cache !== undefined ? { cache: deps.cache } : {}),
