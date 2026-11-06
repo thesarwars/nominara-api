@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import { AgencyService } from "../../src/modules/agency/agency.service.js";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
@@ -37,7 +38,10 @@ describe("STORY-097 · theme assets over HTTP", () => {
   let cacheValkey: StartedValkey;
   let queueValkey: ValkeyFixture;
   let localstack: LocalstackFixture;
+  // The application runs as the real nominara_app role (NOBYPASSRLS): the cross-workspace cases below rely on RLS alone (STORY-021). `db()`
+  // and the fixtures' `pool` stay the superuser.
   const harness = useApiHarness({
+    runAsAppRole: true,
     env: () => ({ VALKEY_CACHE_URL: cacheValkey.url, QUEUE_REDIS_URL: queueValkey.connectionString, ...reportStorageEnv(localstack.endpoint) }),
   });
   let pool: Pool;
@@ -50,7 +54,8 @@ describe("STORY-097 · theme assets over HTTP", () => {
     await Promise.all([cacheValkey.stop(), queueValkey.stop(), localstack.stop()]);
   });
   beforeEach(() => {
-    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const c = harness.db();
+    pool = new Pool({ host: c.host, port: c.port, user: c.user, password: c.password, database: c.database });
     sessions = new SessionService(pool, new MembershipService(new MembershipCacheService()), new InMemoryCacheAdapter());
   });
   afterEach(async () => {
@@ -188,9 +193,49 @@ describe("STORY-097 · theme assets over HTTP", () => {
     }
     expect((await harness.db().query(`SELECT logo_light_key FROM brand_themes WHERE id = $1`, [themeId])).rows[0]).toMatchObject({ logo_light_key: null });
     expect((await fetchAsset(a, themeId, "logo_light")).statusCode).toBe(404);
+    // The request row records the accepted request; the outcome row ("uploaded") is written only with the key, so a failed write has none.
+    const actions = (await harness.db().query(`SELECT action FROM audit_log WHERE resource_id = $1`, [themeId])).rows.map((r: { action: string }) => r.action);
+    expect(actions).toContain("agency.theme_asset_upload_requested");
+    expect(actions).not.toContain("agency.theme_asset_uploaded");
   }, 120_000);
 
-  it("STORY-097 · a manager is 403 naming agency:branding; an unknown theme is 404; unknown body keys are 400 (cross-workspace isolation is RLS, proven by agency-theme-rls.spec.ts: this harness connects as a role that bypasses it)", async () => {
+  it("STORY-097 · a successful upload writes the outcome audit row in the same transaction as the key; a record failure removes the object just written and records no outcome", async () => {
+    const { a, themeId } = await themed();
+    const ok = await upload(a, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10)) });
+    expect(ok.statusCode, ok.body).toBe(201);
+    const outcome = await harness.db().query(`SELECT after_state FROM audit_log WHERE resource_id = $1 AND action = 'agency.theme_asset_uploaded'`, [themeId]);
+    expect(outcome.rows).toHaveLength(1);
+    expect(outcome.rows[0]).toMatchObject({ after_state: { slot: "logo_light", content_type: "image/png" } });
+
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const deleted = vi.spyOn(port, "delete");
+    const record = vi.spyOn(harness.app().get(AgencyService, { strict: false }), "recordAssetKey").mockRejectedValueOnce(new Error("theme went away"));
+    try {
+      const failed = await upload(a, themeId, { slot: "favicon", content_type: "image/png", data_base64: b64(png(16, 16)) });
+      expect(failed.statusCode).toBeGreaterThanOrEqual(500);
+      expect(deleted).toHaveBeenCalledTimes(1);
+      await expect(port.head("reports", String(deleted.mock.calls[0]![1]))).rejects.toThrow();
+    } finally {
+      record.mockRestore();
+      deleted.mockRestore();
+    }
+    expect((await harness.db().query(`SELECT count(*)::int AS n FROM audit_log WHERE resource_id = $1 AND action = 'agency.theme_asset_uploaded'`, [themeId])).rows[0]).toMatchObject({ n: 1 });
+  }, 120_000);
+
+  it("STORY-097 · a workspace never reaches another workspace's theme: a foreign upload and a foreign fetch are 404 and the foreign row's keys stay null (RLS, as nominara_app)", async () => {
+    const mine = await themed();
+    const theirs = await themed();
+    const file = { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10)) };
+    expect((await upload(mine.a, theirs.themeId, file)).statusCode).toBe(404);
+    expect((await fetchAsset(mine.a, theirs.themeId, "logo_light")).statusCode).toBe(404);
+    expect((await harness.db().query(`SELECT logo_light_key, logo_dark_key, favicon_key FROM brand_themes WHERE id = $1`, [theirs.themeId])).rows[0]).toEqual({ logo_light_key: null, logo_dark_key: null, favicon_key: null });
+    // Once the owner uploads, the other workspace still cannot fetch it.
+    expect((await upload(theirs.a, theirs.themeId, file)).statusCode).toBe(201);
+    expect((await fetchAsset(mine.a, theirs.themeId, "logo_light")).statusCode).toBe(404);
+    expect((await fetchAsset(theirs.a, theirs.themeId, "logo_light")).statusCode).toBe(302);
+  }, 120_000);
+
+  it("STORY-097 · a manager is 403 naming agency:branding; an unknown theme is 404; unknown body keys are 400", async () => {
     const { a, themeId } = await themed();
     const m = await member(a.workspaceId, "manager");
     const denied = await upload(m, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10)) });

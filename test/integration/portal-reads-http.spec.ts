@@ -102,6 +102,20 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(res.body).not.toContain(w.p2);
   });
 
+  it("STORY-097 d.67 (o) · a theme edit is served on the very next portal request with the same token (the cached read follows the theme)", async () => {
+    const w = await world();
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const colour = async (): Promise<string | null> => {
+      const res = await get(t.cookie, "/portal/overview");
+      expect(res.statusCode, res.body).toBe(200);
+      return portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.color_primary;
+    };
+    expect(await colour()).toBeNull();
+    expect(await colour()).toBeNull();
+    await harness.db().query("UPDATE brand_themes SET color_primary = '#112233' WHERE id = $1", [w.theme]);
+    expect(await colour()).toBe("#112233");
+  });
+
   it("STORY-100 AC10 · the agency's Reply-To and display name are never part of what a portal viewer is sent", async () => {
     const w = await world();
     await harness.db().query("UPDATE brand_themes SET email_from_name = 'Secret Agency Name', email_reply_to = 'private-inbox@agency.example' WHERE id = $1", [w.theme]);

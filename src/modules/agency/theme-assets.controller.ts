@@ -1,6 +1,7 @@
-import { Body, Controller, Get, Header, HttpCode, Param, Post, Res } from "@nestjs/common";
+import { Body, Controller, Get, Header, HttpCode, Param, Post, Req, Res } from "@nestjs/common";
 import { RouteConfig } from "@nestjs/platform-fastify";
 import type { FastifyReply } from "fastify";
+import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import {
   MAX_THEME_ASSET_BASE64_LENGTH,
   themeAssetFetchParamsSchema,
@@ -28,7 +29,9 @@ export class ThemeAssetsController {
   @HttpCode(201)
   @RequirePermission("agency:branding")
   @RouteConfig({ bodyLimit: MAX_THEME_ASSET_BASE64_LENGTH + 4096 })
-  @Audit({ action: "agency.theme_asset_uploaded", resourceType: "theme" })
+  // The interceptor row records the accepted REQUEST (it commits with the request transaction, before the storage write). The outcome row,
+  // agency.theme_asset_uploaded, is written by ThemeAssetsService in the transaction that records the key.
+  @Audit({ action: "agency.theme_asset_upload_requested", resourceType: "theme" })
   @ApiContract({
     operationId: "uploadThemeAsset",
     paramsSchema: themeAssetParamsSchema,
@@ -38,8 +41,9 @@ export class ThemeAssetsController {
   upload(
     @Param(new ZodValidationPipe(themeAssetParamsSchema)) params: ThemeAssetParams,
     @Body(new ZodValidationPipe(uploadThemeAssetRequestSchema)) body: UploadThemeAssetRequest,
+    @Req() req: AuditableRequest,
   ): Promise<UploadThemeAssetResponse> {
-    return this.service.upload(params, body);
+    return this.service.upload(params, body, req);
   }
 
   // The Location is a short-lived credential: never cached, never leaked in a Referer.

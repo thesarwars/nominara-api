@@ -138,13 +138,21 @@ export class AgencyService {
    * Points a slot at a freshly stored object, in its OWN short tenant transaction: the caller has already written the object, and no
    * request transaction is held across that storage call (KAD-06). Returns the previous key for the caller to delete, or null.
    */
-  async recordAssetKey(context: TenantContext, themeId: string, slot: ThemeAssetSlotName, key: string): Promise<string | null> {
+  async recordAssetKey(
+    context: TenantContext,
+    themeId: string,
+    slot: ThemeAssetSlotName,
+    key: string,
+    /** Runs in the SAME transaction once the key is recorded (the success audit row), so the row and the outcome commit or roll back together. */
+    within?: (tx: ClientBase) => Promise<void>,
+  ): Promise<string | null> {
     const client = await this.pool.connect();
     try {
       return await withTenantContext(client, context, async (tx) => {
         const before = await tx.query<{ key: string | null }>(`SELECT ${this.assetColumn(slot)} AS key FROM brand_themes WHERE id = $1 FOR UPDATE`, [themeId]);
         if (before.rows[0] === undefined) throw new NotFoundError({ message: "no such theme" });
         await tx.query(`UPDATE brand_themes SET ${this.assetColumn(slot)} = $2, updated_at = now() WHERE id = $1`, [themeId, key]);
+        await within?.(tx);
         return before.rows[0].key;
       });
     } finally {
@@ -206,7 +214,9 @@ export class AgencyService {
       color_bg: theme.color_bg,
       color_fg: theme.color_fg,
       font_family: theme.font_family,
-      logo_url: theme.logo_url,
+      // The stored logo's only route needs a workspace session and agency:branding, which an anonymous portal viewer has neither of:
+      // sending its path would be a broken image and a theme id in a URL they cannot use. null until a portal-session route exists.
+      logo_url: null,
       hide_nominara_brand: theme.hide_nominara_brand,
       custom_css: this.safeCustomCss(theme),
     };

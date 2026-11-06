@@ -69,3 +69,22 @@ describe("CP1 e-reports · AgencyService.saveTheme first-theme race", () => {
     await expect(service.saveTheme({ name: "A" })).rejects.toMatchObject({ code: "23505" });
   });
 });
+
+// STORY-097 review round 1 — an anonymous portal viewer is never sent the admin-only asset path.
+describe("STORY-097 · AgencyService.themeForPortal and the logo", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  const row = {
+    id: "0198f6a0-0000-7000-8000-0000000000aa", name: "Agency", is_default: true, color_primary: null, color_accent: null, color_bg: null, color_fg: null, font_family: "Inter",
+    hide_nominara_brand: false, email_from_name: null, email_reply_to: null, custom_css: null, email_footer_html: null, logo_light_key: "dev/ws/reports/branding/t/logo_light-x.png",
+  };
+
+  it("review r1 · the portal's logo_url is null even when a logo is stored (its only route needs a workspace session and agency:branding); the editor still gets the path", async () => {
+    const client = { query: vi.fn(async () => ({ rows: [row] })) };
+    vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ client, context: { workspaceId: "ws-1", actorId: "a" } } as never);
+    const service = new AgencyService({} as never);
+    expect((await service.themeForPortal(row.id)).logo_url).toBeNull();
+    expect((await service.listThemes({ limit: 50 })).items[0]!.logo_url).toBe(`/v1/themes/${row.id}/assets/logo_light`);
+  });
+});

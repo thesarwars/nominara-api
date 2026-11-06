@@ -1,7 +1,7 @@
 
 // STORY-097 · integrations-and-sharing.md §2 — what an agency may upload as a logo or favicon.
 //   logo_light / logo_dark   PNG, JPEG or WebP, <= 1 MB, at most 1200x400   (owner decision 67 (n): SVG is refused, so there is nothing to sanitise)
-//   favicon                  PNG or ICO, <= 100 KB, square
+//   favicon                  PNG, JPEG or WebP, <= 100 KB, square   (ICO is not accepted: decision 67 (n) lists PNG/JPEG/WebP)
 // The file's TYPE is decided by its bytes, never by the declared Content-Type: a declared type that disagrees with the bytes is a
 // refusal.
 
@@ -11,7 +11,7 @@ export const LOGO_MAX_WIDTH = 1200;
 export const LOGO_MAX_HEIGHT = 400;
 
 export type ThemeAssetSlot = "logo_light" | "logo_dark" | "favicon";
-export type ThemeAssetType = "image/png" | "image/jpeg" | "image/webp" | "image/x-icon";
+export type ThemeAssetType = "image/png" | "image/jpeg" | "image/webp";
 export interface AssetRefusal {
   readonly construct: string;
   readonly message: string;
@@ -24,12 +24,11 @@ const refuse = (construct: string, message: string): ThemeAssetResult => ({ ok: 
 const ALLOWED: Readonly<Record<ThemeAssetSlot, readonly ThemeAssetType[]>> = {
   logo_light: ["image/png", "image/jpeg", "image/webp"],
   logo_dark: ["image/png", "image/jpeg", "image/webp"],
-  favicon: ["image/png", "image/x-icon"],
+  favicon: ["image/png", "image/jpeg", "image/webp"],
 };
 
 function normaliseType(declared: string): string {
-  const t = declared.split(";")[0]!.trim().toLowerCase();
-  return t === "image/vnd.microsoft.icon" ? "image/x-icon" : t;
+  return declared.split(";")[0]!.trim().toLowerCase();
 }
 
 const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -76,18 +75,6 @@ function dimensionsOf(type: ThemeAssetType, b: Uint8Array): { width: number; hei
       return { width: view.getUint16(26, true) & 0x3fff, height: view.getUint16(28, true) & 0x3fff };
     }
     return null;
-  }
-  if (type === "image/x-icon") {
-    if (b.length < 22 || !startsWith(b, [0, 0, 1, 0])) return null;
-    const count = view.getUint16(4, true);
-    if (count === 0 || b.length < 6 + count * 16) return null;
-    let width = 0;
-    let height = 0;
-    for (let i = 0; i < count; i += 1) {
-      width = Math.max(width, b[6 + i * 16]! || 256);
-      height = Math.max(height, b[7 + i * 16]! || 256);
-    }
-    return { width, height };
   }
   return null;
 }

@@ -68,10 +68,13 @@ describe("STORY-097 · theme asset limits", () => {
     expect(validateThemeAsset("favicon", "image/png", png(32, 32, FAVICON_MAX_BYTES))).toMatchObject({ ok: false, refused: [{ construct: "size" }] });
     expect(validateThemeAsset("logo_light", "image/png", png(10, 10, LOGO_MAX_BYTES - 33))).toMatchObject({ ok: true });
   });
-  it("a favicon must be square, PNG or ICO", () => {
+  it("owner decision 67 (n) · a favicon is PNG, JPEG or WebP and must be square; an ICO is refused naming the file type", () => {
     expect(validateThemeAsset("favicon", "image/png", png(32, 32))).toMatchObject({ ok: true });
     expect(validateThemeAsset("favicon", "image/png", png(32, 16))).toMatchObject({ ok: false, refused: [{ construct: "dimensions" }] });
-    expect(validateThemeAsset("favicon", "image/x-icon", ico(32, 32))).toMatchObject({ ok: true, contentType: "image/x-icon" });
+    expect(validateThemeAsset("favicon", "image/jpeg", jpeg(32, 32))).toMatchObject({ ok: true, contentType: "image/jpeg" });
+    expect(validateThemeAsset("favicon", "image/webp", webpLossless(32, 32))).toMatchObject({ ok: true, contentType: "image/webp" });
+    expect(validateThemeAsset("favicon", "image/jpeg", jpeg(32, 16))).toMatchObject({ ok: false, refused: [{ construct: "dimensions" }] });
+    expect(validateThemeAsset("favicon", "image/x-icon", ico(32, 32))).toMatchObject({ ok: false, refused: [{ construct: "file type" }] });
     expect(validateThemeAsset("favicon", "image/svg+xml", SVG)).toMatchObject({ ok: false, refused: [{ construct: "file type" }] });
   });
   it("WebP is read (lossless header) and an ICO logo is not a logo type", () => {
@@ -83,7 +86,7 @@ describe("STORY-097 · theme asset limits", () => {
     expect(validateThemeAsset("logo_light", "image/png", new TextEncoder().encode("GIF89a"))).toMatchObject({ ok: false });
     expect(validateThemeAsset("logo_light", "image/png", new Uint8Array(0))).toMatchObject({ ok: false });
   });
-  it("owner decision 67 (n) · a JPEG is accepted (dimensions read from its frame header) and a JPEG favicon is not a favicon type", () => {
+  it("owner decision 67 (n) · a JPEG is accepted (dimensions read from its frame header) ", () => {
     expect(validateThemeAsset("logo_light", "image/jpeg", jpeg(300, 100))).toMatchObject({ ok: true, contentType: "image/jpeg", width: 300, height: 100 });
     expect(validateThemeAsset("logo_light", "image/jpeg", jpeg(1201, 100))).toMatchObject({ ok: false, refused: [{ construct: "dimensions" }] });
     expect(validateThemeAsset("logo_light", "image/jpeg", png(10, 10))).toMatchObject({ ok: false, refused: [{ construct: "file type" }] });

@@ -7,6 +7,8 @@ import {
   type UploadThemeAssetRequest,
   type UploadThemeAssetResponse,
 } from "../../../contracts/agency/index.js";
+import { AuditChainService } from "../audit/audit-chain.service.js";
+import { requestAuditActorOf, type AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { afterTransaction } from "../../api/after-transaction.js";
 import { DegradedError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { validateThemeAsset, type ThemeAssetType } from "../../lib/theme/asset-limits.js";
@@ -30,20 +32,22 @@ import { AgencyService, themeAssetPath } from "./agency.service.js";
 
 export const THEME_ASSET_URL_SECONDS = 60;
 const logger = new Logger("ThemeAssets");
-const EXTENSION: Readonly<Record<ThemeAssetType, string>> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/x-icon": "ico" };
+const EXTENSION: Readonly<Record<ThemeAssetType, string>> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
 
 @Injectable()
 export class ThemeAssetsService {
   constructor(
     private readonly agency: AgencyService,
     private readonly objects: TenantObjectStore,
+    private readonly auditChain: AuditChainService,
   ) {}
 
-  async upload(params: ThemeAssetParams, body: UploadThemeAssetRequest): Promise<UploadThemeAssetResponse> {
+  async upload(params: ThemeAssetParams, body: UploadThemeAssetRequest, req: AuditableRequest): Promise<UploadThemeAssetResponse> {
     const started = Date.now();
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ThemeAssetsService requires an active tenant context");
     const { context } = store;
+    const actor = requestAuditActorOf(req);
     // 404 for an unknown or foreign theme before any byte is looked at (RLS hides the other workspace's row).
     await this.agency.assetKey(params.id, body.slot);
 
@@ -64,7 +68,33 @@ export class ThemeAssetsService {
       let outcome = "error";
       try {
         const key = await bound.put("reports", relative, checked.bytes, { contentType: checked.contentType });
-        const previous = await this.agency.recordAssetKey(context, params.id, body.slot, key);
+        let previous: string | null;
+        try {
+          // The success audit row shares the key's transaction: the log says "uploaded" only if the theme now points at the object.
+          previous = await this.agency.recordAssetKey(context, params.id, body.slot, key, async (tx) => {
+            await this.auditChain.append(tx, {
+              workspaceId: context.workspaceId,
+              actorType: actor.actorType,
+              actorId: context.actorId,
+              actorIp: actor.ip,
+              actorUa: actor.ua,
+              action: "agency.theme_asset_uploaded",
+              resourceType: "theme",
+              resourceId: params.id,
+              beforeState: null,
+              afterState: { slot: body.slot, content_type: checked.contentType, bytes: checked.bytes.length },
+              requestId: actor.requestId,
+              supportGrantId: actor.supportGrantId,
+              severity: "info",
+            });
+          });
+        } catch (error) {
+          // The object was written but no row points at it (the theme went away, or the database is down): remove it, best-effort.
+          await bound.deleteStored("reports", key).catch(() => {
+            incrementCounter("nominara_theme_asset_orphans_total", { slot: body.slot });
+          });
+          throw error;
+        }
         outcome = "stored";
         if (previous !== null && previous !== key && isStoredObjectKey(previous)) {
           await bound.deleteStored("reports", previous).catch(() => {
