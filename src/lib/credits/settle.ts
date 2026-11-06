@@ -1,6 +1,7 @@
 import type { ClientBase } from "pg";
 import { appendLedgerEntry, settlementOf, type LedgerActionCode, type LedgerMovementEntry } from "./ledger.js";
 import { readHoldCarry, settleHoldCarry } from "./hold-carry.js";
+import { measuredInternalCostUsd } from "./internal-cost.js";
 import { commitCredits, lockWallet, readWallet, releaseCredits, type WalletState } from "./wallet.js";
 
 // STORY-073 — the one way a reservation is released, shared by the two
@@ -164,6 +165,10 @@ export async function commitReservation(
   const committed = await commitCredits(tx, reservation.workspaceId, consumed, reservation.credits, carry);
   if (committed === null) return null;
 
+  // AC9: unless the caller supplied one, the cost is what `usage_ledger` already holds for the entry's reference.
+  const internalCostUsd =
+    entry.internalCostUsd ?? (await measuredInternalCostUsd(tx, reservation.workspaceId, entry.referenceType, entry.referenceId));
+
   const appended = await appendLedgerEntry(tx, {
     workspaceId: reservation.workspaceId,
     entryType: "commit",
@@ -175,6 +180,7 @@ export async function commitReservation(
     actorId: reservation.actor?.actorId ?? null,
     actorType: reservation.actor?.actorType ?? "system",
     ...entry,
+    ...(internalCostUsd === null ? {} : { internalCostUsd }),
   });
   if (!appended) {
     // The balance has moved in this transaction; returning would commit a debit the ledger refused to record.

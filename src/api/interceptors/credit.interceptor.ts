@@ -47,12 +47,11 @@ export interface CreditUsage {
   /**
    * What serving this action cost US, in USD.
    *
-   * ⚠ STILL NOTHING SUPPLIES A VALUE HERE, by construction: the commit is
-   * written at request time, before any cell is captured, and `credit_ledger`
-   * is append-only, so the cost cannot be added afterwards. Realised cost is
-   * measured in `usage_ledger` (one `capture` row per live cell, written by
-   * `execute-cell.ts`, E2E-B6) and the Valkey spend meter; join it to the
-   * run through `reference_id`.
+   * ⚠ A ROUTE NEED NOT SUPPLY ONE. STORY-073 AC9: `commitReservation` fills it from the `usage_ledger` rows that already
+   * name this reference when the commit is written, and leaves it NULL (not measured, which is not 0) when there are
+   * none. A flat-priced run commits when it is ACCEPTED, before its cells are captured, and `credit_ledger` is
+   * append-only, so for those the figure stays in `usage_ledger` (one `capture` row per live cell, `execute-cell.ts`),
+   * joined to the run through `reference_id`. A value supplied here wins over the lookup.
    */
   readonly internalCostUsd?: string;
 }
