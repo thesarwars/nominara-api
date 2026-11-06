@@ -35,6 +35,33 @@ export const portalSessionResponseSchema = z
   })
   .strict();
 
+// Owner decision 71 (b) — allowed-email-domain sign-in. Where the token carries `allowed_email_domains`, POST /portal/session
+// (after the password, where one is required) answers 202 with this body and NO cookie: a six-digit code has been mailed to
+// the address. The body is the same constant whether or not the mailbox exists (we cannot know, and must not seem to).
+export const portalSessionCodeSentResponseSchema = z.object({ code_sent: z.literal(true) }).strict();
+
+/** Six digits, as mailed. Anything else is a 400 before any lookup. */
+export const PORTAL_CODE_PATTERN = /^[0-9]{6}$/;
+
+/**
+ * POST /portal/session/verify — the second step. The code is bound to the token and the address it was mailed to, so the
+ * link's `secret` and the address travel with it; the password is not asked again (a code is only issued after it passed).
+ * Answers like POST /portal/session: the cookie and `{ expires_at }`.
+ */
+export const portalSessionVerifyRequestSchema = z
+  .object({
+    secret: z.string().min(16).max(256),
+    email: z.email().max(254),
+    code: z.string().regex(PORTAL_CODE_PATTERN, "a code is six digits"),
+  })
+  .strict();
+
+// Owner decision 71 (c) — telemetry. POST /portal/telemetry, portal cookie only. The VIEW the beat belongs to is the one the
+// cookie carries (`view_id`), never one the request names; the request says only which tab the visitor is on. Duration is
+// measured by the server (now minus the view's start), so a client cannot report a time it did not spend.
+export const portalTelemetryRequestSchema = z.object({ tab: portalTabSchema }).strict();
+export const portalTelemetryResponseSchema = z.object({ recorded: z.boolean() }).strict();
+
 /** The decrypted cookie payload — the ONLY source of portal scope. Never read from path, query or header. */
 export const portalCookiePayloadSchema = z
   .object({
@@ -43,9 +70,18 @@ export const portalCookiePayloadSchema = z
     scope_project_ids: z.array(z.uuid()).min(1),
     scope_tabs: z.array(portalTabSchema).min(1),
     theme_id: z.uuid().nullable(),
+    /**
+     * Owner decision 71 (c): the `share_token_views` row this session opened, so telemetry beats find it without the
+     * request naming one. Optional so a session minted before this field existed stays valid (it simply records nothing).
+     */
+    view_id: z.uuid().optional(),
   })
   .strict();
 
+export type PortalSessionCodeSentResponse = z.infer<typeof portalSessionCodeSentResponseSchema>;
+export type PortalSessionVerifyRequest = z.infer<typeof portalSessionVerifyRequestSchema>;
+export type PortalTelemetryRequest = z.infer<typeof portalTelemetryRequestSchema>;
+export type PortalTelemetryResponse = z.infer<typeof portalTelemetryResponseSchema>;
 export type PortalSessionRequest = z.infer<typeof portalSessionRequestSchema>;
 export type PortalSessionResponse = z.infer<typeof portalSessionResponseSchema>;
 export type PortalCookiePayload = z.infer<typeof portalCookiePayloadSchema>;
