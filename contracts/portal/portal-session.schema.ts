@@ -45,12 +45,14 @@ export const PORTAL_CODE_PATTERN = /^[0-9]{6}$/;
 
 /**
  * POST /portal/session/verify — the second step. The code is bound to the token and the address it was mailed to, so the
- * link's `secret` and the address travel with it; the password is not asked again (a code is only issued after it passed).
- * Answers like POST /portal/session: the cookie and `{ expires_at }`.
+ * link's `secret` and the address travel with it. Where the link has a password it is sent AGAIN and checked again, with the same
+ * lock as the first step: a code alone must never open a password-protected link (a visitor holding only the link could otherwise
+ * guess a live code, 5 tries at a time). Answers like POST /portal/session: the cookie and `{ expires_at }`.
  */
 export const portalSessionVerifyRequestSchema = z
   .object({
     secret: z.string().min(16).max(256),
+    password: z.string().min(1).max(128).optional(),
     email: z.email().max(254),
     code: z.string().regex(PORTAL_CODE_PATTERN, "a code is six digits"),
   })
