@@ -166,15 +166,9 @@ export async function readLedgerPage(
 /**
  * A page of entries, as CSV.
  *
- * ⚠ NO ROUTE CALLS THIS YET, and that is a decision rather than an oversight.
- * A synchronous `ledger.csv` route was built and removed: it required
- * `@NoEnvelope()`, which an architectural gate reserves for the health
- * probes, and it carried no `exports.csv` entitlement check though CSV
- * export is a plan feature Free and Starter do not have. The export belongs
- * in `POST /exports`'s async pipeline (api-specification.md §3), which has
- * both the gate and the artifact store. This is the serialiser that pipeline
- * will call, landed with the story that knows the ledger's shape rather than
- * left for the one that knows the worker's.
+ * STORY-073 AC10: `BillingService.ledgerExport` calls this for `GET /billing/wallet/ledger/export`, which carries the
+ * `exports.csv` entitlement check and the normal response envelope. The earlier synchronous `ledger.csv` route needed
+ * `@NoEnvelope()` and had neither.
  *
  * ⚠ EVERY FIELD IS QUOTED AND EVERY QUOTE IS DOUBLED, including the ones
  * that "cannot" contain a comma. `reason` is free text a human wrote, so it

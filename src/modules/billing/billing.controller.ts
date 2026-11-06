@@ -2,12 +2,16 @@ import { Body, Controller, Get, Put, Query } from "@nestjs/common";
 import {
   autoTopupConfigSchema,
   autoTopupRequestSchema,
+  creditLedgerExportQuerySchema,
+  creditLedgerExportResponseSchema,
   creditLedgerListResponseSchema,
   creditLedgerQuerySchema,
   walletResponseSchema,
   type AutoTopupConfig,
   type AutoTopupRequest,
   type CreditLedgerEntry,
+  type CreditLedgerExportQuery,
+  type CreditLedgerExportResponse,
   type CreditLedgerQuery,
   type WalletResponse,
 } from "../../../contracts/billing/index.js";
@@ -27,21 +31,10 @@ import { BillingService } from "./billing.service.js";
 // names which person spent what, which is employment-adjacent information a
 // viewer has no business reading.
 //
-// ⚠ THE CSV HALF OF AC12 IS NOT HERE, DELIBERATELY. A `GET
-// /billing/wallet/ledger.csv` was written and removed. It needed
-// `@NoEnvelope()`, and `envelope-scope-and-probe-exemption.spec.ts` asserts
-// that marker sits on the three health probes and NOTHING else — a gate
-// worth more than the convenience of a synchronous download, because it is
-// what stops a route quietly dropping §1's envelope.
-//
-// The export belongs where the specification already puts one: `POST
-// /exports` (§3) is async CSV/PDF to a `report_artifact_id`, gated on the
-// `exports.csv` feature flag that Free and Starter do not carry. The
-// synchronous route had no such gate and would have handed two plans a
-// feature they have not bought. `toLedgerCsv` in `credit-ledger.reader.ts`
-// is the serialiser that pipeline will call, and it is tested
-// (`test/unit/credits/ledger-csv.spec.ts`) rather than left to be written
-// under the deadline of whoever builds the exports worker.
+// STORY-073 AC10 - THE CSV EXPORT is `GET /billing/wallet/ledger/export`, and it is NOT a bare `.csv` download. An
+// earlier `ledger.csv` needed `@NoEnvelope()` (a marker an architectural gate reserves for the health probes) and
+// carried no `exports.csv` check. This route answers in the normal envelope with the file inline as a `data:` URL - the
+// same shape as the report export - and the service refuses a plan without `exports.csv`. Same permission as the read.
 @Controller("billing/wallet")
 export class BillingController {
   constructor(private readonly service: BillingService) {}
@@ -83,4 +76,17 @@ export class BillingController {
     return this.service.ledger(query);
   }
 
+  // Declared AFTER `ledger` and as a distinct path segment, so `ledger/export` is never read as a ledger id.
+  @Get("ledger/export")
+  @RequirePermission("billing:read")
+  @ApiContract({
+    operationId: "exportCreditLedger",
+    querySchema: creditLedgerExportQuerySchema,
+    responseSchema: creditLedgerExportResponseSchema,
+  })
+  ledgerExport(
+    @Query(new ZodValidationPipe(creditLedgerExportQuerySchema)) query: CreditLedgerExportQuery,
+  ): Promise<CreditLedgerExportResponse> {
+    return this.service.ledgerExport(query);
+  }
 }
