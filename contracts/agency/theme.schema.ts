@@ -15,8 +15,8 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 //    LIST (frontend `AgencyTheme[]`, exactly one is_default); PUT updates the
 //    theme named by `theme_id`, or creates one when `theme_id` is absent.
 //    No delete / set-default endpoint yet (week 2).
-//  - Every `*_key` asset field is NOT in the request schema (`custom_css` and `email_footer_html` are, since STORY-097 week 2). `.strict()` turns them into a 400 validation_failed rather than
-//    a silent drop (asset pipeline and CSS allow-list are week 2).
+//  - Every `*_key` asset field is NOT in the request schema (`custom_css` and `email_footer_html` are, since STORY-097 week 2).
+//    `.strict()` turns them into a 400 validation_failed rather than a silent drop; they stay refused until the asset endpoint exists.
 //  - hide_nominara_brand = true without whitelabel.remove_branding is
 //    403 feature_not_in_plan (service-enforced).
 
@@ -49,7 +49,7 @@ export const agencyThemeSchema = z
     font_family: z.string().min(1),
     logo_url: z.string().nullable(),
     hide_nominara_brand: z.boolean(),
-    /** STORY-097. The SANITISED, re-serialised style override (never the upload); null = none. Safe to apply as-is. */
+    /** STORY-097. The SANITISED, re-serialised style override (never the upload); null = none. Colours in it are only var(--nm-color-primary|accent|bg|fg) references, each rule contrast-checked against the theme at save time. */
     custom_css: z.string().nullable(),
   })
   .strict();

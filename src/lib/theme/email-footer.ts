@@ -23,8 +23,22 @@ const ATTR = /([^\s=>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
 
 const escapeText = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const escapeAttr = (s: string): string => escapeText(s).replace(/"/g, "&quot;");
-function decodeEntities(s: string): string {
-  return s.replace(/&(amp|lt|gt|quot|#39|apos);/g, (_m, e: string) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'", apos: "'" })[e]!);
+const NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0", copy: "\u00a9", reg: "\u00ae", trade: "\u2122", mdash: "\u2014", ndash: "\u2013",
+};
+/** Numeric references and the named ones above are decoded (the output is then escaped once); an unknown named one is removed and reported. */
+function decodeEntities(s: string, onUnknown?: (entity: string) => void): string {
+  return s.replace(/&(#x[0-9a-f]{1,6}|#[0-9]{1,7}|[a-z][a-z0-9]{1,31});/gi, (m, e: string) => {
+    if (e.startsWith("#")) {
+      const cp = e[1] === "x" || e[1] === "X" ? Number.parseInt(e.slice(2), 16) : Number.parseInt(e.slice(1), 10);
+      const ok = cp >= 0x20 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff) && !(cp >= 0x7f && cp <= 0x9f);
+      if (!ok) onUnknown?.(m);
+      return ok ? String.fromCodePoint(cp) : "";
+    }
+    const named = NAMED_ENTITIES[e.toLowerCase()];
+    if (named === undefined) onUnknown?.(m);
+    return named ?? "";
+  });
 }
 
 export function sanitiseEmailFooter(input: string): EmailFooterResult {
@@ -34,15 +48,16 @@ export function sanitiseEmailFooter(input: string): EmailFooterResult {
     if (!dropped.some((d) => d.construct === construct)) dropped.push({ construct, reason });
   };
   const open: string[] = [];
+  const unknownEntity = (entity: string): void => note(entity + " entity", "unknown character reference removed");
   let out = "";
   let i = 0;
   while (i < input.length) {
     const lt = input.indexOf("<", i);
     if (lt === -1) {
-      out += escapeText(decodeEntities(input.slice(i)));
+      out += escapeText(decodeEntities(input.slice(i), unknownEntity));
       break;
     }
-    out += escapeText(decodeEntities(input.slice(i, lt)));
+    out += escapeText(decodeEntities(input.slice(i, lt), unknownEntity));
     if (input.startsWith("<!--", lt)) {
       const end = input.indexOf("-->", lt + 4);
       note("comment", "comments are removed");

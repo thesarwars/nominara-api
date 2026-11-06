@@ -226,19 +226,19 @@ describe("STORY-097 · agency theme over HTTP", () => {
 
   it("STORY-097 scenario 12 · a disallowed property and an out-of-scope selector are BOTH dropped and reported; the stored text is the re-serialised one", async () => {
     const a = await owner("growth");
-    const res = await put(a, { custom_css: " .nm-card { color : #112233 ; behavior: x }  .evil{color:red}" });
+    const res = await put(a, { custom_css: " .nm-card { color : var(--nm-color-fg) ; behavior: x }  .evil{color:red}" });
     expect(res.statusCode, res.body).toBe(200);
     const body = data<{ theme_id: string; custom_css: string; dropped: Dropped }>(res);
-    expect(body.custom_css).toBe(".nm-card{color:#112233}");
+    expect(body.custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
     expect(body.dropped.custom_css.map((d) => `${d.kind}:${d.construct}`)).toEqual(["property:behavior", "selector:.evil"]);
-    expect((await storedStyle(body.theme_id)).custom_css).toBe(".nm-card{color:#112233}");
+    expect((await storedStyle(body.theme_id)).custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
     const listed = data<Array<{ custom_css: string | null }>>(await get(a));
-    expect(listed[0]!.custom_css).toBe(".nm-card{color:#112233}");
+    expect(listed[0]!.custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
   });
 
   it("STORY-097 scenario 13 · an external reference, an import, generated content and fixed positioning are each 400 naming the construct, and store and audit nothing", async () => {
     const a = await owner("growth");
-    const first = data<{ theme_id: string }>(await put(a, { name: "Base", custom_css: ".nm-card{color:#111111}" }));
+    const first = data<{ theme_id: string }>(await put(a, { name: "Base", custom_css: ".nm-card{color:var(--nm-color-fg)}" }));
     const cases: Array<[string, string]> = [
       [".nm-card{background-color:url(https://evil.test/x)}", "url()"],
       ['@import "https://evil.test/a.css";', "@import"],
@@ -253,9 +253,29 @@ describe("STORY-097 · agency theme over HTTP", () => {
       expect(error.details.refused.map((r) => r.construct)).toEqual([construct]);
       expect(error.details.issues[0]!.path).toEqual(["custom_css"]);
     }
-    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{color:#111111}");
+    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
     const audits = await harness.db().query(`SELECT count(*)::int AS n FROM audit_log WHERE workspace_id = $1 AND action LIKE 'agency.theme%'`, [a.workspaceId]);
     expect((audits.rows[0] as { n: number }).n).toBe(1);
+  });
+
+  it("STORY-097 scenario 8 · custom_css cannot get around the contrast rule: white-on-white is not stored, with the measured ratio; literal colours are dropped", async () => {
+    const a = await owner("growth");
+    const first = data<{ theme_id: string }>(await put(a, { name: "Base", color_bg: "#ffffff", color_fg: "#111111", custom_css: ".nm-card{margin:4px}" }));
+    const bad = await put(a, { theme_id: first.theme_id, custom_css: ".nm-card{color:var(--nm-color-bg);background-color:var(--nm-color-bg)}" });
+    expect(bad.statusCode, bad.body).toBe(400);
+    const error = (bad.json() as { error: { code: string; details: { refused: Array<{ construct: string; message: string }> } } }).error;
+    expect(error.code).toBe("validation_failed");
+    expect(error.details.refused.map((r) => r.construct)).toEqual(["contrast"]);
+    expect(error.details.refused[0]!.message).toContain("1:1");
+    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{margin:4px}");
+    const literal = data<{ custom_css: string | null; dropped: Dropped }>(await put(a, { theme_id: first.theme_id, custom_css: ".nm-card{color:#ffffff;background-color:#ffffff}" }));
+    expect(literal.custom_css).toBeNull();
+    expect(literal.dropped.custom_css.map((d) => d.construct)).toEqual(["color", "background-color"]);
+    // A later colour change that would make the stored override unreadable is refused too.
+    await put(a, { theme_id: first.theme_id, custom_css: ".nm-card{color:var(--nm-color-primary)}" });
+    const recolour = await put(a, { theme_id: first.theme_id, color_primary: "#888888" });
+    expect(recolour.statusCode, recolour.body).toBe(400);
+    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{color:var(--nm-color-primary)}");
   });
 
   it("STORY-097 · an absent custom_css keeps the stored one, null clears it, an all-dropped input stores null, and 20001 characters is 400", async () => {

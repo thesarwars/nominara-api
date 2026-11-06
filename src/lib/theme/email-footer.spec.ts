@@ -25,6 +25,13 @@ describe("STORY-097 · email footer sanitiser", () => {
     expect(clean("a<b").html).toBe("a&lt;b");
     expect(clean("<div>kept</div>").html).toBe("kept");
   });
+  it("numeric and common named entities are decoded then re-escaped once; an unknown named entity is dropped and reported", () => {
+    expect(clean("&copy; 2026 Acme&nbsp;Ltd &#169; &#x2014; &mdash;").html).toBe("\u00a9 2026 Acme\u00a0Ltd \u00a9 \u2014 \u2014");
+    expect(clean("a &amp; b &lt;i&gt;").html).toBe("a &amp; b &lt;i&gt;");
+    const r = clean("x &bogus; y");
+    expect(r.html).toBe("x  y");
+    expect(r.dropped.map((d) => d.construct)).toEqual(["&bogus; entity"]);
+  });
   it("a link may only be https or mailto; http, data and protocol-relative are dropped", () => {
     for (const href of ["http://a.test", "data:text/html,x", "//a.test", " JaVaScRiPt:x"]) {
       expect(clean(`<a href="${href}">x</a>`).html).toBe("<a>x</a>");

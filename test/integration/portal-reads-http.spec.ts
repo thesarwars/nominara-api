@@ -115,13 +115,28 @@ describe("NEW-E-099a · portal read endpoints", () => {
 
   it("STORY-097 · the pinned theme's stored style override reaches the portal; the email footer never does", async () => {
     const w = await world();
-    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:#112233}', email_footer_html = '<p>Footer only for mail</p>' WHERE id = $1", [w.theme]);
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:var(--nm-color-fg)}', email_footer_html = '<p>Footer only for mail</p>' WHERE id = $1", [w.theme]);
     const t = await token(w, { scope: [w.p1], themeId: w.theme });
     const res = await get(t.cookie, "/portal/overview");
     expect(res.statusCode, res.body).toBe(200);
-    expect(portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.custom_css).toBe(".nm-card{color:#112233}");
+    expect(portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
     expect(res.body).not.toContain("Footer only for mail");
     expect(res.body).not.toContain("email_footer_html");
+  });
+
+  it("STORY-097 · a stored override that bypassed the save path (raw SQL) is re-sanitised before it reaches the portal", async () => {
+    const w = await world();
+    // A fresh token per read: the overview is cached per token, and this test is about what the read does, not the cache.
+    const served = async (): Promise<string | null> => {
+      const t = await token(w, { scope: [w.p1], themeId: w.theme });
+      const res = await get(t.cookie, "/portal/overview");
+      expect(res.statusCode, res.body).toBe(200);
+      return portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.custom_css;
+    };
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:url(x)} body{}' WHERE id = $1", [w.theme]);
+    expect(await served()).toBeNull();
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:#ffffff;background-color:#ffffff;margin:4px}' WHERE id = $1", [w.theme]);
+    expect(await served()).toBe(".nm-card{margin:4px}");
   });
 
   it("STORY-097 scenario 5 (content scan) · with hide_nominara_brand on, the portal overview carries no platform name, asset or link", async () => {

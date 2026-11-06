@@ -159,8 +159,22 @@ export class AgencyService {
       font_family: theme.font_family,
       logo_url: theme.logo_url,
       hide_nominara_brand: theme.hide_nominara_brand,
-      custom_css: theme.custom_css,
+      custom_css: this.safeCustomCss(theme),
     };
+  }
+
+  /**
+   * Defence in depth: saveTheme is the only writer today, but a seed, a support fix or a later import could put raw text in
+   * the column. The portal re-parses it against the theme's own colours and sends null when it is not acceptable as-is.
+   */
+  private safeCustomCss(theme: AgencyThemeAdmin): string | null {
+    if (theme.custom_css === null) return null;
+    const result = sanitiseCustomCss(theme.custom_css, theme);
+    if (!result.ok) {
+      this.logger.warn(`stored custom_css not servable theme_id=${theme.theme_id}`);
+      return null;
+    }
+    return result.css === "" ? null : result.css;
   }
 
 
@@ -206,7 +220,7 @@ export class AgencyService {
 
     if (body.hide_nominara_brand === true) await this.assertBrandRemovalGranted(client, workspaceId);
 
-    const style = this.sanitiseStyleInputs(workspaceId, existing, body);
+    const style = this.sanitiseStyleInputs(workspaceId, existing, body, colors);
 
     const font = body.font_family ?? existing?.font_family ?? DEFAULT_FONT_FAMILY;
     const hide = body.hide_nominara_brand ?? existing?.hide_nominara_brand ?? false;
@@ -254,6 +268,7 @@ export class AgencyService {
     workspaceId: string,
     existing: ThemeRow | undefined,
     body: UpdateAgencyThemeRequest,
+    colors: ThemeColors,
   ): { customCss: string | null; emailFooterHtml: string | null; dropped: SaveAgencyThemeResponse["dropped"] } {
     const dropped: SaveAgencyThemeResponse["dropped"] = { custom_css: [], email_footer_html: [] };
     let customCss = existing?.custom_css ?? null;
@@ -262,13 +277,19 @@ export class AgencyService {
     if (body.custom_css !== undefined) {
       if (body.custom_css === null) customCss = null;
       else {
-        const result = sanitiseCustomCss(body.custom_css);
+        const result = sanitiseCustomCss(body.custom_css, colors);
         if (!result.ok) this.refuseStyle(workspaceId, "custom_css", result.refused.map((r) => ({ construct: r.construct, message: r.message })));
         else {
           customCss = result.css === "" ? null : result.css;
           dropped.custom_css = result.dropped.map((d) => ({ kind: d.kind, construct: d.construct, reason: d.reason }));
         }
       }
+    }
+    else if (customCss !== null) {
+      // The stored override references the theme's colours, so a colour change is judged against it too: a save that would
+      // make the existing override unreadable is refused like the override itself would be.
+      const result = sanitiseCustomCss(customCss, colors);
+      if (!result.ok) this.refuseStyle(workspaceId, "custom_css", result.refused.map((r) => ({ construct: r.construct, message: r.message })));
     }
     if (body.email_footer_html !== undefined) {
       if (body.email_footer_html === null) emailFooterHtml = null;

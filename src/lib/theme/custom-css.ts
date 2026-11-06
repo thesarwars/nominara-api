@@ -6,8 +6,15 @@
 //   dropped   anything else not on the allow-list (property, selector, at-rule, value). Kept out of the stored text AND
 //             reported back, so the agency learns which of its CSS does nothing instead of filing a ticket about it.
 //   kept      re-serialised one rule per line.
-// Colour properties are allowed here but are NOT contrast-validated (the contrast check judges the four theme colour tokens);
-// that gap is recorded in the story evidence for the owner.
+// COLOURS ARE TOKEN REFERENCES ONLY. A colour-valued property (colour, background, border, outline) accepts nothing but
+// `var(--nm-color-primary|accent|bg|fg)`, the four tokens PUT /agency/theme already contrast-validates; a literal colour is
+// dropped and reported. Each rule's resulting pair is then judged with the same WCAG thresholds the colour fields use: text on
+// its background at 4.5:1 (a side the rule does not set is the theme's own fg / bg), a border or outline stroke on the
+// background at 3:1. A rule that fails is REFUSED with the measured ratio (FR-AGY-01h: the API path cannot store what the
+// editor would refuse). Values that could hide content are dropped too: font-size under 10px, a negative margin.
+// Limit: the pair is judged per rule; a descendant or :hover state is a rule of its own and is judged on its own.
+
+import { contrastRatio, STROKE_CONTRAST_MIN, TEXT_CONTRAST_MIN, themeTokenColour, type ThemeColors, type ThemeToken } from "./contrast.js";
 
 export const MAX_CUSTOM_CSS_CHARS = 20_000;
 
@@ -17,6 +24,8 @@ export const MAX_CUSTOM_CSS_CHARS = 20_000;
  */
 export const DESIGN_SYSTEM_CLASSES: readonly string[] = ["nm-card", "nm-kpi", "nm-heading", "nm-table", "nm-button", "nm-badge", "nm-nav", "nm-chart"];
 
+export const MIN_FONT_SIZE_PX = 10;
+
 export interface CssDropped {
   readonly kind: "property" | "value" | "selector" | "at_rule" | "rule";
   /** The offending text (truncated), for the agency to find in its own input. */
@@ -24,7 +33,7 @@ export interface CssDropped {
   readonly reason: string;
 }
 export interface CssRefusal {
-  readonly construct: "url()" | "@import" | "content" | "position: fixed" | "escape sequence" | "size";
+  readonly construct: "url()" | "@import" | "content" | "position: fixed" | "escape sequence" | "size" | "contrast";
   readonly message: string;
 }
 export type CustomCssResult =
@@ -40,12 +49,15 @@ const ALLOWED_PROPERTIES: ReadonlySet<string> = new Set([
   "border", "border-width", "border-style", ...SIDES.flatMap((s) => [`border-${s}`, `border-${s}-width`, `border-${s}-style`]),
 ]);
 
+const COLOR_PROPERTIES: ReadonlySet<string> = new Set(["color", "background-color", "border-color", "outline-color", ...SIDES.map((s) => `border-${s}-color`)]);
+const BORDER_SHORTHANDS: ReadonlySet<string> = new Set(["border", ...SIDES.map((s) => `border-${s}`)]);
+const BORDER_KEYWORDS: ReadonlySet<string> = new Set(["none", "solid", "dashed", "dotted", "double", "thin", "medium", "thick"]);
+const MARGIN_PROPERTIES: ReadonlySet<string> = new Set(["margin", ...SIDES.map((s) => `margin-${s}`)]);
+
 const COMPOUND = /^\.([a-z][a-z0-9-]*)(?::(?:hover|focus-visible|focus|active))?$/;
-const HEX = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/;
 const NUMBER = /^-?(?:\d+|\d*\.\d+)(?:px|rem|em|%)?$/;
 const KEYWORD = /^[a-z][a-z-]*$/;
-const COLOR_FN = /^(?:rgba?|hsla?)\([0-9a-z.,%\s/]+\)$/;
-const VAR_FN = /^var\(--[a-z0-9-]+\)$/;
+const VAR_FN = /^var\((--nm-color-(?:primary|accent|bg|fg))\)$/;
 const MAX_VALUE_TOKENS = 6;
 
 const trunc = (s: string): string => (s.length > 80 ? s.slice(0, 80) + "..." : s);
@@ -69,14 +81,42 @@ function valueTokens(value: string): string[] | null {
   return out;
 }
 
-function normaliseValue(value: string): string | null {
+/** px-equivalent of a font-size token (1rem = 16px; a percentage is of 16px), or null when it is not a length. */
+function fontSizePx(token: string): number | null {
+  const m = /^(-?(?:\d+|\d*\.\d+))(px|rem|em|%)?$/.exec(token);
+  if (m === null) return null;
+  const n = Number(m[1]);
+  return m[2] === "rem" || m[2] === "em" ? n * 16 : m[2] === "%" ? n * 0.16 : n;
+}
+
+type ValueResult = { readonly value: string; readonly vars: string[] } | { readonly reason: string };
+
+function normaliseValue(prop: string, value: string): ValueResult {
   const lowered = value.trim().toLowerCase().replace(/\s*,\s*/g, ",").replace(/\s+/g, " ");
   const tokens = valueTokens(lowered);
-  if (tokens === null || tokens.length === 0 || tokens.length > MAX_VALUE_TOKENS) return null;
+  const bad: ValueResult = { reason: "value is not recognised for " + prop };
+  if (tokens === null || tokens.length === 0 || tokens.length > MAX_VALUE_TOKENS) return bad;
+  const vars: string[] = [];
+  const colourOnly = COLOR_PROPERTIES.has(prop);
+  if (colourOnly && tokens.length !== 1) return { reason: prop + " takes one colour, written as a theme token such as var(--nm-color-fg)" };
   for (const t of tokens) {
-    if (!(HEX.test(t) || NUMBER.test(t) || KEYWORD.test(t) || COLOR_FN.test(t) || VAR_FN.test(t))) return null;
+    const v = VAR_FN.exec(t);
+    if (v !== null) {
+      vars.push(v[1]!);
+      continue;
+    }
+    if (colourOnly) return { reason: "colours must reference a theme token: var(--nm-color-primary), var(--nm-color-accent), var(--nm-color-bg) or var(--nm-color-fg)" };
+    if (BORDER_SHORTHANDS.has(prop)) {
+      if (!(NUMBER.test(t) || BORDER_KEYWORDS.has(t))) return { reason: "a border colour must reference a theme token; only a width and a line style may be literal" };
+    } else if (!(NUMBER.test(t) || KEYWORD.test(t))) return bad;
+    if (prop === "font-size") {
+      const px = fontSizePx(t);
+      if (px !== null && px < MIN_FONT_SIZE_PX) return { reason: "font-size is below the " + String(MIN_FONT_SIZE_PX) + "px minimum" };
+    }
+    if (MARGIN_PROPERTIES.has(prop) && t.startsWith("-")) return { reason: "negative margins are not allowed" };
   }
-  return tokens.join(" ");
+  if (prop === "font-size" && tokens.some((t) => /^0+(?:\.0+)?[a-z%]*$/.test(t))) return { reason: "font-size is below the " + String(MIN_FONT_SIZE_PX) + "px minimum" };
+  return { value: tokens.join(" "), vars };
 }
 
 function normaliseSelector(selector: string): string | null {
@@ -121,7 +161,13 @@ function closeOf(text: string, open: number): number {
   return -1;
 }
 
-function declarations(selectors: string, body: string, dropped: CssDropped[]): string {
+interface RuleColours {
+  text: string | undefined;
+  background: string | undefined;
+  strokes: string[];
+}
+
+function declarations(selectors: string, body: string, dropped: CssDropped[], colours: RuleColours): string {
   const kept: string[] = [];
   for (const raw of body.split(";")) {
     const decl = raw.trim();
@@ -140,15 +186,41 @@ function declarations(selectors: string, body: string, dropped: CssDropped[]): s
     } else if (/!\s*important/i.test(value)) {
       dropped.push({ kind: "value", construct: prop, reason: "!important is not allowed" });
     } else {
-      const v = normaliseValue(value);
-      if (v === null) dropped.push({ kind: "value", construct: prop, reason: "value is not recognised for " + prop });
-      else kept.push(prop + ":" + v);
+      const v = normaliseValue(prop, value);
+      if ("reason" in v) dropped.push({ kind: "value", construct: prop, reason: v.reason });
+      else {
+        kept.push(prop + ":" + v.value);
+        if (prop === "color") colours.text = v.vars[0];
+        else if (prop === "background-color") colours.background = v.vars[0];
+        else colours.strokes.push(...v.vars);
+      }
     }
   }
   return kept.length === 0 ? "" : selectors + "{" + kept.join(";") + "}";
 }
 
-export function sanitiseCustomCss(input: string): CustomCssResult {
+/** The rule's resulting pairs against the theme's own colours (a null colour is the platform default, as in validateThemeContrast). */
+function contrastFailures(selectors: string, c: RuleColours, theme: ThemeColors): CssRefusal[] {
+  const tone = (cssVar: string | undefined, fallback: ThemeToken): string => themeTokenColour(theme, cssVar === undefined ? fallback : (cssVar.slice("--nm-color-".length) as ThemeToken));
+  const out: CssRefusal[] = [];
+  const ratioText = (n: number): string => String(Math.round(n * 100) / 100) + ":1";
+  const bg = tone(c.background, "bg");
+  if (c.text !== undefined || c.background !== undefined) {
+    const r = contrastRatio(tone(c.text, "fg"), bg);
+    if (r < TEXT_CONTRAST_MIN) {
+      out.push({ construct: "contrast", message: selectors + ": text over its background measures " + ratioText(r) + ", below the " + ratioText(TEXT_CONTRAST_MIN) + " requirement" });
+    }
+  }
+  for (const stroke of c.strokes) {
+    const r = contrastRatio(tone(stroke, "fg"), bg);
+    if (r < STROKE_CONTRAST_MIN) {
+      out.push({ construct: "contrast", message: selectors + ": a border or outline over its background measures " + ratioText(r) + ", below the " + ratioText(STROKE_CONTRAST_MIN) + " requirement" });
+    }
+  }
+  return out;
+}
+
+export function sanitiseCustomCss(input: string, theme: ThemeColors): CustomCssResult {
   if (input.length > MAX_CUSTOM_CSS_CHARS) {
     return { ok: false, refused: [{ construct: "size", message: "the override is longer than " + String(MAX_CUSTOM_CSS_CHARS) + " characters" }] };
   }
@@ -158,6 +230,7 @@ export function sanitiseCustomCss(input: string): CustomCssResult {
 
   const dropped: CssDropped[] = [];
   const rules: string[] = [];
+  const contrast: CssRefusal[] = [];
   let i = 0;
   while (i < text.length) {
     while (i < text.length && /\s/.test(text[i]!)) i += 1;
@@ -197,8 +270,13 @@ export function sanitiseCustomCss(input: string): CustomCssResult {
       else keptSelectors.push(norm);
     }
     if (keptSelectors.length === 0) continue;
-    const rule = declarations(keptSelectors.join(", "), body, dropped);
-    if (rule !== "") rules.push(rule);
+    const colours: RuleColours = { text: undefined, background: undefined, strokes: [] };
+    const rule = declarations(keptSelectors.join(", "), body, dropped, colours);
+    if (rule !== "") {
+      rules.push(rule);
+      contrast.push(...contrastFailures(keptSelectors.join(", "), colours, theme));
+    }
   }
+  if (contrast.length > 0) return { ok: false, refused: contrast };
   return { ok: true, css: rules.join("\n"), dropped };
 }

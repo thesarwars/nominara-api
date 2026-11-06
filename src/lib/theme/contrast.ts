@@ -35,6 +35,9 @@ export const PLATFORM_DEFAULT_COLORS = {
 export const CURATED_FONT_FAMILIES = ["Inter", "Geist"] as const;
 
 export type ThemeColorField = "color_primary" | "color_accent" | "color_bg" | "color_fg";
+export const THEME_TOKENS = ["primary", "accent", "bg", "fg"] as const;
+export type ThemeToken = (typeof THEME_TOKENS)[number];
+
 export type ThemeColors = { readonly [K in ThemeColorField]: string | null };
 
 export interface ContrastFailure {
@@ -153,4 +156,10 @@ export function validateThemeContrast(colors: ThemeColors): ContrastResult {
     }
   }
   return { ok: true };
+}
+
+/** The effective colour of one theme token (null = the platform default), for the style override's contrast check. */
+export function themeTokenColour(colors: ThemeColors, token: ThemeToken): string {
+  const field: ThemeColorField = `color_${token}`;
+  return colors[field] ?? PLATFORM_DEFAULT_COLORS[field];
 }
