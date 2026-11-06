@@ -244,6 +244,22 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(body.series.map((s) => s.label)).toContain(RIVAL);
   });
 
+  it("STORY-098 s11 · hide_competitors: the matrix carries no competitor table, row, label or id under any setting (engines only), and the overview names no competitor", async () => {
+    const w = await world();
+    const t = await token(w, { scope: [w.p1], hideCompetitors: true });
+    const res = await get(t.cookie, `/portal/matrix?project=${w.p1}`);
+    expect(res.statusCode, res.body).toBe(200);
+    const data = (res.json() as { data: Record<string, unknown> }).data;
+    // The only collection is `engines`; nothing competitor-shaped rides beside it.
+    expect(Object.keys(data)).toEqual(["engines"]);
+    expect(res.body).not.toContain("Globex");
+    expect(res.body).not.toContain(w.rival);
+    expect(res.body.toLowerCase()).not.toContain("competitor");
+    const overview = await get(t.cookie, "/portal/overview");
+    expect(overview.body).not.toContain("Globex");
+    expect(overview.body).not.toContain(w.rival);
+  });
+
   it("STORY-098 s12 · hide_costs: a key scan of every portal payload finds no quota, credit, cost or capture-count field", async () => {
     const w = await world();
     const t = await token(w, { scope: [w.p1], hideCosts: true });
