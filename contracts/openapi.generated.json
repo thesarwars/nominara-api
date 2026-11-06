@@ -16914,6 +16914,16 @@
                           },
                           "occurred_at": {
                             "type": "string"
+                          },
+                          "internal_cost_usd": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
@@ -16933,7 +16943,8 @@
                           "reference_id",
                           "unit_detail",
                           "reason",
-                          "occurred_at"
+                          "occurred_at",
+                          "internal_cost_usd"
                         ],
                         "additionalProperties": false
                       }
