@@ -1,6 +1,10 @@
 import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Req, Res } from "@nestjs/common";
 import type { FastifyReply } from "fastify";
 import {
+  auxAuditToolAcceptedSchema,
+  auxAuditToolEstimateQuerySchema,
+  auxAuditToolEstimateSchema,
+  auxAuditToolRequestSchema,
   competitorFinderAcceptedSchema,
   competitorFinderRequestSchema,
   convertToolRunRequestSchema,
@@ -23,6 +27,10 @@ import {
   updateToolRunRequestSchema,
   visibilityScanEstimateResponseSchema,
   visibilityScanRequestSchema,
+  type AuxAuditToolAccepted,
+  type AuxAuditToolEstimate,
+  type AuxAuditToolEstimateQuery,
+  type AuxAuditToolRequest,
   type CompetitorFinderAccepted,
   type CompetitorFinderRequest,
   type ConvertToolRunRequest,
@@ -57,6 +65,7 @@ import type { Page } from "../../api/pagination/page.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { openSseReply } from "../../api/streaming/sse-reply.js";
+import { AuxAuditToolService } from "./aux-audit.service.js";
 import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { ToolsService } from "./tools.service.js";
 import { PromptResearchService } from "./prompt-research.service.js";
@@ -76,6 +85,7 @@ export class ToolsController {
     private readonly scans: VisibilityScanService,
     private readonly research: PromptResearchService,
     private readonly finder: CompetitorFinderService,
+    private readonly auxAudit: AuxAuditToolService,
   ) {}
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
@@ -186,6 +196,36 @@ export class ToolsController {
     const tenant = request.tenant;
     if (tenant === undefined) throw new Error("the competitor-finder route has no tenant context: WorkspaceGuard did not run");
     return this.finder.start(tenant, body, confirmedCredits);
+  }
+
+  // STORY-082 - api-specification.md section 3 "Tools". Site-files mode is FREE and cached per host (a cache hit answers `completed` with no job); the full audit is
+  // priced per page band, with the site files and every patch included. Verification decides scope, never price. Asynchronous (KAD-06): 202 with the run, read
+  // from GET /tools/runs/{id}. 422 unsafe_target for an internal address, before anything is charged. `aux:trigger` is the permission the reference names.
+  @Post("aux-audit")
+  @HttpCode(202)
+  @Idempotent()
+  @RequirePermission("aux:trigger")
+  @ScopedByQuery()
+  @RateLimitClass("project_aux_audits")
+  @Audit({ action: "tool_run.aux_audit_started", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ mode: (body as AuxAuditToolAccepted).mode, credits: (body as AuxAuditToolAccepted).credits_charged, cached: (body as AuxAuditToolAccepted).cached }) })
+  @ApiContract({ operationId: "startAuxAuditTool", requestSchema: auxAuditToolRequestSchema, responseSchema: auxAuditToolAcceptedSchema })
+  auxAuditStart(
+    @Body(new ZodValidationPipe(auxAuditToolRequestSchema)) body: AuxAuditToolRequest,
+    @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
+    @Req() request: AuditableRequest,
+  ): Promise<AuxAuditToolAccepted> {
+    const tenant = request.tenant;
+    if (tenant === undefined) throw new Error("the aux-audit route has no tenant context: WorkspaceGuard did not run");
+    return this.auxAudit.start(tenant, body, confirmedCredits);
+  }
+
+  // STORY-082 - the free paired estimate for the full audit: the page band, the figure to echo, and what it includes. Recomputes for every `pages`.
+  @Get("aux-audit/estimate")
+  @RequirePermission("aux:trigger")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "estimateAuxAuditTool", querySchema: auxAuditToolEstimateQuerySchema, responseSchema: auxAuditToolEstimateSchema })
+  auxAuditEstimate(@Query(new ZodValidationPipe(auxAuditToolEstimateQuerySchema)) query: AuxAuditToolEstimateQuery): Promise<AuxAuditToolEstimate> {
+    return this.auxAudit.estimate(query.pages);
   }
 
   @Get("runs")

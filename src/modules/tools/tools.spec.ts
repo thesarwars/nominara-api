@@ -58,3 +58,16 @@ describe("STORY-081 · the Competitor Finder route declares its guards", () => {
     expect(Reflect.getMetadata(STREAMING_KEY, handler)).toBeUndefined();
   });
 });
+
+// STORY-082 - the AUX audit tool routes: the permission the reference names, the crawl-backed rate class (10/hour per user), and no streaming.
+describe("STORY-082 · the AUX audit tool routes declare their guards", () => {
+  const handler = (name: string): object => (ToolsController.prototype as unknown as Record<string, object>)[name]!;
+  it("the start route is on the AUX audit rate class and is not a stream", () => {
+    expect(Reflect.getMetadata(RATE_LIMIT_CLASS_KEY, handler("auxAuditStart"))).toBe("project_aux_audits");
+    expect(Reflect.getMetadata(STREAMING_KEY, handler("auxAuditStart"))).toBeUndefined();
+  });
+  it("the free estimate is neither daily-capped nor streaming", () => {
+    expect(Reflect.getMetadata(DAILY_CAP_KEY, handler("auxAuditEstimate"))).toBeUndefined();
+    expect(Reflect.getMetadata(STREAMING_KEY, handler("auxAuditEstimate"))).toBeUndefined();
+  });
+});

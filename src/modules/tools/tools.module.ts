@@ -3,6 +3,7 @@ import { AuditModule } from "../audit/audit.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
 import { ProjectsModule } from "../projects/projects.module.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
+import { AuxAuditToolService } from "./aux-audit.service.js";
 import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { ToolsController } from "./tools.controller.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
@@ -16,7 +17,7 @@ import { VisibilityScanService } from "./visibility-scan.service.js";
 @Module({
   imports: [AuditModule, EntitlementsModule, ProjectsModule, QueueProducerModule],
   controllers: [ToolsController],
-  providers: [ToolsService, VisibilityScanService, PromptResearchService, CompetitorFinderService, UrlGuard],
+  providers: [ToolsService, VisibilityScanService, PromptResearchService, CompetitorFinderService, AuxAuditToolService, UrlGuard],
   exports: [ToolsService],
 })
 export class ToolsModule {}

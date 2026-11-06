@@ -37,6 +37,7 @@ import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
+import { findingView } from "../../lib/aux/finding-view.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
@@ -752,19 +753,22 @@ function toFinding(row: FindingRow, patch: AuxPatch | null): AuxFinding {
     finding_id: row.id,
     audit_id: row.audit_id,
     project_id: row.project_id,
-    rule_code: row.rule_code,
-    title: row.title,
-    category: row.category ?? null,
-    severity: row.severity,
+    // STORY-082 AC8: the consequence-first fields are shaped by the renderer the AUX audit tool shares.
+    ...findingView({
+      consequence: row.consequence ?? null,
+      title: row.title,
+      rule_code: row.rule_code,
+      category: row.category ?? null,
+      severity: row.severity,
+      url: row.url,
+      affected_pages: row.affected_pages,
+      measured_value: num(row.measured_value),
+      threshold_value: num(row.threshold_value),
+      evidence: row.evidence,
+      auto_fixable: row.auto_fixable,
+      requires_human_review: row.requires_human_review,
+    }),
     status: row.status,
-    consequence: row.consequence ?? null,
-    url: row.url,
-    affected_pages: row.affected_pages,
-    measured_value: num(row.measured_value),
-    threshold_value: num(row.threshold_value),
-    evidence: row.evidence,
-    auto_fixable: row.auto_fixable,
-    requires_human_review: row.requires_human_review,
     wont_fix:
       row.status === "wont_fix" && row.wont_fix_reason !== null
         ? { reason: row.wont_fix_reason, resurfaces_at: row.wont_fix_at === null ? null : new Date(row.wont_fix_at.getTime() + WONT_FIX_RESURFACE_DAYS * 86_400_000).toISOString() }
