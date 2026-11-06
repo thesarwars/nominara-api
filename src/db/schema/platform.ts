@@ -77,3 +77,14 @@ export const purgeRuns = pgTable("purge_runs", {
   failed: integer("failed").notNull(),
   status: text("status").notNull(),
 });
+
+export const subjectErasureQueue = pgTable("subject_erasure_queue", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  requestId: uuid("request_id").notNull().unique(),
+  userId: uuid("user_id").notNull(),
+  requestedBy: uuid("requested_by"),
+  heldWorkspaceCount: integer("held_workspace_count").notNull(),
+  status: text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+});

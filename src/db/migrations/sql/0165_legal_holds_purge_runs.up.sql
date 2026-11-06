@@ -47,9 +47,27 @@ CREATE TABLE purge_runs (
 );
 CREATE INDEX ix_purge_runs_started ON purge_runs (started_at DESC);
 
+-- subject_erasure_queue (owner decision 68b): an individual erasure requested while a legal hold covers a workspace of the subject is QUEUED here
+-- and run when the hold lapses or is released. One pending row per subject; request_id is the id the audit trail and the operator already hold.
+-- Holds ids and a status only: no email, no name. Same owner-only class as legal_holds.
+CREATE TABLE subject_erasure_queue (
+  id                   uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id           uuid        NOT NULL UNIQUE,
+  user_id              uuid        NOT NULL REFERENCES users(id),
+  requested_by         uuid        REFERENCES users(id),
+  held_workspace_count integer     NOT NULL CHECK (held_workspace_count > 0),
+  status               text        NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'executed', 'blocked')),
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  finished_at          timestamptz,
+  CONSTRAINT ck_subject_erasure_queue_finished CHECK ((status = 'pending') = (finished_at IS NULL))
+);
+CREATE UNIQUE INDEX ux_subject_erasure_queue_pending ON subject_erasure_queue (user_id) WHERE status = 'pending';
+
 COMMENT ON TABLE legal_holds IS
   'STORY-111 - the only exemption from a purge. Two distinct people, a reason, an expiry; the purge skips and reports held subjects. Owner-only; global-classified.';
+COMMENT ON TABLE subject_erasure_queue IS
+  'STORY-111 (decision 68b) - individual erasures deferred by a legal hold. Owner-only; global-classified.';
 COMMENT ON TABLE purge_runs IS
   'STORY-111 - one row of counts per purge cycle. Owner-only; global-classified.';
 
-REVOKE ALL ON legal_holds, purge_runs FROM nominara_app, nominara_worker, nominara_report, nominara_portal;
+REVOKE ALL ON legal_holds, purge_runs, subject_erasure_queue FROM nominara_app, nominara_worker, nominara_report, nominara_portal;

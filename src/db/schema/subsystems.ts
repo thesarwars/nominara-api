@@ -86,7 +86,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "report_artifacts",
     "scheduled_report_deliveries",
   ],
-  platform: ["audit_log", "audit_chain_marks", "purge_failures", "legal_holds", "purge_runs"],
+  platform: ["audit_log", "audit_chain_marks", "purge_failures", "legal_holds", "purge_runs", "subject_erasure_queue"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type SchemaSubsystem = keyof typeof SCHEMA_SUBSYSTEMS;

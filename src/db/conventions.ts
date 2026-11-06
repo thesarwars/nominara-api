@@ -120,6 +120,8 @@ export const GLOBAL_TABLES = [
   // connection; GRANT-protected with NO privilege for any runtime role (see expectedTablePrivileges). Migration 0165_legal_holds_purge_runs.up.sql.
   "legal_holds",
   "purge_runs",
+  // STORY-111 (decision 68b) - erasures deferred by a legal hold; owner-only like legal_holds. Same migration.
+  "subject_erasure_queue",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -462,7 +464,7 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
   // application is a mark the application can learn how to forge around.
   if (table === "audit_chain_marks") return NO_PRIVILEGES;
   // STORY-111 - owner-only, like the chain marks: a hold the application could write is a hold a request handler could place or lift.
-  if (table === "legal_holds" || table === "purge_runs") return NO_PRIVILEGES;
+  if (table === "legal_holds" || table === "purge_runs" || table === "subject_erasure_queue") return NO_PRIVILEGES;
   // STORY-178 — the webhook route (nominara_app) appends and every sender reads; a worker only reads (it sends reports and
   // alerts); the report and portal roles send nothing. Lifting a suppression is the operator's, on the owner connection.
   if (table === "email_suppressions") {
