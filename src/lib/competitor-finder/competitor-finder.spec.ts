@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { COMPETITOR_FINDER_SCOPE_STATEMENT, competitorFinderRequestSchema, competitorFinderResultSchema } from "../../../contracts/tools/index.js";
+import { COMPETITOR_FINDER_SCOPE_STATEMENT, competitorFinderEntitySchema, competitorFinderRequestSchema, competitorFinderResultSchema } from "../../../contracts/tools/index.js";
 import { toolConversionPlan } from "../tools/conversion.js";
 import { buildEntityRows } from "./build-rows.js";
 import { deriveCategoryQuery } from "./category-query.js";
@@ -59,6 +59,18 @@ describe("STORY-081 scenarios 4 and 5 - every row is built from a detected span,
     expect(rows.find((r) => r.name === "Paygrid")!.cited_domain).toBe("paygrid.example");
     expect(rows.find((r) => r.name === "LedgerLark")!.cited_domain).toBeNull();
   });
+  it("scenario 4 (decision 67b) - a row with no cited website is returned, labelled no_source_cited; a cited row is labelled cited", () => {
+    const bare = rows.find((r) => r.name === "LedgerLark")!;
+    expect(bare.source_status).toBe("no_source_cited");
+    expect(rows.find((r) => r.name === "Billwise")!.source_status).toBe("cited");
+    for (const r of rows) expect(r.source_status === "no_source_cited").toBe(r.cited_domain === null);
+  });
+  it("scenario 4 (decision 67b) - the contract refuses a label that disagrees with the domain", () => {
+    const base = { name: "X", span: { char_start: 0, char_end: 1 }, excerpt: "X" };
+    expect(competitorFinderEntitySchema.safeParse({ ...base, cited_domain: null, source_status: "cited" }).success).toBe(false);
+    expect(competitorFinderEntitySchema.safeParse({ ...base, cited_domain: "x.example", source_status: "no_source_cited" }).success).toBe(false);
+    expect(competitorFinderEntitySchema.safeParse({ ...base, cited_domain: null }).success).toBe(false);
+  });
   it("scenario 4 - a structured citation whose host matches the entity supplies the domain", () => {
     const built = buildEntityRows({ text: ANSWER, spans, citations: [{ url: "https://www.ledgerlark.example/features", slot: 1 }] });
     expect(built.find((r) => r.name === "LedgerLark")!.cited_domain).toBe("ledgerlark.example");
@@ -105,7 +117,7 @@ describe("STORY-081 scenario 7 and 12 - the result states its scope and pre-fill
   const result = {
     schema_version: 1 as const,
     scope: { engine: "gemini", query: "q", captured_at: "2026-11-06T10:00:00.000Z", statement: COMPETITOR_FINDER_SCOPE_STATEMENT },
-    entities: [{ name: "Billwise", span: { char_start: 5, char_end: 13 }, excerpt: "x Billwise", cited_domain: null }],
+    entities: [{ name: "Billwise", span: { char_start: 5, char_end: 13 }, excerpt: "x Billwise", cited_domain: null, source_status: "no_source_cited" as const }],
     competitors: ["Billwise"],
   };
   it("scenario 7 - the scope is stated: one engine, one query, one moment", () => {

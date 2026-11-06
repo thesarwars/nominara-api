@@ -74,11 +74,14 @@ export function buildEntityRows(input: BuildRowsInput): CompetitorFinderEntity[]
     if (span.start < 0 || span.end > input.text.length || span.end <= span.start) throw new Error("a span outside its text");
     const name = input.text.slice(span.start, span.end);
     const line = lineBounds(input.text, span.start);
+    const cited = citedDomain(input.text, line, name, input.citations);
     return {
       name,
       span: { char_start: span.start, char_end: span.end },
       excerpt: excerptOf(input.text, line, span.start),
-      cited_domain: citedDomain(input.text, line, name, input.citations),
+      cited_domain: cited,
+      // Decision 67(b): a row with no cited website is shown, labelled - not dropped.
+      source_status: cited === null ? ("no_source_cited" as const) : ("cited" as const),
     };
   });
 }

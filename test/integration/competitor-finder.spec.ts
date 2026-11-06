@@ -193,7 +193,7 @@ describe("STORY-081 · Competitor Finder", () => {
     return w === undefined ? GRANT[actor.plan] : w.included_balance + w.purchased_balance - w.reserved;
   };
   const count = async (sql: string, args: unknown[] = []): Promise<number> => (await harness.db().query<{ n: number }>(sql, args)).rows[0]!.n;
-  const detail = async (a: Actor, id: string) => (await get(a, `/tools/runs/${id}`)).json() as { data: { status: string; credits_charged: number; error_code: string | null; result: { entities: { name: string; excerpt: string }[]; scope: Record<string, string>; competitors: string[] } | null; headline: { entities_found: number | null }; presentation: { not_tracked: boolean; did_not_check: string }; conversion: { prefill: { competitors: string[] } } } };
+  const detail = async (a: Actor, id: string) => (await get(a, `/tools/runs/${id}`)).json() as { data: { status: string; credits_charged: number; error_code: string | null; result: { entities: { name: string; excerpt: string; cited_domain: string | null; source_status: string }[]; scope: Record<string, string>; competitors: string[] } | null; headline: { entities_found: number | null }; presentation: { not_tracked: boolean; did_not_check: string }; conversion: { prefill: { competitors: string[] } } } };
   const runId = (): string => enqueued[0]!.payload["toolRunId"] as string;
   const settle = async (): Promise<void> => {
     await Promise.all(workers);
@@ -243,6 +243,8 @@ describe("STORY-081 · Competitor Finder", () => {
     const d = (await detail(a, runId())).data;
     expect(d.result!.entities.map((e) => e.name)).toEqual(["Billwise", "LedgerLark"]);
     expect(d.result!.entities.every((e) => e.excerpt.includes(e.name))).toBe(true);
+    // Decision 67(b): the label always agrees with the domain, whichever way this fixture's citations fall.
+    expect(d.result!.entities.every((e) => e.source_status === (e.cited_domain === null ? "no_source_cited" : "cited"))).toBe(true);
     expect(JSON.stringify(d.result)).not.toContain("Salesforce");
     expect(d.result!.scope).toMatchObject({ engine: "perplexity" });
     expect(d.result!.scope["statement"]!.toLowerCase()).toContain("one engine, one query, one moment");
