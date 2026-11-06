@@ -293,6 +293,13 @@ describe("STORY-177 · monthly included-credit refresh", () => {
     expect((await wallet(id)).cycle_start).toBe("2026-02-15");
   });
 
+  it("[STORY-177 AC1] a trialing annual subscription gets the monthly refresh too (decision 67(d))", async () => {
+    const id = await seed({ plan: "growth", cycle: YEAR_CYCLE, grant: GROWTH_GRANT, sub: annualSub("trialing") });
+    expect((await sweep(at("2026-02-20"))).workspacesRolled).toBe(1);
+    expect((await wallet(id)).cycle_start).toBe("2026-02-15");
+    expect((await sweep(at("2026-02-21"))).workspacesRolled).toBe(0);
+  });
+
   it("[STORY-177 AC1] a monthly-billed paid wallet is never this job's: the webhook owns it", async () => {
     const id = await seed({
       plan: "growth", cycle: { start: "2026-10-01", end: "2026-11-01" }, grant: GROWTH_GRANT,

@@ -26,8 +26,8 @@ import { rollIncludedCycle } from "./cycle-roll.js";
 // the twelfth, and the job's next run finds the subscription's NEW period and nothing to do.
 //
 // ⚠ NOT A PAYMENT-OUTSTANDING ROLL. Only a subscription that is `active` rolls. `past_due` waits for the payment (the
-// webhook's recovery roll, or the next run after the status returns to `active`); a `trialing` annual
-// subscription is left to the webhook (OPEN OWNER QUESTION: should it get the monthly refresh?). A monthly-billed paid wallet is never this job's.
+// webhook's recovery roll, or the next run after the status returns to `active`). A `trialing` annual
+// subscription ROLLS like an active one (owner decision 67(d), 2026-11-06). A monthly-billed paid wallet is never this job's.
 //
 // The decision is made INSIDE each workspace's tenant transaction, AFTER taking the wallet's row lock and reading the
 // subscription in a later statement (a fresh READ COMMITTED snapshot, so a webhook that committed while we waited is
@@ -149,7 +149,7 @@ async function sweep({ discovery, work, now }: MonthlyRefreshConnections): Promi
              AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.workspace_id = w.workspace_id AND s.plan_key <> 'free'))
          OR (w.cycle_start < $1::date
              AND EXISTS (SELECT 1 FROM subscriptions s
-                          WHERE s.workspace_id = w.workspace_id AND s.billing_interval = 'annual' AND s.status = 'active'))
+                          WHERE s.workspace_id = w.workspace_id AND s.billing_interval = 'annual' AND s.status IN ('active', 'trialing')))
       ORDER BY w.workspace_id`,
     [today],
   );
@@ -206,11 +206,11 @@ async function refreshOne(tx: ClientBase, workspaceId: string, today: string): P
   if (isFree) {
     window = calendarMonthWindow(today);
     grant = row.grant_free;
-  } else if (row.billing_interval === "annual" && row.status === "active" && row.period_start !== null && row.grant_plan !== null) {
+  } else if (row.billing_interval === "annual" && (row.status === "active" || row.status === "trialing") && row.period_start !== null && row.grant_plan !== null) {
     window = annualWindow(row.period_start, today);
     grant = row.grant_plan;
   } else {
-    // Monthly-billed paid wallet, or an annual one that is past_due / trialing: the webhook's.
+    // Monthly-billed paid wallet, or an annual one that is past_due: the webhook's.
     return false;
   }
   if (window.start <= row.cycle_start) return false;
