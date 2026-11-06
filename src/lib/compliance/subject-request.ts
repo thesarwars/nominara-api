@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import {
   subjectExportSchema,
@@ -7,12 +8,12 @@ import {
   type SubjectRequestAuditAction,
   type SubjectRequestKind,
 } from "../../../contracts/compliance/index.js";
-import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { buildMethodologyFooter } from "../reports/methodology-footer.js";
 import { CROSS_ENGINE_KEY } from "../rollup/roll-up-day.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { requestIndividualErasure } from "../../workers/rollup/retention.js";
 import { appendComplianceAudit } from "./compliance-audit.js";
+import { activeHolds } from "./legal-hold.js";
 import { SUBJECT_INVENTORY } from "./subject-inventory.js";
 
 // STORY-111 / NFR-CMP-02, NFR-CMP-03, NFR-CMP-13 - subject requests: right of access and portability, and right to erasure.
@@ -32,14 +33,15 @@ export interface SubjectRequestContext {
   readonly now?: Date;
 }
 
-/** Columns that hold a secret or a credential: NAMED in the export, never exported. */
-const SECRET_COLUMN = /(hash|secret|token|ciphertext|password|private|signature|api_key|wrapped|dek)/i;
+const logger = new Logger("subject-request");
+
 export const MAX_ROWS_PER_TABLE = 10_000;
 export const METRIC_TIMEFRAME = "30d" as const;
 
 export const SOLE_OWNER_BLOCK_PATH =
   "Transfer ownership of the workspace to another member (POST /v1/workspaces/{id}/transfer-ownership), or delete the workspace, then request erasure again.";
 
+/** Every workspace the subject has a membership row in, removed ones included: these are the audit chains the request is traced in. */
 async function workspacesOf(client: ClientBase, userId: string): Promise<string[]> {
   const rows = await client.query<{ workspace_id: string }>("SELECT DISTINCT workspace_id FROM workspace_members WHERE user_id = $1", [userId]);
   return rows.rows.map((r) => r.workspace_id);
@@ -68,6 +70,9 @@ async function audit(
     });
   }
   incrementCounter("nominara_compliance_subject_request_events_total", { action, kind });
+  // A subject with NO membership has no workspace chain to write to; the request is still traced, by id, here. The line carries the request id,
+  // the kind, the step and a count - never the subject's identifier, email or name.
+  logger.log({ event: "subject_request", request_id: ctx.requestId, kind, action, audited_workspaces: workspaceIds.length });
 }
 
 async function foreignKeyColumnsToUsers(client: ClientBase, table: string): Promise<string[]> {
@@ -86,41 +91,58 @@ async function foreignKeyColumnsToUsers(client: ClientBase, table: string): Prom
   return rows.rows.map((r) => r.column_name);
 }
 
-/** The subject columns of a tenant table: every foreign key to users(id), plus the declared FK-less actor columns. */
+/**
+ * The columns that select a table's rows for a subject: the declared `subjectColumns` when the entry narrows them, otherwise every foreign key
+ * to users(id) plus the declared FK-less actor columns.
+ */
 export async function subjectColumnsFor(client: ClientBase, table: string): Promise<string[]> {
   const entry = SUBJECT_INVENTORY[table];
   if (entry === undefined || entry.disposition !== "export") return [];
+  if (entry.subjectColumns !== undefined) return [...entry.subjectColumns].sort();
   const found = await foreignKeyColumnsToUsers(client, table);
   return [...new Set([...found, ...(entry.extraColumns ?? [])])].sort();
 }
 
+const quote = (identifier: string): string => `"${identifier.replaceAll('"', '""')}"`;
+
 async function exportTable(client: ClientBase, table: string, userId: string) {
+  const entry = SUBJECT_INVENTORY[table];
+  if (entry === undefined || entry.disposition !== "export") return null;
   const subjectColumns = await subjectColumnsFor(client, table);
   if (subjectColumns.length === 0) return null;
-  const columns = await client.query<{ column_name: string }>(
-    "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+  const live = await client.query<{ column_name: string }>(
+    "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
     [table],
   );
-  const kept = columns.rows.map((c) => c.column_name).filter((c) => !SECRET_COLUMN.test(c));
-  const omitted = columns.rows.map((c) => c.column_name).filter((c) => SECRET_COLUMN.test(c));
-  // Identifiers come from the catalog (never from a caller) and are quoted; the subject id is a parameter.
-  const select = kept.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
-  const where = subjectColumns.map((c) => `"${c.replaceAll('"', '""')}" = $1`).join(" OR ");
-  const result = await client.query(`SELECT ${select} FROM "${table}" WHERE ${where} LIMIT ${String(MAX_ROWS_PER_TABLE + 1)}`, [userId]);
+  const present = new Set(live.rows.map((c) => c.column_name));
+  // DEFAULT-DENY: only a column the registry declares exportable is selected. An undeclared column is not read at all.
+  const kept = entry.columns.filter((c) => present.has(c));
+  if (kept.length === 0) return null;
+  // A user id that is not the subject's belongs to someone else: it is exported as null (Art. 15(4)). Actor columns without a foreign key
+  // (audit_log.actor_id, credit_ledger.actor_id) are selected on the subject, so they can only ever hold the subject's id.
+  const userRefs = new Set(await foreignKeyColumnsToUsers(client, table));
+  // Identifiers come from the registry and the catalogue (never from a caller) and are quoted; the subject id is a parameter.
+  const select = kept.map((c) => (userRefs.has(c) ? `CASE WHEN ${quote(c)} = $1 THEN ${quote(c)} END AS ${quote(c)}` : quote(c))).join(", ");
+  const where = subjectColumns.map((c) => `${quote(c)} = $1`).join(" OR ");
+  const result = await client.query(`SELECT ${select} FROM ${quote(table)} WHERE ${where} LIMIT ${String(MAX_ROWS_PER_TABLE + 1)}`, [userId]);
   const truncated = result.rows.length > MAX_ROWS_PER_TABLE;
   const rows = truncated ? result.rows.slice(0, MAX_ROWS_PER_TABLE) : result.rows;
   if (rows.length === 0) return null;
-  return { table, subject_columns: subjectColumns, omitted_columns: omitted, row_count: rows.length, truncated, rows: rows as Record<string, unknown>[] };
+  return { table, subject_columns: subjectColumns, omitted_columns: [...entry.omit], row_count: rows.length, truncated, rows: rows as Record<string, unknown>[] };
 }
 
 /**
  * The Visibility Score of each project the subject created, with the six facts that say what the number meant (NFR-CMP-13). `value` is null
- * when no cross-engine score exists in the window - never 0 for "nothing measured".
+ * when no cross-engine score exists in the window - never 0 for "nothing measured". Only workspaces where the subject is an ACTIVE member: the
+ * score is the workspace's current measurement, and a member who was removed no longer has access to it (this runs on the owner connection, so
+ * the membership check is the access check).
  */
 async function exportMetrics(client: ClientBase, userId: string): Promise<SubjectExportMetric[]> {
   const projects = await client.query<{ id: string; workspace_id: string; scoring_version: string; timezone: string }>(
     `SELECT p.id, p.workspace_id, w.scoring_version, w.timezone
-       FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+       FROM projects p
+       JOIN workspaces w ON w.id = p.workspace_id
+       JOIN workspace_members m ON m.workspace_id = p.workspace_id AND m.user_id = $1 AND m.status = 'active'
       WHERE p.created_by = $1 AND p.deleted_at IS NULL ORDER BY p.created_at, p.id`,
     [userId],
   );
@@ -219,6 +241,11 @@ export interface ErasureOutcome {
   readonly status: "completed" | "blocked";
   /** The exact reason and the way forward, stated to the requester. null when completed. */
   readonly reason: string | null;
+  /**
+   * Workspaces of the subject that were under an ACTIVE legal hold when the erasure ran. The erasure is not blocked by a hold (the audit rows are
+   * pseudonymised, not deleted - see the evidence file for the owner question); it is REPORTED so the operator knows evidence was altered.
+   */
+  readonly heldWorkspaces: readonly string[];
 }
 
 export async function processErasureRequest(client: ClientBase, userId: string, ctx: SubjectRequestContext): Promise<ErasureOutcome> {
@@ -226,17 +253,22 @@ export async function processErasureRequest(client: ClientBase, userId: string, 
   const audited = { requestId, requestedBy: ctx.requestedBy };
   // Captured BEFORE the erasure: it marks memberships removed, and these are the chains the trail is written to.
   const workspaceIds = await workspacesOf(client, userId);
+  const holds = await activeHolds(client, ctx.now ?? new Date());
+  const heldWorkspaces = workspaceIds.filter((w) => holds.workspaces.has(w) || holds.workspacesWithHeldProject.has(w));
   await audit(client, workspaceIds, "subject_request.received", "erasure", audited);
   try {
     const result = await requestIndividualErasure(client, userId);
     if (result.blocked) {
       const reason = `${result.reason} ${SOLE_OWNER_BLOCK_PATH}`;
       await audit(client, workspaceIds, "subject_request.blocked", "erasure", audited, { blocked_reason: "sole_owner" });
-      return { requestId, status: "blocked", reason };
+      return { requestId, status: "blocked", reason, heldWorkspaces: [] };
     }
-    await audit(client, workspaceIds, "subject_request.processed", "erasure", { requestId, requestedBy: SYSTEM_ACTOR_ID }, {});
-    await audit(client, workspaceIds, "subject_request.completed", "erasure", { requestId, requestedBy: SYSTEM_ACTOR_ID }, {});
-    return { requestId, status: "completed", reason: null };
+    // The steps after the erasure are the SYSTEM's (no actor id): the requester's id is pseudonymised away by the erasure itself, and a surviving
+    // user id on these rows would defeat that.
+    const after = { requestId, requestedBy: null };
+    await audit(client, workspaceIds, "subject_request.processed", "erasure", after, heldWorkspaces.length > 0 ? { legal_hold_workspaces: heldWorkspaces.length } : {});
+    await audit(client, workspaceIds, "subject_request.completed", "erasure", after, {});
+    return { requestId, status: "completed", reason: null, heldWorkspaces };
   } catch (error) {
     await audit(client, workspaceIds, "subject_request.failed", "erasure", audited, { error: error instanceof Error ? error.name : "unknown" });
     throw error;

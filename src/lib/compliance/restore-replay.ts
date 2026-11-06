@@ -1,6 +1,6 @@
 import type { ClientBase } from "pg";
 import type { PurgeJournalEntry } from "../../../contracts/compliance/index.js";
-import { cascadeDeleteWorkspace } from "../../workers/rollup/retention.js";
+import { cascadeDeleteWorkspace, deleteProjectRows } from "../../workers/rollup/retention.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
 import { incrementCounter } from "../telemetry/metrics.js";
@@ -21,10 +21,8 @@ export async function reapplyPurgeEntry(privilegedClient: ClientBase, entry: Pur
     return;
   }
   await withTenantContext(privilegedClient, { workspaceId: entry.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-    await tx.query("DELETE FROM citation_facts WHERE project_id = $1", [entry.scope_id]);
-    await tx.query("DELETE FROM mention_facts WHERE project_id = $1", [entry.scope_id]);
-    await tx.query("DELETE FROM answer_captures WHERE project_id = $1", [entry.scope_id]);
-    await tx.query("DELETE FROM projects WHERE id = $1", [entry.scope_id]);
+    // The SAME deletion the purge ran (including the tables no foreign key reaches), so a replay cannot leave what the purge removed.
+    await deleteProjectRows(tx, entry.scope_id);
   });
 }
 

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ComplianceExportRow } from "../../workers/rollup/retention.js";
+import type { ComplianceExportRow, ComplianceExportTable } from "../../workers/rollup/retention.js";
 import { pseudonymiseWorkspaceId } from "../crypto/pseudonymise.js";
 import type { KeyListingPort, ObjectStoragePort } from "../storage/storage.port.js";
 import type { JournalStore } from "./purge-journal.js";
@@ -9,7 +9,7 @@ import type { JournalStore } from "./purge-journal.js";
 // 1. S3JournalStore: the purge journal in the RAW bucket under `purge-journal/{env}/`, a prefix no workspace prefix (`{env}/{ws}/`) can
 //    reach, so neither a workspace purge nor an object-prefix delete can remove its own record. Every entry is a new key (a UUID is in the
 //    name); nothing here overwrites or deletes.
-// 2. writeComplianceExports: the two surviving record sets (audit log, financial records), written BEFORE the cascade by
+// 2. writeComplianceExports: the two surviving record sets (audit log; financial records = credit ledger, invoices, subscriptions, add-ons, credit purchases), written BEFORE the cascade by
 //    executeWorkspaceHardDelete. Each object carries its expiry (`expires_at`, 7 years) and a retention-class prefix, which is what the
 //    bucket's lifecycle rule keys on: "a retention with no end is not a retention" (data-model.md section 7). The lifecycle rule and the
 //    Object Lock configuration themselves are infrastructure (owner decision 45: Terraform parked); this code is what they act on.
@@ -30,10 +30,24 @@ export class S3JournalStore implements JournalStore {
 /** Statutory accounting retention and the audit-log retention are both seven years (data-model.md section 7). */
 export const COMPLIANCE_EXPORT_RETENTION_YEARS = 7;
 
-export const COMPLIANCE_EXPORT_CLASSES = {
+const FINANCIAL_PREFIX = "compliance-exports/financial/";
+
+/** One retention-class prefix per exported table. The financial records (data-model.md section 7: ledger, invoices, subscription state) share one. */
+export const COMPLIANCE_EXPORT_CLASSES: Readonly<Record<ComplianceExportTable, string>> = {
   audit_log: "compliance-exports/audit-log/",
-  credit_ledger: "compliance-exports/financial/",
-} as const;
+  credit_ledger: FINANCIAL_PREFIX,
+  invoices: FINANCIAL_PREFIX,
+  subscriptions: FINANCIAL_PREFIX,
+  subscription_addons: FINANCIAL_PREFIX,
+  credit_purchases: FINANCIAL_PREFIX,
+};
+
+/** The columns of each financial table that name a PERSON. Each is replaced by a random per-export alias; nothing else in these tables identifies one. */
+const PERSON_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  credit_ledger: ["actor_id"],
+  credit_purchases: ["purchased_by"],
+  subscription_addons: ["created_by"],
+};
 
 export function complianceExpiry(now: Date): Date {
   const expiry = new Date(now.getTime());
@@ -70,9 +84,13 @@ export function writeComplianceExports(
         return alias;
       };
       const rows =
-        record.table === "credit_ledger"
-          ? record.rows.map((row) => ({ ...row, workspace_id: pseudonym, actor_id: actorPseudonym(row.actor_id) }))
-          : record.rows;
+        record.table === "audit_log"
+          ? record.rows
+          : record.rows.map((row) => {
+              const out: Record<string, unknown> = { ...row, workspace_id: pseudonym };
+              for (const column of PERSON_COLUMNS[record.table] ?? []) if (column in out) out[column] = actorPseudonym(out[column]);
+              return out;
+            });
       await port.put({
         bucket: "raw",
         key: `${COMPLIANCE_EXPORT_CLASSES[record.table]}${keyEnv}/${pseudonym}/${at.toISOString().replaceAll(":", "-")}-${randomUUID()}.json`,

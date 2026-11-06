@@ -227,7 +227,7 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect((await db.query("SELECT 1 FROM purge_failures WHERE scope_id = $1 AND resolved_at IS NULL", [proj])).rowCount).toBe(1);
     });
 
-    it("S17 after a workspace hard delete, no table and no object still holds its content; only identifiers in the three record sets remain", async () => {
+    it("S17 after a workspace hard delete, no TABLE still holds its content and the reports objects are gone (raw/crawl objects are STORY-182); only identifiers in the three record sets remain", async () => {
       const ws = await workspace();
       const u = await user();
       await member(ws, u, "owner");
@@ -247,13 +247,15 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       const result = await runDailyPurgeCycle(db, {
         journal: new PurgeJournal(store, "n"),
         exporterFor: () => async (records) => void exports.push(...records.map((r) => r.table)),
+        // PRODUCTION-FAITHFUL: retention-purge.handler.ts wires deleteWorkspaceReports ONLY (the reports bucket). The raw and crawl prefixes are
+        // STORY-182's, so the stub removes the reports prefix and nothing else.
         deleteWorkspaceObjects: (w) => {
-          for (const k of [...bucket.keys()]) if (k.includes(`/${w}/`)) bucket.delete(k);
+          for (const k of [...bucket.keys()]) if (k.includes(`/${w}/reports/`)) bucket.delete(k);
           return Promise.resolve();
         },
       });
       expect(result.workspacesPurged).toContain(ws);
-      expect(exports.sort()).toEqual(["audit_log", "credit_ledger"]);
+      expect(exports.sort()).toEqual(["audit_log", "credit_ledger", "credit_purchases", "invoices", "subscription_addons", "subscriptions"]);
 
       // EVERY base table, searched as text for the sentinels and for the workspace id.
       const tables = (await db.query<{ t: string }>("SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','p') AND NOT c.relispartition")).rows.map((r) => r.t);
@@ -265,7 +267,9 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       // audit_chain_marks keeps a TOMBSTONE: the workspace id and a reason, no content (STORY-143). That is the only database row that names it.
       expect(offenders).toEqual(["audit_chain_marks"]);
       expect((await db.query("SELECT reason FROM audit_chain_marks WHERE workspace_id = $1", [ws])).rows.map((r) => r.reason)).toEqual(["tombstone"]);
-      expect([...bucket.keys()].filter((k) => k.includes(ws))).toEqual([]);
+      // The reports object is gone. The RAW object is NOT (STORY-182 owns the raw and crawl prefixes): stated, not hidden - the AC "no purge path
+      // leaves content behind" is Partial for objects until that story wires the prefix deletes.
+      expect([...bucket.keys()]).toEqual([`test/${ws}/raw/a.json`]);
       expect([...store.objects.values()].join("")).not.toMatch(/SENTINEL/);
     });
 
@@ -447,6 +451,224 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1", [ws])).rowCount).toBe(1);
       expect((await db.query("SELECT 1 FROM credit_ledger WHERE workspace_id = $1 AND actor_id = $2", [ws, u])).rowCount).toBe(0);
       expect((await auditActions(ws)).filter((a) => a.startsWith("subject_request."))).toEqual(["subject_request.received", "subject_request.processed", "subject_request.completed"]);
+    });
+  });
+
+  // ------------------------------------------------------------------ review round 1
+  describe("review round 1", () => {
+    const hold = (scope: "project" | "workspace", scopeId: string, a: string, b: string) =>
+      placeLegalHold(db, { scope, scopeId, reason: "Litigation hold, matter 77", requestedBy: a, approvedBy: b, expiresAt: new Date(Date.now() + 30 * DAY) });
+
+    it("S23 RACE a hold placed AFTER the cycle read the holds still protects a due PROJECT: the data and the hold both survive", async () => {
+      const ws = await workspace();
+      const [a, b] = [await user(), await user()];
+      const p = await dueProject(ws);
+      await capture(ws, p, "HOLD-RACE-PROJECT");
+      let holdId = "";
+      const result = await runDailyPurgeCycle(db, {
+        deleteObjectPrefix: noop,
+        afterHoldsRead: async () => void (holdId = (await hold("project", p, a, b)).id),
+      });
+      expect(result.projectsPurged).not.toContain(p);
+      expect(result.held).toContainEqual({ scope: "project", scopeId: p, reason: "legal-hold" });
+      expect(await exists("projects", p)).toBe(true);
+      expect((await db.query("SELECT 1 FROM answer_captures WHERE project_id = $1", [p])).rowCount).toBe(1);
+      expect((await db.query("SELECT 1 FROM legal_holds WHERE id = $1 AND released_at IS NULL", [holdId])).rowCount).toBe(1);
+    });
+
+    it("S23 RACE a hold placed AFTER the cycle read the holds still protects a due WORKSPACE: the workspace, its data and the hold survive, and nothing is exported", async () => {
+      const ws = await workspace();
+      const [a, b] = [await user(), await user()];
+      const p = await project(ws);
+      await capture(ws, p, "HOLD-RACE-WORKSPACE");
+      await db.query("UPDATE workspaces SET status = 'pending_deletion', deletion_execute_at = now() - interval '1 day' WHERE id = $1", [ws]);
+      let holdId = "";
+      const objects: string[] = [];
+      const exported: string[] = [];
+      const journal = new InMemoryJournalStore();
+      const result = await runDailyPurgeCycle(db, {
+        journal: new PurgeJournal(journal, "race"),
+        exportComplianceRecords: (r) => { exported.push(...r.map((x) => x.table)); return Promise.resolve(); },
+        deleteWorkspaceObjects: (w) => { objects.push(w); return Promise.resolve(); },
+        afterHoldsRead: async () => void (holdId = (await hold("workspace", ws, a, b)).id),
+      });
+      expect(result.workspacesPurged).not.toContain(ws);
+      expect(result.held).toContainEqual({ scope: "workspace", scopeId: ws, reason: "legal-hold" });
+      expect(await exists("workspaces", ws)).toBe(true);
+      expect((await db.query("SELECT 1 FROM answer_captures WHERE workspace_id = $1", [ws])).rowCount).toBe(1);
+      expect((await db.query("SELECT 1 FROM legal_holds WHERE id = $1", [holdId])).rowCount).toBe(1);
+      expect(objects).toEqual([]);
+      expect(journal.objects.size).toBe(0);
+    });
+
+    it("S23 a RELEASED hold row is cleaned up with its workspace, an ACTIVE one is never deleted by the cleanup", async () => {
+      const ws = await workspace();
+      const [a, b] = [await user(), await user()];
+      const h = await hold("workspace", ws, a, b);
+      await releaseLegalHold(db, h.id, a);
+      await db.query("UPDATE workspaces SET status = 'pending_deletion', deletion_execute_at = now() - interval '1 day' WHERE id = $1", [ws]);
+      await runDailyPurgeCycle(db, { exportComplianceRecords: noop, deleteWorkspaceObjects: noop });
+      expect(await exists("workspaces", ws)).toBe(false);
+      expect((await db.query("SELECT 1 FROM legal_holds WHERE id = $1", [h.id])).rowCount).toBe(0);
+    });
+
+    it("S1 an access export never carries credential material: a subject who created a GSC connection and a GA4 attribution config gets neither *_enc value", async () => {
+      const ws = await workspace();
+      const u = await user();
+      await member(ws, u, "owner");
+      const proj = await project(ws, u);
+      await seedRow("gsc_connections", { workspace_id: ws, project_id: proj, created_by: u, property_type: "domain", credentials_enc: "ENC-SECRET-GSC-CRED", refresh_enc: "ENC-SECRET-GSC-REFRESH", dek_id: "dek-1" });
+      await seedRow("attribution_configs", { workspace_id: ws, project_id: proj, created_by: u, method: "ga4", ga4_credentials_enc: "ENC-SECRET-GA4", site_token: "SITE-TOKEN-X" });
+      const out = await processAccessRequest(db, u, { requestedBy: u });
+      const text = JSON.stringify(out);
+      expect(text).not.toMatch(/ENC-SECRET/);
+      expect(text).not.toContain("SITE-TOKEN-X");
+      const gsc = out.tables.find((t) => t.table === "gsc_connections")!;
+      expect(gsc.rows).toHaveLength(1);
+      expect(gsc.omitted_columns).toEqual(expect.arrayContaining(["credentials_enc", "refresh_enc"]));
+    });
+
+    it("S1 DEFAULT-DENY every column of every exported table is classified (exportable or omitted): a new column fails here until a person decides", async () => {
+      const unclassified: string[] = [];
+      for (const [table, entry] of Object.entries(SUBJECT_INVENTORY)) {
+        if (entry.disposition !== "export") continue;
+        const live = (await db.query<{ column_name: string }>("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1", [table])).rows.map((r) => r.column_name);
+        const declared = new Set([...entry.columns, ...entry.omit]);
+        for (const c of live) if (!declared.has(c)) unclassified.push(`${table}.${c}`);
+        for (const c of declared) if (!live.includes(c)) unclassified.push(`${table}.${c} (declared, not in the database)`);
+        for (const c of entry.columns) if (entry.omit.includes(c)) unclassified.push(`${table}.${c} (both exportable and omitted)`);
+      }
+      expect(unclassified).toEqual([]);
+    });
+
+    it("S1 an access export holds NO other person's data: a subject who invited V gets neither V's email nor V's id", async () => {
+      const ws = await workspace();
+      const u = await user();
+      const v = await user();
+      const vEmail = `victim-${randomUUID().slice(0, 8)}@third-party.example`;
+      await db.query("UPDATE users SET email = $2, full_name = 'Vera Victim' WHERE id = $1", [v, vEmail]);
+      await member(ws, u, "owner");
+      await db.query("INSERT INTO workspace_members (workspace_id, user_id, role, status, invited_by) VALUES ($1,$2,'viewer','active',$3)", [ws, v, u]);
+      await db.query("INSERT INTO workspace_invitations (workspace_id, email, role, token_hash, invited_by, expires_at) VALUES ($1,$2,'viewer',decode('01','hex'),$3, now() + interval '1 day')", [ws, `invitee-${randomUUID().slice(0, 8)}@third-party.example`, u]);
+      const proj = await project(ws, u);
+      await seedRow("tasks", { workspace_id: ws, project_id: proj, kind: "content", completed_by: u, assignee_id: v });
+      const out = await processAccessRequest(db, u, { requestedBy: u });
+      const text = JSON.stringify(out);
+      expect(text).not.toContain(vEmail);
+      expect(text).not.toContain(v);
+      expect(text).not.toContain("Vera Victim");
+      expect(text).not.toContain("invitee-");
+      // The task the subject completed is exported, with the OTHER person's id nulled.
+      const tasks = out.tables.find((t) => t.table === "tasks")!;
+      expect(tasks.rows).toHaveLength(1);
+      expect(tasks.rows[0]!.assignee_id).toBeNull();
+      expect(tasks.rows[0]!.completed_by).toBe(u);
+      // The subject's OWN membership is still there.
+      expect(out.tables.find((t) => t.table === "workspace_members")!.rows.map((r) => r.user_id)).toEqual([u]);
+    });
+
+    it("S7 a REMOVED member's export holds no metric for the workspace they left", async () => {
+      const ws = await workspace();
+      const owner = await user();
+      const u = await user();
+      await member(ws, owner, "owner");
+      await db.query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1,$2,'viewer','removed')", [ws, u]);
+      const proj = await project(ws, u);
+      await db.query(
+        `INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date, cells_total, live_capture_ratio, visibility_score, scoring_version)
+         VALUES ($1,$2,'all','brand',gen_random_uuid(), CURRENT_DATE, 12, 0.5, 77.000, (SELECT scoring_version FROM workspaces WHERE id = $1))`,
+        [ws, proj],
+      );
+      const out = await processAccessRequest(db, u, { requestedBy: u });
+      expect(out.metrics.filter((m) => m.workspace_id === ws)).toEqual([]);
+      expect(JSON.stringify(out)).not.toContain("77");
+    });
+
+    it("S3 S4 erasure is COMPLETE: the subject's email survives in no base table except the pseudonymised audit and ledger sets", async () => {
+      const ws = await workspace();
+      const owner = await user();
+      const u = await user();
+      const email = `erase-me-${randomUUID().slice(0, 8)}@sweep.example`;
+      await db.query("UPDATE users SET email = $2, full_name = 'Erin Erasable' WHERE id = $1", [u, email]);
+      await member(ws, owner, "owner");
+      await member(ws, u);
+      await db.query("INSERT INTO workspace_invitations (workspace_id, email, role, token_hash, invited_by, expires_at) VALUES ($1,$2,'viewer',decode('02','hex'),$3, now() + interval '1 day')", [ws, email, owner]);
+      await seedRow("scheduled_reports", { workspace_id: ws, created_by: owner, cadence: "weekly", recipients: [email, "other@sweep.example"], project_ids: [] });
+      await seedRow("downgrade_notices", { workspace_id: ws, kind: "paused", recipient: email, subject: "Your plan", text_body: `Hi Erin Erasable, a note for ${email}` });
+      const out = await processErasureRequest(db, u, { requestedBy: u });
+      expect(out.status).toBe("completed");
+      const tables = (await db.query<{ t: string }>("SELECT c.relname AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','p') AND NOT c.relispartition")).rows.map((r) => r.t);
+      const offenders: string[] = [];
+      for (const t of tables) {
+        if (t === "audit_log" || t === "credit_ledger") continue;
+        const hit = await db.query(`SELECT count(*)::int AS n FROM "${t}" x WHERE x::text ILIKE $1 OR x::text LIKE '%Erin Erasable%'`, [`%${email}%`]);
+        if ((hit.rows[0]!.n as number) > 0) offenders.push(t);
+      }
+      expect(offenders).toEqual([]);
+      // Another recipient of the report is untouched.
+      expect((await db.query("SELECT recipients::text AS r FROM scheduled_reports WHERE workspace_id = $1", [ws])).rows[0]!.r).toContain("other@sweep.example");
+    });
+
+    it("S17 PROJECT scope: a hard-deleted project leaves no notification (no foreign key reaches it) and no content behind", async () => {
+      const ws = await workspace();
+      const p = await dueProject(ws);
+      const keep = await project(ws);
+      await seedRow("notifications", { workspace_id: ws, project_id: p, severity: "info", title: "PROJECT-SENTINEL-17" });
+      await seedRow("notifications", { workspace_id: ws, project_id: keep, severity: "info", title: "KEEP-17" });
+      const result = await runDailyPurgeCycle(db, { deleteObjectPrefix: noop });
+      expect(result.projectsPurged).toContain(p);
+      expect((await db.query("SELECT 1 FROM notifications WHERE title = 'PROJECT-SENTINEL-17'")).rowCount).toBe(0);
+      expect((await db.query("SELECT 1 FROM notifications WHERE title = 'KEEP-17'")).rowCount).toBe(1);
+    });
+
+    it("S18 S19 the FINANCIAL export carries invoices, subscriptions and credit purchases before the cascade, with every person id pseudonymised", async () => {
+      const ws = await workspace();
+      const u = await user();
+      await db.query("UPDATE workspaces SET status = 'pending_deletion', deletion_execute_at = now() - interval '1 day' WHERE id = $1", [ws]);
+      await db.query(
+        `INSERT INTO invoices (workspace_id, stripe_invoice_id, number, status, subtotal, total, period_start, period_end) VALUES ($1,$2,'INV-7','paid',10.00,10.00,now(),now())`,
+        [ws, `in_${randomUUID()}`],
+      );
+      await db.query(`INSERT INTO credit_purchases (workspace_id, pack_key, credits, amount_usd, purchased_by) VALUES ($1,(SELECT key FROM credit_packs LIMIT 1),100,5.00,$2)`, [ws, u]);
+      const seen: Record<string, number> = {};
+      await executeWorkspaceHardDelete(db, ws, { exportComplianceRecords: (records) => { for (const r of records) seen[r.table] = r.rows.length; return Promise.resolve(); } });
+      expect(seen.invoices).toBe(1);
+      expect(seen.credit_purchases).toBe(1);
+      expect(Object.keys(seen)).toEqual(expect.arrayContaining(["subscriptions", "subscription_addons"]));
+      // And the writer pseudonymises the person id of a purchase.
+      const puts: PutObjectRequest[] = [];
+      const port = { put: (r: PutObjectRequest) => { puts.push(r); return Promise.resolve(); } } as unknown as ObjectStoragePort;
+      await writeComplianceExports(port, "prod", ws)([{ table: "credit_purchases", rows: [{ id: 1, workspace_id: ws, purchased_by: u }] }, { table: "invoices", rows: [{ id: 2, workspace_id: ws, total: "10.00" }] }]);
+      expect(puts.map((p) => p.key.startsWith(COMPLIANCE_EXPORT_CLASSES.invoices))).toEqual([true, true]);
+      const text = puts.map((p) => String(p.body)).join("");
+      expect(text).not.toContain(u);
+      expect(text).not.toContain(ws);
+    });
+
+    it("S23 individual erasure REPORTS a legal hold on the subject's workspace in its outcome", async () => {
+      const ws = await workspace();
+      const [a, b] = [await user(), await user()];
+      const owner = await user();
+      const u = await user();
+      await member(ws, owner, "owner");
+      await member(ws, u);
+      await hold("workspace", ws, a, b);
+      const out = await processErasureRequest(db, u, { requestedBy: u });
+      expect(out.status).toBe("completed");
+      expect(out.heldWorkspaces).toEqual([ws]);
+    });
+
+    it("S6 post-erasure audit rows are written by the SYSTEM actor (no actor id), and a subject with no workspace is still traced by request id in the log", async () => {
+      const ws = await workspace();
+      const owner = await user();
+      const u = await user();
+      await member(ws, owner, "owner");
+      await member(ws, u);
+      const requestId = randomUUID();
+      await processErasureRequest(db, u, { requestedBy: u, requestId });
+      const rows = (await db.query("SELECT action, actor_type, actor_id FROM audit_log WHERE workspace_id = $1 AND resource_id = $2 ORDER BY seq", [ws, requestId])).rows;
+      expect(rows.map((r) => [r.action, r.actor_type])).toEqual([["subject_request.received", "user"], ["subject_request.processed", "system"], ["subject_request.completed", "system"]]);
+      expect(rows[1]!.actor_id).toBeNull();
     });
   });
 });

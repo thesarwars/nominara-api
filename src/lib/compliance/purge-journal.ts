@@ -18,7 +18,7 @@ import {
 
 export type { PurgeJournalEntry };
 
-/** The storage seam. The S3 implementation (journal-store.s3.ts) lives in the raw bucket outside any workspace prefix. */
+/** The storage seam. The S3 implementation (`S3JournalStore`, storage-adapters.ts) lives in the raw bucket outside any workspace prefix. */
 export interface JournalStore {
   /** Writes a NEW object. Must fail rather than overwrite an existing key. */
   putNew(key: string, body: string): Promise<void>;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auditResidency, ResidencyViolationError, type ResidencyResource } from "./residency-audit.js";
+import { auditResidency, ResidencyInventoryEmptyError, ResidencyViolationError, type ResidencyResource } from "./residency-audit.js";
 
 const WS_EU = "01990000-0000-7000-8000-0000000000e1";
 const WS_US = "01990000-0000-7000-8000-0000000000a1";
@@ -12,7 +12,7 @@ describe("STORY-111 residency audit", () => {
       { kind: "s3_object", id: `prod/${WS_EU}/a.json`, region: "eu-west-1", workspaceId: WS_EU },
       { kind: "s3_object", id: `prod/${WS_US}/b.json`, region: "us-east-1", workspaceId: WS_US },
     ];
-    expect(auditResidency(pins, resources)).toEqual({ checked: 2, violations: [], unattributed: [] });
+    expect(auditResidency(pins, resources)).toEqual({ checked: 2, violations: [], unattributed: [], inventoryEmpty: false });
   });
 
   it("S26 FAILS LOUDLY on a planted out-of-region object", () => {
@@ -38,7 +38,12 @@ describe("STORY-111 residency audit", () => {
     expect(r.violations).toEqual([]);
   });
 
-  it("S26 an empty inventory still reports zero checked (the audit ran)", () => {
-    expect(auditResidency(pins, [])).toEqual({ checked: 0, violations: [], unattributed: [] });
+  it("S26 an empty inventory still reports zero checked (the audit ran) when NO workspace is pinned", () => {
+    expect(auditResidency(new Map(), [])).toEqual({ checked: 0, violations: [], unattributed: [], inventoryEmpty: true });
+  });
+
+  it("S26 an EMPTY inventory while workspaces ARE pinned is fail-closed: a listing that returned nothing proves nothing", () => {
+    expect(() => auditResidency(pins, [], { failOnViolation: true })).toThrow(ResidencyInventoryEmptyError);
+    expect(auditResidency(pins, []).inventoryEmpty).toBe(true);
   });
 });

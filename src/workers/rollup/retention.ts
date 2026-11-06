@@ -10,7 +10,7 @@ import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
 import { RECHAINED_MARKER_ACTION } from "../../lib/crypto/audit-chain.js";
 import { settleFinishedRunCredits } from "../../lib/credits/run-settlement.js";
 import { pseudonymiseWorkspaceId } from "../../lib/crypto/pseudonymise.js";
-import { activeHolds, releaseExpiredHolds } from "../../lib/compliance/legal-hold.js";
+import { activeHolds, lockHoldRegister, projectHasActiveHold, releaseExpiredHolds, workspaceHasActiveHold } from "../../lib/compliance/legal-hold.js";
 import type { PurgeJournal } from "../../lib/compliance/purge-journal.js";
 import { incrementCounter, observeValue } from "../../lib/telemetry/metrics.js";
 import { AuditChainService } from "../../modules/audit/audit-chain.service.js";
@@ -189,6 +189,57 @@ export interface HardDeleteProjectOptions {
   /** `{env}/{workspace_id}/...` — security-and-tenancy.md §10 ISO-14's object-key namespacing convention. Defaults to `process.env.NOMINARA_ENV ?? "local"`. */
   readonly env?: string;
   readonly deleteObjectPrefix?: (prefix: string) => Promise<void>;
+  /**
+   * STORY-111 / NFR-CMP-10: when present, the purge re-checks for an ACTIVE legal hold (at this instant) INSIDE its own transaction, under the
+   * lock `placeLegalHold` also takes, and deletes nothing if one exists. The caller's earlier read of the holds is not enough: a hold can be placed
+   * between that read and this delete. Owner connection only (`legal_holds` is granted to no runtime role).
+   */
+  readonly holdCheckAt?: Date;
+}
+
+/** Tables with a `project_id` that the purge must NOT empty: financial and metering records are retained on their own schedule (data-model.md §7). */
+const RETAINED_ON_PROJECT_PURGE: readonly string[] = ["audit_log", "credit_ledger", "usage_ledger"];
+
+/**
+ * STORY-111 "no purge path leaves customer content behind", project scope: every base table with a `project_id` column that `DELETE FROM projects`
+ * does NOT reach through a chain of ON DELETE CASCADE foreign keys, discovered from the catalog (so a table added later without a cascade is purged
+ * anyway). Today: the three partitioned fact tables (no foreign key by design) and `notifications` (its `project_id` carries no foreign key, so a
+ * project purge used to leave its alerts - which name the brand - until the whole workspace was purged).
+ */
+export async function projectTablesWithoutCascade(client: ClientBase): Promise<string[]> {
+  const rows = await client.query<{ relname: string }>(
+    `WITH RECURSIVE reach(oid) AS (
+       SELECT k.conrelid FROM pg_constraint k WHERE k.contype = 'f' AND k.confdeltype = 'c' AND k.confrelid = 'public.projects'::regclass
+       UNION
+       SELECT k.conrelid FROM pg_constraint k JOIN reach r ON k.confrelid = r.oid WHERE k.contype = 'f' AND k.confdeltype = 'c'
+     )
+     SELECT c.relname
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'project_id' AND NOT a.attisdropped
+      WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+        AND c.oid NOT IN (SELECT oid FROM reach)
+        AND c.relname <> ALL ($1::text[])
+      ORDER BY c.relname`,
+    [RETAINED_ON_PROJECT_PURGE],
+  );
+  return rows.rows.map((r) => r.relname);
+}
+
+/**
+ * The project's rows, inside an open tenant-context transaction: the three fact tables first (they carry no foreign key and are the bulk), every
+ * other table the cascade does not reach, then the project (which cascades the rest). Shared by the purge and by the restore replay, so the two
+ * cannot drift apart.
+ */
+export async function deleteProjectRows(tx: ClientBase, projectId: string): Promise<void> {
+  await tx.query("DELETE FROM citation_facts WHERE project_id = $1", [projectId]);
+  await tx.query("DELETE FROM mention_facts WHERE project_id = $1", [projectId]);
+  await tx.query("DELETE FROM answer_captures WHERE project_id = $1", [projectId]);
+  for (const table of await projectTablesWithoutCascade(tx)) {
+    if (table === "citation_facts" || table === "mention_facts" || table === "answer_captures") continue;
+    await tx.query(`DELETE FROM "${table.replaceAll('"', '""')}" WHERE project_id = $1`, [projectId]);
+  }
+  await tx.query("DELETE FROM projects WHERE id = $1", [projectId]);
 }
 
 export async function hardDeleteProject(
@@ -196,13 +247,16 @@ export async function hardDeleteProject(
   workspaceId: string,
   projectId: string,
   options: HardDeleteProjectOptions = {},
-): Promise<void> {
-  await withTenantContext(client, { workspaceId, actorId: options.actorId ?? SYSTEM_ACTOR_ID }, async (tx) => {
-    await tx.query("DELETE FROM citation_facts WHERE project_id = $1", [projectId]);
-    await tx.query("DELETE FROM mention_facts WHERE project_id = $1", [projectId]);
-    await tx.query("DELETE FROM answer_captures WHERE project_id = $1", [projectId]);
-    await tx.query("DELETE FROM projects WHERE id = $1", [projectId]);
+): Promise<"deleted" | "held"> {
+  const outcome = await withTenantContext(client, { workspaceId, actorId: options.actorId ?? SYSTEM_ACTOR_ID }, async (tx) => {
+    if (options.holdCheckAt !== undefined) {
+      await lockHoldRegister(tx, workspaceId);
+      if (await projectHasActiveHold(tx, workspaceId, projectId, options.holdCheckAt)) return "held" as const;
+    }
+    await deleteProjectRows(tx, projectId);
+    return "deleted" as const;
   });
+  if (outcome === "held") return "held";
 
   if (!options.deleteObjectPrefix) {
     throw new Error(
@@ -211,6 +265,7 @@ export async function hardDeleteProject(
   }
   const env = options.env ?? process.env.NOMINARA_ENV ?? "local";
   await options.deleteObjectPrefix(`${env}/${workspaceId}/projects/${projectId}/`);
+  return "deleted";
 }
 
 // ---------------------------------------------------------------------------
@@ -253,20 +308,36 @@ export async function requestWorkspaceDeletion(
 // unconditionally re-enabled afterward (even on failure).
 // ---------------------------------------------------------------------------
 
+/**
+ * The two surviving record sets (data-model.md §7): the AUDIT LOG, and the FINANCIAL RECORDS - the credit ledger, invoices and subscription state
+ * (the subscription, its add-ons and the credit-pack purchases). The financial tables are statutory accounting records (7 years) and every one of
+ * them cascades from `workspaces`, so the export must precede the cascade or the cascade destroys them with no copy.
+ */
+export const FINANCIAL_EXPORT_TABLES = ["credit_ledger", "invoices", "subscriptions", "subscription_addons", "credit_purchases"] as const;
+export type ComplianceExportTable = "audit_log" | (typeof FINANCIAL_EXPORT_TABLES)[number];
+
 export interface ComplianceExportRow {
-  readonly table: "audit_log" | "credit_ledger";
+  readonly table: ComplianceExportTable;
   readonly rows: readonly Record<string, unknown>[];
 }
 
+const FINANCIAL_ORDER: Readonly<Record<(typeof FINANCIAL_EXPORT_TABLES)[number], string>> = {
+  credit_ledger: "occurred_at, id",
+  invoices: "created_at, id",
+  subscriptions: "created_at, id",
+  subscription_addons: "created_at, id",
+  credit_purchases: "created_at, id",
+};
+
 export async function collectComplianceExport(client: ClientBase, workspaceId: string): Promise<ComplianceExportRow[]> {
   const auditLog = await client.query("SELECT * FROM audit_log WHERE workspace_id = $1 ORDER BY seq", [workspaceId]);
-  const creditLedger = await client.query("SELECT * FROM credit_ledger WHERE workspace_id = $1 ORDER BY occurred_at", [
-    workspaceId,
-  ]);
-  return [
-    { table: "audit_log", rows: auditLog.rows },
-    { table: "credit_ledger", rows: creditLedger.rows },
-  ];
+  const exports: ComplianceExportRow[] = [{ table: "audit_log", rows: auditLog.rows }];
+  for (const table of FINANCIAL_EXPORT_TABLES) {
+    // Table and ORDER BY come from the constants above, never from a caller.
+    const result = await client.query(`SELECT * FROM ${table} WHERE workspace_id = $1 ORDER BY ${FINANCIAL_ORDER[table]}`, [workspaceId]);
+    exports.push({ table, rows: result.rows });
+  }
+  return exports;
 }
 
 export interface ExecuteWorkspaceHardDeleteOptions {
@@ -277,6 +348,8 @@ export interface ExecuteWorkspaceHardDeleteOptions {
    * Its failure is a `WorkspaceObjectsLeftBehindError`: the workspace IS erased, its objects are not.
    */
   readonly deleteWorkspaceObjects?: (workspaceId: string) => Promise<void>;
+  /** STORY-111: the instant the in-transaction legal-hold check is made at (see `CascadeDeleteWorkspaceOptions`). Defaults to now: a purge ALWAYS checks. */
+  readonly holdCheckAt?: Date;
 }
 
 /** The cascade committed but the workspace's stored objects could not be deleted. The row is gone, so no later run rediscovers them: an operator must. */
@@ -324,7 +397,21 @@ export async function workspaceTablesWithoutCascade(client: ClientBase): Promise
  * re-applying a journalled purge (restore-replay.ts) calls it directly, because that purge was exported when it first ran.
  * Idempotent: deleting an already-absent workspace deletes nothing.
  */
-export async function cascadeDeleteWorkspace(privilegedClient: ClientBase, workspaceId: string): Promise<void> {
+export interface CascadeDeleteWorkspaceOptions {
+  /**
+   * STORY-111 / NFR-CMP-10: when present, the cascade re-checks for an ACTIVE legal hold (at this instant) INSIDE its own transaction, under the
+   * lock `placeLegalHold` also takes, and deletes NOTHING if one covers the workspace or one of its projects. The caller's earlier read of the
+   * holds cannot be trusted by the time the delete runs: a hold placed in between would otherwise be destroyed with the data it protects.
+   * Absent only for the restore replay, which re-applies a purge that was legitimate when it ran.
+   */
+  readonly holdCheckAt?: Date;
+}
+
+export async function cascadeDeleteWorkspace(
+  privilegedClient: ClientBase,
+  workspaceId: string,
+  options: CascadeDeleteWorkspaceOptions = {},
+): Promise<"deleted" | "held"> {
   // Blocking (code review): ENABLE TRIGGER used to run in a `finally` block
   // AFTER COMMIT — as new, separately autocommitted statements. Once COMMIT
   // ran, the disabled-trigger state was durable and visible to every OTHER
@@ -340,6 +427,13 @@ export async function cascadeDeleteWorkspace(privilegedClient: ClientBase, works
   // step is needed or run on that path.
   await privilegedClient.query("BEGIN");
   try {
+    if (options.holdCheckAt !== undefined) {
+      await lockHoldRegister(privilegedClient, workspaceId);
+      if (await workspaceHasActiveHold(privilegedClient, workspaceId, options.holdCheckAt)) {
+        await privilegedClient.query("ROLLBACK");
+        return "held";
+      }
+    }
     // STORY-143 AC7 — a tombstone, in the SAME transaction as the delete, so
     // the verifier either sees the chain and no tombstone, or neither. Without
     // it the vanished chain is indistinguishable from a deleted one and the
@@ -358,11 +452,13 @@ export async function cascadeDeleteWorkspace(privilegedClient: ClientBase, works
     }
     await privilegedClient.query("DELETE FROM workspaces WHERE id = $1", [workspaceId]);
     // STORY-111: "exactly three record sets survive". A released or lapsed legal hold names this workspace and states a reason about a legal
-    // matter; its audit rows are in the audit export, so the register row is deleted with the tenant. (An ACTIVE hold never reaches here.)
-    await privilegedClient.query("DELETE FROM legal_holds WHERE workspace_id = $1", [workspaceId]);
+    // matter; its audit rows are in the audit export, so the register row is deleted with the tenant. ONLY a released or lapsed row: an active hold
+    // is never deleted by a purge (the check above keeps it from getting here; this predicate keeps it true if that check is ever bypassed).
+    await privilegedClient.query("DELETE FROM legal_holds WHERE workspace_id = $1 AND (released_at IS NOT NULL OR expires_at <= now())", [workspaceId]);
     await privilegedClient.query("ALTER TABLE audit_log ENABLE TRIGGER reject_update_delete");
     await privilegedClient.query("ALTER TABLE credit_ledger ENABLE TRIGGER reject_update_delete");
     await privilegedClient.query("COMMIT");
+    return "deleted";
   } catch (error) {
     await privilegedClient.query("ROLLBACK");
     throw error;
@@ -373,7 +469,7 @@ export async function executeWorkspaceHardDelete(
   privilegedClient: ClientBase,
   workspaceId: string,
   options: ExecuteWorkspaceHardDeleteOptions,
-): Promise<void> {
+): Promise<"deleted" | "held"> {
   const exportData = await collectComplianceExport(privilegedClient, workspaceId);
   // STORY-020 AC "rows are retained only in the immutable export, with the
   // workspace identifier pseudonymised" — the export copy's audit_log rows
@@ -389,7 +485,10 @@ export async function executeWorkspaceHardDelete(
   // following it."
   await options.exportComplianceRecords(pseudonymisedExportData);
 
-  await cascadeDeleteWorkspace(privilegedClient, workspaceId);
+  // A hold placed after the caller read the holds is caught HERE, in the cascade's own transaction. (The export above was then written for a
+  // workspace that was not purged; a later purge writes a fresh one, and an export is a copy, not a deletion.)
+  const outcome = await cascadeDeleteWorkspace(privilegedClient, workspaceId, { holdCheckAt: options.holdCheckAt ?? new Date() });
+  if (outcome === "held") return "held";
   // AFTER the commit, with no transaction open: the objects of an erased workspace.
   if (options.deleteWorkspaceObjects !== undefined) {
     try {
@@ -398,6 +497,7 @@ export async function executeWorkspaceHardDelete(
       throw new WorkspaceObjectsLeftBehindError(workspaceId, error);
     }
   }
+  return "deleted";
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +545,11 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
       return { blocked: true, reason: SOLE_OWNER_ERASURE_BLOCK_REASON };
     }
 
+    // STORY-111 NFR-CMP-02: the address as it was BEFORE the anonymisation below, so it can be removed from every other place that stores it as
+    // a bare address (it is a free-text key there, not a reference to users).
+    const prior = await privilegedClient.query<{ email: string }>("SELECT email::text AS email FROM users WHERE id = $1", [userId]);
+    const priorEmail = prior.rows[0]?.email;
+
     await privilegedClient.query(
       `UPDATE users
           SET email = 'deleted+' || id || '@nominara.invalid',
@@ -455,6 +560,24 @@ export async function requestIndividualErasure(privilegedClient: ClientBase, use
         WHERE id = $1`,
       [userId],
     );
+    if (priorEmail !== undefined) {
+      // An invitation row is keyed by the address; with the person erased it is a record of nobody.
+      await privilegedClient.query("DELETE FROM workspace_invitations WHERE email = $1::citext", [priorEmail]);
+      // A scheduled report keeps its other recipients; one left with none is deactivated rather than left to send to an empty list.
+      await privilegedClient.query(
+        `UPDATE scheduled_reports
+            SET recipients = array_remove(recipients, $1::citext),
+                active = CASE WHEN cardinality(array_remove(recipients, $1::citext)) = 0 THEN false ELSE active END
+          WHERE recipients @> ARRAY[$1::citext]`,
+        [priorEmail],
+      );
+      // The stored copy of a downgrade notice names the address and greets the person; the row (a record that a notice was sent) stays.
+      await privilegedClient.query(
+        `UPDATE downgrade_notices SET recipient = 'deleted+' || $2::text || '@nominara.invalid', text_body = '[redacted: erasure request]'
+          WHERE lower(recipient) = lower($1)`,
+        [priorEmail, userId],
+      );
+    }
     await privilegedClient.query("UPDATE workspace_members SET status = 'removed' WHERE user_id = $1", [userId]);
     await privilegedClient.query("UPDATE task_events SET actor_id = $2, actor_type = 'system' WHERE actor_id = $1", [
       userId,
@@ -1038,6 +1161,11 @@ export interface DailyPurgeCycleOptions {
    * (an entry for a delete that rolled back would make a restore purge a live tenant). A failed append is a recorded `purge_failures` row.
    */
   readonly journal?: PurgeJournal;
+  /**
+   * TEST SEAM (STORY-111): awaited right after the cycle has read the active holds and before it purges anything - exactly the gap a hold placed
+   * mid-cycle falls into. Production passes nothing.
+   */
+  readonly afterHoldsRead?: () => Promise<void>;
   /** Builds the per-workspace `exportComplianceRecords` (object storage). Takes precedence over `exportComplianceRecords`. */
   readonly exporterFor?: (workspaceId: string) => (records: readonly ComplianceExportRow[]) => Promise<void>;
 }
@@ -1079,6 +1207,8 @@ export async function runDailyPurgeCycle(
   // A lapsed hold releases by itself (the `active` predicate is on expires_at); this records and audits that it did.
   await releaseExpiredHolds(privilegedClient, referenceDate);
   const holds = await activeHolds(privilegedClient, referenceDate);
+  // The read above is only the fast path. Each purge below re-checks inside its own transaction (see hardDeleteProject / cascadeDeleteWorkspace).
+  await options.afterHoldsRead?.();
   const held: PurgeHeld[] = [];
   let failed = 0;
   const hardDeleteCutoff = new Date(referenceDate.getTime() - 30 * 86_400_000);
@@ -1103,20 +1233,26 @@ export async function runDailyPurgeCycle(
     // exists ONLY to stop that rethrow from propagating past this one
     // project's iteration.
     try {
+      let heldInTransaction = false;
       const outcome = await tryPurgeProject(privilegedClient, project.id, async (tx) => {
         try {
           const hardDeleteOptions: HardDeleteProjectOptions = options.deleteObjectPrefix
-            ? { deleteObjectPrefix: options.deleteObjectPrefix }
-            : {};
-          await hardDeleteProject(tx, project.workspace_id, project.id, hardDeleteOptions);
+            ? { deleteObjectPrefix: options.deleteObjectPrefix, holdCheckAt: referenceDate }
+            : { holdCheckAt: referenceDate };
+          heldInTransaction = (await hardDeleteProject(tx, project.workspace_id, project.id, hardDeleteOptions)) === "held";
         } catch (error) {
           await recordPurgeFailure(tx, { scope: "project", scopeId: project.id, reason: (error as Error).message });
           throw error;
         }
       });
-      if ("purged" in outcome) {
+      if ("purged" in outcome && heldInTransaction) {
+        // A hold was placed after the holds were read; the in-transaction check kept the project (and the hold row) intact.
+        held.push({ scope: "project", scopeId: project.id, reason: "legal-hold" });
+        incrementCounter("nominara_retention_purge_held_total", { scope: "project", job: "purge" });
+      } else if ("purged" in outcome) {
         projectsPurged.push(project.id);
-        await privilegedClient.query("DELETE FROM legal_holds WHERE scope = 'project' AND scope_id = $1", [project.id]);
+        // Only a released or lapsed register row goes with the project; an active one is never deleted by a purge.
+        await privilegedClient.query("DELETE FROM legal_holds WHERE scope = 'project' AND scope_id = $1 AND (released_at IS NOT NULL OR expires_at <= now())", [project.id]);
         if (!(await journalPurge(privilegedClient, options.journal, { scope: "project", scopeId: project.id, workspaceId: project.workspace_id, reason: "project_hard_deleted" }))) failed += 1;
       } else {
         skipped.push(outcome);
@@ -1145,7 +1281,8 @@ export async function runDailyPurgeCycle(
       continue;
     }
     try {
-      await executeWorkspaceHardDelete(privilegedClient, workspace.id, {
+      const outcome = await executeWorkspaceHardDelete(privilegedClient, workspace.id, {
+        holdCheckAt: referenceDate,
         exportComplianceRecords:
           (options.exporterFor !== undefined ? options.exporterFor(workspace.id) : undefined) ??
           options.exportComplianceRecords ??
@@ -1156,13 +1293,23 @@ export async function runDailyPurgeCycle(
           }),
         ...(options.deleteWorkspaceObjects !== undefined ? { deleteWorkspaceObjects: options.deleteWorkspaceObjects } : {}),
       });
+      if (outcome === "held") {
+        // A hold was placed after the holds were read; the cascade's own check kept the workspace, its data and the hold row intact.
+        held.push({ scope: "workspace", scopeId: workspace.id, reason: "legal-hold" });
+        incrementCounter("nominara_retention_purge_held_total", { scope: "workspace", job: "purge" });
+        continue;
+      }
       workspacesPurged.push(workspace.id);
+      // CRASH WINDOW, accepted and documented (docs/plans/story-111-evidence.md): the entry is appended AFTER the cascade commits, because an entry
+      // for a delete that rolled back would make a restore purge a LIVE tenant. A process killed between the commit and this append leaves a purge
+      // with no journal entry and no purge_failures row.
       if (!(await journalPurge(privilegedClient, options.journal, { scope: "workspace", scopeId: workspace.id, workspaceId: workspace.id, reason: "workspace_deletion_executed" }))) failed += 1;
     } catch (error) {
       // The cascade committed: the workspace IS purged, and the leftover objects are an unresolved failure the operator must clear.
       if (error instanceof WorkspaceObjectsLeftBehindError) {
         workspacesPurged.push(workspace.id);
-        await journalPurge(privilegedClient, options.journal, { scope: "workspace", scopeId: workspace.id, workspaceId: workspace.id, reason: "workspace_deletion_executed" });
+        // Two problems are outstanding here (objects left behind, and possibly no journal entry): a journal failure is counted as well.
+        if (!(await journalPurge(privilegedClient, options.journal, { scope: "workspace", scopeId: workspace.id, workspaceId: workspace.id, reason: "workspace_deletion_executed" }))) failed += 1;
       }
       failed += 1;
       await recordPurgeFailure(privilegedClient, { scope: "workspace", scopeId: workspace.id, reason: (error as Error).message });

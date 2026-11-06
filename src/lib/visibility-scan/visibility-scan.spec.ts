@@ -355,3 +355,27 @@ describe("STORY-079 review round 2 - wrapper detection and the engine row's sent
     expect(r.sentiment.label).toBe(aggregateScan([r], [], ["perplexity"]).sentiment_label);
   });
 });
+
+describe("STORY-111 review - contact identifiers in a scan answer never reach the stream or the stored result (NFR-CMP-01)", () => {
+  const LEAKY = "Acme is a CRM. Questions? Mail help@acme-support.test or call +1 (415) 555-0132 for Acme pricing.";
+
+  it("toEngineResult minimises the excerpt it was given (placeholders, not the email or the phone)", async () => {
+    const parse = await parseScanAnswer({ engineKey: "perplexity", text: LEAKY, ...base });
+    const r = toEngineResult({ engine: "perplexity", parse, capturedAt: NOW, now: NOW, latencyMs: 1, cacheLayer: "none", excerpt: LEAKY });
+    expect(r.excerpt).not.toContain("help@acme-support.test");
+    expect(r.excerpt).not.toContain("555-0132");
+    expect(r.excerpt).toContain("[email]");
+    expect(r.excerpt).toContain("[phone]");
+  });
+
+  it("the streamed result AND the result handed back for persistence are both minimised", async () => {
+    const { ports: p, published } = ports({ capture: async () => ({ text: LEAKY, latencyMs: 5 }) });
+    const outcome = await run(["perplexity"], p);
+    const streamed = published.find((e) => e.kind === "engine_result");
+    expect(streamed?.kind === "engine_result" ? streamed.result.excerpt : "").toContain("[email]");
+    for (const text of [JSON.stringify(published), JSON.stringify(outcome.results)]) {
+      expect(text).not.toContain("help@acme-support.test");
+      expect(text).not.toContain("555-0132");
+    }
+  });
+});

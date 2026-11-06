@@ -1,4 +1,5 @@
 import { SCAN_SAMPLE_STATEMENT, type ScanStreamEngineResult } from "../../../contracts/tools/index.js";
+import { minimiseExcerpt } from "../compliance/minimise.js";
 import { parseCapture, type ParseResult } from "../parser/parse-capture.js";
 import { labelFor } from "../parser/sentiment/classify.js";
 import type { AliasEntry } from "../parser/entity-matcher.js";
@@ -116,7 +117,9 @@ export function toEngineResult(input: ToEngineResultInput): ScanStreamEngineResu
       const brandHost = (input.brandHost ?? "").replace(/^www\./u, "").toLowerCase();
       return { slot: c.slotIndex, domain: hint, is_owned: brandHost !== "" && isHostOrSubdomain(hint, brandHost) };
     }),
-    excerpt: input.excerpt.slice(0, EXCERPT_CHARS),
+    // STORY-111 NFR-CMP-01: contact identifiers become typed placeholders BEFORE the excerpt is streamed, shown or stored (tool_runs.result). The whole
+    // text is minimised first and then cut, so the cut can never leave half an identifier.
+    excerpt: minimiseExcerpt(input.excerpt, EXCERPT_CHARS),
     age_ms: Math.max(0, input.now.getTime() - input.capturedAt.getTime()),
     estimated: true,
   };

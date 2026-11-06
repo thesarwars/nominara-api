@@ -47,6 +47,10 @@ export async function placeLegalHold(client: ClientBase, input: PlaceLegalHoldIn
 
   await client.query("BEGIN");
   try {
+    // SERIALISED with every purge of this workspace (`holdsGuardPurge`): either the purge's check sees this hold, or this insert waits for the
+    // purge to finish and then finds the subject gone. The workspace is resolved AGAIN under the lock for exactly that second case.
+    await lockHoldRegister(client, workspaceId);
+    if ((await resolveWorkspace(client, input.scope, input.scopeId)) === null) throw new LegalHoldError("unknown_subject", `no such ${input.scope}`);
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO legal_holds (scope, scope_id, workspace_id, reason, requested_by, approved_by, created_at, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
@@ -71,6 +75,32 @@ export async function placeLegalHold(client: ClientBase, input: PlaceLegalHoldIn
     await client.query("ROLLBACK");
     throw error;
   }
+}
+
+/**
+ * Takes the transaction-scoped lock that serialises placing a hold on a workspace (or any of its projects) with purging that workspace (or any
+ * of its projects). Must be called inside an open transaction; released at COMMIT/ROLLBACK. Without it the purge's "is there a hold?" read and
+ * its delete are two steps a hold can slip between - the time-of-check/time-of-use gap that destroys the very data the hold protects.
+ */
+export async function lockHoldRegister(client: ClientBase, workspaceId: string): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`legal-hold:${workspaceId}`]);
+}
+
+/** True when an ACTIVE hold (unreleased, unexpired at `now`) covers the workspace or any project in it. Call after `lockHoldRegister`, in the purge's own transaction. */
+export async function workspaceHasActiveHold(client: ClientBase, workspaceId: string, now: Date): Promise<boolean> {
+  const rows = await client.query("SELECT 1 FROM legal_holds WHERE workspace_id = $1 AND released_at IS NULL AND expires_at > $2 LIMIT 1", [workspaceId, now.toISOString()]);
+  return (rows.rowCount ?? 0) > 0;
+}
+
+/** True when an ACTIVE hold covers this project or its workspace. Same contract as `workspaceHasActiveHold`. */
+export async function projectHasActiveHold(client: ClientBase, workspaceId: string, projectId: string, now: Date): Promise<boolean> {
+  const rows = await client.query(
+    `SELECT 1 FROM legal_holds
+      WHERE workspace_id = $1 AND released_at IS NULL AND expires_at > $3
+        AND ((scope = 'workspace' AND scope_id = $1) OR (scope = 'project' AND scope_id = $2)) LIMIT 1`,
+    [workspaceId, projectId, now.toISOString()],
+  );
+  return (rows.rowCount ?? 0) > 0;
 }
 
 async function resolveWorkspace(client: ClientBase, scope: "project" | "workspace", scopeId: string): Promise<string | null> {
