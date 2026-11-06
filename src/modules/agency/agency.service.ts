@@ -200,6 +200,19 @@ export class AgencyService {
   }
 
   /**
+   * Owner decision 71 (a) — the stored object key of a theme's light logo, for the portal to inline. Read on the same ambient transaction as
+   * `themeForPortal`, pinned to the context's workspace. null = no logo (or no such theme). The key never leaves the server.
+   */
+  async portalLogoKey(themeId: string): Promise<string | null> {
+    const { client } = this.store();
+    const result = await client.query<{ key: string | null }>(
+      `SELECT logo_light_key AS key FROM brand_themes WHERE id = $1 AND workspace_id = app.current_workspace()`,
+      [themeId],
+    );
+    return result.rows[0]?.key ?? null;
+  }
+
+  /**
    * The portal's view of a theme, by an explicit field list (default deny): the agency's mail configuration (display name,
    * Reply-To) is never part of what a portal viewer is sent, so a field added to the editor's theme later stays out of the
    * portal until it is named here.
@@ -215,7 +228,8 @@ export class AgencyService {
       color_fg: theme.color_fg,
       font_family: theme.font_family,
       // The stored logo's only route needs a workspace session and agency:branding, which an anonymous portal viewer has neither of:
-      // sending its path would be a broken image and a theme id in a URL they cannot use. null until a portal-session route exists.
+      // sending its path would be a broken image and a theme id in a URL they cannot use. So it is null HERE and PortalContextInterceptor
+      // fills it in, after its transaction, with the logo as a size-capped data: URL (owner decision 71 a; ThemeAssetsService.portalLogo).
       logo_url: null,
       hide_nominara_brand: theme.hide_nominara_brand,
       custom_css: this.safeCustomCss(theme),

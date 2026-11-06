@@ -66,7 +66,16 @@ describe("STORY-098 s8 · the portal session cookie", () => {
     expect(await openPortalCookie(wrapped, KEY)).toBeNull();
   });
 
-  it("STORY-098 s8 · a payload with a key beyond the five, or a missing scope, is refused (the cookie confers nothing else)", async () => {
+  it("STORY-098 d.71 (c) · the view id rides in the cookie when present, and a cookie minted without one still opens (a session from before it existed stays valid)", async () => {
+    const withView = { ...payload(), view_id: randomUUID() };
+    expect(await openPortalCookie((await sealPortalCookie(withView, KEY)).value, KEY)).toEqual(withView);
+    const without = payload();
+    expect((await openPortalCookie((await sealPortalCookie(without, KEY)).value, KEY))?.view_id).toBeUndefined();
+    const notAUuid = await sealPortalCookie({ ...payload(), view_id: "../../x" }, KEY);
+    expect(await openPortalCookie(notAUuid.value, KEY)).toBeNull();
+  });
+
+  it("STORY-098 s8 · a payload with a key beyond the scope fields, or a missing scope, is refused (the cookie confers nothing else)", async () => {
     const extra = await sealPortalCookie({ ...payload(), role: "owner" } as unknown as PortalCookiePayload, KEY);
     expect(await openPortalCookie(extra.value, KEY)).toBeNull();
     const empty = await sealPortalCookie({ ...payload(), scope_project_ids: [] }, KEY);

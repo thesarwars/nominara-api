@@ -13,7 +13,8 @@ import { afterTransaction } from "../../api/after-transaction.js";
 import { DegradedError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { validateThemeAsset, type ThemeAssetType } from "../../lib/theme/asset-limits.js";
 import { isStoredObjectKey } from "../../lib/reports/artifact-key.js";
-import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
+import { portalLogoDataUrl } from "../../lib/theme/portal-logo.js";
+import { BoundObjectStore, TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { AgencyService, themeAssetPath } from "./agency.service.js";
@@ -31,6 +32,8 @@ import { AgencyService, themeAssetPath } from "./agency.service.js";
 // fetch. The theme carries the platform path, never the key, the bucket host or the URL.
 
 export const THEME_ASSET_URL_SECONDS = 60;
+/** The portal's logo cache: how many distinct stored logos are kept in memory (each at most 256 KB as bytes, a third more as a data URL). */
+export const PORTAL_LOGO_CACHE_ENTRIES = 64;
 const logger = new Logger("ThemeAssets");
 const EXTENSION: Readonly<Record<ThemeAssetType, string>> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
 
@@ -41,6 +44,62 @@ export class ThemeAssetsService {
     private readonly objects: TenantObjectStore,
     private readonly auditChain: AuditChainService,
   ) {}
+
+  private readonly portalLogos = new Map<string, string | null>();
+
+  /** Owner decision 71 (a). Call INSIDE the tenant context (it only reads the workspace id); use the result after the transaction. */
+  bindForPortal(): BoundObjectStore {
+    return this.objects.bind();
+  }
+
+  /**
+   * Owner decision 71 (a) — the theme's light logo as the portal serves it: a `data:` URL of the stored bytes, re-validated, at most 256 KB,
+   * or null. Called by PortalContextInterceptor AFTER its transaction has committed and released the connection, so no transaction is held
+   * across the storage read (ADR-0003). `stored` is read through the BOUND store, which refuses (StorageTenancyError) any key outside the
+   * workspace it was bound to, so a forged row cannot make the portal serve another tenant's file.
+   *
+   * Null is never an error to the visitor, but it is never silent: every outcome is counted and logged with the workspace ID.
+   * The memory cache is keyed by workspace AND stored key (unique per upload), so a re-upload is a new entry and a logo can never be
+   * served under another tenant's session, even if a forged row names its key. Only DEFINITE outcomes are cached (a logo, or a refusal of its bytes); a
+   * storage failure is retried on the next request.
+   */
+  async portalLogo(bound: BoundObjectStore, stored: string, workspaceId: string): Promise<string | null> {
+    // The workspace is PART of the cache key: a forged row naming another tenant's key must miss, and meet the bound store's refusal.
+    const cacheKey = workspaceId + "|" + stored;
+    const hit = this.portalLogos.get(cacheKey);
+    if (hit !== undefined) {
+      incrementCounter("nominara_portal_logo_total", { outcome: hit === null ? "refused_cached" : "cache_hit" });
+      return hit;
+    }
+    let dataUrl: string | null = null;
+    let outcome: string;
+    let definite: boolean;
+    try {
+      definite = true;
+      if (!isStoredObjectKey(stored)) {
+        outcome = "invalid_key";
+      } else {
+        const result = portalLogoDataUrl(new Uint8Array(await bound.getStored("reports", stored)));
+        if (result.ok) {
+          dataUrl = result.dataUrl;
+          outcome = "served";
+        } else {
+          outcome = result.reason;
+        }
+      }
+    } catch (error) {
+      // Includes StorageTenancyError (a key outside the workspace) and a storage outage. A foreign key is definite; an outage is not.
+      outcome = error instanceof Error && error.name === "StorageTenancyError" ? "foreign_key" : "storage_error";
+      definite = outcome === "foreign_key";
+    }
+    if (definite) {
+      if (this.portalLogos.size >= PORTAL_LOGO_CACHE_ENTRIES) this.portalLogos.delete(this.portalLogos.keys().next().value as string);
+      this.portalLogos.set(cacheKey, dataUrl);
+    }
+    incrementCounter("nominara_portal_logo_total", { outcome });
+    logger.log({ span: "portal.logo", workspace_id: workspaceId, outcome, bytes: dataUrl === null ? 0 : dataUrl.length });
+    return dataUrl;
+  }
 
   async upload(params: ThemeAssetParams, body: UploadThemeAssetRequest, req: AuditableRequest): Promise<UploadThemeAssetResponse> {
     const started = Date.now();

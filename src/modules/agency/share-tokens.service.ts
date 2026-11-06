@@ -417,9 +417,9 @@ export class ShareTokensService {
    * A session mint (FR-AGY-01m, scenario 18): one atomic statement re-checks revoked / expiry / view cap, increments
    * `view_count`, clears the failure count and lock, and a view row is written in the same transaction. False means
    * the token was refused at the last possible moment (revoked or capped between lookup and now), and nothing was
-   * written. The cap is evaluated inside the UPDATE, so N parallel mints on a cap of M produce exactly M sessions.
+   * written. Returns the new view row's id (owner decision 71 c: the session's telemetry beats find the view by it), or null when refused. The cap is evaluated inside the UPDATE, so N parallel mints on a cap of M produce exactly M sessions.
    */
-  async consumeView(id: string, view: ViewFacts): Promise<boolean> {
+  async consumeView(id: string, view: ViewFacts): Promise<string | null> {
     const { client, workspaceId } = this.store();
     const updated = await client.query<{ view_count: number; label: string }>(
       `UPDATE share_tokens
@@ -432,9 +432,9 @@ export class ShareTokensService {
         RETURNING view_count, label`,
       [id],
     );
-    if (updated.rowCount !== 1) return false;
-    await client.query(
-      `INSERT INTO share_token_views (workspace_id, share_token_id, ip, user_agent, authenticated) VALUES ($1, $2, $3::inet, $4, $5)`,
+    if (updated.rowCount !== 1) return null;
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO share_token_views (workspace_id, share_token_id, ip, user_agent, authenticated) VALUES ($1, $2, $3::inet, $4, $5) RETURNING id`,
       [workspaceId, id, view.ip, view.userAgent, view.authenticated],
     );
     // FR-AGY-01o — the FIRST view notifies the agency. "First" is decided by the same atomic UPDATE that took the view
@@ -450,7 +450,7 @@ export class ShareTokensService {
       incrementCounter("nominara_portal_first_view_notifications_total", {});
       this.logger.log({ message: "portal first view notified", workspace_id: workspaceId, share_token_id: id });
     }
-    return true;
+    return inserted.rows[0]!.id;
   }
 
   /**

@@ -7,6 +7,8 @@ import { PG_POOL, PORTAL_PG_POOL } from "../../db/pg-pool.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { PortalFacts } from "../../lib/portal/portal-facts.js";
 import { AgencyService } from "../../modules/agency/agency.service.js";
+import { ThemeAssetsService } from "../../modules/agency/theme-assets.service.js";
+import type { BoundObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { ProjectsService } from "../../modules/projects/projects.service.js";
 import { WorkspacesService } from "../../modules/workspaces/workspaces.service.js";
 import { ShareTokensService, type PortalSessionPolicy } from "../../modules/agency/share-tokens.service.js";
@@ -53,6 +55,7 @@ export class PortalContextInterceptor implements NestInterceptor {
     private readonly workspaces: WorkspacesService,
     private readonly projects: ProjectsService,
     private readonly agency: AgencyService,
+    private readonly themeAssets: ThemeAssetsService,
   ) {}
 
   async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
@@ -74,12 +77,16 @@ export class PortalContextInterceptor implements NestInterceptor {
       throw new UnauthenticatedError({ message: "no portal session" });
     }
 
-    const resolved = await this.resolveOnAppPool(payload.workspace_id, payload.token_id, payload.scope_project_ids, payload.theme_id);
-    if (resolved === null) {
+    const read = await this.resolveOnAppPool(payload.workspace_id, payload.token_id, payload.scope_project_ids, payload.theme_id);
+    if (read === null) {
       incrementCounter("nominara_portal_request_refusals_total", { reason: "token_not_live" });
       logger.log(`portal request refused workspace_id=${payload.workspace_id} reason=token_not_live`);
       throw new TokenRevokedError({ message: "this link is no longer available" });
     }
+
+    // Owner decision 71 (a): the logo is read from storage HERE, after the app-pool transaction has committed and released its
+    // connection (ADR-0003), never inside it. A logo that cannot be served leaves the portal up with no logo.
+    const resolved = { policy: read.policy, facts: await this.withLogo(read.facts, read.logo, payload.workspace_id) };
 
     const session: PortalSessionContext = {
       tokenId: payload.token_id,
@@ -87,6 +94,7 @@ export class PortalContextInterceptor implements NestInterceptor {
       scopeProjectIds: payload.scope_project_ids,
       scopeTabs: payload.scope_tabs,
       themeId: payload.theme_id,
+      viewId: payload.view_id ?? null,
       policy: resolved.policy,
       facts: resolved.facts,
     };
@@ -114,7 +122,7 @@ export class PortalContextInterceptor implements NestInterceptor {
     tokenId: string,
     scopeProjectIds: readonly string[],
     themeId: string | null,
-  ): Promise<{ policy: PortalSessionPolicy; facts: PortalFacts } | null> {
+  ): Promise<{ policy: PortalSessionPolicy; facts: PortalFacts; logo: { readonly key: string; readonly bound: BoundObjectStore } | null } | null> {
     const client = await this.appPool.connect();
     try {
       return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async () => {
@@ -125,10 +133,18 @@ export class PortalContextInterceptor implements NestInterceptor {
           this.agency.themeForPortal(themeId),
           this.projects.portalEngines(scopeProjectIds),
         ]);
-        return { policy, facts: { workspace, theme, engines } };
+        // Inside the transaction only the KEY is read and the workspace is captured; the storage read comes after the commit.
+        const logoKey = await this.agency.portalLogoKey(theme.theme_id);
+        return { policy, facts: { workspace, theme, engines }, logo: logoKey === null ? null : { key: logoKey, bound: this.themeAssets.bindForPortal() } };
       });
     } finally {
       client.release();
     }
+  }
+
+  private async withLogo(facts: PortalFacts, logo: { readonly key: string; readonly bound: BoundObjectStore } | null, workspaceId: string): Promise<PortalFacts> {
+    if (logo === null) return facts;
+    const logoUrl = await this.themeAssets.portalLogo(logo.bound, logo.key, workspaceId);
+    return logoUrl === null ? facts : { ...facts, theme: { ...facts.theme, logo_url: logoUrl } };
   }
 }

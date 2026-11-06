@@ -25,6 +25,8 @@ export interface PortalSessionContext {
   readonly scopeProjectIds: readonly string[];
   readonly scopeTabs: readonly string[];
   readonly themeId: string | null;
+  /** Owner decision 71 (c) — the `share_token_views` row this session opened, from the cookie; null for a session minted before view ids existed. */
+  readonly viewId: string | null;
   /** NEW-E-099a — the token row's serving policy, re-read on every request (never from the cookie or the request). */
   readonly policy: PortalSessionPolicy;
   /** NEW-E-099a — workspace facts read on the app pool in the same per-request step (the portal role cannot read them). */
