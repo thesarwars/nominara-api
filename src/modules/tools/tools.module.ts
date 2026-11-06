@@ -5,6 +5,7 @@ import { ProjectsModule } from "../projects/projects.module.js";
 import { ToolsController } from "./tools.controller.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { ToolsService } from "./tools.service.js";
+import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
 
 // STORY-022 - system-architecture.md section 5 module inventory. Registration only - no logic here (coding-standards.md section 1's module layout).
@@ -13,7 +14,7 @@ import { VisibilityScanService } from "./visibility-scan.service.js";
 @Module({
   imports: [AuditModule, EntitlementsModule, ProjectsModule, QueueProducerModule],
   controllers: [ToolsController],
-  providers: [ToolsService, VisibilityScanService],
+  providers: [ToolsService, VisibilityScanService, PromptResearchService],
   exports: [ToolsService],
 })
 export class ToolsModule {}

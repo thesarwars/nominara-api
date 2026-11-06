@@ -14,6 +14,7 @@ import {
   type ToolRunResult,
   type ToolRunStatus,
 } from "../../../contracts/tools/index.js";
+import type { LedgerUnitDetail } from "../../../contracts/billing/ledger-unit-detail.schema.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -77,6 +78,8 @@ export interface StartToolRunInput {
    * resolved them before taking its connection passes them here.
    */
   readonly entitlements?: ResolvedEntitlementsResponse["entitlements"];
+  /** What the debit's ledger entry says it was FOR (STORY-080: Prompt Research names the prompts kept). Absent leaves the entry's detail empty. */
+  readonly unitDetail?: LedgerUnitDetail;
 }
 
 export interface StartedToolRun {
@@ -284,6 +287,7 @@ export class ToolsService {
             referenceType: "tool_run",
             referenceId: id,
             includedGrant: includedGrantOf(resolved.entitlements),
+            ...(input.unitDetail === undefined ? {} : { unitDetail: input.unitDetail }),
           });
         }
         incrementCounter("nominara_tools_runs_started_total", { tool_key: input.toolKey });

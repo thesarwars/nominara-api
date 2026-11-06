@@ -4,6 +4,8 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import {
   lookupExecuteJobPayloadSchema,
+  promptResearchJobPayloadSchema,
+  type PromptResearchJobPayload,
   SCAN_SAMPLE_STATEMENT,
   visibilityScanResultSchema,
   type LookupExecuteJobPayload,
@@ -34,6 +36,8 @@ import type { QueueHandlerContext } from "../handlers.js";
 import { buildCaptureEngineGate, buildSpendMeter } from "./capture-execute.handler.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor } from "../worker-factory.js";
 import { commitEntryIdFor } from "../../credits/internal-cost.js";
+import { aggregateResearch } from "../../prompt-research/aggregate.js";
+import { runPromptResearch, type ResearchPorts, type ResearchRunOutcome } from "../../prompt-research/run-research.js";
 
 // STORY-079 - `lookup.execute`: one Visibility Scan, on the DEDICATED interactive pool (system-architecture.md section 6.2).
 //
@@ -58,6 +62,11 @@ export const SCAN_ENGINE_TIMEOUT_MS = 30_000;
 export const SCAN_DEADLINE_MS = 45_000;
 /** After the deadline, how long a capture still in flight is given to report its cost before the usage_ledger rows are fixed. */
 export const SCAN_LATE_COST_GRACE_MS = 2_000;
+/**
+ * STORY-080 - a Prompt Research run asks up to 10 prompts of each engine, so its latency deadline is longer than a one-query scan's. BUILDER'S FIGURE, owner to confirm:
+ * the references give the scan's 45 s and no figure for this tool. The per-engine capture timeout above is unchanged.
+ */
+export const RESEARCH_DEADLINE_MS = 120_000;
 
 export interface LookupExecuteDeps {
   readonly cache?: Cache;
@@ -75,12 +84,41 @@ interface EngineWindow {
   readonly adapterVersion: string;
 }
 
+/** What one capture needs to know about the run it belongs to. */
+interface CaptureScope {
+  readonly workspaceId: string;
+  readonly toolRunId: string;
+  readonly locale: string;
+  readonly windows: ReadonlyMap<string, EngineWindow>;
+  readonly sharedCacheEnabled: boolean;
+  readonly liveCosts: Map<string, number>;
+  readonly runAbort: AbortController;
+  }
+
 interface Prepared {
   readonly payload: LookupExecuteJobPayload & { workspaceId: string };
   readonly windows: ReadonlyMap<string, EngineWindow>;
   /** False for a workspace whose plan carries `no_shared_cache`: it neither reads nor writes the cross-tenant L1. */
   readonly sharedCacheEnabled: boolean;
 }
+
+/** STORY-080 - a Prompt Research run's job state (kind `prompt_research` in the signed payload). */
+interface ResearchPrepared {
+  readonly kind: "research";
+  readonly payload: PromptResearchJobPayload & { workspaceId: string };
+  readonly windows: ReadonlyMap<string, EngineWindow>;
+  readonly sharedCacheEnabled: boolean;
+}
+
+interface ResearchFetched {
+  readonly kind: "research";
+  readonly outcome: ResearchRunOutcome;
+  readonly costs: ReadonlyMap<string, number>;
+  readonly durationMs: number;
+}
+
+const isResearchState = (state: unknown): state is ResearchPrepared | ResearchFetched => (state as { kind?: unknown }).kind === "research";
+const isResearchJob = (job: Job): boolean => ((job.data as { payload?: { kind?: unknown } }).payload ?? {}).kind === "prompt_research";
 
 interface Fetched {
   /** The vendor cost of each LIVE capture this delivery made, per engine (USD). Zero-cost fixtures are absent. */
@@ -127,6 +165,80 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         throw new Error("a scan job never converts a run");
       },
     } as unknown as ProjectsService);
+  };
+
+  // ONE CAPTURE, for a scan and for a Prompt Research cell alike: the spend ceiling, the engine gate, the timeout, the cost record and the L1 seed are the same.
+  const capturer = (scope: CaptureScope) => async (engine: string, promptText: string): Promise<LiveAnswer> => {
+      const window = scope.windows.get(engine);
+      const key = engineKeySchema.safeParse(engine);
+      if (!key.success) throw new ScanCaptureError("engine_unavailable");
+      // THE SPEND CEILING, BEFORE THE VENDOR IS CALLED. An unreadable meter fails closed.
+      if (await spend().isCeilingReached(key.data)) {
+        incrementCounter("nominara_tools_scan_spend_ceiling_blocked_total", { engine_key: key.data });
+        throw new ScanCaptureError("engine_spend_ceiling_reached");
+      }
+      const admission = await engineGate().admit(key.data);
+      if (admission.kind !== "admit") throw new ScanCaptureError(admission.kind === "skip" ? admission.errorCode : "engine_unavailable");
+      let adapter: CaptureAdapter;
+      try {
+        adapter = adapterFor(key.data);
+      } catch (error) {
+        if (error instanceof EngineRefusalError) throw new ScanCaptureError("engine_unavailable");
+        throw error;
+      }
+      const controller = new AbortController();
+      scope.runAbort.signal.addEventListener("abort", () => controller.abort(), { once: true });
+      const timer = setTimeout(() => controller.abort(), SCAN_ENGINE_TIMEOUT_MS);
+      const costs = { usd: 0 };
+      const ctx: CaptureContext = {
+        signal: controller.signal,
+        span: { setAttribute: () => undefined, recordException: () => undefined, end: () => undefined },
+        recordCost: (usd: number) => {
+          costs.usd += usd;
+        },
+      };
+      let raw: RawCapture;
+      try {
+        // `requestMode: "live"`: a person is watching, so a licensed-SERP engine takes its fast path (tracking-engine.md section 3).
+        raw = await adapter.capture({ promptText, locale: scope.locale, sampleIndex: 0, requireCitations: adapter.supportsCitations, requestMode: "live" }, ctx);
+      } catch (error) {
+        if (costs.usd > 0) {
+          scope.liveCosts.set(engine, (scope.liveCosts.get(engine) ?? 0) + costs.usd);
+          await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
+        }
+        if (error instanceof CaptureFailureError) {
+          // Our own cancellation (the scan resolved and aborted the run) is not the vendor's failure: spend is recorded above, the breaker is not told.
+          const selfCancelled = scope.runAbort.signal.aborted;
+          if (!selfCancelled) await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
+          if (classifyCaptureFailure(error.code) === null && error.code === "content_policy_refusal") throw new ScanCaptureError("content_policy_refusal");
+          throw new ScanCaptureError(error.code);
+        }
+        throw error;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (costs.usd > 0) {
+        scope.liveCosts.set(engine, (scope.liveCosts.get(engine) ?? 0) + costs.usd);
+        await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
+      }
+      await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
+      // A TRUNCATED EMPTY ANSWER is a token-budget failure, not a refusal (the scheduled path's rule): the cell failed as `malformed_response`, the breaker above
+      // already heard a success (the engine was reachable), and nothing is seeded. Cost was recorded above.
+      if (raw.text.trim() === "" && raw.truncated) {
+        incrementCounter("nominara_capture_truncated_empty_total", { engine_key: key.data });
+        throw new ScanCaptureError("malformed_response");
+      }
+      if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
+      if (window !== undefined && scope.sharedCacheEnabled) {
+        await seedSharedCache(
+          await liveCache(),
+          { workspaceId: scope.workspaceId, projectId: scope.toolRunId, runId: scope.toolRunId, promptId: scope.toolRunId, promptText, engineKey: engine, sampleIndex: 0, adapterVersion: window.adapterVersion, ttlSeconds: window.ttlSeconds, locale: scope.locale, personaHint: null, normalizerVersion: NORMALIZER_VERSION },
+          raw,
+          now(),
+        ).catch(() => undefined);
+      }
+      const citations = raw.structuredCitations?.map((c) => ({ url: c.url, slot: c.slot, ...(c.title !== undefined ? { title: c.title } : {}) }));
+      return { text: raw.text, ...(citations !== undefined ? { structuredCitations: citations } : {}), latencyMs: raw.latencyMs };
   };
 
   const prepare = async (tx: ClientBase, job: Job): Promise<Prepared | typeof PHASES_DONE> => {
@@ -187,78 +299,7 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
         await writeScanEvent(await liveCache(), env, payload.workspaceId, payload.toolRunId, event);
       },
     };
-    const captureOne = async (engine: string): Promise<LiveAnswer> => {
-        const window = windows.get(engine);
-        const key = engineKeySchema.safeParse(engine);
-        if (!key.success) throw new ScanCaptureError("engine_unavailable");
-        // THE SPEND CEILING, BEFORE THE VENDOR IS CALLED. An unreadable meter fails closed.
-        if (await spend().isCeilingReached(key.data)) {
-          incrementCounter("nominara_tools_scan_spend_ceiling_blocked_total", { engine_key: key.data });
-          throw new ScanCaptureError("engine_spend_ceiling_reached");
-        }
-        const admission = await engineGate().admit(key.data);
-        if (admission.kind !== "admit") throw new ScanCaptureError(admission.kind === "skip" ? admission.errorCode : "engine_unavailable");
-        let adapter: CaptureAdapter;
-        try {
-          adapter = adapterFor(key.data);
-        } catch (error) {
-          if (error instanceof EngineRefusalError) throw new ScanCaptureError("engine_unavailable");
-          throw error;
-        }
-        const controller = new AbortController();
-        runAbort.signal.addEventListener("abort", () => controller.abort(), { once: true });
-        const timer = setTimeout(() => controller.abort(), SCAN_ENGINE_TIMEOUT_MS);
-        const costs = { usd: 0 };
-        const ctx: CaptureContext = {
-          signal: controller.signal,
-          span: { setAttribute: () => undefined, recordException: () => undefined, end: () => undefined },
-          recordCost: (usd: number) => {
-            costs.usd += usd;
-          },
-        };
-        let raw: RawCapture;
-        try {
-          // `requestMode: "live"`: a person is watching, so a licensed-SERP engine takes its fast path (tracking-engine.md section 3).
-          raw = await adapter.capture({ promptText: payload.queryText, locale: payload.locale, sampleIndex: 0, requireCitations: adapter.supportsCitations, requestMode: "live" }, ctx);
-        } catch (error) {
-          if (costs.usd > 0) {
-            liveCosts.set(engine, costs.usd);
-            await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
-          }
-          if (error instanceof CaptureFailureError) {
-            // Our own cancellation (the scan resolved and aborted the run) is not the vendor's failure: spend is recorded above, the breaker is not told.
-            const selfCancelled = runAbort.signal.aborted;
-            if (!selfCancelled) await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
-            if (classifyCaptureFailure(error.code) === null && error.code === "content_policy_refusal") throw new ScanCaptureError("content_policy_refusal");
-            throw new ScanCaptureError(error.code);
-          }
-          throw error;
-        } finally {
-          clearTimeout(timer);
-        }
-        if (costs.usd > 0) {
-          liveCosts.set(engine, costs.usd);
-          await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
-        }
-        await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
-        // A TRUNCATED EMPTY ANSWER is a token-budget failure, not a refusal (the scheduled path's rule): the cell failed as `malformed_response`, the breaker above
-        // already heard a success (the engine was reachable), and nothing is seeded. Cost was recorded above.
-        if (raw.text.trim() === "" && raw.truncated) {
-          incrementCounter("nominara_capture_truncated_empty_total", { engine_key: key.data });
-          throw new ScanCaptureError("malformed_response");
-        }
-        if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
-        if (window !== undefined && sharedCacheEnabled) {
-          await seedSharedCache(
-            await liveCache(),
-            { workspaceId: payload.workspaceId, projectId: payload.toolRunId, runId: payload.toolRunId, promptId: payload.toolRunId, promptText: payload.queryText, engineKey: engine, sampleIndex: 0, adapterVersion: window.adapterVersion, ttlSeconds: window.ttlSeconds, locale: payload.locale, personaHint: null, normalizerVersion: NORMALIZER_VERSION },
-            raw,
-            now(),
-          ).catch(() => undefined);
-        }
-        const citations = raw.structuredCitations?.map((c) => ({ url: c.url, slot: c.slot, ...(c.title !== undefined ? { title: c.title } : {}) }));
-        return { text: raw.text, ...(citations !== undefined ? { structuredCitations: citations } : {}), latencyMs: raw.latencyMs };
-    };
+    const captureOne = (engine: string): Promise<LiveAnswer> => capturer({ workspaceId: payload.workspaceId, toolRunId: payload.toolRunId, locale: payload.locale, windows, sharedCacheEnabled, liveCosts, runAbort })(engine, payload.queryText);
     const outcome = await tracer.startActiveSpan("tools.scan.run", async (span) => {
       try {
         span.setAttributes({ "nominara.workspace_id": payload.workspaceId, "nominara.run_id": payload.toolRunId, "nominara.engines": remaining.length });
@@ -333,5 +374,127 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     return true;
   };
 
-  return phasedProcessor<Prepared, Fetched>({ prepare, run, commit, recover });
+  // ---------------------------------------------------------------------------------------------------------------------------------
+  // STORY-080 - Prompt Research: the same three phases, over prompts x engines cells.
+  //
+  // WHAT IT WRITES: `tool_runs` through ToolsService.finishRun, and the cost rows. No capture, mention or citation fact (FR-TL-11). The shared L1 is seeded with each live answer.
+  // ---------------------------------------------------------------------------------------------------------------------------------
+  const researchPrepare = async (tx: ClientBase, job: Job): Promise<ResearchPrepared | typeof PHASES_DONE> => {
+    const payload = promptResearchJobPayloadSchema.parse((job.data as { payload: unknown }).payload) as ResearchPrepared["payload"];
+    // THE RUN ROW IS THE TRUTH, not the payload: a redelivery after the run settled does nothing (at-least-once delivery).
+    const found = await tx.query<{ status: string }>("SELECT status FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1", [payload.toolRunId]);
+    if (found.rows[0]?.status !== "running") return PHASES_DONE;
+    const engines = await tx.query<{ key: string; cache_ttl_seconds: number; adapter_version: string }>(
+      "SELECT key, cache_ttl_seconds, adapter_version FROM engines WHERE key = ANY($1::text[])",
+      [payload.engines],
+    );
+    return { kind: "research", payload, windows: new Map(engines.rows.map((row) => [row.key, { ttlSeconds: row.cache_ttl_seconds, adapterVersion: row.adapter_version }])), sharedCacheEnabled: payload.sharedCacheEnabled };
+  };
+
+  const researchRun = async (prepared: ResearchPrepared): Promise<ResearchFetched> => {
+    const { payload, windows, sharedCacheEnabled } = prepared;
+    const liveCosts = new Map<string, number>();
+    const runAbort = new AbortController();
+    const inflight = new Set<Promise<LiveAnswer>>();
+    const started = now();
+    const capture = capturer({ workspaceId: payload.workspaceId, toolRunId: payload.toolRunId, locale: payload.locale, windows, sharedCacheEnabled, liveCosts, runAbort });
+    const ports: ResearchPorts = {
+      now,
+      cached: async (engine, prompt): Promise<CachedAnswer | undefined> => {
+        const window = windows.get(engine);
+        if (window === undefined) return undefined;
+        const candidate = { promptId: payload.toolRunId, promptText: prompt, engineKey: engine, sampleIndex: 0, ttlSeconds: window.ttlSeconds, adapterVersion: window.adapterVersion };
+        const hits = await probeExactHash(await liveCache(), { env, locale: payload.locale, personaHint: null, nowMs: now().getTime(), sharedCacheEnabled }, [candidate]);
+        const hit = [...hits.values()][0];
+        if (hit === undefined || hit.capturedAt === null) return undefined;
+        const text = hit.payload["text"];
+        if (typeof text !== "string") return undefined;
+        const structured = hit.payload["structured_citations"];
+        return { text, ...(Array.isArray(structured) ? { structuredCitations: structured as CachedAnswer["structuredCitations"] & object } : {}), capturedAt: new Date(hit.capturedAt) };
+      },
+      capture: (engine, prompt): Promise<LiveAnswer> => {
+        const attempt = capture(engine, prompt);
+        inflight.add(attempt);
+        void attempt.then(
+          () => inflight.delete(attempt),
+          () => inflight.delete(attempt),
+        );
+        return attempt;
+      },
+    };
+    const outcome = await tracer.startActiveSpan("tools.prompt_research.execute", async (span) => {
+      try {
+        span.setAttributes({ "nominara.workspace_id": payload.workspaceId, "nominara.run_id": payload.toolRunId, "nominara.engines": payload.engines.length, "nominara.prompts": payload.prompts.length });
+        return await runPromptResearch({ engines: payload.engines, prompts: payload.prompts, deadlineMs: deps.deadlineMs ?? RESEARCH_DEADLINE_MS }, ports);
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+    runAbort.abort();
+    await Promise.race([Promise.allSettled([...inflight]), new Promise<void>((resolve) => setTimeout(resolve, deps.lateCostGraceMs ?? SCAN_LATE_COST_GRACE_MS).unref())]);
+    return { kind: "research", outcome, costs: new Map(liveCosts), durationMs: Math.max(0, now().getTime() - started.getTime()) };
+  };
+
+  const researchCommit = async (tx: ClientBase, prepared: ResearchPrepared, fetched: ResearchFetched): Promise<void> => {
+    const { payload } = prepared;
+    const aggregate = aggregateResearch({
+      prompts: payload.prompts,
+      asked: payload.prompts.length * payload.engines.length,
+      answers: fetched.outcome.answers,
+      failures: fetched.outcome.failures,
+      engines: payload.engines,
+    });
+    // WHAT THE RUN COST US, per workspace (usage_ledger, source 'lookup'): one row per engine with its live captures (quantity x unit cost), written once per (run, engine) so a
+    // redelivered commit adds nothing. A cached answer cost nothing and has no row. The customer's own charge is the run's credit_ledger entry.
+    const commitEntryId = fetched.costs.size === 0 ? null : await commitEntryIdFor(tx, payload.workspaceId, "tool_run", payload.toolRunId);
+    for (const [engine, usd] of fetched.costs) {
+      const captures = Math.max(1, fetched.outcome.liveCaptures.get(engine) ?? 1);
+      await tx.query(
+        `INSERT INTO usage_ledger (workspace_id, metric, quantity, unit_cost_usd, engine_key, source, credits_charged, credit_ledger_id, reference_type, reference_id, cache_layer)
+         SELECT app.current_workspace(), 'capture', $5::int, $1::numeric, $2, 'lookup', 0, $4::uuid, 'tool_run', $3::uuid, 'live'
+          WHERE NOT EXISTS (SELECT 1 FROM usage_ledger WHERE workspace_id = app.current_workspace() AND reference_type = 'tool_run' AND reference_id = $3::uuid AND engine_key = $2)`,
+        [(usd / captures).toFixed(6), engine, payload.toolRunId, commitEntryId, captures],
+      );
+    }
+    const liveCount = [...fetched.outcome.liveCaptures.values()].reduce((a, b) => a + b, 0);
+    await (await tools()).finishRun(payload.toolRunId, {
+      enginesSucceeded: aggregate.enginesSucceeded,
+      enginesFailed: aggregate.enginesFailed,
+      result: aggregate.result,
+      // `null` entitiesFound = nothing answered, so nothing was measured; 0 is a measured zero (answers that named nothing).
+      headline: aggregate.entitiesFound === null ? {} : { entities_found: aggregate.entitiesFound },
+      durationMs: fetched.durationMs,
+      cacheLayer: fetched.outcome.answers.length > 0 && liveCount === 0 ? "l1" : "live",
+    });
+    incrementCounter("nominara_tools_prompt_research_answers_total", { outcome: "answered" });
+    for (const failure of fetched.outcome.failures) incrementCounter("nominara_tools_prompt_research_answers_total", { outcome: "failed", code: failure.code });
+    logger.log({
+      event: "tools.prompt_research.finished",
+      workspace_id: payload.workspaceId,
+      run_id: payload.toolRunId,
+      answers: fetched.outcome.answers.length,
+      failed: fetched.outcome.failures.length,
+      entities: aggregate.entitiesFound,
+      deadline_reached: fetched.outcome.deadlineReached,
+    });
+  };
+
+  const researchRecover = async (job: Job): Promise<boolean> => {
+    if (!isFinalAttempt(job)) return false;
+    const payload = promptResearchJobPayloadSchema.parse((job.data as { payload: unknown }).payload);
+    await (await tools()).finishRun(payload.toolRunId, { enginesSucceeded: [], enginesFailed: payload.engines, errorCode: "research_job_failed" });
+    logger.warn({ event: "tools.prompt_research.job_failed", workspace_id: (job.data as { payload: { workspaceId?: string } }).payload.workspaceId, run_id: payload.toolRunId });
+    return true;
+  };
+
+  // ONE queue, two kinds of job: the signed payload's `kind` says which. A scan's payload carries no `kind`.
+  return phasedProcessor<Prepared | ResearchPrepared, Fetched | ResearchFetched>({
+    prepare: (tx, job) => (isResearchJob(job) ? researchPrepare(tx, job) : prepare(tx, job)),
+    run: (prepared) => (isResearchState(prepared) ? researchRun(prepared as ResearchPrepared) : run(prepared as Prepared)),
+    commit: (tx, prepared, fetched) => (isResearchState(prepared) ? researchCommit(tx, prepared as ResearchPrepared, fetched as ResearchFetched) : commit(tx, prepared as Prepared, fetched as Fetched)),
+    recover: (tx, job) => (isResearchJob(job) ? researchRecover(job) : recover(tx, job)),
+  });
 }

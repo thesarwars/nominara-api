@@ -23,12 +23,11 @@ import { parseConfirmedCredits, requireConfirmedCredits } from "../../lib/credit
 import { readWallet } from "../../lib/credits/wallet.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { ResolvedEntitlementsResponse } from "../../lib/entitlements/resolution.js";
-import { captureReadyEngineKeys } from "../../lib/engines/registry.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { compensateDailyCounter } from "../../lib/usage/daily-cap.js";
 import { DID_NOT_CHECK } from "../../lib/tools/presentation.js";
-import { selectScanEngines } from "../../lib/visibility-scan/engine-set.js";
+import { toolsEngineSet } from "../../lib/tools/tools-engine-set.js";
 import { readScanEvents } from "../../lib/visibility-scan/scan-events.js";
 import { aggregateScan } from "../../lib/visibility-scan/scan-aggregate.js";
 import { PG_POOL } from "../../db/pg-pool.js";
@@ -174,18 +173,7 @@ export class VisibilityScanService {
 
   /** The plan's engine set, with display names, for one workspace. */
   private async engineSet(client: ClientBase, resolved: ResolvedEntitlementsResponse): Promise<{ engine_key: string; display_name: string }[]> {
-    const size = Number(resolved.entitlements["tools.engine_set"]?.value);
-    // The plan floor is compared in the database (plans.sort_order), exactly as the catalog's entitled-engines view does: no tier name is parsed in code.
-    const rows = await client.query<{ key: string; display_name: string }>(
-      `SELECT e.key, e.display_name
-         FROM engines e
-         JOIN plans floor ON floor.key = e.min_plan_key
-         JOIN workspaces w ON w.id = app.current_workspace()
-         JOIN plans own ON own.key = w.plan_key
-        WHERE e.status = 'active' AND floor.sort_order <= own.sort_order`,
-    );
-    const names = new Map(rows.rows.map((row) => [row.key, row.display_name]));
-    return selectScanEngines({ size: Number.isFinite(size) ? size : 0, entitled: [...names.keys()], captureReady: captureReadyEngineKeys() }).map((key) => ({ engine_key: key, display_name: names.get(key) ?? key }));
+    return await toolsEngineSet(client, resolved);
   }
 
   // ---------------------------------------------------------------------------------------------------------------------------------
