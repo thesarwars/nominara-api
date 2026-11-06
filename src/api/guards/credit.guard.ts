@@ -17,7 +17,7 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { compensateDailyCounter } from "../../lib/usage/daily-cap.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
-import { CREDITS_KEY, CREDIT_PRICE_KEY, type CreditAction } from "../decorators/credits.decorator.js";
+import { CREDITS_KEY, CREDIT_ACTIONS, CREDIT_PRICE_KEY, type CreditAction } from "../decorators/credits.decorator.js";
 import {
   ConflictError,
   DomainError,
@@ -125,6 +125,18 @@ export interface CreditReservation {
 /** §1's header, verbatim. Lowercased because Node normalises incoming header names. */
 export { CONFIRMED_CREDITS_HEADER };
 
+/**
+ * A route declared a priced action this build does not know. Fails CLOSED: an unknown action has no price entry, so
+ * resolving it would read `null`, and a null price lets the route run UNPRICED (STORY-110, unknown-key rejection).
+ * The type system forbids it at compile time; this is the runtime half, for metadata that was cast or generated.
+ */
+export class UnknownCreditActionError extends Error {
+  constructor(action: unknown) {
+    super(`route declares credit action ${JSON.stringify(action)}, which is not one of ${CREDIT_ACTIONS.join(", ")}; refusing rather than running it unpriced`);
+    this.name = "UnknownCreditActionError";
+  }
+}
+
 @Injectable()
 export class CreditGuard implements CanActivate {
   constructor(
@@ -139,6 +151,7 @@ export class CreditGuard implements CanActivate {
       context.getClass(),
     ]);
     if (action === undefined) return true;
+    if (!(CREDIT_ACTIONS as readonly unknown[]).includes(action)) throw new UnknownCreditActionError(action);
 
     const request = context.switchToHttp().getRequest<CreditScopedRequest>();
     // ⚠ NO `?? request.auth?.ws` FALLBACK, AND ITS REMOVAL IS STORY-153's ONE
