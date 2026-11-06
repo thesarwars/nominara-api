@@ -25,6 +25,7 @@ import { MembershipService } from "../../src/modules/workspaces/membership.servi
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { realisedInternalCostUsd } from "../../src/lib/credits/internal-cost.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
@@ -514,6 +515,19 @@ describe("STORY-079 · Visibility Scan", () => {
     const id = enqueued[0]!.payload["toolRunId"] as string;
     const rows = (await harness.db().query<{ engine_key: string; source: string; unit_cost_usd: string; cache_layer: string; reference_type: string }>("SELECT engine_key, source, unit_cost_usd, cache_layer, reference_type FROM usage_ledger WHERE workspace_id = $1 AND reference_id = $2", [a.workspaceId, id])).rows;
     expect(rows).toEqual([{ engine_key: "perplexity", source: "lookup", unit_cost_usd: "0.004000", cache_layer: "live", reference_type: "tool_run" }]);
+  });
+
+  it("STORY-073 AC9 - the scan's cost row is linked to the tool run's commit entry (the debit committed at accept, before the cost existed), and the ledger read sums it", async () => {
+    const a = await owner("starter");
+    adapters = { perplexity: async (ctx) => { ctx.recordCost(0.004); return raw(ANSWER, 0.004); }, chatgpt: async () => raw("HubSpot is the most common choice for this.", 0) };
+    await post(a);
+    const id = enqueued[0]!.payload["toolRunId"] as string;
+    const commit = (await harness.db().query<{ id: string; internal_cost_usd: string | null }>("SELECT id, internal_cost_usd::text FROM credit_ledger WHERE workspace_id = $1 AND entry_type = 'commit' AND reference_type = 'tool_run' AND reference_id = $2", [a.workspaceId, id])).rows;
+    expect(commit).toHaveLength(1);
+    expect(commit[0]!.internal_cost_usd).toBeNull();
+    const linked = (await harness.db().query<{ credit_ledger_id: string | null }>("SELECT credit_ledger_id FROM usage_ledger WHERE workspace_id = $1 AND reference_id = $2", [a.workspaceId, id])).rows;
+    expect(linked).toEqual([{ credit_ledger_id: commit[0]!.id }]);
+    expect(await realisedInternalCostUsd(harness.db(), commit[0]!.id)).toBe("0.004000");
   });
 
   it("round 2 - the spend meter's verdict on a Tools capture is reported: the call that crosses 80% logs the alert, and the crossing into the hard stop is logged", async () => {
