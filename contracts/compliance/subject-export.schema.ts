@@ -63,6 +63,8 @@ export const subjectRequestAuditActionSchema = z.enum([
   "subject_request.processed",
   "subject_request.completed",
   "subject_request.blocked",
+  /** Erasure queued, not run: a legal hold covers a workspace of the subject (owner decision 68b). It runs when the hold lapses or is released. */
+  "subject_request.deferred",
   "subject_request.failed",
 ]);
 export type SubjectRequestAuditAction = z.infer<typeof subjectRequestAuditActionSchema>;
