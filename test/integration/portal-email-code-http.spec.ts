@@ -401,6 +401,36 @@ describe("STORY-098 s7 · allowed-domain code sign-in", () => {
     expect((await requestCode(other, "person10@acme.test")).statusCode).toBe(429);
   });
 
+  it("STORY-098 security review · at most 30 codes per link per rolling 24 hours: the 30th is issued, the 31st is 429 rate_limited with retry_after_ms and mails nothing; the hourly caps still apply", async () => {
+    const w = await workspace();
+    const seed = async (tokenId: string, n: number): Promise<void> => {
+      // Spread 2h..23h back, a few per address, so NEITHER hourly cap is what refuses the request.
+      await harness.db().query(
+        `INSERT INTO share_token_email_codes (id, workspace_id, share_token_id, email_hash, code_hash, max_attempts, expires_at, created_at)
+         SELECT gen_random_uuid(), $1, $2, digest('seed' || (g / 3)::text, 'sha256'), 'x', 5, now() - interval '1 hour', now() - make_interval(hours => 2 + (g % 21))
+           FROM generate_series(1, $3::int) g`,
+        [w.workspaceId, tokenId, n],
+      );
+    };
+    const full = await token(w);
+    await seed(full.id, 29);
+    expect((await requestCode(full, "daily@acme.test")).statusCode).toBe(202);
+    await sentCount(1);
+    const over = await requestCode(full, "other@acme.test");
+    expect(over.statusCode).toBe(429);
+    expect(errorOf(over).code).toBe("rate_limited");
+    expect((over.json() as { error: { details: { retry_after_ms: number } } }).error.details.retry_after_ms).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(sender.sent).toHaveLength(1);
+    // Another link is unaffected by this link's day.
+    const fresh = await token(w);
+    expect((await requestCode(fresh, "daily@acme.test")).statusCode).toBe(202);
+    // The hourly per-link cap (10) still refuses well before the daily one.
+    const hourly = await token(w);
+    for (let i = 0; i < 10; i += 1) expect((await requestCode(hourly, `h${String(i)}@acme.test`)).statusCode).toBe(202);
+    expect((await requestCode(hourly, "h10@acme.test")).statusCode).toBe(429);
+  });
+
   it("STORY-098 s7 · both endpoints are rate limited per address: the code request by portal_session (burst 2), the code step by the auth class (burst 5)", async () => {
     const w = await workspace();
     const t = await token(w);

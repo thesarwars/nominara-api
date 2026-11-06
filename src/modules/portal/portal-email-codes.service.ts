@@ -3,7 +3,7 @@ import type { ClientBase } from "pg";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { hash as argon2idHash, verify as argon2idVerify, verifyDecoy } from "../../lib/crypto/argon2id.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
-import { PORTAL_CODE_ISSUE_LIMIT_PER_HOUR, PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_HOUR, PORTAL_CODE_MAX_ATTEMPTS, PORTAL_CODE_TTL_MS } from "./portal-email-code.js";
+import { PORTAL_CODE_ISSUE_LIMIT_PER_HOUR, PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_DAY, PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_HOUR, PORTAL_CODE_MAX_ATTEMPTS, PORTAL_CODE_TTL_MS } from "./portal-email-code.js";
 
 export type IssueOutcome = { readonly kind: "issued" } | { readonly kind: "rate_limited"; readonly retryAfterMs: number };
 export type CheckOutcome = "match" | "wrong" | "none";
@@ -16,7 +16,7 @@ export type CheckOutcome = "match" | "wrong" | "none";
 // Nothing here touches the network: the mail is sent by the caller AFTER the transaction commits (ADR-0003).
 @Injectable()
 export class PortalEmailCodesService {
-  /** Applies the per-address and per-link hourly caps, supersedes the address's live codes, stores the new one hashed. */
+  /** Applies the per-address and per-link hourly caps and the per-link daily cap, supersedes the address's live codes, stores the new one hashed. */
   async issue(tokenId: string, emailHash: Buffer, code: string): Promise<IssueOutcome> {
     const { client, workspaceId } = this.store();
     const perAddress = await client.query<{ n: number; retry_ms: number | null }>(
@@ -33,6 +33,14 @@ export class PortalEmailCodesService {
       [tokenId],
     );
     if ((perToken.rows[0]?.n ?? 0) >= PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_HOUR) return { kind: "rate_limited", retryAfterMs: Math.max(1, perToken.rows[0]?.retry_ms ?? 0) };
+    // The oldest code leaving the window is when the next one may be issued.
+    const perDay = await client.query<{ n: number; retry_ms: number | null }>(
+      `SELECT count(*)::int AS n, (extract(epoch from (min(created_at) + interval '24 hours' - now())) * 1000)::int AS retry_ms
+         FROM share_token_email_codes
+        WHERE workspace_id = app.current_workspace() AND share_token_id = $1 AND created_at > now() - interval '24 hours'`,
+      [tokenId],
+    );
+    if ((perDay.rows[0]?.n ?? 0) >= PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_DAY) return { kind: "rate_limited", retryAfterMs: Math.max(1, perDay.rows[0]?.retry_ms ?? 0) };
 
     await client.query(
       `UPDATE share_token_email_codes SET invalidated_at = now(), invalidated_reason = 'superseded'

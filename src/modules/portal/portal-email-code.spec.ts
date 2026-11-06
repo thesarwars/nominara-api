@@ -4,6 +4,8 @@ import {
   domainAllowed,
   generatePortalCode,
   PORTAL_CODE_ISSUE_LIMIT_PER_HOUR,
+  PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_DAY,
+  PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_HOUR,
   PORTAL_CODE_MAX_ATTEMPTS,
   PORTAL_CODE_TTL_MS,
   renderPortalCodeEmail,
@@ -15,6 +17,8 @@ describe("STORY-098 d.71 (b) · portal sign-in code primitives", () => {
     expect(PORTAL_CODE_TTL_MS).toBe(600_000);
     expect(PORTAL_CODE_MAX_ATTEMPTS).toBe(5);
     expect(PORTAL_CODE_ISSUE_LIMIT_PER_HOUR).toBeGreaterThan(0);
+    expect(PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_DAY).toBe(30);
+    expect(PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_DAY).toBeGreaterThan(PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_HOUR);
   });
 
   it("a code is exactly six digits, zero-padded, over many draws", () => {

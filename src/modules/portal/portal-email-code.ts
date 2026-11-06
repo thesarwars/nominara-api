@@ -17,6 +17,12 @@ export const PORTAL_CODE_ISSUE_LIMIT_PER_HOUR = 3;
 /** Across ALL addresses of one link: a visitor with the link cannot farm fresh five-attempt budgets by varying the address. Not from a reference. */
 export const PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_HOUR = 10;
 
+/**
+ * Across ALL addresses of one link, per rolling 24 hours (098 security review). The hourly caps alone let a link holder with no password
+ * run codes continuously (10 an hour, 5 guesses each) and, over a year, reach a material chance of a correct guess; this bounds the day.
+ */
+export const PORTAL_CODE_ISSUE_LIMIT_PER_TOKEN_PER_DAY = 30;
+
 const CODE_DIGITS = 6;
 
 /**
