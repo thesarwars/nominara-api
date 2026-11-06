@@ -17,6 +17,12 @@ const METHOD_KEY = "method";
 const GET = 0;
 const MUTATING = new Map<number, string>([[1, "POST"], [2, "PUT"], [3, "DELETE"], [4, "PATCH"]]);
 const SESSION_MINT = "portal/session";
+// STORY-099 / owner decision 71 (c): the ONE portal-session route that is a POST. It is a @PortalRoute (it needs the session cookie) but it does NOT write
+// through the portal role: the portal transaction stays READ ONLY (layer 2) and the beat is recorded on the app pool in its own tenant transaction.
+// Named here exactly, so any OTHER non-GET portal route still fails both checks below.
+const TELEMETRY_BEAT = "portal/telemetry";
+// STORY-098 (decision 71 b): the second half of the gate for an allowed-domain link. Like the mint it creates the session and is not one.
+const SESSION_VERIFY = "portal/session/verify";
 
 describe("STORY-110 · scenario 13 — the portal is read-only in the application's route table", () => {
   let routes: DiscoveredRoute[] = [];
@@ -33,15 +39,18 @@ describe("STORY-110 · scenario 13 — the portal is read-only in the applicatio
     expect(routes.some((r) => r.fullPath === SESSION_MINT)).toBe(true);
   });
 
-  it("every @PortalRoute handler is a GET", () => {
-    const offenders = routes.filter((r) => isPortalRoute(r) && verbOf(r) !== GET).map((r) => `${MUTATING.get(verbOf(r)) ?? String(verbOf(r))} ${r.fullPath}`);
+  it("every @PortalRoute handler is a GET, except the telemetry beat (decision 71 c), which is a POST and the only one", () => {
+    const offenders = routes.filter((r) => isPortalRoute(r) && verbOf(r) !== GET && r.fullPath !== TELEMETRY_BEAT).map((r) => `${MUTATING.get(verbOf(r)) ?? String(verbOf(r))} ${r.fullPath}`);
     expect(offenders).toEqual([]);
+    const beat = routes.filter((r) => r.fullPath === TELEMETRY_BEAT);
+    expect(beat.map((r) => MUTATING.get(verbOf(r)))).toEqual(["POST"]);
+    expect(beat.every(isPortalRoute)).toBe(true);
   });
 
-  it("the only mutating verb under /portal is the session mint, and it is not a @PortalRoute (it is the gate, not a session)", () => {
+  it("the only mutating verbs under /portal are the session mint and its code verification (not @PortalRoute: they are the gate, not a session) and the telemetry beat (decision 71 c)", () => {
     const mutating = routes.filter((r) => (r.fullPath === "portal" || r.fullPath.startsWith("portal/")) && MUTATING.has(verbOf(r)));
-    expect(mutating.map((r) => `${MUTATING.get(verbOf(r))!} ${r.fullPath}`)).toEqual([`POST ${SESSION_MINT}`]);
-    expect(mutating.every((r) => !isPortalRoute(r))).toBe(true);
+    expect(mutating.map((r) => `${MUTATING.get(verbOf(r))!} ${r.fullPath}`)).toEqual([`POST ${SESSION_MINT}`, `POST ${SESSION_VERIFY}`, `POST ${TELEMETRY_BEAT}`]);
+    expect(mutating.filter((r) => r.fullPath === SESSION_MINT || r.fullPath === SESSION_VERIFY).every((r) => !isPortalRoute(r))).toBe(true);
   });
 
   it("a portal route carries no permission, credit or idempotency metadata: it has no user, no wallet and nothing to write", () => {
