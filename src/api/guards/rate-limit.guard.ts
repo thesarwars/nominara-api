@@ -6,7 +6,7 @@ import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { DailyLimitReachedError, RateLimitedError } from "../errors/domain-errors.js";
 import { RateLimitBuckets } from "../rate-limit/buckets.js";
-import { defaultRouteClass, RATE_LIMIT_CLASS_KEY } from "../rate-limit/route-class.js";
+import { defaultRouteClass, RATE_LIMIT_CLASS_KEY, type RateLimitClassResolver } from "../rate-limit/route-class.js";
 import type { AuthenticatedRequest } from "./auth.guard.js";
 
 // STORY-025 T17 — replaces STORY-022's pass-through no-op.
@@ -25,6 +25,7 @@ import type { AuthenticatedRequest } from "./auth.guard.js";
 const logger = new Logger("rate-limit");
 
 interface RateLimitedRequest extends AuthenticatedRequest {
+  body?: unknown;
   url?: string;
   ip?: string;
 }
@@ -44,11 +45,11 @@ export class RateLimitGuard implements CanActivate {
     const workspaceId = request.auth?.ws ?? undefined;
     const userId = request.auth?.sub ?? undefined;
 
-    const declared = this.reflector.getAllAndOverride<RateLimitRouteClass>(RATE_LIMIT_CLASS_KEY, [
+    const declared = this.reflector.getAllAndOverride<RateLimitRouteClass | RateLimitClassResolver>(RATE_LIMIT_CLASS_KEY, [
       context.getHandler(),
       context.getClass(),
     ]);
-    const routeClass = declared ?? defaultRouteClass(request.method ?? "GET", request.url ?? "");
+    const routeClass = (typeof declared === "function" ? declared(request) : declared) ?? defaultRouteClass(request.method ?? "GET", request.url ?? "");
 
     // Unauthenticated traffic is limited, not skipped. §12 gives `/auth/*`,
     // `/portal/session` and `/public/niche-reports*` IP buckets precisely

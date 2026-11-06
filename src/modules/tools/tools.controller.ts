@@ -201,12 +201,14 @@ export class ToolsController {
   // STORY-082 - api-specification.md section 3 "Tools". Site-files mode is FREE and cached per host (a cache hit answers `completed` with no job); the full audit is
   // priced per page band, with the site files and every patch included. Verification decides scope, never price. Asynchronous (KAD-06): 202 with the run, read
   // from GET /tools/runs/{id}. 422 unsafe_target for an internal address, before anything is charged. `aux:trigger` is the permission the reference names.
+  // Rate class by mode (owner decision 71(d)): site-files is `tool_site_files`, the full audit keeps `project_aux_audits`. An unknown or missing mode takes the
+  // stricter class, so a malformed body is never counted more generously than a real one.
   @Post("aux-audit")
   @HttpCode(202)
   @Idempotent()
   @RequirePermission("aux:trigger")
   @ScopedByQuery()
-  @RateLimitClass("project_aux_audits")
+  @RateLimitClass((request) => ((request.body as { mode?: unknown } | undefined)?.mode === "site_files" ? "tool_site_files" : "project_aux_audits"))
   @Audit({ action: "tool_run.aux_audit_started", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ mode: (body as AuxAuditToolAccepted).mode, credits: (body as AuxAuditToolAccepted).credits_charged, cached: (body as AuxAuditToolAccepted).cached }) })
   @ApiContract({ operationId: "startAuxAuditTool", requestSchema: auxAuditToolRequestSchema, responseSchema: auxAuditToolAcceptedSchema })
   auxAuditStart(
@@ -219,7 +221,8 @@ export class ToolsController {
     return this.auxAudit.start(tenant, body, confirmedCredits);
   }
 
-  // STORY-082 - the free paired estimate for the full audit: the page band, the figure to echo, and what it includes. Recomputes for every `pages`.
+  // STORY-082 - the free paired estimate for the full audit: the page band, the figure to echo, and what it includes. Recomputes for every `pages`. The full audit is
+  // a paid-plan action, so the estimate answers 403 feature_not_in_plan on a plan without it (shared requireAuxAudits).
   @Get("aux-audit/estimate")
   @RequirePermission("aux:trigger")
   @ScopedByQuery()

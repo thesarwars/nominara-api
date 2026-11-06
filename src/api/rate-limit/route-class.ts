@@ -17,7 +17,10 @@ import type { RateLimitRouteClass } from "../../../contracts/common/rate-limit.s
 
 export const RATE_LIMIT_CLASS_KEY = "rateLimitClass";
 
-export const RateLimitClass = (routeClass: RateLimitRouteClass): MethodDecorator =>
+/** A route whose class depends on the request (e.g. a mode in the body) declares a resolver instead of a fixed class. */
+export type RateLimitClassResolver = (request: { body?: unknown }) => RateLimitRouteClass;
+
+export const RateLimitClass = (routeClass: RateLimitRouteClass | RateLimitClassResolver): MethodDecorator =>
   SetMetadata(RATE_LIMIT_CLASS_KEY, routeClass);
 
 /**

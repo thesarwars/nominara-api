@@ -5,8 +5,8 @@ import { z } from "zod";
 // the SHAPE of that configuration. The fifteen route classes' numbers are
 // data (src/api/rate-limit/defaults.ts), transcribed from §12's table.
 //
-// §12 defines FIFTEEN route classes (the fourteenth and fifteenth, `plan_change` and `plan_change_preview`, are
-// STORY-184's). STORY-025's own acceptance criteria
+// §12 defines SIXTEEN route classes (`plan_change` and `plan_change_preview` are STORY-184's; `tool_site_files` is owner
+// decision 71(d)'s). STORY-025's own acceptance criteria
 // list nine. The reference beats the story (spec-navigation precedence), so
 // fifteen are implemented and the story text goes on the hand-carried
 // specification-fix list.
@@ -25,6 +25,7 @@ export const rateLimitRouteClassSchema = z.enum([
   "capture_backed_tools_capped_tiers",
   "project_runs",
   "project_aux_audits",
+  "tool_site_files",
   "geo_alignment",
   "command_parse",
   "command_execute",
