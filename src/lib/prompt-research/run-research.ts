@@ -79,7 +79,8 @@ export async function runPromptResearch(input: RunResearchInput, ports: Research
       for (;;) {
         const index = next;
         next += 1;
-        if (index >= input.prompts.length) return;
+        // A closed run (the deadline fired) starts nothing more: a capture begun now would spend with no run left to record it.
+        if (closed || index >= input.prompts.length) return;
         await one(engine, index);
       }
     });

@@ -42,6 +42,10 @@ import { judgeVectors, type VectorDedupePort } from "./vector-dedupe.js";
 /** `text_hash` hex -> the id of the prompt that owns it. */
 export type ExistingHashes = ReadonlyMap<string, string> | ReadonlySet<string>;
 
+/** The documented generator defaults, shared by the project service and the Prompt Research tool so the two cannot drift. */
+export const DEFAULT_PRIORITY_SUBSET_SIZE = 6;
+export const DEFAULT_GENERATION_TEMPERATURE = 0.35;
+
 export interface GeneratePassInput {
   readonly generationBatchId: string;
   readonly workspaceId: string;

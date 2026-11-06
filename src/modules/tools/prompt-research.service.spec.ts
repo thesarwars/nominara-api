@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { PROMPT_RESEARCH_DISCOVER_COUNT, discoverPromptsResponseSchema, keepPromptsResponseSchema } from "../../../contracts/tools/index.js";
-import { PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { PROMPT_RESEARCH_DISCOVER_COUNT, discoverPromptsResponseSchema, keepPromptsRequestSchema, keepPromptsResponseSchema, promptResearchRunRequestSchema } from "../../../contracts/tools/index.js";
+import { PreconditionUnmetError, PriceChangedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import * as generate from "../../lib/promptgen/generate.js";
 import { quoteActivation } from "../../lib/promptgen/activation-charge.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
@@ -18,8 +18,8 @@ const RICH = { category_slug: "crm", personas: ["marketing_director"], verticals
 
 const ENTITLEMENTS = { "prompts.credits_per_generated": { value: 1 }, "tools.engine_set": { value: 2 } };
 
-function build(over: { price?: number } = {}) {
-  const entitlements = { ...ENTITLEMENTS, "prompts.credits_per_generated": { value: over.price ?? 1 } };
+function build(over: { price?: number | null } = {}) {
+  const entitlements = { ...ENTITLEMENTS, "prompts.credits_per_generated": { value: over.price === undefined ? 1 : over.price } };
   const startRun = vi.fn(async () => ({ id: "00000000-0000-7000-8000-0000000000aa", expiresAt: new Date(), creditsCharged: 0 }));
   const finishRun = vi.fn(async () => ({}));
   const tools = { startRun, finishRun };
@@ -63,6 +63,21 @@ describe("STORY-080 Discover", () => {
     expect(out.credits_charged).toBe(0);
     expect(startRun).not.toHaveBeenCalled();
   });
+  it("a plan that publishes no per-prompt price (Free) still gets the candidates: the keep price is null with the reason, and Discover never throws", async () => {
+    const { service, inTenant } = build({ price: null });
+    const out = await inTenant(() => service.discover({ brand_name: "Acme", context: RICH }));
+    expect(discoverPromptsResponseSchema.safeParse(out).success).toBe(true);
+    expect(out.candidates.length).toBeGreaterThan(0);
+    expect(out.keep).toMatchObject({ credits_per_prompt: null, unavailable_reason: "price_not_agreed" });
+    expect(out.credits_charged).toBe(0);
+  });
+  it("on a priced plan the keep price is a number and no reason is given (0 stays 0, not null)", async () => {
+    for (const price of [0, 1]) {
+      const { service, inTenant } = build({ price });
+      const out = await inTenant(() => service.discover({ brand_name: "Acme", context: RICH }));
+      expect(out.keep).toMatchObject({ credits_per_prompt: price, unavailable_reason: null });
+    }
+  });
   it("a discover with neither a brand nor a topic is refused", async () => {
     const { service, inTenant } = build();
     await expect(inTenant(() => service.discover({}))).rejects.toBeInstanceOf(ValidationFailedError);
@@ -102,6 +117,24 @@ describe("STORY-080 Keep", () => {
     await expect(ctx.inTenant(() => ctx.service.keep({ prompts: eleven }, "11"))).rejects.toThrow(/10/u);
     await expect(ctx.inTenant(() => ctx.service.keep({ prompts: [] }, "0"))).rejects.toBeInstanceOf(ValidationFailedError);
     expect(ctx.startRun).not.toHaveBeenCalled();
+  });
+});
+
+describe("STORY-080 Free plan keep price (OWNER DECISION OPEN: what Keep costs on Free)", () => {
+  it("keep and the keep estimate fail closed with price_not_agreed while Free publishes no price; nothing is written", async () => {
+    const { service, inTenant, startRun } = build({ price: null });
+    await expect(inTenant(() => service.keep({ prompts: ["a"] }, "1"))).rejects.toBeInstanceOf(PreconditionUnmetError);
+    await expect(inTenant(() => service.estimate({ mode: "keep", prompt_count: 2 }))).rejects.toBeInstanceOf(PreconditionUnmetError);
+    expect(startRun).not.toHaveBeenCalled();
+  });
+});
+
+describe("STORY-080 duplicate prompts", () => {
+  it("keep and run requests refuse a repeated prompt (trimmed, case-insensitive) and accept distinct ones", () => {
+    expect(keepPromptsRequestSchema.safeParse({ prompts: ["x", " X ", "y"] }).success).toBe(false);
+    expect(promptResearchRunRequestSchema.safeParse({ prompt_texts: ["x", "x"] }).success).toBe(false);
+    expect(keepPromptsRequestSchema.safeParse({ prompts: ["x", "y"] }).success).toBe(true);
+    expect(promptResearchRunRequestSchema.safeParse({ prompt_texts: ["x"] }).success).toBe(true);
   });
 });
 

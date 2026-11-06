@@ -19,7 +19,7 @@ import { parseConfirmedCredits, requireConfirmedCredits } from "../../lib/credit
 import { readWallet } from "../../lib/credits/wallet.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import type { ResolvedEntitlementsResponse } from "../../lib/entitlements/resolution.js";
-import { generatePass } from "../../lib/promptgen/generate.js";
+import { DEFAULT_GENERATION_TEMPERATURE, DEFAULT_PRIORITY_SUBSET_SIZE, generatePass } from "../../lib/promptgen/generate.js";
 import { generatedPromptPrice } from "../../lib/promptgen/activation-charge.js";
 import type { SlotContext } from "../../lib/promptgen/slots.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
@@ -49,10 +49,6 @@ const logger = new Logger("tools.prompt-research");
 
 const ENGINE_LOCALE = "en-US";
 
-export interface ResearchRequestMeta {
-  readonly requestId: string;
-}
-
 @Injectable()
 export class PromptResearchService {
   constructor(
@@ -80,6 +76,15 @@ export class PromptResearchService {
     return (await readWallet(client, context.workspaceId))?.available ?? 0;
   }
 
+  private keepPriceOrNull(entitlements: ResolvedEntitlementsResponse["entitlements"]): number | null {
+    try {
+      return generatedPromptPrice(entitlements);
+    } catch (error) {
+      if (error instanceof PreconditionUnmetError) return null;
+      throw error;
+    }
+  }
+
   // ---------------------------------------------------------------------------------------------------------------------------------
   // Discover: free. Writes nothing.
   // ---------------------------------------------------------------------------------------------------------------------------------
@@ -91,7 +96,8 @@ export class PromptResearchService {
         if (body.brand_name === undefined && body.topic === undefined) {
           throw new ValidationFailedError({ message: "name a brand_name or a topic to discover prompts for", details: { issues: [{ path: ["brand_name"], message: "required unless a topic is given" }] } });
         }
-        const price = generatedPromptPrice((await this.resolved()).entitlements);
+        // DISCOVER IS FREE AND NEVER DEPENDS ON THE KEEP PRICE: a plan that publishes none (Free) gets the candidates and a null price with the reason.
+        const keepPrice = this.keepPriceOrNull((await this.resolved()).entitlements);
         const supplied = body.context ?? {};
         const slots: SlotContext = {
           ...(body.brand_name === undefined ? {} : { brandName: body.brand_name }),
@@ -113,9 +119,9 @@ export class PromptResearchService {
           context: slots,
           existingHashes: new Set<string>(),
           batchSize: 1,
-          prioritySubsetSize: 6,
+          prioritySubsetSize: DEFAULT_PRIORITY_SUBSET_SIZE,
           naturaliser: null,
-          temperature: 0.35,
+          temperature: DEFAULT_GENERATION_TEMPERATURE,
           ...(body.topic === undefined ? {} : { topicHint: body.topic }),
         });
         span.setAttribute("nominara.tool_run.prompts_generated", pass.candidates.length);
@@ -126,7 +132,7 @@ export class PromptResearchService {
           requested: PROMPT_RESEARCH_DISCOVER_COUNT,
           generated: pass.candidates.length,
           credits_charged: 0 as const,
-          keep: { credits_per_prompt: price, max_per_save: PROMPT_RESEARCH_MAX_PROMPTS },
+          keep: { credits_per_prompt: keepPrice, unavailable_reason: keepPrice === null ? ("price_not_agreed" as const) : null, max_per_save: PROMPT_RESEARCH_MAX_PROMPTS },
           not_tracked: true as const,
           did_not_check: DID_NOT_CHECK.prompt_research,
         };
@@ -241,8 +247,7 @@ export class PromptResearchService {
   // ---------------------------------------------------------------------------------------------------------------------------------
   // Run: validate, charge per answer through the shared core, enqueue. The engines are asked by the worker.
   // ---------------------------------------------------------------------------------------------------------------------------------
-  async run(body: PromptResearchRunRequest, confirmedHeader: string | readonly string[] | undefined, _meta: ResearchRequestMeta): Promise<PromptResearchRunAccepted> {
-    void _meta;
+  async run(body: PromptResearchRunRequest, confirmedHeader: string | readonly string[] | undefined): Promise<PromptResearchRunAccepted> {
     const { context } = this.store();
     let started = false;
     return await tracer.startActiveSpan("tools.prompt_research.run", async (span) => {

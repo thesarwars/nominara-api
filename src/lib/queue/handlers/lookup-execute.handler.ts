@@ -93,7 +93,7 @@ interface CaptureScope {
   readonly sharedCacheEnabled: boolean;
   readonly liveCosts: Map<string, number>;
   readonly runAbort: AbortController;
-  }
+}
 
 interface Prepared {
   readonly payload: LookupExecuteJobPayload & { workspaceId: string };
@@ -169,76 +169,78 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
 
   // ONE CAPTURE, for a scan and for a Prompt Research cell alike: the spend ceiling, the engine gate, the timeout, the cost record and the L1 seed are the same.
   const capturer = (scope: CaptureScope) => async (engine: string, promptText: string): Promise<LiveAnswer> => {
-      const window = scope.windows.get(engine);
-      const key = engineKeySchema.safeParse(engine);
-      if (!key.success) throw new ScanCaptureError("engine_unavailable");
-      // THE SPEND CEILING, BEFORE THE VENDOR IS CALLED. An unreadable meter fails closed.
-      if (await spend().isCeilingReached(key.data)) {
-        incrementCounter("nominara_tools_scan_spend_ceiling_blocked_total", { engine_key: key.data });
-        throw new ScanCaptureError("engine_spend_ceiling_reached");
-      }
-      const admission = await engineGate().admit(key.data);
-      if (admission.kind !== "admit") throw new ScanCaptureError(admission.kind === "skip" ? admission.errorCode : "engine_unavailable");
-      let adapter: CaptureAdapter;
-      try {
-        adapter = adapterFor(key.data);
-      } catch (error) {
-        if (error instanceof EngineRefusalError) throw new ScanCaptureError("engine_unavailable");
-        throw error;
-      }
-      const controller = new AbortController();
-      scope.runAbort.signal.addEventListener("abort", () => controller.abort(), { once: true });
-      const timer = setTimeout(() => controller.abort(), SCAN_ENGINE_TIMEOUT_MS);
-      const costs = { usd: 0 };
-      const ctx: CaptureContext = {
-        signal: controller.signal,
-        span: { setAttribute: () => undefined, recordException: () => undefined, end: () => undefined },
-        recordCost: (usd: number) => {
-          costs.usd += usd;
-        },
-      };
-      let raw: RawCapture;
-      try {
-        // `requestMode: "live"`: a person is watching, so a licensed-SERP engine takes its fast path (tracking-engine.md section 3).
-        raw = await adapter.capture({ promptText, locale: scope.locale, sampleIndex: 0, requireCitations: adapter.supportsCitations, requestMode: "live" }, ctx);
-      } catch (error) {
-        if (costs.usd > 0) {
-          scope.liveCosts.set(engine, (scope.liveCosts.get(engine) ?? 0) + costs.usd);
-          await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
-        }
-        if (error instanceof CaptureFailureError) {
-          // Our own cancellation (the scan resolved and aborted the run) is not the vendor's failure: spend is recorded above, the breaker is not told.
-          const selfCancelled = scope.runAbort.signal.aborted;
-          if (!selfCancelled) await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
-          if (classifyCaptureFailure(error.code) === null && error.code === "content_policy_refusal") throw new ScanCaptureError("content_policy_refusal");
-          throw new ScanCaptureError(error.code);
-        }
-        throw error;
-      } finally {
-        clearTimeout(timer);
-      }
+    // A run already settled (deadline or finished) starts no new vendor call: its cost could not be recorded against it.
+    if (scope.runAbort.signal.aborted) throw new ScanCaptureError("deadline_exceeded");
+    const window = scope.windows.get(engine);
+    const key = engineKeySchema.safeParse(engine);
+    if (!key.success) throw new ScanCaptureError("engine_unavailable");
+    // THE SPEND CEILING, BEFORE THE VENDOR IS CALLED. An unreadable meter fails closed.
+    if (await spend().isCeilingReached(key.data)) {
+      incrementCounter("nominara_tools_scan_spend_ceiling_blocked_total", { engine_key: key.data });
+      throw new ScanCaptureError("engine_spend_ceiling_reached");
+    }
+    const admission = await engineGate().admit(key.data);
+    if (admission.kind !== "admit") throw new ScanCaptureError(admission.kind === "skip" ? admission.errorCode : "engine_unavailable");
+    let adapter: CaptureAdapter;
+    try {
+      adapter = adapterFor(key.data);
+    } catch (error) {
+      if (error instanceof EngineRefusalError) throw new ScanCaptureError("engine_unavailable");
+      throw error;
+    }
+    const controller = new AbortController();
+    const linked = AbortSignal.any([scope.runAbort.signal, controller.signal]);
+    const timer = setTimeout(() => controller.abort(), SCAN_ENGINE_TIMEOUT_MS);
+    const costs = { usd: 0 };
+    const ctx: CaptureContext = {
+      signal: linked,
+      span: { setAttribute: () => undefined, recordException: () => undefined, end: () => undefined },
+      recordCost: (usd: number) => {
+        costs.usd += usd;
+      },
+    };
+    let raw: RawCapture;
+    try {
+      // `requestMode: "live"`: a person is watching, so a licensed-SERP engine takes its fast path (tracking-engine.md section 3).
+      raw = await adapter.capture({ promptText, locale: scope.locale, sampleIndex: 0, requireCitations: adapter.supportsCitations, requestMode: "live" }, ctx);
+    } catch (error) {
       if (costs.usd > 0) {
         scope.liveCosts.set(engine, (scope.liveCosts.get(engine) ?? 0) + costs.usd);
         await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
       }
-      await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
-      // A TRUNCATED EMPTY ANSWER is a token-budget failure, not a refusal (the scheduled path's rule): the cell failed as `malformed_response`, the breaker above
-      // already heard a success (the engine was reachable), and nothing is seeded. Cost was recorded above.
-      if (raw.text.trim() === "" && raw.truncated) {
-        incrementCounter("nominara_capture_truncated_empty_total", { engine_key: key.data });
-        throw new ScanCaptureError("malformed_response");
+      if (error instanceof CaptureFailureError) {
+        // Our own cancellation (the scan resolved and aborted the run) is not the vendor's failure: spend is recorded above, the breaker is not told.
+        const selfCancelled = scope.runAbort.signal.aborted;
+        if (!selfCancelled) await engineGate().record(key.data, { outcome: "failure", code: error.code }).catch(() => undefined);
+        if (classifyCaptureFailure(error.code) === null && error.code === "content_policy_refusal") throw new ScanCaptureError("content_policy_refusal");
+        throw new ScanCaptureError(error.code);
       }
-      if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
-      if (window !== undefined && scope.sharedCacheEnabled) {
-        await seedSharedCache(
-          await liveCache(),
-          { workspaceId: scope.workspaceId, projectId: scope.toolRunId, runId: scope.toolRunId, promptId: scope.toolRunId, promptText, engineKey: engine, sampleIndex: 0, adapterVersion: window.adapterVersion, ttlSeconds: window.ttlSeconds, locale: scope.locale, personaHint: null, normalizerVersion: NORMALIZER_VERSION },
-          raw,
-          now(),
-        ).catch(() => undefined);
-      }
-      const citations = raw.structuredCitations?.map((c) => ({ url: c.url, slot: c.slot, ...(c.title !== undefined ? { title: c.title } : {}) }));
-      return { text: raw.text, ...(citations !== undefined ? { structuredCitations: citations } : {}), latencyMs: raw.latencyMs };
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (costs.usd > 0) {
+      scope.liveCosts.set(engine, (scope.liveCosts.get(engine) ?? 0) + costs.usd);
+      await recordEngineSpend(spend(), logger, key.data, costs.usd, "lookup");
+    }
+    await engineGate().record(key.data, { outcome: "success", latencyMs: raw.latencyMs }).catch(() => undefined);
+    // A TRUNCATED EMPTY ANSWER is a token-budget failure, not a refusal (the scheduled path's rule): the cell failed as `malformed_response`, the breaker above
+    // already heard a success (the engine was reachable), and nothing is seeded. Cost was recorded above.
+    if (raw.text.trim() === "" && raw.truncated) {
+      incrementCounter("nominara_capture_truncated_empty_total", { engine_key: key.data });
+      throw new ScanCaptureError("malformed_response");
+    }
+    if (raw.flags?.includes("engine_refused_to_answer") === true || raw.text.trim() === "") throw new ScanCaptureError("content_policy_refusal");
+    if (window !== undefined && scope.sharedCacheEnabled) {
+      await seedSharedCache(
+        await liveCache(),
+        { workspaceId: scope.workspaceId, projectId: scope.toolRunId, runId: scope.toolRunId, promptId: scope.toolRunId, promptText, engineKey: engine, sampleIndex: 0, adapterVersion: window.adapterVersion, ttlSeconds: window.ttlSeconds, locale: scope.locale, personaHint: null, normalizerVersion: NORMALIZER_VERSION },
+        raw,
+        now(),
+      ).catch(() => undefined);
+    }
+    const citations = raw.structuredCitations?.map((c) => ({ url: c.url, slot: c.slot, ...(c.title !== undefined ? { title: c.title } : {}) }));
+    return { text: raw.text, ...(citations !== undefined ? { structuredCitations: citations } : {}), latencyMs: raw.latencyMs };
   };
 
   const prepare = async (tx: ClientBase, job: Job): Promise<Prepared | typeof PHASES_DONE> => {
@@ -469,7 +471,8 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
       durationMs: fetched.durationMs,
       cacheLayer: fetched.outcome.answers.length > 0 && liveCount === 0 ? "l1" : "live",
     });
-    incrementCounter("nominara_tools_prompt_research_answers_total", { outcome: "answered" });
+    // Both outcomes count ANSWERS (cells), so the answered-to-failed ratio on a dashboard is true.
+    for (let i = 0; i < fetched.outcome.answers.length; i += 1) incrementCounter("nominara_tools_prompt_research_answers_total", { outcome: "answered" });
     for (const failure of fetched.outcome.failures) incrementCounter("nominara_tools_prompt_research_answers_total", { outcome: "failed", code: failure.code });
     logger.log({
       event: "tools.prompt_research.finished",

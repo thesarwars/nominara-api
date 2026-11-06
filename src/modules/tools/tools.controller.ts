@@ -157,9 +157,8 @@ export class ToolsController {
   runResearch(
     @Body(new ZodValidationPipe(promptResearchRunRequestSchema)) body: PromptResearchRunRequest,
     @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
-    @Req() request: AuditableRequest,
   ): Promise<PromptResearchRunAccepted> {
-    return this.research.run(body, confirmedCredits, { requestId: String(request.id ?? "") });
+    return this.research.run(body, confirmedCredits);
   }
 
   @Get("runs")

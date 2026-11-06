@@ -155,4 +155,21 @@ describe("STORY-080 scenarios 12, 13 - outcome of the cells", () => {
     expect(out.failures).toEqual([expect.objectContaining({ engine: "b", code: "deadline_exceeded" })]);
     expect(out.deadlineReached).toBe(true);
   });
+  it("no capture starts after the deadline: lanes stop taking cells once the run is closed", async () => {
+    let started = 0;
+    const slow: ResearchPorts = {
+      cached: async () => undefined,
+      capture: () => {
+        started += 1;
+        return new Promise((_, reject) => setTimeout(() => reject(new ResearchCaptureError("timeout")), 80));
+      },
+      now: () => new Date(),
+    };
+    const out = await runPromptResearch({ engines: ["a"], prompts: ["1", "2", "3", "4", "5", "6", "7"], deadlineMs: 30 }, slow);
+    expect(out.deadlineReached).toBe(true);
+    const atDeadline = started;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(started).toBe(atDeadline);
+    expect(atDeadline).toBe(3);
+  });
 });

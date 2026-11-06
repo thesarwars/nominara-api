@@ -152,6 +152,16 @@ describe("STORY-080 · Prompt Research", () => {
     return { userId, workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken, plan };
   }
 
+  async function member(workspace: Actor, role: "viewer" | "analyst"): Promise<Actor> {
+    const userId = uuidV7();
+    await harness.db().query(`INSERT INTO users (id, email, email_verified_at, status, created_at, updated_at) VALUES ($1,$2,now(),'active',now(),now())`, [userId, `${userId}@example.test`]);
+    await harness.db().query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1,$2,$3,'active')", [workspace.workspaceId, userId, role]);
+    const tokens = await sessions.createSession(userId);
+    const version = (await harness.db().query<{ entitlement_version: number }>("SELECT entitlement_version FROM workspaces WHERE id = $1", [workspace.workspaceId])).rows[0]!.entitlement_version;
+    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspace.workspaceId, role, null, version);
+    return { userId, workspaceId: workspace.workspaceId, cookie: cookieOf(entered), csrf: entered.csrfToken, plan: workspace.plan };
+  }
+
   const send = (a: Actor, method: "GET" | "POST", path: string, over: { body?: unknown; confirmed?: number | null; key?: string | null } = {}) => {
     const headers: Record<string, string> = { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json" };
     if (over.confirmed !== undefined && over.confirmed !== null) headers["x-nominara-confirmed-credits"] = String(over.confirmed);
@@ -182,7 +192,49 @@ describe("STORY-080 · Prompt Research", () => {
     expect(enqueued).toHaveLength(0);
   });
 
-  it("Discover is permission-gated (prompt:write): a viewer is refused 403 and an unknown body key is a 400", async () => {
+  it("Free plan: Discover works (the keep price is null with its reason); Keep and the keep estimate fail closed with price_not_agreed (OWNER DECISION OPEN: Keep price on Free); nothing is written", async () => {
+    const a = await owner("free");
+    const before = await available(a);
+    const res = await send(a, "POST", "/tools/prompt-research/discover", { body: { brand_name: "Acme CRM", context: RICH } });
+    expect(res.statusCode, res.body).toBe(200);
+    const out = (res.json() as { data: { generated: number; credits_charged: number; keep: Record<string, unknown> } }).data;
+    expect(out.generated).toBeGreaterThan(0);
+    expect(out).toMatchObject({ credits_charged: 0, keep: { credits_per_prompt: null, unavailable_reason: "price_not_agreed" } });
+    const estimate = await send(a, "GET", "/tools/prompt-research/estimate?mode=keep&prompt_count=3");
+    expect(estimate.statusCode, estimate.body).toBe(422);
+    expect(estimate.json()).toMatchObject({ error: { details: { reason: "price_not_agreed" } } });
+    const keep = await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: prompts(2) }, confirmed: 2 });
+    expect(keep.statusCode, keep.body).toBe(422);
+    expect(await available(a)).toBe(before);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(0);
+  });
+
+  it("a viewer is refused 403 naming the permission on Discover (prompt:write), Keep (prompt:write) and Run (lookup:execute); nothing is charged or started", async () => {
+    const a = await owner("starter");
+    const viewer = await member(a, "viewer");
+    const before = await available(a);
+    for (const [path, body, confirmed, permission] of [
+      ["/tools/prompt-research/discover", { brand_name: "Acme" }, null, "prompt:write"],
+      ["/tools/prompt-research/keep", { prompts: prompts(1) }, 1, "prompt:write"],
+      ["/tools/prompt-research/run", { prompt_texts: prompts(1) }, 10, "lookup:execute"],
+    ] as const) {
+      const res = await send(viewer, "POST", path, { body, confirmed });
+      expect(res.statusCode, `${path} ${res.body}`).toBe(403);
+      expect(res.body).toContain(permission);
+    }
+    expect(await available(a)).toBe(before);
+    expect(enqueued).toHaveLength(0);
+  });
+
+  it("a repeated prompt is a 400 on keep and on run (ignoring case); nothing is charged", async () => {
+    const a = await owner("starter");
+    const before = await available(a);
+    expect((await send(a, "POST", "/tools/prompt-research/keep", { body: { prompts: ["same prompt", "SAME prompt"] }, confirmed: 2 })).statusCode).toBe(400);
+    expect((await send(a, "POST", "/tools/prompt-research/run", { body: { prompt_texts: ["same prompt", "same prompt "] }, confirmed: 20 })).statusCode).toBe(400);
+    expect(await available(a)).toBe(before);
+  });
+
+  it("Discover is permission-gated: an unknown body key is a 400, and an empty body is a 400", async () => {
     const a = await owner("starter");
     expect((await send(a, "POST", "/tools/prompt-research/discover", { body: { brand_name: "Acme", engines: ["chatgpt"] } })).statusCode).toBe(400);
     expect((await send(a, "POST", "/tools/prompt-research/discover", { body: {} })).statusCode).toBe(400);
