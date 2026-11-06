@@ -65,6 +65,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0112_share_token_lookup_definer_owner",
       // STORY-013 (ADR-0004) — checkRls() expects the seven maintenance_count_* policies migration 0160 creates (computeDefinerOwnerPolicies).
       "0160_maintenance_count_definer",
+      // STORY-067 — the eighth post-0006 tenant table (task_verifications); its policy ships in migration 0163.
+      "0163_task_verifications",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");
