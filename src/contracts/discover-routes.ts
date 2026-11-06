@@ -143,8 +143,13 @@ function findControllerFiles(): string[] {
 export async function discoverContractRoutes(): Promise<DiscoveredContractRoute[]> {
   const routes: DiscoveredContractRoute[] = [];
 
-  for (const absolutePath of findControllerFiles()) {
-    const module = (await import(pathToFileURL(absolutePath).href)) as Record<string, unknown>;
+  // Imported concurrently, then walked in the sorted order: the module graph
+  // behind ~100 controllers is the whole cost of a cold call, and awaiting each
+  // import in turn serialised its file reads and transforms.
+  const files = findControllerFiles();
+  const modules = await Promise.all(files.map(async (file) => (await import(pathToFileURL(file).href)) as Record<string, unknown>));
+
+  for (const module of modules) {
 
     for (const [controllerName, exported] of Object.entries(module)) {
       if (!isControllerClass(exported)) continue;

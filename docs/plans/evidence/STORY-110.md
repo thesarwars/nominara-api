@@ -46,3 +46,10 @@ Triaged without a code change:
 - STORY-110 status: ACs "Guarded-fetch rejection", "Unknown keys", "Portal read-only" (all three layers asserted), "Enumeration" (workspace id), "Prompt injection" (parser, arbiter, crawled pages, task generation) move to Met in the api; the rest stay open as listed above.
 - security-and-tenancy.md: state that `POST /workspaces/:id/switch` refuses a non-member identically whether or not the workspace exists (F-3); decide T-3 wording.
 - edge-cases-and-slos.md EC-49: define the abuse signal (metric names, thresholds) before it is built.
+
+## Owner decision 68(e) and slow unit specs
+
+- CSV export: a cell starting `-` is quote-prefixed only when it is not a plain decimal number (`src/lib/reports/export-csv.ts`; `test/unit/reports/export-csv-injection.spec.ts`, red first: 5 failures, then green). `= + @ tab CR` still prefix.
+- Slow unit specs: the cost is the cold import of every `*.controller.ts` graph in `discoverContractRoutes()` (awaited serially), paid once per contract/client spec file. Imports now run concurrently (worked-example 2.95 s to 1.8 s cold). No timeout changed.
+- Not fixable by code: `guarded-fetch.test.ts` scenario 15 waits a real 10 s by design; `document-model-budget.test.ts` is a latency budget; `worker.spec.ts` boots the app context per test (about 2.2 s each).
+- Doc note: the CSV rule in the reports reference should read "quote prefix on `-` only for non-numeric cells".
