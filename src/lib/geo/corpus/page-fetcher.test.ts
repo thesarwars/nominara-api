@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { CrawlRefusal } from "../../net/crawl-gate.js";
 import { GuardedFetchRefusal, guardedFetch } from "../../net/guarded-fetch.js";
 import { createGuardedPageFetcher } from "./page-fetcher.js";
 
@@ -44,5 +45,26 @@ describe("guarded page fetcher - STORY-058 AC4 / scenario 5", () => {
     })("https://x.example/");
     expect(seen.headers?.["user-agent"]).toMatch(/^NominaraBot\//);
     expect(seen.truncateAtCap).toBe(true);
+  });
+});
+
+vi.mock("../../net/crawl-gate.js", async (importOriginal) => ({ ...(await importOriginal<object>()), crawlGatedFetch: vi.fn() }));
+
+describe("page fetcher - decision 70(d) robots gate", () => {
+  it("a robots refusal is a refused result with its reason, and the page was not fetched", async () => {
+    const fetcher = createGuardedPageFetcher(async () => {
+      throw new CrawlRefusal("robots_disallowed");
+    });
+    await expect(fetcher("https://x.example/private")).resolves.toEqual({ kind: "refused", reason: "robots_disallowed" });
+    const unavailable = createGuardedPageFetcher(async () => {
+      throw new CrawlRefusal("robots_unavailable");
+    });
+    await expect(unavailable("https://x.example/p")).resolves.toEqual({ kind: "refused", reason: "robots_unavailable" });
+  });
+  it("the DEFAULT fetch is the robots-gated one", async () => {
+    const { crawlGatedFetch } = await import("../../net/crawl-gate.js");
+    vi.mocked(crawlGatedFetch).mockResolvedValue(ok("<p>hi</p>"));
+    await expect(createGuardedPageFetcher()("https://x.example/p")).resolves.toEqual({ kind: "html", html: "<p>hi</p>" });
+    expect(crawlGatedFetch).toHaveBeenCalledTimes(1);
   });
 });

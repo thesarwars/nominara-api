@@ -2,7 +2,7 @@ import type { SiteFileEvidence, SiteFileFinding } from "../../../contracts/aux/i
 import { SITE_FILE_EVIDENCE_SNIPPET_MAX } from "../../../contracts/aux/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { elementsOf, firstElement } from "./xml-scan.js";
-import { blockingRule, parseRobots, rulesFor, type RobotsRule } from "./robots.js";
+import { blockingRule, parseRobots, rulesFor, type RobotsRule } from "../net/robots.js";
 
 // NEW-C-8 (STORY-051 subset) — pure evaluators for the three site files:
 // robots.txt (AUX-R-001, 002, 003), llms.txt (AUX-R-004) and the sitemap

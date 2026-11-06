@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+import { CrawlRefusal } from "../../../src/lib/net/crawl-gate.js";
 import { GuardedFetchRefusal, type GuardedResponse } from "../../../src/lib/net/guarded-fetch.js";
 import {
   PRESENCE_CACHE_DAYS,
   isDemoDomain,
+  SeededFetchError,
+  fetchSeededTarget,
   selectPresenceChecks,
+  type SeededVerificationPlan,
   verifyUrlPresence,
   type PresenceCandidate,
 } from "../../../src/lib/sources/verify-presence.js";
@@ -192,5 +196,25 @@ describe("NEW-C-15 · isDemoDomain — only a real citation verifies", () => {
     ["reviews.dev", false],
   ])("%s -> %s", (domain, expected) => {
     expect(isDemoDomain(domain)).toBe(expected);
+  });
+});
+
+// Decision 70(d) - a path robots.txt disallows is a TERMINAL answer for the verification (retrying changes nothing), and a robots.txt
+// that could not be read is transient (retried, like any fetch error).
+describe("decision 70(d) - the crawl gate's refusals in the presence check", () => {
+  const brand = { name: "Acme", aliases: [], negativeAliases: [] };
+  it("robots_disallowed is a failed outcome with its own reason, and the seeded check does not retry it", async () => {
+    const fetch = async (): Promise<never> => {
+      throw new CrawlRefusal("robots_disallowed");
+    };
+    await expect(verifyUrlPresence("https://x.example/p", brand, fetch)).resolves.toEqual({ status: "failed", reason: "robots_disallowed" });
+    await expect(fetchSeededTarget({ url: "https://x.example/p", brand } as unknown as SeededVerificationPlan, fetch)).resolves.toEqual({ status: "failed", reason: "robots_disallowed" });
+  });
+  it("robots_unavailable is a fetch_error (transient): the seeded check retries it", async () => {
+    const fetch = async (): Promise<never> => {
+      throw new CrawlRefusal("robots_unavailable");
+    };
+    await expect(verifyUrlPresence("https://x.example/p", brand, fetch)).resolves.toEqual({ status: "failed", reason: "fetch_error" });
+    await expect(fetchSeededTarget({ url: "https://x.example/p", brand } as unknown as SeededVerificationPlan, fetch)).rejects.toBeInstanceOf(SeededFetchError);
   });
 });

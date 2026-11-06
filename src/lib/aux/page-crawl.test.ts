@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { GuardedFetchRefusal, type GuardedResponse } from "../net/guarded-fetch.js";
 import { crawlPages, NOMINARA_USER_AGENT, type PageCrawlDeps } from "./page-crawl.js";
 import { PolitenessBudget } from "./politeness.js";
-import { parseRobots } from "./robots.js";
+import { parseRobots } from "../net/robots.js";
 import { RendererUnavailable, unavailableRenderer, type Renderer } from "./renderer.js";
 
 const sha = (b: Buffer | string): string => createHash("sha256").update(b).digest("hex");

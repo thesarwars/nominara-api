@@ -1,8 +1,12 @@
-import { GuardedFetchRefusal, guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
-import { NOMINARA_USER_AGENT } from "../../aux/page-crawl.js";
+import { CrawlRefusal, crawlGatedFetch } from "../../net/crawl-gate.js";
+import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
+import { NOMINARA_USER_AGENT } from "../../net/user-agent.js";
 
 // STORY-058 AC4 - the page fetch for a citation that carried no text directive. It goes through the SSRF-guarded fetcher
 // (STORY-049's `guardedFetch`), so a citation URL that resolves to an internal address is REFUSED at the guard, not fetched.
+//
+// Owner decision 70(d): the default fetch is the shared crawl gate (robots.txt + per-host budget) over the guard, so a path the site disallows
+// is a `refused` result (`robots_disallowed` / `robots_unavailable`) and is never requested.
 //
 // A result, never an exception: one blocked, refused or dead URL is a fact about that URL, and the corpus builder records it and
 // carries on (a partial corpus is an explicit `partial` build, never a swallowed error). Reasons are short codes - never the
@@ -17,13 +21,13 @@ export type PageFetcher = (url: string) => Promise<PageFetchResult>;
 
 type FetchImpl = (url: string, init: GuardedFetchInit) => Promise<GuardedResponse>;
 
-export function createGuardedPageFetcher(fetchImpl: FetchImpl = (url, init) => guardedFetch(url, init)): PageFetcher {
+export function createGuardedPageFetcher(fetchImpl: FetchImpl = crawlGatedFetch): PageFetcher {
   return async (url) => {
     let response: GuardedResponse;
     try {
       response = await fetchImpl(url, { headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" }, truncateAtCap: true });
     } catch (error) {
-      if (error instanceof GuardedFetchRefusal) return { kind: "refused", reason: error.reason };
+      if (error instanceof GuardedFetchRefusal || error instanceof CrawlRefusal) return { kind: "refused", reason: error.reason };
       return { kind: "failed", reason: "fetch_error" };
     }
     if (response.status < 200 || response.status >= 300) return { kind: "failed", reason: `http_${String(response.status)}` };
