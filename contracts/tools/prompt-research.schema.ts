@@ -15,8 +15,10 @@ import { generatableArchetypeSchema } from "../prompts/archetype.schema.js";
 
 /** FR-TL-01: Discover generates 15 prompts. */
 export const PROMPT_RESEARCH_DISCOVER_COUNT = 15;
-/** FR-TL-01: a run is capped at 10 prompts. `tool_runs.ck_tr_shape` caps `prompt_texts` at the same 10, so a keep is capped there too. */
+/** FR-TL-01: a run is capped at 10 prompts. */
 export const PROMPT_RESEARCH_MAX_PROMPTS = 10;
+/** OWNER DECISION 67f: a Keep saves up to the 15 that Discover generates. `tool_runs.ck_tr_shape` caps `prompt_texts` at the same 15 (migration 0167). */
+export const PROMPT_RESEARCH_MAX_KEPT_PER_SAVE = 15;
 /** product-spec.md section 11: "5 per answer". An answer is one prompt asked of one engine. */
 export const PROMPT_RESEARCH_CREDITS_PER_ANSWER = 5;
 /** FR-TL-01f: an entity detected fewer than 3 times across the run is not a peer of a repeatedly named one. */
@@ -68,7 +70,7 @@ export const keepPromptsRequestSchema = z
     prompts: z
       .array(promptTextSchema)
       .min(1, "keep at least one prompt")
-      .max(PROMPT_RESEARCH_MAX_PROMPTS, `at most ${String(PROMPT_RESEARCH_MAX_PROMPTS)} prompts can be kept in one save`)
+      .max(PROMPT_RESEARCH_MAX_KEPT_PER_SAVE, `at most ${String(PROMPT_RESEARCH_MAX_KEPT_PER_SAVE)} prompts can be kept in one save`)
       .refine(noDuplicatePrompts, DUPLICATE_PROMPTS),
     brand_name: subjectText.optional(),
     topic: subjectText.optional(),
@@ -101,7 +103,7 @@ export const promptResearchEstimateResponseSchema = z
     mode: z.enum(["keep", "run"]),
     prompt_count: z.number().int().nonnegative(),
     max_prompts: z.number().int().positive(),
-    /** False when the selection is above the cap: the control blocks the eleventh prompt with the reason, rather than failing server-side. */
+    /** False when the selection is above the cap for the mode (15 kept, 10 run): the control blocks the extra prompt with the reason, rather than failing server-side. */
     within_cap: z.boolean(),
     /** The engines a run will use, named BEFORE it (FR-TL-07); empty for a keep. */
     engines: z.array(z.object({ engine_key: z.string().min(1), display_name: z.string().min(1) }).strict()),

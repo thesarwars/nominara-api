@@ -58903,7 +58903,7 @@
                 "properties": {
                   "prompts": {
                     "minItems": 1,
-                    "maxItems": 10,
+                    "maxItems": 15,
                     "type": "array",
                     "items": {
                       "type": "string",
