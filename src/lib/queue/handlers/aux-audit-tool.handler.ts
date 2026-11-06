@@ -25,7 +25,7 @@ import type { QueueHandlerContext } from "../handlers.js";
 //   commit    one short tenant transaction: the result, the headline and the settlement. Nothing delivered is refunded in full; a partial audit is charged in full.
 //
 // WHAT IT WRITES: `tool_runs` through ToolsService.finishRun and one cache key. No `aux_audits`, `aux_findings` or `patches` row, no fact row (FR-TL-11).
-// THERE IS NO SECOND FETCH PATH: the fetches are tool-audit.ts's, and that file imports `guardedFetch` and no socket module.
+// THERE IS NO SECOND FETCH PATH: the fetches are aux-audit-run.ts's, and that file imports `guardedFetch` and no socket module.
 
 const logger = new Logger("lookup.execute.aux-audit");
 const tracer = trace.getTracer("nominara-api");
@@ -86,7 +86,7 @@ export function createAuxAuditToolPhases(context: QueueHandlerContext, deps: Aux
     } catch {
       domain = "";
     }
-    const verified = domain === "" ? false : (await tx.query("SELECT 1 FROM domain_verifications dv JOIN projects p ON p.id = dv.project_id WHERE dv.domain = $1 AND dv.verified_at IS NOT NULL AND p.deleted_at IS NULL LIMIT 1", [domain])).rows.length > 0;
+    const verified = domain === "" ? false : (await tx.query("SELECT 1 FROM domain_verifications dv JOIN projects p ON p.id = dv.project_id WHERE dv.workspace_id = app.current_workspace() AND p.workspace_id = app.current_workspace() AND dv.domain = $1 AND dv.verified_at IS NOT NULL AND p.deleted_at IS NULL LIMIT 1", [domain])).rows.length > 0;
     // The catalog is versioned data; its weights are asserted again when the engine loads it.
     const catalog = await tx.query<Omit<ToolCatalogRow, "weight"> & { weight: string | number }>(
       "SELECT code, category, title, weight, rule_version, thresholds, task_threshold, auto_fixable, rationale FROM aux_rule_catalog",
@@ -104,7 +104,7 @@ export function createAuxAuditToolPhases(context: QueueHandlerContext, deps: Aux
         if (outcome.kind === "done" && payload.mode === "site_files") {
           // Cached per host (AC1) so a repeat check costs nothing and adds no load. A cache that cannot be written is logged, never fatal: the answer is still delivered.
           try {
-            await writeSiteFilesCache(await liveCache(), cacheKeyNamespace(), outcome.result.host, outcome.result.site_files);
+            await writeSiteFilesCache(await liveCache(), cacheKeyNamespace(), new URL(payload.targetUrl).origin, outcome.result.site_files);
           } catch (error) {
             logger.warn({ event: "tools.aux_audit.cache_write_failed", workspace_id: payload.workspaceId, error: error instanceof Error ? error.name : "unknown" });
           }

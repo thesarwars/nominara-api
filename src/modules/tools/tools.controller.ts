@@ -224,8 +224,10 @@ export class ToolsController {
   @RequirePermission("aux:trigger")
   @ScopedByQuery()
   @ApiContract({ operationId: "estimateAuxAuditTool", querySchema: auxAuditToolEstimateQuerySchema, responseSchema: auxAuditToolEstimateSchema })
-  auxAuditEstimate(@Query(new ZodValidationPipe(auxAuditToolEstimateQuerySchema)) query: AuxAuditToolEstimateQuery): Promise<AuxAuditToolEstimate> {
-    return this.auxAudit.estimate(query.pages);
+  auxAuditEstimate(@Query(new ZodValidationPipe(auxAuditToolEstimateQuerySchema)) query: AuxAuditToolEstimateQuery, @Req() request: AuditableRequest): Promise<AuxAuditToolEstimate> {
+    const tenant = request.tenant;
+    if (tenant === undefined) throw new Error("the aux-audit estimate route has no tenant context: WorkspaceGuard did not run");
+    return this.auxAudit.estimate(tenant, query.pages);
   }
 
   @Get("runs")

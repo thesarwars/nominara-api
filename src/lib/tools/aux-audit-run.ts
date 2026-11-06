@@ -439,10 +439,8 @@ export function siteFilesAccess(args: {
   sitemapCount: number;
   checkedAt: Date;
 }): AuxSiteFilesAccess {
-  const rootPath = (() => {
-    const u = new URL(args.rootUrl);
-    return `${u.pathname}${u.search}`;
-  })();
+  // The SITE-ROOT reading: the verdict is for `/`, whatever path was asked, because the reading is cached per origin and shared (site-files-cache.ts).
+  const rootPath = "/";
   const robotsStatus = args.robots.responded ? args.robots.status : null;
   // No file (404/410) means no rules: everything is allowed. A file we could not read (unreachable, 5xx) is NOT "allowed by default".
   const rulesKnown = args.parsedRobots !== null || (robotsStatus !== null && robotsStatus >= 400 && robotsStatus < 500);

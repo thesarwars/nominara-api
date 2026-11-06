@@ -238,6 +238,49 @@ describe("STORY-082 - the AUX audit tool", () => {
     expect(fetched.every((p) => ["/robots.txt", "/llms.txt", "/.well-known/llms.txt", "/sitemap.xml"].includes(p))).toBe(true);
   });
 
+  it("scenario 3b - full mode is a PAID-plan action (decision 47): Free is refused 403 feature_not_in_plan before any write; Free site_files stays free; Starter is accepted", async () => {
+    const free = await owner("free");
+    const before = await available(free);
+    const refused = await full(free);
+    expect(refused.statusCode, refused.body).toBe(403);
+    expect(refused.json()).toMatchObject({ error: { code: "feature_not_in_plan", details: { key: "aux.scheduled_audits" } } });
+    expect((refused.json() as { error: { details: { min_plan: string } } }).error.details.min_plan).not.toBe("free");
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [free.workspaceId])).toBe(0);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1", [free.workspaceId])).toBe(0);
+    expect(enqueued).toHaveLength(0);
+    expect(await available(free)).toBe(before);
+    const est = await get(free, "/tools/aux-audit/estimate?pages=3");
+    expect(est.statusCode, est.body).toBe(403);
+    const sf = await siteFiles(free);
+    expect(sf.statusCode, sf.body).toBe(202);
+    expect((sf.json() as { data: Record<string, unknown> }).data).toMatchObject({ credits_charged: 0 });
+    await settle();
+    const starter = await owner("starter");
+    expect((await full(starter)).statusCode).toBe(202);
+    await settle();
+  });
+
+  it("scenario 2b - the cache is keyed by ORIGIN and holds a site-root reading: a different path never changes the verdict, a different scheme is a different entry", async () => {
+    site["/robots.txt"] = reply(200, "User-agent: GPTBot\nDisallow: /blog/\n");
+    const a = await owner("free");
+    const first = await siteFiles(a, `${ORIGIN}/blog/post`);
+    expect(first.statusCode, first.body).toBe(202);
+    await settle();
+    const d1 = await detail(a, lastRun());
+    expect(d1.result!.site_files.agents.find((x) => x.agent === "GPTBot")?.access).toBe("allowed");
+    const b = await owner("starter");
+    const second = await siteFiles(b, `${ORIGIN}/`);
+    expect((second.json() as { data: Record<string, unknown> }).data).toMatchObject({ status: "completed", cached: true });
+    const d2 = await detail(b, (second.json() as { data: { tool_run_id: string } }).data.tool_run_id);
+    expect(d2.result!.site_files.agents.find((x) => x.agent === "GPTBot")?.access).toBe("allowed");
+    const plain = await siteFiles(b, "http://acme.example/");
+    expect((plain.json() as { data: Record<string, unknown> }).data).toMatchObject({ status: "running", cached: false });
+    await settle();
+    const other = await siteFiles(b, "https://acme.example:8443/");
+    expect((other.json() as { data: Record<string, unknown> }).data).toMatchObject({ cached: false });
+    await settle();
+  });
+
   it("scenario 2 - a repeat on the same host is served from the cache: completed in the request, no job, no fetch, no charge - even for another workspace", async () => {
     const a = await owner("free");
     await siteFiles(a);
@@ -274,7 +317,7 @@ describe("STORY-082 - the AUX audit tool", () => {
     expect(audit.pages).toMatchObject({ raw_fetched: 3, rendered_fetched: 3, judged: 3 });
     expect(audit.charge).toEqual({ credits: 10, band_label: "up to 25 pages", site_files_included: true, patches_credits: 0 });
     expect(audit.findings.length).toBeGreaterThan(0);
-    // Postgres jsonb does not keep key order, so "leads with" is the field's presence and text (the renderer's key order is asserted in tool-audit.test.ts).
+    // Postgres jsonb does not keep key order, so "leads with" is the field's presence and text (the renderer's key order is asserted in aux-audit-run.test.ts).
     expect(audit.findings.every((f) => typeof f.consequence === "string" && f.consequence.length > 0)).toBe(true);
     expect(audit.patches_included).toBeGreaterThan(0);
     for (const f of audit.findings.filter((x) => x.patch !== null)) expect(f.patch).toMatchObject({ free: true, credits_charged: 0 });

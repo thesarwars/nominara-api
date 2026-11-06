@@ -9,6 +9,7 @@ import {
 } from "../../../contracts/tools/index.js";
 import { PriceChangedError, UnsafeTargetError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { auxAuditEstimate } from "../../lib/aux/audit-band.js";
+import { requireAuxAudits } from "../../lib/aux/plan-gate.js";
 import { pageCapForPlan } from "../../lib/aux/page-selection.js";
 import { readSiteFilesCache } from "../../lib/aux/site-files-cache.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
@@ -47,7 +48,11 @@ export class AuxAuditToolService {
   ) {}
 
   /** The free paired estimate: the band, the figure, and what it includes. Recomputed from the page count on every call; no ledger row, no run, no job. */
-  async estimate(pages: number | undefined): Promise<AuxAuditToolEstimate> {
+  async estimate(tenant: TenantContext, pages: number | undefined): Promise<AuxAuditToolEstimate> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("AuxAuditToolService requires an active tenant context");
+    // The quote is for the full audit, which a Free workspace cannot start: it is refused here too rather than quoting a price for an action that is refused.
+    await requireAuxAudits(store.client, (await this.entitlements.resolveForWorkspace(tenant.workspaceId)).entitlements);
     const cap = await this.pageCap();
     try {
       const estimate = auxAuditEstimate(pages ?? cap, cap);
@@ -77,10 +82,13 @@ export class AuxAuditToolService {
         const store = currentTenantStore();
         if (store === undefined) throw new Error("AuxAuditToolService requires an active tenant context");
         const host = new URL(body.url).hostname.toLowerCase();
-        const verified = (await store.client.query("SELECT 1 FROM domain_verifications dv JOIN projects p ON p.id = dv.project_id WHERE dv.domain = $1 AND dv.verified_at IS NOT NULL AND p.deleted_at IS NULL LIMIT 1", [rootDomain])).rows.length > 0;
+        const verified = (await store.client.query("SELECT 1 FROM domain_verifications dv JOIN projects p ON p.id = dv.project_id WHERE dv.workspace_id = app.current_workspace() AND p.workspace_id = app.current_workspace() AND dv.domain = $1 AND dv.verified_at IS NOT NULL AND p.deleted_at IS NULL LIMIT 1", [rootDomain])).rows.length > 0;
 
         if (body.mode === "site_files") return await this.startSiteFiles(tenant, body.url, host, verified);
 
+        // THE PLAN GATE, before the price and before any write (decision 47): the full page audit stays on paid plans; only site-files mode is on every tier.
+        const resolved = await this.entitlements.resolveForWorkspace(tenant.workspaceId);
+        await requireAuxAudits(store.client, resolved.entitlements);
         const cap = await this.pageCap();
         let estimate: AuxAuditToolEstimate;
         try {
@@ -93,7 +101,6 @@ export class AuxAuditToolService {
         if (confirmed !== estimate.credits) {
           throw new PriceChangedError({ message: "the confirmed price does not match this audit's price", details: { shown: confirmed, recomputed: estimate.credits, reason: "the confirmed figure is not the price of the requested page band" } });
         }
-        const resolved = await this.entitlements.resolveForWorkspace(tenant.workspaceId);
         const started = await this.tools.startRun({ toolKey: "aux_audit", brandName: host, targetUrl: body.url, credits: estimate.credits, entitlements: resolved.entitlements });
         this.enqueue(tenant, started.id, { mode: "full", targetUrl: body.url, pages: estimate.pages, credits: estimate.credits });
         incrementCounter("nominara_tools_aux_audit_requests_total", { mode: "full", result: "started" });
@@ -112,7 +119,7 @@ export class AuxAuditToolService {
   private async startSiteFiles(tenant: TenantContext, url: string, host: string, verified: boolean): Promise<AuxAuditToolAccepted> {
     const started = await this.tools.startRun({ toolKey: "aux_audit", brandName: host, targetUrl: url, credits: 0 });
     // A cache that cannot be read is a miss, never an error: the check then runs.
-    const cached = await readSiteFilesCache(this.cache, cacheKeyNamespace(), host).catch((error: unknown) => {
+    const cached = await readSiteFilesCache(this.cache, cacheKeyNamespace(), new URL(url).origin).catch((error: unknown) => {
       logger.warn({ event: "tools.aux_audit.cache_read_failed", workspace_id: tenant.workspaceId, error: error instanceof Error ? error.name : "unknown" });
       return null;
     });

@@ -37,24 +37,26 @@ describe("STORY-082 · the AUX audit worker (site-files mode)", () => {
     const h = harness(cache);
     const out = await h.run();
     expect(out.outcome.kind).toBe("done");
-    const hit = await readSiteFilesCache(cache, "test", "acme.example");
+    const hit = await readSiteFilesCache(cache, "test", "https://acme.example");
     expect(hit?.agents.find((a) => a.agent === "GPTBot")?.access).toBe("blocked");
     expect(hit?.files.map((f) => f.file)).toEqual(["robots.txt", "llms.txt", "sitemap"]);
   });
 
   it("the cache holds the AI-agent reading and no tenant identifier: one platform-wide key per host, with a bounded lifetime", async () => {
-    const key = siteFilesCacheKey("test", "ACME.example");
-    expect(key).toBe("test:global:aux-site-files:acme.example");
+    const key = siteFilesCacheKey("test", "https://ACME.example");
+    expect(key).toBe("test:global:aux-site-files:https%3A%2F%2Facme.example");
+    expect(siteFilesCacheKey("test", "http://acme.example")).not.toBe(key);
+    expect(siteFilesCacheKey("test", "https://acme.example:8443")).not.toBe(key);
     expect(key).not.toContain(WORKSPACE);
     expect(SITE_FILES_CACHE_TTL_MS).toBeGreaterThan(0);
   });
 
   it("a cached value that no longer parses is a miss, not an answer", async () => {
     const cache = new InMemoryCacheAdapter();
-    await cache.set(siteFilesCacheKey("test", "acme.example"), JSON.stringify({ summary: "x" }), { ttlMs: 60_000 });
-    expect(await readSiteFilesCache(cache, "test", "acme.example")).toBeNull();
-    await cache.set(siteFilesCacheKey("test", "acme.example"), "not json", { ttlMs: 60_000 });
-    expect(await readSiteFilesCache(cache, "test", "acme.example")).toBeNull();
+    await cache.set(siteFilesCacheKey("test", "https://acme.example"), JSON.stringify({ summary: "x" }), { ttlMs: 60_000 });
+    expect(await readSiteFilesCache(cache, "test", "https://acme.example")).toBeNull();
+    await cache.set(siteFilesCacheKey("test", "https://acme.example"), "not json", { ttlMs: 60_000 });
+    expect(await readSiteFilesCache(cache, "test", "https://acme.example")).toBeNull();
   });
 
   it("a written value round-trips", async () => {
@@ -62,8 +64,8 @@ describe("STORY-082 · the AUX audit worker (site-files mode)", () => {
     const h = harness(cache);
     const out = await h.run();
     if (out.outcome.kind !== "done") throw new Error("expected a result");
-    await writeSiteFilesCache(cache, "test", "other.example", out.outcome.result.site_files);
-    expect(await readSiteFilesCache(cache, "test", "other.example")).toEqual(out.outcome.result.site_files);
+    await writeSiteFilesCache(cache, "test", "https://other.example", out.outcome.result.site_files);
+    expect(await readSiteFilesCache(cache, "test", "https://other.example")).toEqual(out.outcome.result.site_files);
   });
 
   it("scenario 12 - the worker has no fetch path of its own: the guarded fetcher is the only way out", () => {
