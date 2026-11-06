@@ -3,6 +3,7 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { runDailyPurgeCycle } from "../../../workers/rollup/retention.js";
+import { executePendingErasures } from "../../compliance/subject-request.js";
 import { PurgeJournal } from "../../compliance/purge-journal.js";
 import { S3JournalStore, writeComplianceExports } from "../../compliance/storage-adapters.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
@@ -89,6 +90,10 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
           ? { deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => void (await deleteWorkspaceReports(adapter, storage.keyEnv, workspaceId)) }
           : {}),
       });
+
+      // Decision 68b: the nightly job also runs the erasures a legal hold had deferred, for holds that lapsed (the cycle above recorded them).
+      const queued = await executePendingErasures(client);
+      if (queued.executed + queued.blocked + queued.stillHeld > 0) logger.log({ event: "queued_erasures", ...queued });
 
       incrementCounter("nominara_retention_purge_runs_total");
       // Counts only: a project or workspace ID in a log line is a deletion record that belongs in the purge journal.

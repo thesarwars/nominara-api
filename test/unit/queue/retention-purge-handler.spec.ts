@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
   cycleThrows: false,
   result: { projectsPurged: ["p1", "p2"] as string[], workspacesPurged: [] as string[], skipped: [] as { scope: string; scopeId: string; reason: string }[], held: [] as unknown[], failed: 0 },
   unlocked: 0,
+  queueRuns: 0,
 }));
 
 vi.mock("../../../src/db/client.js", () => ({
@@ -32,6 +33,12 @@ vi.mock("../../../src/lib/queue/locks.js", async () => {
     releaseAdvisorySessionLock: vi.fn(async () => { state.unlocked += 1; return true; }),
   };
 });
+vi.mock("../../../src/lib/compliance/subject-request.js", () => ({
+  executePendingErasures: vi.fn(async () => {
+    state.queueRuns += 1;
+    return { executed: 0, blocked: 0, stillHeld: 0 };
+  }),
+}));
 vi.mock("../../../src/workers/rollup/retention.js", () => ({
   runDailyPurgeCycle: vi.fn(async (_client: unknown, options?: { deleteWorkspaceObjects?: (id: string) => Promise<void> }) => {
     state.cycleCalls += 1;
@@ -56,6 +63,7 @@ beforeEach(() => {
   state.clients.length = 0;
   state.locked = true;
   state.cycleCalls = 0;
+  state.queueRuns = 0;
   state.cycleOptions = undefined;
   state.cycleThrows = false;
   state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: [], skipped: [], held: [], failed: 0 };
@@ -94,6 +102,16 @@ describe("retention.purge — enabled", () => {
     expect(state.clients).toHaveLength(1);
     expect(state.clients[0]!.ended).toBe(true);
     expect(state.unlocked).toBe(1);
+  });
+
+  it("S23 (decision 68b) runs the queued erasures after the purge cycle on the same connection; a yielding tick runs none", async () => {
+    vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    await run("true");
+    expect(state.queueRuns).toBe(1);
+    state.locked = false;
+    vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    await run("true");
+    expect(state.queueRuns).toBe(1);
   });
 
   it("YIELDS when another replica holds the lock: nothing is purged", async () => {

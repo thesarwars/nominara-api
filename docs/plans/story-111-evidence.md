@@ -104,3 +104,24 @@ snapshot needs is listed under "Doc changes needed" for carrying to the docs rep
 
 - `data-model.md` section 7: financial records export = ledger, invoices, subscriptions, add-ons, credit purchases; legal-hold check is inside the purge transaction; project purge also removes `project_id` tables no cascade reaches; the journal/exports bucket decision.
 - `STORY-111`: AC statuses as above (Partial: access/erasure/hold/restore/residency have no operator entry point; "no content left behind" blocked on STORY-182 for objects).
+
+## Owner decision 68 (a)(b) - operator CLI and legal-hold deferral
+
+- **(a) CLI.** `pnpm db:subject:export -- --user <id> --requested-by <operator id> --out <file>` and `pnpm db:subject:erase -- --user <id>
+  --requested-by <operator id> --confirm <same user id>` (`src/db/subject-cli.ts`, owner connection via `DATABASE_URL`). Ids only, no email
+  accepted or printed; the export goes to a 0600 file created exclusively, stdout is counts and the request id; erasure without `--confirm`
+  changes nothing; the operator must be a known user and is the audit actor in every workspace of the subject (`subject_request.received ...`).
+  Exit codes: 0 done/deferred, 1 failure, 2 refused before any change, 3 blocked (sole owner). The unauthenticated HTTP route is still not built.
+- **(b) Hold defers erasure.** `processErasureRequest` queues the request in `subject_erasure_queue` (added to migration 0165, which is not yet
+  merged; census 90/67/23) and returns `deferred` with the delay reason; the trail gets `subject_request.deferred`. `executePendingErasures`
+  runs the queue under the SAME request id and without a second `received`: from the nightly `retention.purge` handler (after the cycle has
+  recorded lapsed holds) and from `releaseLegalHoldAndRunQueue` (manual release). A queued subject who has become a sole owner is marked
+  `blocked`. Tests: S23 D1-D5, CLI cases, handler unit test; mutation (deferral disabled) fails 7 integration tests.
+- **Not done / needs the owner or infrastructure.** (1) The legal text telling the subject the erasure is delayed (the CLI prints a plain
+  reason for the operator to relay; the subject-facing notice wording is the owner's). (2) The nightly job only executes the queue when
+  `RETENTION_PURGE_ENABLED=true` (it shares that handler; a disabled purge opens no connection). Until then a manual release runs it, or an
+  operator re-runs the erase command after the hold ends. (3) No CLI to place or release holds exists; `releaseLegalHoldAndRunQueue` has no
+  caller yet. (4) A hold placed in the instant between the CLI's hold read and the erasure is not re-checked under the register lock (unlike
+  the purge); the window is one request.
+- Doc changes: STORY-111 status/ACs (operator-run access and erasure, hold defers erasure); data-model.md: `subject_erasure_queue` global table,
+  census 90 / 67 / 23; a runbook entry for the two commands.

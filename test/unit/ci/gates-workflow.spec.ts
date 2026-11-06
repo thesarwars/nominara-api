@@ -100,6 +100,8 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "billing:invoices-resync": "the operator CLI; it re-fetches recorded invoices from live Stripe",
   "support:grant": "the operator CLI; it issues a time-boxed support access grant",
   "support:revoke": "the operator CLI; it revokes a support access grant",
+  "db:subject:export": "the operator CLI (STORY-111, decision 68a); it exports one person's data from the owner connection",
+  "db:subject:erase": "the operator CLI (STORY-111, decision 68a); it erases one person, irreversibly, from the owner connection",
   "audit:verify": "an operational job against a live audit chain",
   "audit:export": "an operational export",
   "contracts:generate": "writes the generated OpenAPI document; contracts:check is the gate over it",

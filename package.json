@@ -43,6 +43,8 @@
     "audit:verify": "tsx src/workers/rollup/audit-verify.ts",
     "audit:export": "tsx src/workers/rollup/audit-export.ts",
     "db:purge-check": "tsx src/db/purge-check.ts",
+    "db:subject:export": "tsx src/db/subject-cli.ts export",
+    "db:subject:erase": "tsx src/db/subject-cli.ts erase",
     "email:unsuppress": "tsx src/lib/email/unsuppress-email.ts",
     "contracts:generate": "tsx src/contracts/generate.ts",
     "contracts:check": "tsx src/contracts/check.ts",

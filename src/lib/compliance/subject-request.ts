@@ -13,7 +13,7 @@ import { CROSS_ENGINE_KEY } from "../rollup/roll-up-day.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { requestIndividualErasure } from "../../workers/rollup/retention.js";
 import { appendComplianceAudit } from "./compliance-audit.js";
-import { activeHolds } from "./legal-hold.js";
+import { activeHolds, releaseLegalHold } from "./legal-hold.js";
 import { SUBJECT_INVENTORY } from "./subject-inventory.js";
 
 // STORY-111 / NFR-CMP-02, NFR-CMP-03, NFR-CMP-13 - subject requests: right of access and portability, and right to erasure.
@@ -238,25 +238,48 @@ export async function processAccessRequest(client: ClientBase, userId: string, c
 
 export interface ErasureOutcome {
   readonly requestId: string;
-  readonly status: "completed" | "blocked";
+  /** `deferred` = queued behind a legal hold (owner decision 68b); it runs when the hold lapses or is released. */
+  readonly status: "completed" | "blocked" | "deferred";
   /** The exact reason and the way forward, stated to the requester. null when completed. */
   readonly reason: string | null;
-  /**
-   * Workspaces of the subject that were under an ACTIVE legal hold when the erasure ran. The erasure is not blocked by a hold (the audit rows are
-   * pseudonymised, not deleted - see the evidence file for the owner question); it is REPORTED so the operator knows evidence was altered.
-   */
+  /** Workspaces of the subject under an ACTIVE legal hold when the request arrived. Non-empty exactly when the status is `deferred`. */
   readonly heldWorkspaces: readonly string[];
 }
 
-export async function processErasureRequest(client: ClientBase, userId: string, ctx: SubjectRequestContext): Promise<ErasureOutcome> {
+export const LEGAL_HOLD_DELAY_REASON =
+  "A legal hold covers a workspace this person belongs to, so the erasure is delayed for a legal reason. It is queued and runs automatically when the hold is released or expires.";
+
+export interface ErasureRequestContext extends SubjectRequestContext {
+  /** Set only by the queue runner: the request was already received and deferred, so `received` is not written a second time. */
+  readonly resume?: boolean;
+}
+
+export async function processErasureRequest(client: ClientBase, userId: string, ctx: ErasureRequestContext): Promise<ErasureOutcome> {
   const requestId = ctx.requestId ?? randomUUID();
   const audited = { requestId, requestedBy: ctx.requestedBy };
   // Captured BEFORE the erasure: it marks memberships removed, and these are the chains the trail is written to.
   const workspaceIds = await workspacesOf(client, userId);
   const holds = await activeHolds(client, ctx.now ?? new Date());
   const heldWorkspaces = workspaceIds.filter((w) => holds.workspaces.has(w) || holds.workspacesWithHeldProject.has(w));
-  await audit(client, workspaceIds, "subject_request.received", "erasure", audited);
+  if (ctx.resume !== true) await audit(client, workspaceIds, "subject_request.received", "erasure", audited);
   try {
+    // Owner decision 68b: a legal hold BLOCKS individual erasure inside the held workspace. Queue it (one pending row per subject; a repeat
+    // request returns the queued one) and tell the requester why. Nothing about the subject is changed.
+    if (heldWorkspaces.length > 0) {
+      const queued = await client.query<{ request_id: string }>(
+        `INSERT INTO subject_erasure_queue (request_id, user_id, requested_by, held_workspace_count) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id) WHERE status = 'pending' DO NOTHING RETURNING request_id`,
+        [requestId, userId, ctx.requestedBy, heldWorkspaces.length],
+      );
+      const existing =
+        queued.rows[0] === undefined
+          ? (await client.query<{ request_id: string }>("SELECT request_id FROM subject_erasure_queue WHERE user_id = $1 AND status = 'pending'", [userId])).rows[0]
+          : undefined;
+      const effectiveId = existing?.request_id ?? requestId;
+      await audit(client, workspaceIds, "subject_request.deferred", "erasure", { requestId: effectiveId, requestedBy: ctx.requestedBy }, { legal_hold_workspaces: heldWorkspaces.length });
+      incrementCounter("nominara_compliance_erasure_deferred_total");
+      return { requestId: effectiveId, status: "deferred", reason: LEGAL_HOLD_DELAY_REASON, heldWorkspaces };
+    }
     const result = await requestIndividualErasure(client, userId);
     if (result.blocked) {
       const reason = `${result.reason} ${SOLE_OWNER_BLOCK_PATH}`;
@@ -266,11 +289,59 @@ export async function processErasureRequest(client: ClientBase, userId: string, 
     // The steps after the erasure are the SYSTEM's (no actor id): the requester's id is pseudonymised away by the erasure itself, and a surviving
     // user id on these rows would defeat that.
     const after = { requestId, requestedBy: null };
-    await audit(client, workspaceIds, "subject_request.processed", "erasure", after, heldWorkspaces.length > 0 ? { legal_hold_workspaces: heldWorkspaces.length } : {});
+    await audit(client, workspaceIds, "subject_request.processed", "erasure", after, {});
     await audit(client, workspaceIds, "subject_request.completed", "erasure", after, {});
-    return { requestId, status: "completed", reason: null, heldWorkspaces };
+    return { requestId, status: "completed", reason: null, heldWorkspaces: [] };
   } catch (error) {
     await audit(client, workspaceIds, "subject_request.failed", "erasure", audited, { error: error instanceof Error ? error.name : "unknown" });
     throw error;
   }
+}
+
+export interface QueueRunResult {
+  readonly executed: number;
+  /** Queued erasures that hit the sole-owner limit when they ran: the subject must act, then re-request. */
+  readonly blocked: number;
+  /** Still behind an active hold: left pending. */
+  readonly stillHeld: number;
+}
+
+/**
+ * Runs every queued erasure whose workspaces are no longer under an active hold (owner decision 68b). Called by the nightly retention job and
+ * after a manual hold release. Idempotent: a finished row is never picked up again. A failure leaves the row pending for the next run.
+ */
+export async function executePendingErasures(client: ClientBase, now: Date = new Date()): Promise<QueueRunResult> {
+  const pending = await client.query<{ id: string; request_id: string; user_id: string; requested_by: string | null }>(
+    "SELECT id, request_id, user_id, requested_by FROM subject_erasure_queue WHERE status = 'pending' ORDER BY created_at, id",
+  );
+  let executed = 0;
+  let blocked = 0;
+  let stillHeld = 0;
+  for (const row of pending.rows) {
+    try {
+      const outcome = await processErasureRequest(client, row.user_id, { requestedBy: row.requested_by, requestId: row.request_id, now, resume: true });
+      if (outcome.status === "deferred") {
+        stillHeld += 1;
+        continue;
+      }
+      await client.query("UPDATE subject_erasure_queue SET status = $2, finished_at = $3 WHERE id = $1 AND status = 'pending'", [
+        row.id,
+        outcome.status === "completed" ? "executed" : "blocked",
+        now.toISOString(),
+      ]);
+      if (outcome.status === "completed") executed += 1;
+      else blocked += 1;
+    } catch (error) {
+      incrementCounter("nominara_compliance_erasure_queue_failures_total");
+      logger.error({ event: "queued_erasure_failed", request_id: row.request_id, error: error instanceof Error ? error.name : "unknown" });
+    }
+  }
+  if (executed + blocked > 0) incrementCounter("nominara_compliance_erasure_queue_runs_total", { outcome: "released" });
+  return { executed, blocked, stillHeld };
+}
+
+/** Manual hold release, then the queue: the erasure a hold was delaying runs as soon as the hold ends. */
+export async function releaseLegalHoldAndRunQueue(client: ClientBase, holdId: string, releasedBy: string, now: Date = new Date()): Promise<QueueRunResult> {
+  await releaseLegalHold(client, holdId, releasedBy, now);
+  return executePendingErasures(client, now);
 }

@@ -11,8 +11,9 @@ import { InMemoryJournalStore, PurgeJournal } from "../../src/lib/compliance/pur
 import { reapplyPurgesAfterRestore } from "../../src/lib/compliance/restore-replay.js";
 import { COMPLIANCE_EXPORT_CLASSES, writeComplianceExports } from "../../src/lib/compliance/storage-adapters.js";
 import { SUBJECT_INVENTORY } from "../../src/lib/compliance/subject-inventory.js";
-import { processAccessRequest, processErasureRequest, subjectColumnsFor } from "../../src/lib/compliance/subject-request.js";
+import { executePendingErasures, processAccessRequest, processErasureRequest, releaseLegalHoldAndRunQueue, subjectColumnsFor } from "../../src/lib/compliance/subject-request.js";
 import type { ObjectStoragePort, PutObjectRequest } from "../../src/lib/storage/storage.port.js";
+import { runSubjectCommand } from "../../src/db/subject-cli.js";
 import { executeWorkspaceHardDelete, runDailyPurgeCycle, runNightlySweep } from "../../src/workers/rollup/retention.js";
 
 // STORY-111 - subject requests, legal hold, purge journal, restore across a purge, no archive. One container, migrations applied once, the
@@ -645,19 +646,6 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect(text).not.toContain(ws);
     });
 
-    it("S23 individual erasure REPORTS a legal hold on the subject's workspace in its outcome", async () => {
-      const ws = await workspace();
-      const [a, b] = [await user(), await user()];
-      const owner = await user();
-      const u = await user();
-      await member(ws, owner, "owner");
-      await member(ws, u);
-      await hold("workspace", ws, a, b);
-      const out = await processErasureRequest(db, u, { requestedBy: u });
-      expect(out.status).toBe("completed");
-      expect(out.heldWorkspaces).toEqual([ws]);
-    });
-
     it("S6 post-erasure audit rows are written by the SYSTEM actor (no actor id), and a subject with no workspace is still traced by request id in the log", async () => {
       const ws = await workspace();
       const owner = await user();
@@ -669,6 +657,161 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       const rows = (await db.query("SELECT action, actor_type, actor_id FROM audit_log WHERE workspace_id = $1 AND resource_id = $2 ORDER BY seq", [ws, requestId])).rows;
       expect(rows.map((r) => [r.action, r.actor_type])).toEqual([["subject_request.received", "user"], ["subject_request.processed", "system"], ["subject_request.completed", "system"]]);
       expect(rows[1]!.actor_id).toBeNull();
+    });
+  });
+
+  // ------------------------------------------------------------------ decision 68: a legal hold DEFERS individual erasure; operator CLI
+  describe("decision 68 (b) a legal hold defers individual erasure; (a) the operator CLI", () => {
+    const hold = (scope: "project" | "workspace", scopeId: string, a: string, b: string, days = 30) =>
+      placeLegalHold(db, { scope, scopeId, reason: "Litigation hold, matter 88", requestedBy: a, approvedBy: b, expiresAt: new Date(Date.now() + days * DAY) });
+    const email = async (u: string): Promise<string> => (await db.query<{ email: string }>("SELECT email FROM users WHERE id = $1", [u])).rows[0]!.email;
+    const queue = async (u: string) => (await db.query<{ status: string; request_id: string }>("SELECT status, request_id FROM subject_erasure_queue WHERE user_id = $1", [u])).rows;
+    async function held() {
+      const ws = await workspace();
+      const [a, b, owner, u] = [await user(), await user(), await user(), await user()];
+      await member(ws, owner, "owner");
+      await member(ws, u);
+      return { ws, a, b, owner, u };
+    }
+
+    it("S23 D1 erasure inside a held workspace is QUEUED, not run: nothing is erased, the reason is stated, the trail says deferred, a repeat request does not queue twice", async () => {
+      const { ws, a, b, u } = await held();
+      await hold("workspace", ws, a, b);
+      const before = await email(u);
+      const out = await processErasureRequest(db, u, { requestedBy: u });
+      expect(out.status).toBe("deferred");
+      expect(out.reason).toContain("legal hold");
+      expect(out.heldWorkspaces).toEqual([ws]);
+      expect(await email(u)).toBe(before);
+      expect(await queue(u)).toEqual([{ status: "pending", request_id: out.requestId }]);
+      expect((await auditActions(ws)).filter((x) => x.startsWith("subject_request."))).toEqual(["subject_request.received", "subject_request.deferred"]);
+      const again = await processErasureRequest(db, u, { requestedBy: u });
+      expect(again).toMatchObject({ status: "deferred", requestId: out.requestId });
+      expect(await queue(u)).toHaveLength(1);
+    });
+
+    it("S23 D2 releasing the hold runs the queued erasure under the SAME request id, once, and the trail is complete", async () => {
+      const { ws, a, b, u } = await held();
+      const h = await hold("workspace", ws, a, b);
+      const out = await processErasureRequest(db, u, { requestedBy: u });
+      const run = await releaseLegalHoldAndRunQueue(db, h.id, b);
+      expect(run).toMatchObject({ executed: 1 });
+      expect(await email(u)).toMatch(/^deleted\+.*@nominara\.invalid$/);
+      expect((await queue(u))[0]).toEqual({ status: "executed", request_id: out.requestId });
+      expect((await auditActions(ws)).filter((x) => x.startsWith("subject_request."))).toEqual(["subject_request.received", "subject_request.deferred", "subject_request.processed", "subject_request.completed"]);
+      expect(await executePendingErasures(db)).toMatchObject({ executed: 0 }); // idempotent
+    });
+
+    it("S23 D3 a still-active hold leaves the queue alone; a LAPSED hold lets the nightly run execute it", async () => {
+      const { ws, a, b, u } = await held();
+      await placeLegalHold(db, { scope: "workspace", scopeId: ws, reason: "Short hold for the queue", requestedBy: a, approvedBy: b, expiresAt: new Date(Date.now() + DAY) });
+      await processErasureRequest(db, u, { requestedBy: u });
+      const first = await executePendingErasures(db); // the queue is shared with the other cases' pending rows, whose holds are also active
+      expect(first.executed).toBe(0);
+      expect(first.stillHeld).toBeGreaterThanOrEqual(1);
+      expect((await queue(u))[0]!.status).toBe("pending");
+      const later = new Date(Date.now() + 2 * DAY);
+      await releaseExpiredHolds(db, later);
+      expect(await executePendingErasures(db, later)).toMatchObject({ executed: 1 });
+      expect(await email(u)).toContain("deleted+");
+    });
+
+    it("S23 D4 a hold on a PROJECT of the workspace defers too; a hold elsewhere does not", async () => {
+      const { ws, a, b, u } = await held();
+      const p = await project(ws);
+      await hold("project", p, a, b);
+      expect((await processErasureRequest(db, u, { requestedBy: u })).status).toBe("deferred");
+      const other = await held();
+      const unrelated = await workspace();
+      await hold("workspace", unrelated, other.a, other.b);
+      expect((await processErasureRequest(db, other.u, { requestedBy: other.u })).status).toBe("completed");
+    });
+
+    it("S23 D5 a queued erasure whose subject has meanwhile become a sole owner is marked blocked on release, not erased", async () => {
+      const { ws, a, b, owner, u } = await held();
+      const h = await hold("workspace", ws, a, b);
+      await processErasureRequest(db, u, { requestedBy: u });
+      await db.query("UPDATE workspace_members SET status = 'removed' WHERE workspace_id = $1 AND user_id = $2", [ws, owner]);
+      await db.query("UPDATE workspace_members SET role = 'owner' WHERE workspace_id = $1 AND user_id = $2", [ws, u]);
+      const before = await email(u);
+      expect(await releaseLegalHoldAndRunQueue(db, h.id, b)).toMatchObject({ executed: 0, blocked: 1 });
+      expect(await email(u)).toBe(before);
+      expect((await queue(u))[0]!.status).toBe("blocked");
+    });
+
+    // -------- CLI
+    const sink = () => {
+      const lines: string[] = [];
+      return { lines, io: { out: (l: string) => void lines.push(l), err: (l: string) => void lines.push(l) } };
+    };
+
+    it("CLI export writes the document to a 0600 file, prints a summary with no personal data, refuses to overwrite, and audits with the operator as actor", async () => {
+      const { ws, owner, u } = await held();
+      const { mkdtemp, readFile, stat } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const dir = await mkdtemp(`${tmpdir()}/dsar-`);
+      const file = `${dir}/out.json`;
+      const operator = await user();
+      const s = sink();
+      const code = await runSubjectCommand(db, ["export", "--user", u, "--requested-by", operator, "--out", file], s.io);
+      expect(code).toBe(0);
+      expect(subjectExportSchema.parse(JSON.parse(await readFile(file, "utf8"))).subject_user_id).toBe(u);
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+      const printed = s.lines.join("\n");
+      expect(printed).toMatch(/request_id/);
+      expect(printed).not.toContain(await email(u));
+      expect(printed).not.toContain(await email(owner));
+      const s2 = sink();
+      expect(await runSubjectCommand(db, ["export", "--user", u, "--requested-by", operator, "--out", file], s2.io)).toBe(1);
+      const actor = (await db.query("SELECT actor_id FROM audit_log WHERE workspace_id = $1 AND action = 'subject_request.received' ORDER BY seq LIMIT 1", [ws])).rows[0]!;
+      expect(actor.actor_id).toBe(operator);
+    });
+
+    it("CLI erase needs --confirm equal to the user id: without it, or with a different one, nothing changes", async () => {
+      const { u } = await held();
+      const operator = await user();
+      const before = await email(u);
+      for (const extra of [[], ["--confirm", randomUUID()]]) {
+        const s = sink();
+        expect(await runSubjectCommand(db, ["erase", "--user", u, "--requested-by", operator, ...extra], s.io)).toBe(2);
+        expect(s.lines.join("\n")).toContain("--confirm");
+      }
+      expect(await email(u)).toBe(before);
+      expect(await queue(u)).toEqual([]);
+    });
+
+    it("CLI erase with the confirmation erases, prints the request id and no address; under a hold it exits 0 and reports the delay reason; a sole owner exits 3 with the way forward", async () => {
+      const a1 = await held();
+      const operator = await user();
+      const s = sink();
+      expect(await runSubjectCommand(db, ["erase", "--user", a1.u, "--requested-by", operator, "--confirm", a1.u], s.io)).toBe(0);
+      expect(s.lines.join("\n")).toContain("completed");
+      expect(s.lines.join("\n")).not.toContain("@");
+      expect(await email(a1.u)).toContain("deleted+");
+
+      const h = await held();
+      await hold("workspace", h.ws, h.a, h.b);
+      const s2 = sink();
+      expect(await runSubjectCommand(db, ["erase", "--user", h.u, "--requested-by", operator, "--confirm", h.u], s2.io)).toBe(0);
+      expect(s2.lines.join("\n")).toMatch(/deferred/);
+      expect(s2.lines.join("\n")).toMatch(/legal hold/);
+      expect((await queue(h.u))[0]!.status).toBe("pending");
+
+      const solo = await workspace();
+      const only = await user();
+      await member(solo, only, "owner");
+      const s3 = sink();
+      expect(await runSubjectCommand(db, ["erase", "--user", only, "--requested-by", operator, "--confirm", only], s3.io)).toBe(3);
+      expect(s3.lines.join("\n")).toContain("Transfer ownership");
+    });
+
+    it("CLI refuses an unknown operator and an unknown subject without touching anything, and never prints a connection string or SQL", async () => {
+      const { u } = await held();
+      const s = sink();
+      expect(await runSubjectCommand(db, ["erase", "--user", u, "--requested-by", randomUUID(), "--confirm", u], s.io)).toBe(2);
+      expect(await runSubjectCommand(db, ["erase", "--user", randomUUID(), "--requested-by", u, "--confirm", u], s.io)).toBe(2);
+      expect(await email(u)).not.toContain("deleted+");
+      expect(s.lines.join("\n")).not.toMatch(/postgres:\/\/|SELECT |INSERT /);
     });
   });
 });
