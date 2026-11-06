@@ -44,6 +44,15 @@ export interface PrefixDeletingPort {
   deletePrefix(bucket: StorageBucketName, prefix: string): Promise<number>;
 }
 
+/**
+ * PURGE-JOURNAL / AUDIT SIDE ONLY (STORY-111). Lists the keys under a prefix of one bucket. Separate from ObjectStoragePort for the same
+ * reason PrefixDeletingPort is: feature code takes TenantObjectStore, which cannot enumerate a bucket.
+ */
+export interface KeyListingPort {
+  /** Every key under `prefix`, in key order, across pages. The prefix must be non-empty. */
+  listKeys(bucket: StorageBucketName, prefix: string): Promise<string[]>;
+}
+
 export interface ObjectStoragePort {
   put(request: PutObjectRequest): Promise<void>;
   /** Throws NotFoundError (404) when the object is absent. Reads the whole object into memory: for small blobs only. */
