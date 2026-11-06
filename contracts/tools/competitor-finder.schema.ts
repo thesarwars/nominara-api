@@ -39,8 +39,11 @@ export const competitorFinderEntitySchema = z
     excerpt: z.string().min(1),
     /** The domain the answer cited for this entity; `null` when the answer cited none for it (never a guess). */
     cited_domain: z.string().min(1).nullable(),
+    /** Decision 67(b): a row with no cited website is still shown, labelled `no_source_cited` (the client renders "No source cited"). Derived from `cited_domain`, never independent of it. */
+    source_status: z.enum(["cited", "no_source_cited"]),
   })
-  .strict();
+  .strict()
+  .refine((e) => (e.cited_domain === null) === (e.source_status === "no_source_cited"), { message: "source_status must be no_source_cited exactly when cited_domain is null", path: ["source_status"] });
 
 export const competitorFinderResultSchema = z
   .object({
