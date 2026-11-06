@@ -17,8 +17,12 @@ const HEADER = ["section", "period", "entity", "engine_key", "metric", "value", 
 /** Formula characters a spreadsheet would execute at the start of a cell (OWASP CSV injection). */
 const FORMULA_START = /^[=+\-@\t\r]/;
 
+/** A plain decimal number with a leading minus; anything else starting `-` can still be read as a formula. */
+const NEGATIVE_NUMBER = /^-(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 function cell(value: string): string {
-  const safe = FORMULA_START.test(value) ? `'${value}` : value;
+  const needsQuote = FORMULA_START.test(value) && !NEGATIVE_NUMBER.test(value);
+  const safe = needsQuote ? `'${value}` : value;
   return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
