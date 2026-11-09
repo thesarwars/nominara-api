@@ -4,6 +4,8 @@ import { ProjectsService } from "./projects.service.js";
 import { ProjectEnginesController } from "./project-engines.controller.js";
 import { ProjectBenchmarkController } from "./project-benchmark.controller.js";
 import { ProjectBenchmarkService } from "./project-benchmark.service.js";
+import { BusinessCategoriesController } from "./business-categories.controller.js";
+import { BusinessCategoriesService } from "./business-categories.service.js";
 import { CompetitorsController } from "./competitors.controller.js";
 import { ProjectFingerprintController } from "./project-fingerprint.controller.js";
 import { ProjectFingerprintService } from "./project-fingerprint.service.js";
@@ -32,6 +34,7 @@ import { defaultCheckDeps } from "../../lib/verification/checkers.js";
     ProjectEnginesController,
     ProjectFingerprintController,
     ProjectBenchmarkController,
+    BusinessCategoriesController,
   ],
   providers: [
     ProjectsService,
@@ -39,6 +42,7 @@ import { defaultCheckDeps } from "../../lib/verification/checkers.js";
     ProjectEnginesService,
     ProjectFingerprintService,
     ProjectBenchmarkService,
+    BusinessCategoriesService,
     UrlGuard,
     DomainVerificationService,
     // A factory, so a test supplies its own resolver and fetcher and the
