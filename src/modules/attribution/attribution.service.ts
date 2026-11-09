@@ -44,7 +44,17 @@ interface RollupRow {
 
 const ratio = (numerator: number, denominator: number): number | null => (denominator === 0 ? null : Math.round((numerator / denominator) * 1e6) / 1e6);
 
-function figure(current: number, prior: number): AttributionFigure {
+/** What the beacon was collecting, from `attribution_configs`: dates are UTC `YYYY-MM-DD`. `null` first = nothing measured at all. */
+interface Coverage {
+  readonly first: string | null;
+  readonly last: string | null;
+  /** True only when the beacon's first event is on or before the prior window's first day. */
+  readonly priorCovered: boolean;
+}
+
+function figure(current: number, prior: number, cov: Coverage): AttributionFigure {
+  if (cov.first === null) return { current: null, prior: null, delta: null, delta_pct: null };
+  if (!cov.priorCovered) return { current, prior: null, delta: null, delta_pct: null };
   return { current, prior, delta: current - prior, delta_pct: ratio(current - prior, prior) };
 }
 
@@ -138,23 +148,39 @@ export class AttributionService {
         GROUP BY d.referrer_class`,
       [projectId, windowStart, priorStart, endExclusive],
     );
+    const cfg = await tx.query<{ first: string | null; last: string | null }>(
+      `SELECT (first_event_at AT TIME ZONE 'UTC')::date::text AS first, (last_event_at AT TIME ZONE 'UTC')::date::text AS last
+         FROM attribution_configs
+        WHERE workspace_id = app.current_workspace() AND project_id = $1
+        ORDER BY (status <> 'disabled') DESC, created_at DESC
+        LIMIT 1`,
+      [projectId],
+    );
+    const first = cfg.rows[0]?.first ?? null;
+    const cov: Coverage = { first, last: cfg.rows[0]?.last ?? null, priorCovered: first !== null && first <= priorStart };
     const byClass = new Map(found.rows.map((r) => [r.referrer_class, r]));
     const get = (cls: string) => byClass.get(cls) ?? { sessions: 0, sessions_prior: 0, conversions: 0, conversions_prior: 0 };
     const engines = ATTRIBUTION_AI_REFERRER_CLASSES.map((cls) => {
       const r = get(cls);
-      return { referrer_class: cls, sessions: figure(r.sessions, r.sessions_prior), conversions: figure(r.conversions, r.conversions_prior) };
+      return { referrer_class: cls, sessions: figure(r.sessions, r.sessions_prior, cov), conversions: figure(r.conversions, r.conversions_prior, cov) };
     });
-    const sum = (pick: (e: (typeof engines)[number]) => AttributionFigure, key: "current" | "prior"): number => engines.reduce((n, e) => n + pick(e)[key], 0);
-    const aiSessions = figure(sum((e) => e.sessions, "current"), sum((e) => e.sessions, "prior"));
-    const aiConversions = figure(sum((e) => e.conversions, "current"), sum((e) => e.conversions, "prior"));
+    const sum = (pick: (r: ReturnType<typeof get>) => number): number => ATTRIBUTION_AI_REFERRER_CLASSES.reduce((n, cls) => n + pick(get(cls)), 0);
+    const aiSessionsCur = sum((r) => r.sessions);
+    const aiSessionsPri = sum((r) => r.sessions_prior);
+    const aiConvCur = sum((r) => r.conversions);
+    const aiConvPri = sum((r) => r.conversions_prior);
+    const aiSessions = figure(aiSessionsCur, aiSessionsPri, cov);
+    const aiConversions = figure(aiConvCur, aiConvPri, cov);
     const stripped = get("unattributed_direct");
     return {
+      measured_from: cov.first,
+      measured_to: cov.last,
       ai_sessions: aiSessions,
       conversions: aiConversions,
-      conversion_rate: ratio(aiConversions.current, aiSessions.current),
-      conversion_rate_prior: ratio(aiConversions.prior, aiSessions.prior),
+      conversion_rate: cov.first === null ? null : ratio(aiConvCur, aiSessionsCur),
+      conversion_rate_prior: cov.priorCovered ? ratio(aiConvPri, aiSessionsPri) : null,
       by_engine: engines,
-      unattributed: { sessions: figure(stripped.sessions, stripped.sessions_prior), conversions: figure(stripped.conversions, stripped.conversions_prior) },
+      unattributed: { sessions: figure(stripped.sessions, stripped.sessions_prior, cov), conversions: figure(stripped.conversions, stripped.conversions_prior, cov) },
     };
   }
 

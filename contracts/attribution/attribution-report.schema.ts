@@ -56,13 +56,19 @@ export type AttributionRow = z.infer<typeof attributionRowSchema>;
 export const ATTRIBUTION_AI_REFERRER_CLASSES = ["chatgpt", "perplexity", "gemini", "claude", "copilot", "meta_ai", "other_ai"] as const;
 export type AttributionAiReferrerClass = (typeof ATTRIBUTION_AI_REFERRER_CLASSES)[number];
 
-/** One measured count for the window and for the window before it, so the movement is read off one object. Both are counts, never estimates. */
+/**
+ * One measured count for the window and for the window before it, so the movement is read off one object. Both are counts, never estimates.
+ * Coverage rule: `prior`, `delta` and `delta_pct` are `null` unless the beacon was already collecting for the WHOLE prior window, because a
+ * count over a part-covered window is a coverage artefact, not a movement. `current` keeps its real count when the beacon covered only part of
+ * the current window (the totals' `measured_from` says so); it is `null` only when there is no beacon data at all (no beacon config, or one
+ * that has not yet received an event). A measured zero after the beacon started stays 0.
+ */
 export const attributionFigureSchema = z.object({
-  current: z.number().int().min(0),
-  prior: z.number().int().min(0),
-  /** `current - prior`. */
-  delta: z.number().int(),
-  /** `delta / prior`; `null` when `prior` is 0, because a change from nothing has no percentage and a zero would read as "flat". */
+  current: z.number().int().min(0).nullable(),
+  prior: z.number().int().min(0).nullable(),
+  /** `current - prior`; `null` when either is. */
+  delta: z.number().int().nullable(),
+  /** `delta / prior`; `null` when `prior` is 0 or not measured, because a change from nothing has no percentage and a zero would read as "flat". */
   delta_pct: z.number().nullable(),
 });
 export type AttributionFigure = z.infer<typeof attributionFigureSchema>;
@@ -80,10 +86,15 @@ export type AttributionEngineBreakdown = z.infer<typeof attributionEngineBreakdo
  * `unattributed` is the sessions whose referrer was stripped: displayed beside the AI figures and NEVER added into them.
  */
 export const attributionTotalsSchema = z.object({
+  /** `YYYY-MM-DD` (UTC) the beacon first received an event; `null` when it never has or there is no beacon. A date after the window start means the current window is only partly covered. */
+  measured_from: z.string().nullable(),
+  /** `YYYY-MM-DD` (UTC) of the beacon's last event; a date before the window's end means the beacon stopped. Counts are not altered. */
+  measured_to: z.string().nullable(),
   ai_sessions: attributionFigureSchema,
   conversions: attributionFigureSchema,
-  /** `conversions / ai_sessions`; `null` when there were no AI sessions, never 0. */
+  /** `conversions / ai_sessions`; `null` when there were no AI sessions or no beacon data, never 0. */
   conversion_rate: z.number().min(0).nullable(),
+  /** Also `null` when the prior window was not wholly covered by the beacon. */
   conversion_rate_prior: z.number().min(0).nullable(),
   /** Every AI referrer class, in a fixed order; a class with no sessions is a measured 0. */
   by_engine: z.array(attributionEngineBreakdownSchema),

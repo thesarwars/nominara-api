@@ -103,8 +103,10 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
   const get = (a: Actor, query = "") => harness.app().inject({ method: "GET", url: url(a, query), headers: { cookie: a.cookie } });
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
   interface Row { url: string; pattern: string; flagged: boolean; note: string | null; conversion_rate: number | null; gsc_ai_impressions: number | null; organic_clicks: number | null; ai_sessions: number }
-  interface Fig { current: number; prior: number; delta: number; delta_pct: number | null }
+  interface Fig { current: number | null; prior: number | null; delta: number | null; delta_pct: number | null }
   interface Totals {
+    measured_from: string | null;
+    measured_to: string | null;
     ai_sessions: Fig;
     conversions: Fig;
     conversion_rate: number | null;
@@ -131,6 +133,14 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
       `INSERT INTO attribution_daily (workspace_id, project_id, metric_date, landing_url_hash, landing_url, referrer_class, sessions, conversions, country, device)
        VALUES ($1,$2,$3,sha256(convert_to($4::text,'UTF8')),$4::text,$5,$6,$7,'ZZ','desktop')`,
       [a.workspaceId, project, date, landing, referrerClass, sessions, conversions],
+    );
+  }
+
+  async function beacon(a: Actor, firstEventAt: string | null, lastEventAt: string | null = firstEventAt): Promise<void> {
+    const token = uuidV7();
+    await db().query(
+      "INSERT INTO attribution_configs (workspace_id, project_id, method, site_token, site_token_hash, allowed_origins, status, first_event_at, last_event_at) VALUES ($1,$2,'script',$3,sha256(convert_to($3,'UTF8')),ARRAY['https://shop.example.com'],'receiving',$4,$5)",
+      [a.workspaceId, a.projectId, token, firstEventAt, lastEventAt],
     );
   }
 
@@ -196,6 +206,7 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
   // STORY-116 F1 / F2 - window 2026-10-15 for 30 days: current 10-15..11-13, prior 09-15..10-14.
   it("STORY-116 F1 - totals, deltas, conversion rate and the per-engine breakdown are the measured counts of the window and its prior", async () => {
     const a = await owner();
+    await beacon(a, "2026-09-01T00:00:00Z", "2026-11-13T00:00:00Z");
     await seed(a, "/p");
     await daily(a, "2026-10-20", "chatgpt", 60, 6);
     await daily(a, "2026-10-21", "chatgpt", 40, 4, "/q");
@@ -217,6 +228,7 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
 
   it("STORY-116 F2 - the unattributed class is displayed beside the AI figures and never added into them", async () => {
     const a = await owner();
+    await beacon(a, "2026-09-01T00:00:00Z", "2026-11-13T00:00:00Z");
     await seed(a, "/p");
     await daily(a, "2026-10-20", "chatgpt", 30, 3);
     await daily(a, "2026-10-20", "unattributed_direct", 500, 25);
@@ -236,6 +248,7 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
     expect(data<Report>(await get(a)).totals).toBeNull();
     await seed(a, "/p");
     const none = await owner();
+    await beacon(none, "2026-09-01T00:00:00Z", "2026-11-13T00:00:00Z");
     await seed(none, "/p");
     const empty = data<Report>(await get(none)).totals!;
     expect(empty.ai_sessions).toEqual({ current: 0, prior: 0, delta: 0, delta_pct: null });
@@ -243,6 +256,7 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
     expect(empty.conversion_rate_prior).toBeNull();
     expect(empty.unattributed.sessions).toEqual({ current: 0, prior: 0, delta: 0, delta_pct: null });
     const sessionsButNoConversions = await owner();
+    await beacon(sessionsButNoConversions, "2026-09-01T00:00:00Z", "2026-11-13T00:00:00Z");
     await seed(sessionsButNoConversions, "/p");
     await daily(sessionsButNoConversions, "2026-10-20", "claude", 8, 0);
     expect(data<Report>(await get(sessionsButNoConversions)).totals!.conversion_rate).toBe(0);
@@ -250,6 +264,7 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
 
   it("STORY-116 F1 - totals cover the project's whole window, not the pattern filter, and never another project, workspace or window", async () => {
     const a = await owner();
+    await beacon(a, "2026-09-01T00:00:00Z", "2026-11-13T00:00:00Z");
     await seed(a, "/p", { pattern: "ai_only" });
     await daily(a, "2026-10-20", "chatgpt", 10);
     await daily(a, "2026-11-14", "chatgpt", 999);
@@ -261,5 +276,62 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
     await daily(a, "2026-10-20", "chatgpt", 555, 0, "/p", sibling);
     expect(data<Report>(await get(a, "?pattern=invisible_both")).totals!.ai_sessions).toEqual({ current: 10, prior: 0, delta: 10, delta_pct: null });
     expect(data<Report>(await get(a, "?timeframe=7d")).totals).toBeNull();
+  }, 120_000);
+
+  // Beacon coverage. Window 2026-10-15 / 30d: prior starts 2026-09-15. The prior is only comparable when the beacon was collecting for all of it.
+  async function covered(first: string | null, last: string | null, rows = true): Promise<Totals> {
+    const a = await owner();
+    if (first !== null || last !== null) await beacon(a, first, last);
+    await seed(a, "/p");
+    if (rows) {
+      await daily(a, "2026-10-20", "chatgpt", 60, 6);
+      await daily(a, "2026-09-20", "chatgpt", 50, 5);
+    }
+    return data<Report>(await get(a)).totals!;
+  }
+  const NULL_FIG = { current: null, prior: null, delta: null, delta_pct: null };
+
+  it("STORY-116 coverage - no beacon config at all (Search Console only): every beacon figure is null, not zero", async () => {
+    const t = await covered(null, null, false);
+    expect(t.ai_sessions).toEqual(NULL_FIG);
+    expect(t.conversions).toEqual(NULL_FIG);
+    expect(t.conversion_rate).toBeNull();
+    expect(t.conversion_rate_prior).toBeNull();
+    expect(t.unattributed.sessions).toEqual(NULL_FIG);
+    expect(t.by_engine.every((e) => e.sessions.current === null && e.conversions.prior === null)).toBe(true);
+    expect(t.measured_from).toBeNull();
+    expect(t.measured_to).toBeNull();
+  }, 120_000);
+
+  it("STORY-116 coverage - a beacon younger than the window: prior is null (never 0, never +current), the current count is real and measured_from says when it began", async () => {
+    const t = await covered("2026-11-01T08:00:00Z", "2026-11-13T00:00:00Z");
+    expect(t.ai_sessions).toEqual({ current: 60, prior: null, delta: null, delta_pct: null });
+    expect(t.conversions).toEqual({ current: 6, prior: null, delta: null, delta_pct: null });
+    expect(t.conversion_rate).toBeCloseTo(0.1, 6);
+    expect(t.conversion_rate_prior).toBeNull();
+    expect(t.measured_from).toBe("2026-11-01");
+    expect(t.by_engine.find((e) => e.referrer_class === "gemini")!.sessions).toEqual({ current: 0, prior: null, delta: null, delta_pct: null });
+    expect(t.unattributed.sessions).toEqual({ current: 0, prior: null, delta: null, delta_pct: null });
+  }, 120_000);
+
+  it("STORY-116 coverage - a beacon that started mid-prior: no coverage-artefact delta_pct", async () => {
+    const t = await covered("2026-09-25T00:00:00Z", "2026-11-13T00:00:00Z");
+    expect(t.ai_sessions).toEqual({ current: 60, prior: null, delta: null, delta_pct: null });
+    expect(t.conversion_rate_prior).toBeNull();
+    expect(t.measured_from).toBe("2026-09-25");
+  }, 120_000);
+
+  it("STORY-116 coverage - a beacon covering the whole prior (first event on the prior's first day) keeps real deltas and a measured zero stays 0", async () => {
+    const t = await covered("2026-09-15T00:00:00Z", "2026-11-13T00:00:00Z");
+    expect(t.ai_sessions).toEqual({ current: 60, prior: 50, delta: 10, delta_pct: 0.2 });
+    expect(t.conversion_rate_prior).toBeCloseTo(0.1, 6);
+    expect(t.by_engine.find((e) => e.referrer_class === "gemini")!.sessions).toEqual({ current: 0, prior: 0, delta: 0, delta_pct: null });
+    expect(t.measured_from).toBe("2026-09-15");
+  }, 120_000);
+
+  it("STORY-116 coverage - a beacon that stopped: counts are untouched and measured_to carries the last event date", async () => {
+    const t = await covered("2026-09-01T00:00:00Z", "2026-10-25T17:00:00Z");
+    expect(t.ai_sessions).toEqual({ current: 60, prior: 50, delta: 10, delta_pct: 0.2 });
+    expect(t.measured_to).toBe("2026-10-25");
   }, 120_000);
 });
