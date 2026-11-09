@@ -23235,6 +23235,16 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "live_content_md": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         }
                       },
                       "required": [
@@ -23253,7 +23263,8 @@
                         "anti_filler_policy",
                         "status",
                         "status_reason",
-                        "draft_status"
+                        "draft_status",
+                        "live_content_md"
                       ],
                       "additionalProperties": false
                     },
@@ -24052,6 +24063,16 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "live_content_md": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         }
                       },
                       "required": [
@@ -24070,7 +24091,8 @@
                         "anti_filler_policy",
                         "status",
                         "status_reason",
-                        "draft_status"
+                        "draft_status",
+                        "live_content_md"
                       ],
                       "additionalProperties": false
                     },
