@@ -6,6 +6,7 @@ import { ShareTokensService } from "./share-tokens.service.js";
 // The first view is decided by the SAME atomic UPDATE that takes the view, so two parallel first mints cannot both be first.
 const WS = "0198f6a0-0000-7000-8000-000000000001";
 const TOKEN = "0198f6a0-0000-7000-8000-0000000000a1";
+const VIEW = "0198f6a0-0000-7000-8000-0000000000b1";
 
 interface Recorded {
   readonly sql: string;
@@ -22,7 +23,7 @@ describe("NEW-E-099b · ShareTokensService.consumeView first-view notification",
       client: {
         query: vi.fn(async (sql: string, params: unknown[]) => {
           calls.push({ sql, params });
-          return /UPDATE share_tokens/.test(sql) ? updated : { rowCount: 1, rows: [] };
+          return /UPDATE share_tokens/.test(sql) ? updated : /INSERT INTO share_token_views/.test(sql) ? { rowCount: 1, rows: [{ id: VIEW }] } : { rowCount: 1, rows: [] };
         }),
       },
     } as never);
@@ -38,7 +39,7 @@ describe("NEW-E-099b · ShareTokensService.consumeView first-view notification",
 
   it("FR-AGY-01o · the first view of a token (view_count becomes 1) writes ONE workspace-wide in-app notification", async () => {
     const svc = service({ rowCount: 1, rows: [{ view_count: 1, label: "Q3 client report" }] });
-    expect(await svc.consumeView(TOKEN, view)).toBe(true);
+    expect(await svc.consumeView(TOKEN, view)).toBe(VIEW);
     const n = notifications();
     expect(n).toHaveLength(1);
     expect(n[0]!.sql).toMatch(/'portal\.first_view'/);
@@ -59,14 +60,20 @@ describe("NEW-E-099b · ShareTokensService.consumeView first-view notification",
   it("FR-AGY-01o · a later view (view_count 2 and up) writes no notification", async () => {
     for (const count of [2, 3, 50]) {
       const svc = service({ rowCount: 1, rows: [{ view_count: count, label: "L" }] });
-      expect(await svc.consumeView(TOKEN, view)).toBe(true);
+      expect(await svc.consumeView(TOKEN, view)).toBe(VIEW);
       expect(notifications()).toHaveLength(0);
     }
   });
 
+  it("d.71 (c) · a taken view returns the view row's id (the telemetry key); a refused one returns null, never an id", async () => {
+    const svc = service({ rowCount: 1, rows: [{ view_count: 4, label: "L" }] });
+    expect(await svc.consumeView(TOKEN, view)).toBe(VIEW);
+    expect(calls.some((c) => /INSERT INTO share_token_views[\s\S]*RETURNING id/.test(c.sql))).toBe(true);
+  });
+
   it("FR-AGY-01o · a refused view (nothing updated) writes no view row and no notification", async () => {
     const svc = service({ rowCount: 0, rows: [] });
-    expect(await svc.consumeView(TOKEN, view)).toBe(false);
+    expect(await svc.consumeView(TOKEN, view)).toBeNull();
     expect(notifications()).toHaveLength(0);
     expect(calls).toHaveLength(1);
   });

@@ -15,9 +15,8 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 //    LIST (frontend `AgencyTheme[]`, exactly one is_default); PUT updates the
 //    theme named by `theme_id`, or creates one when `theme_id` is absent.
 //    No delete / set-default endpoint yet (week 2).
-//  - `custom_css` and every `*_key` asset field are NOT in the request
-//    schema. `.strict()` turns them into a 400 validation_failed rather than
-//    a silent drop (asset pipeline and CSS allow-list are week 2).
+//  - Every `*_key` asset field is NOT in the request schema (`custom_css` and `email_footer_html` are, since STORY-097 week 2).
+//    `.strict()` turns them into a 400 validation_failed rather than a silent drop; they stay refused until the asset endpoint exists.
 //  - hide_nominara_brand = true without whitelabel.remove_branding is
 //    403 feature_not_in_plan (service-enforced).
 
@@ -33,6 +32,10 @@ const emailFromNameSchema = z
   .regex(/^[^\u0000-\u001f\u007f<>"\\]+$/, "a display name cannot contain control characters, angle brackets, quotes or a backslash");
 const emailReplyToSchema = z.email().max(254);
 
+/** Mirrors src/lib/theme (custom-css.ts / email-footer.ts), which a unit test holds equal. The contract is the published number. */
+export const MAX_CUSTOM_CSS_LENGTH = 20_000;
+export const MAX_EMAIL_FOOTER_LENGTH = 2_000;
+
 export const agencyThemeSchema = z
   .object({
     theme_id: z.uuid(),
@@ -46,6 +49,8 @@ export const agencyThemeSchema = z
     font_family: z.string().min(1),
     logo_url: z.string().nullable(),
     hide_nominara_brand: z.boolean(),
+    /** STORY-097. The SANITISED, re-serialised style override (never the upload); null = none. Colours in it are only var(--nm-color-primary|accent|bg|fg) references, each rule contrast-checked against the theme at save time. */
+    custom_css: z.string().nullable(),
   })
   .strict();
 
@@ -58,6 +63,8 @@ export const agencyThemeAdminSchema = agencyThemeSchema
     email_from_name: emailFromNameSchema.nullable(),
     /** Owner decision 6: the Reply-To of a scheduled report's email. null = the header is omitted. */
     email_reply_to: emailReplyToSchema.nullable(),
+    /** STORY-097. The SANITISED email footer subset (never the upload); null = none. Agency editor only, like the other mail fields. */
+    email_footer_html: z.string().nullable(),
   })
   .strict();
 
@@ -83,8 +90,37 @@ export const updateAgencyThemeRequestSchema = z
     email_from_name: emailFromNameSchema.nullable().optional(),
     /** STORY-100 AC10 / owner decision 6. Absent leaves it as stored; null clears it (the Reply-To header is then omitted). */
     email_reply_to: emailReplyToSchema.nullable().optional(),
+    /** STORY-097. Parsed against a property allow-list and RE-SERIALISED; unrecognised input is dropped and reported, url()/@import/content/position:fixed refuse the save. null clears. */
+    custom_css: z.string().max(MAX_CUSTOM_CSS_LENGTH).nullable().optional(),
+    /** STORY-097. A sanitised HTML subset, re-serialised. null clears. */
+    email_footer_html: z.string().max(MAX_EMAIL_FOOTER_LENGTH).nullable().optional(),
   })
   .strict();
+
+const droppedInputSchema = z.object({ construct: z.string(), reason: z.string() }).strict();
+
+/**
+ * STORY-097 — what PUT /agency/theme answers: the saved theme plus what the sanitisers LEFT OUT, so an agency learns which of its
+ * input does nothing instead of believing the product is broken. Both arrays are empty when nothing was dropped.
+ */
+export const saveAgencyThemeResponseSchema = agencyThemeAdminSchema
+  .extend({
+    dropped: z
+      .object({
+        custom_css: z.array(droppedInputSchema.extend({ kind: z.enum(["property", "value", "selector", "at_rule", "rule"]) }).strict()),
+        email_footer_html: z.array(droppedInputSchema),
+      })
+      .strict(),
+  })
+  .strict();
+
+/**
+ * STORY-097 — a REFUSED style override or footer (url(), @import, content, position:fixed, an escape sequence, oversize). 400
+ * `validation_failed`; `refused` names each construct so the agency knows which one to remove.
+ */
+export const styleRefusalDetailsSchema = validationFailedDetailsSchema.extend({
+  refused: z.array(z.object({ construct: z.string().min(1), message: z.string().min(1) }).strict()).min(1),
+});
 
 /**
  * Contrast rejection (FR-AGY-01h). The status/code follow api-specification
@@ -109,5 +145,7 @@ export const contrastRejectionDetailsSchema = validationFailedDetailsSchema.exte
 
 export type AgencyTheme = z.infer<typeof agencyThemeSchema>;
 export type AgencyThemeAdmin = z.infer<typeof agencyThemeAdminSchema>;
+export type SaveAgencyThemeResponse = z.infer<typeof saveAgencyThemeResponseSchema>;
+export type StyleRefusalDetails = z.infer<typeof styleRefusalDetailsSchema>;
 export type UpdateAgencyThemeRequest = z.infer<typeof updateAgencyThemeRequestSchema>;
 export type ContrastRejectionDetails = z.infer<typeof contrastRejectionDetailsSchema>;

@@ -581,6 +581,13 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
   for (let i = 0; i < R; i++) {
     await client.query("INSERT INTO share_token_views (workspace_id, share_token_id) VALUES ($1, $2)", [workspaceId, shareTokenIds[i]]);
   }
+  // STORY-098 (migration 0169) — an issued sign-in code per share token. Tenant-scoped, not portal-readable.
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      "INSERT INTO share_token_email_codes (workspace_id, share_token_id, email_hash, code_hash, expires_at) VALUES ($1, $2, $3, 'x', now() + interval '10 minutes')",
+      [workspaceId, shareTokenIds[i], h(`code-${label}-${i}`)],
+    );
+  }
   const scheduledReportIds: string[] = [];
   for (let i = 0; i < R; i++) {
     const result = await client.query<{ id: string }>(

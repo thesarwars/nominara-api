@@ -102,6 +102,20 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(res.body).not.toContain(w.p2);
   });
 
+  it("STORY-097 d.67 (o) · a theme edit is served on the very next portal request with the same token (the cached read follows the theme)", async () => {
+    const w = await world();
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const colour = async (): Promise<string | null> => {
+      const res = await get(t.cookie, "/portal/overview");
+      expect(res.statusCode, res.body).toBe(200);
+      return portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.color_primary;
+    };
+    expect(await colour()).toBeNull();
+    expect(await colour()).toBeNull();
+    await harness.db().query("UPDATE brand_themes SET color_primary = '#112233' WHERE id = $1", [w.theme]);
+    expect(await colour()).toBe("#112233");
+  });
+
   it("STORY-100 AC10 · the agency's Reply-To and display name are never part of what a portal viewer is sent", async () => {
     const w = await world();
     await harness.db().query("UPDATE brand_themes SET email_from_name = 'Secret Agency Name', email_reply_to = 'private-inbox@agency.example' WHERE id = $1", [w.theme]);
@@ -111,6 +125,44 @@ describe("NEW-E-099a · portal read endpoints", () => {
     expect(res.body).not.toContain("private-inbox@agency.example");
     expect(res.body).not.toContain("Secret Agency Name");
     expect(res.body).not.toContain("email_reply_to");
+  });
+
+  it("STORY-097 · the pinned theme's stored style override reaches the portal; the email footer never does", async () => {
+    const w = await world();
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:var(--nm-color-fg)}', email_footer_html = '<p>Footer only for mail</p>' WHERE id = $1", [w.theme]);
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const res = await get(t.cookie, "/portal/overview");
+    expect(res.statusCode, res.body).toBe(200);
+    expect(portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
+    expect(res.body).not.toContain("Footer only for mail");
+    expect(res.body).not.toContain("email_footer_html");
+  });
+
+  it("STORY-097 · a stored override that bypassed the save path (raw SQL) is re-sanitised before it reaches the portal", async () => {
+    const w = await world();
+    // A fresh token per read: the overview is cached per token, and this test is about what the read does, not the cache.
+    const served = async (): Promise<string | null> => {
+      const t = await token(w, { scope: [w.p1], themeId: w.theme });
+      const res = await get(t.cookie, "/portal/overview");
+      expect(res.statusCode, res.body).toBe(200);
+      return portalOverviewResponseSchema.parse((res.json() as { data: unknown }).data).theme.custom_css;
+    };
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:url(x)} body{}' WHERE id = $1", [w.theme]);
+    expect(await served()).toBeNull();
+    await harness.db().query("UPDATE brand_themes SET custom_css = '.nm-card{color:#ffffff;background-color:#ffffff;margin:4px}' WHERE id = $1", [w.theme]);
+    expect(await served()).toBe(".nm-card{margin:4px}");
+  });
+
+  it("STORY-097 scenario 5 (content scan) · with hide_nominara_brand on, the portal overview carries no platform name, asset or link", async () => {
+    const w = await world();
+    await harness.db().query("UPDATE brand_themes SET hide_nominara_brand = true WHERE id = $1", [w.theme]);
+    const t = await token(w, { scope: [w.p1], themeId: w.theme });
+    const res = await get(t.cookie, "/portal/overview");
+    expect(res.statusCode, res.body).toBe(200);
+    const data = (res.json() as { data: unknown }).data;
+    expect(portalOverviewResponseSchema.parse(data).theme.hide_nominara_brand).toBe(true);
+    // The contract's own key `hide_nominara_brand` is machine vocabulary, not content a viewer sees; every VALUE is scanned.
+    expect(JSON.stringify(data).replaceAll('"hide_nominara_brand"', '"flag"')).not.toMatch(/nominara/i);
   });
 
   it("STORY-099 s8 · a workspace with no stored theme gets the platform default (null colours), not an error", async () => {
@@ -190,6 +242,22 @@ describe("NEW-E-099a · portal read endpoints", () => {
     const t = await token(w, { scope: [w.p1] });
     const body = portalGrowthMapResponseSchema.parse(((await get(t.cookie, `/portal/growth-map?project=${w.p1}`)).json() as { data: unknown }).data);
     expect(body.series.map((s) => s.label)).toContain(RIVAL);
+  });
+
+  it("STORY-098 s11 · hide_competitors: the matrix carries no competitor table, row, label or id under any setting (engines only), and the overview names no competitor", async () => {
+    const w = await world();
+    const t = await token(w, { scope: [w.p1], hideCompetitors: true });
+    const res = await get(t.cookie, `/portal/matrix?project=${w.p1}`);
+    expect(res.statusCode, res.body).toBe(200);
+    const data = (res.json() as { data: Record<string, unknown> }).data;
+    // The only collection is `engines`; nothing competitor-shaped rides beside it.
+    expect(Object.keys(data)).toEqual(["engines"]);
+    expect(res.body).not.toContain("Globex");
+    expect(res.body).not.toContain(w.rival);
+    expect(res.body.toLowerCase()).not.toContain("competitor");
+    const overview = await get(t.cookie, "/portal/overview");
+    expect(overview.body).not.toContain("Globex");
+    expect(overview.body).not.toContain(w.rival);
   });
 
   it("STORY-098 s12 · hide_costs: a key scan of every portal payload finds no quota, credit, cost or capture-count field", async () => {
@@ -283,6 +351,41 @@ describe("NEW-E-099a · portal read endpoints", () => {
     for (const res of [await get(t.cookie, "/portal/overview"), await get(t.cookie, `/portal/matrix?project=${w.p1}`), await get(null, "/portal/overview")]) {
       expect(res.headers["cache-control"]).toBe("private, no-store");
       expect(String(res.headers["x-robots-tag"])).toContain("noindex");
+    }
+  });
+
+  it("STORY-099 s13 / NFR-AGY-03 · portal time to first byte is within 400 ms at p95, on the cold (uncached) read of each of 20 links and on the warm read", async () => {
+    const w = await world();
+    const p95 = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.ceil(xs.length * 0.95) - 1]!;
+    const cold: number[] = [];
+    const warm: number[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      const t = await token(w, { scope: [w.p1] });
+      for (const [bucket, route] of [[cold, "overview"], [warm, "overview"]] as const) {
+        const started = performance.now();
+        const res = await get(t.cookie, `/portal/${route}`);
+        bucket.push(performance.now() - started);
+        expect(res.statusCode, res.body).toBe(200);
+      }
+    }
+    // In-process inject: no network leg, so this bounds the server's own time to a complete response, which is the TTFB the API controls.
+    expect(p95(cold), `cold p95 ${String(p95(cold))} ms`).toBeLessThanOrEqual(400);
+    expect(p95(warm), `warm p95 ${String(p95(warm))} ms`).toBeLessThanOrEqual(400);
+  }, 120_000);
+
+  it("STORY-099 s11 · every portal refusal discloses nothing about the workspace: no name, label, project name, theme or id in the body", async () => {
+    const w = await world();
+    const t = await token(w, { scope: [w.p1], themeId: w.theme, label: "Q3 client report" });
+    const refusals = [
+      await get(null, "/portal/overview"),
+      await get(t.cookie, `/portal/matrix?project=${w.p2}`),
+      await get(t.cookie, "/portal/overview?timeframe=bogus"),
+      await get(t.cookie, "/portal/overview?scope=all"),
+      await get(t.cookie, "/portal/nonexistent"),
+    ];
+    for (const res of refusals) {
+      expect(res.statusCode).toBeGreaterThanOrEqual(400);
+      for (const secret of ["Agency One", "Client One", "Client Two", "Q3 client report", w.ws, w.theme, w.p1, w.p2]) expect(res.body, `${String(res.statusCode)} ${res.body}`).not.toContain(secret);
     }
   });
 

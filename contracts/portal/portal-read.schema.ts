@@ -22,6 +22,20 @@ import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 // relabels to Competitor A/B/C and drops the comparison. The payload shapes
 // below have no cost fields at all, so the key scan is structural.
 
+/**
+ * Owner decision 71 (a) — the portal's logo is an enveloped `data:` URL, because an anonymous viewer has no route to the
+ * stored file. The envelope is closed: an image type the upload accepts (PNG, JPEG, WebP — never SVG, never `text/html`), base64
+ * and nothing after it, at most 256 KB of decoded bytes. A value outside it fails the response parse, so it is never served.
+ */
+export const PORTAL_LOGO_MAX_BYTES = 256 * 1024;
+const PORTAL_LOGO_ENVELOPE = /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+/** `data:image/jpeg;base64,` is the longest prefix (23 characters); base64 of 256 KiB is 349,528. */
+export const PORTAL_LOGO_DATA_URL_MAX_LENGTH = 23 + 4 * Math.ceil(PORTAL_LOGO_MAX_BYTES / 3);
+export const portalLogoDataUrlSchema = z.string().max(PORTAL_LOGO_DATA_URL_MAX_LENGTH).regex(PORTAL_LOGO_ENVELOPE);
+
+/** The theme as the portal serves it: the agency theme with a logo that is a closed-envelope data URL or null. */
+export const portalThemeSchema = agencyThemeSchema.extend({ logo_url: portalLogoDataUrlSchema.nullable() }).strict();
+
 export const portalOverviewQuerySchema = z.object({ timeframe: reportTimeframeSchema.optional() }).strict();
 
 export const portalProjectQuerySchema = z
@@ -58,7 +72,7 @@ export const portalOverviewProjectSchema = z
 export const portalOverviewResponseSchema = z
   .object({
     agency: z.string(),
-    theme: agencyThemeSchema,
+    theme: portalThemeSchema,
     label: z.string(),
     tabs: z.array(portalTabSchema),
     hide_competitors: z.boolean(),

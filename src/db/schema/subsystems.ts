@@ -82,6 +82,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "custom_domains",
     "share_tokens",
     "share_token_views",
+    "share_token_email_codes",
     "scheduled_reports",
     "report_artifacts",
     "scheduled_report_deliveries",

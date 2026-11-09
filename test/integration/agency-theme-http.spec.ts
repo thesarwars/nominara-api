@@ -16,8 +16,8 @@ import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture
 
 // STORY-097 — GET/PUT /v1/agency/theme through the REAL ApiModule: RbacGuard,
 // the tenant transaction (RLS), the audit interceptor, the problem filter.
-// Scenario numbers are the story's Test scenarios table. Scenarios 9-15
-// (assets, custom_css, email identity) are deferred to week 2.
+// Scenario numbers are the story's Test scenarios table. Scenarios 12-13 (custom_css) are
+// here; 9-11 (the asset endpoint) and 15 (a sent email) are not built over HTTP yet.
 
 type Cookie = Pick<SessionTokens, "accessToken" | "csrfToken">;
 const cookieOf = (t: Cookie): string => `${ACCESS_COOKIE_NAME}=${t.accessToken}; ${CSRF_COOKIE_NAME}=${t.csrfToken}`;
@@ -208,13 +208,99 @@ describe("STORY-097 · agency theme over HTTP", () => {
     expect((stored.rows[0] as { color_bg: string }).color_bg).toBe("#ffffff");
   });
 
-  it("STORY-097 · custom_css and *_key fields are rejected with validation_failed, not silently dropped", async () => {
+  it("STORY-097 · a *_key asset field and an unknown key are rejected with validation_failed, not silently dropped", async () => {
     const a = await owner("growth");
-    for (const payload of [{ custom_css: ".a{color:red}" }, { logo_light_key: "k" }, { workspace_id: uuidV7() }]) {
+    for (const payload of [{ logo_light_key: "k" }, { workspace_id: uuidV7() }]) {
       const res = await put(a, payload);
       expect(res.statusCode, JSON.stringify(payload)).toBe(400);
       expect((res.json() as { error: { code: string } }).error.code).toBe("validation_failed");
     }
+  });
+
+  const storedStyle = async (themeId: string): Promise<{ custom_css: string | null; email_footer_html: string | null }> =>
+    (await harness.db().query(`SELECT custom_css, email_footer_html FROM brand_themes WHERE id = $1`, [themeId])).rows[0] as {
+      custom_css: string | null;
+      email_footer_html: string | null;
+    };
+  type Dropped = { custom_css: Array<{ kind: string; construct: string; reason: string }>; email_footer_html: Array<{ construct: string }> };
+
+  it("STORY-097 scenario 12 · a disallowed property and an out-of-scope selector are BOTH dropped and reported; the stored text is the re-serialised one", async () => {
+    const a = await owner("growth");
+    const res = await put(a, { custom_css: " .nm-card { color : var(--nm-color-fg) ; behavior: x }  .evil{color:red}" });
+    expect(res.statusCode, res.body).toBe(200);
+    const body = data<{ theme_id: string; custom_css: string; dropped: Dropped }>(res);
+    expect(body.custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
+    expect(body.dropped.custom_css.map((d) => `${d.kind}:${d.construct}`)).toEqual(["property:behavior", "selector:.evil"]);
+    expect((await storedStyle(body.theme_id)).custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
+    const listed = data<Array<{ custom_css: string | null }>>(await get(a));
+    expect(listed[0]!.custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
+  });
+
+  it("STORY-097 scenario 13 · an external reference, an import, generated content and fixed positioning are each 400 naming the construct, and store and audit nothing", async () => {
+    const a = await owner("growth");
+    const first = data<{ theme_id: string }>(await put(a, { name: "Base", custom_css: ".nm-card{color:var(--nm-color-fg)}" }));
+    const cases: Array<[string, string]> = [
+      [".nm-card{background-color:url(https://evil.test/x)}", "url()"],
+      ['@import "https://evil.test/a.css";', "@import"],
+      ['.nm-card::before{content:"x"}', "content"],
+      [".nm-card{position:fixed}", "position: fixed"],
+    ];
+    for (const [css, construct] of cases) {
+      const res = await put(a, { theme_id: first.theme_id, custom_css: css });
+      expect(res.statusCode, css).toBe(400);
+      const error = (res.json() as { error: { code: string; details: { refused: Array<{ construct: string }>; issues: Array<{ path: string[] }> } } }).error;
+      expect(error.code).toBe("validation_failed");
+      expect(error.details.refused.map((r) => r.construct)).toEqual([construct]);
+      expect(error.details.issues[0]!.path).toEqual(["custom_css"]);
+    }
+    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{color:var(--nm-color-fg)}");
+    const audits = await harness.db().query(`SELECT count(*)::int AS n FROM audit_log WHERE workspace_id = $1 AND action LIKE 'agency.theme%'`, [a.workspaceId]);
+    expect((audits.rows[0] as { n: number }).n).toBe(1);
+  });
+
+  it("STORY-097 scenario 8 · custom_css cannot get around the contrast rule: white-on-white is not stored, with the measured ratio; literal colours are dropped", async () => {
+    const a = await owner("growth");
+    const first = data<{ theme_id: string }>(await put(a, { name: "Base", color_bg: "#ffffff", color_fg: "#111111", custom_css: ".nm-card{margin:4px}" }));
+    const bad = await put(a, { theme_id: first.theme_id, custom_css: ".nm-card{color:var(--nm-color-bg);background-color:var(--nm-color-bg)}" });
+    expect(bad.statusCode, bad.body).toBe(400);
+    const error = (bad.json() as { error: { code: string; details: { refused: Array<{ construct: string; message: string }> } } }).error;
+    expect(error.code).toBe("validation_failed");
+    expect(error.details.refused.map((r) => r.construct)).toEqual(["contrast"]);
+    expect(error.details.refused[0]!.message).toContain("1:1");
+    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{margin:4px}");
+    const literal = data<{ custom_css: string | null; dropped: Dropped }>(await put(a, { theme_id: first.theme_id, custom_css: ".nm-card{color:#ffffff;background-color:#ffffff}" }));
+    expect(literal.custom_css).toBeNull();
+    expect(literal.dropped.custom_css.map((d) => d.construct)).toEqual(["color", "background-color"]);
+    // A later colour change that would make the stored override unreadable is refused too.
+    await put(a, { theme_id: first.theme_id, custom_css: ".nm-card{color:var(--nm-color-primary)}" });
+    const recolour = await put(a, { theme_id: first.theme_id, color_primary: "#888888" });
+    expect(recolour.statusCode, recolour.body).toBe(400);
+    expect((await storedStyle(first.theme_id)).custom_css).toBe(".nm-card{color:var(--nm-color-primary)}");
+  });
+
+  it("STORY-097 · an absent custom_css keeps the stored one, null clears it, an all-dropped input stores null, and 20001 characters is 400", async () => {
+    const a = await owner("growth");
+    const { theme_id } = data<{ theme_id: string }>(await put(a, { custom_css: ".nm-card{margin:4px}" }));
+    await put(a, { theme_id, name: "Renamed" });
+    expect((await storedStyle(theme_id)).custom_css).toBe(".nm-card{margin:4px}");
+    const dropped = data<{ custom_css: string | null; dropped: Dropped }>(await put(a, { theme_id, custom_css: "body{color:red}" }));
+    expect(dropped.custom_css).toBeNull();
+    expect(dropped.dropped.custom_css).toHaveLength(1);
+    await put(a, { theme_id, custom_css: ".nm-card{margin:4px}" });
+    expect(data<{ custom_css: string | null }>(await put(a, { theme_id, custom_css: null })).custom_css).toBeNull();
+    expect((await put(a, { theme_id, custom_css: "a".repeat(20_001) })).statusCode).toBe(400);
+  });
+
+  it("STORY-097 · the email footer is stored as the sanitised subset, what was removed is reported, and it is served to the editor only", async () => {
+    const a = await owner("growth");
+    const res = await put(a, { email_footer_html: '<p onclick="x()">Acme <a href="javascript:alert(1)">link</a><script>alert(1)</script></p>' });
+    expect(res.statusCode, res.body).toBe(200);
+    const body = data<{ theme_id: string; email_footer_html: string; dropped: Dropped }>(res);
+    expect(body.email_footer_html).toBe("<p>Acme <a>link</a></p>");
+    expect(body.dropped.email_footer_html.map((d) => d.construct)).toEqual(expect.arrayContaining(["onclick attribute", "javascript: link", "script element"]));
+    expect((await storedStyle(body.theme_id)).email_footer_html).toBe("<p>Acme <a>link</a></p>");
+    expect((await put(a, { theme_id: body.theme_id, email_footer_html: "x".repeat(2_001) })).statusCode).toBe(400);
+    expect(data<{ email_footer_html: string | null }>(await put(a, { theme_id: body.theme_id, email_footer_html: null })).email_footer_html).toBeNull();
   });
 
   it("STORY-097 scenario 14 · a font outside the curated self-hosted set is refused", async () => {

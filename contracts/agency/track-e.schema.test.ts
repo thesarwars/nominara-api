@@ -63,7 +63,8 @@ describe("Track E contracts (NEW-E-0)", () => {
 
   it("KAD-05: request schemas are strict (an unknown key is refused, not dropped)", () => {
     expect(mintShareTokenRequestSchema.safeParse({ ...mint, workspace_id: randomUUID() }).success).toBe(false);
-    expect(updateAgencyThemeRequestSchema.safeParse({ custom_css: "a{}" }).success).toBe(false);
+    expect(updateAgencyThemeRequestSchema.safeParse({ custom_css: "a{}" }).success).toBe(true); // STORY-097: a request field now, sanitised by the service
+    expect(updateAgencyThemeRequestSchema.safeParse({ email_footer_css: "a{}" }).success).toBe(false);
     expect(updateAgencyThemeRequestSchema.safeParse({ logo_light_key: "x" }).success).toBe(false);
     expect(portalProjectQuerySchema.safeParse({ project: randomUUID(), workspace: "x" }).success).toBe(false);
   });

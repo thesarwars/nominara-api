@@ -294,6 +294,9 @@ export const SUBJECT_INVENTORY: Readonly<Record<string, InventoryEntry>> = Objec
   scheduled_report_deliveries: exportOf("scheduled_report_deliveries"),
   scheduled_reports: exportOf("scheduled_reports"),
   semantic_nodes: exempt(DERIVED),
+  share_token_email_codes: exempt(
+    "Single-use sign-in code (10-minute life) for an external share-link visitor: a peppered address hash and a code hash only, never the address or the code, and no foreign key to users; it cannot be turned back into a person, and it cascades with its share token.",
+  ),
   share_token_views: exportOf("share_token_views"),
   share_tokens: exportOf("share_tokens"),
   source_domains: exempt(WORKSPACE_CONFIG),

@@ -148,7 +148,7 @@ describe("STORY-098 part B · POST /portal/session", () => {
     for (const needle of [w.projectId, w.workspaceId, t.id, "Acme"]) expect(bad.body).not.toContain(needle);
   });
 
-  it("STORY-098 s8 · the cookie is __Host-, HttpOnly, Secure, SameSite=Lax, Path=/, no Domain, 4 h — and opens to exactly the five scope fields", async () => {
+  it("STORY-098 s8 · the cookie is __Host-, HttpOnly, Secure, SameSite=Lax, Path=/, no Domain, 4 h — and opens to exactly the scope fields plus the view it opened (owner decision 71 c)", async () => {
     const w = await workspace();
     const t = await token(w, { tabs: ["overview", "matrix"] });
     const res = await session({ secret: t.secret, password: PASSWORD });
@@ -163,7 +163,8 @@ describe("STORY-098 part B · POST /portal/session", () => {
     const value = decodeURIComponent(cookie.split(";")[0]!.slice(PORTAL_COOKIE_NAME.length + 1));
     for (const needle of [t.id, w.workspaceId, w.projectId]) expect(value).not.toContain(needle);
     const opened = await openPortalCookie(value, loadPortalCookieKey(COOKIE_KEY_B64));
-    expect(opened).toEqual({ token_id: t.id, workspace_id: w.workspaceId, scope_project_ids: [w.projectId], scope_tabs: ["overview", "matrix"], theme_id: null });
+    const view = (await viewRows(t.id))[0]!;
+    expect(opened).toEqual({ token_id: t.id, workspace_id: w.workspaceId, scope_project_ids: [w.projectId], scope_tabs: ["overview", "matrix"], theme_id: null, view_id: view.id });
     const expiresAt = new Date((ok(res).data as { expires_at: string }).expires_at).getTime();
     expect(Math.abs(expiresAt - (Date.now() + PORTAL_SESSION_TTL_SECONDS * 1000))).toBeLessThan(30_000);
   });
@@ -303,7 +304,7 @@ describe("STORY-098 part B · POST /portal/session", () => {
     expect((await viewRows(t.id))[0]).toMatchObject({ authenticated: false });
   });
 
-  it("STORY-098 s7 · where allowed domains are set: an email is required, a foreign domain is refused, and an allowed one is refused until the code step exists (deferred, fail closed)", async () => {
+  it("STORY-098 s7 · where allowed domains are set: an email is required, a foreign domain is refused, and an allowed one is answered 202 with no session (the code flow is in portal-email-code-http.spec.ts)", async () => {
     const w = await workspace();
     const t = await token(w, { domains: ["acme.test"] });
     const missing = await session({ secret: t.secret, password: PASSWORD });
@@ -313,8 +314,7 @@ describe("STORY-098 part B · POST /portal/session", () => {
     expect(foreign.statusCode).toBe(401);
     expect(errorOf(foreign).code).toBe("unauthenticated");
     const allowed = await session({ secret: t.secret, password: PASSWORD, email: "Jane@ACME.test" });
-    expect(allowed.statusCode).toBe(503);
-    expect(errorOf(allowed).code).toBe("degraded");
+    expect(allowed.statusCode).toBe(202);
     expect(allowed.headers["set-cookie"]).toBeUndefined();
     expect(await viewRows(t.id), "no session was minted, so no view").toHaveLength(0);
     expect((await row(t.id)).view_count).toBe(0);

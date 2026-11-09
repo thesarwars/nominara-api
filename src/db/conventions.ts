@@ -359,6 +359,8 @@ export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   "notification_emails",
   // 0163_task_verifications.up.sql — STORY-067; tenant-scoped, NOT portal-readable.
   "task_verifications",
+  // 0169_share_token_email_codes.up.sql — STORY-098 (owner decision 71 b); tenant-scoped, NOT portal-readable.
+  "share_token_email_codes",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every

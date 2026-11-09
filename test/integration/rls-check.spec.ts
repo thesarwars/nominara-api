@@ -67,6 +67,10 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0160_maintenance_count_definer",
       // STORY-067 — the eighth post-0006 tenant table (task_verifications); its policy ships in migration 0163.
       "0163_task_verifications",
+      // STORY-098 (owner decision 71 b) — the ninth post-0006 tenant table (share_token_email_codes); its policy ships in migration 0169.
+      // 0081 supplies the (workspace_id, id) key on share_tokens that 0169's composite foreign key references.
+      "0081_share_token_tenant_fk",
+      "0169_share_token_email_codes",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

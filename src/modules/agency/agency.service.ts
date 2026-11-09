@@ -1,12 +1,16 @@
-import { Injectable, Logger } from "@nestjs/common";
-import type { ClientBase } from "pg";
+import { Inject, Injectable, Logger } from "@nestjs/common";
+import type { ClientBase, Pool } from "pg";
 import {
   contrastRejectionDetailsSchema,
+  styleRefusalDetailsSchema,
   type AgencyTheme,
+  type ThemeAssetSlotName,
+  type SaveAgencyThemeResponse,
   type AgencyThemeAdmin,
   type AgencyThemeListQuery,
   type UpdateAgencyThemeRequest,
 } from "../../../contracts/agency/index.js";
+import { API_VERSION_PREFIX } from "../../api/configure-app.js";
 import { ConflictError, FeatureNotInPlanError, NotFoundError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { pageFrom, Page } from "../../api/pagination/page.js";
@@ -18,8 +22,11 @@ import {
   type ThemeColorField,
   type ThemeColors,
 } from "../../lib/theme/contrast.js";
+import { sanitiseCustomCss } from "../../lib/theme/custom-css.js";
+import { sanitiseEmailFooter } from "../../lib/theme/email-footer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
+import { PG_POOL } from "../../db/pg-pool.js";
+import { currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 
 /**
  * GET returns this id for the unsaved platform-default theme (D6, STORY-097).
@@ -45,9 +52,13 @@ interface ThemeRow {
   readonly hide_nominara_brand: boolean;
   readonly email_from_name: string | null;
   readonly email_reply_to: string | null;
+  readonly custom_css: string | null;
+  readonly email_footer_html: string | null;
+  readonly logo_light_key: string | null;
 }
 
-const COLUMNS = "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to";
+const COLUMNS =
+  "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to, custom_css, email_footer_html, logo_light_key";
 
 const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -65,6 +76,11 @@ function ratioText(n: number): string {
   return String(n) + ":1";
 }
 
+/** The platform-origin path a stored asset is fetched from. Never the object key, never a bucket host. */
+export function themeAssetPath(themeId: string, slot: ThemeAssetSlotName): string {
+  return "/" + API_VERSION_PREFIX + "/themes/" + themeId + "/assets/" + slot;
+}
+
 function toTheme(row: ThemeRow): AgencyThemeAdmin {
   return {
     theme_id: row.id,
@@ -75,11 +91,13 @@ function toTheme(row: ThemeRow): AgencyThemeAdmin {
     color_bg: row.color_bg,
     color_fg: row.color_fg,
     font_family: row.font_family,
-    // Asset upload is week 2 (STORY-097 scenarios 9-11): no logo is ever stored yet.
-    logo_url: null,
+    // A path on the platform's own origin (scenario 11); the route behind it redirects to a short presign. null = no logo uploaded.
+    logo_url: row.logo_light_key === null ? null : themeAssetPath(row.id, "logo_light"),
     hide_nominara_brand: row.hide_nominara_brand,
     email_from_name: row.email_from_name,
     email_reply_to: row.email_reply_to,
+    custom_css: row.custom_css,
+    email_footer_html: row.email_footer_html,
   };
 }
 
@@ -93,6 +111,54 @@ function toTheme(row: ThemeRow): AgencyThemeAdmin {
 @Injectable()
 export class AgencyService {
   private readonly logger = new Logger(AgencyService.name);
+
+  constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+
+  /** slot -> brand_themes column. A closed switch: the column name in the SQL never comes from input. */
+  private assetColumn(slot: ThemeAssetSlotName): string {
+    switch (slot) {
+      case "logo_light":
+        return "logo_light_key";
+      case "logo_dark":
+        return "logo_dark_key";
+      case "favicon":
+        return "favicon_key";
+    }
+  }
+
+  /** The stored object key for one slot of a theme in the caller's workspace (null = none uploaded). 404 for an unknown or foreign theme. */
+  async assetKey(themeId: string, slot: ThemeAssetSlotName): Promise<string | null> {
+    const { client } = this.store();
+    const result = await client.query<{ key: string | null }>(`SELECT ${this.assetColumn(slot)} AS key FROM brand_themes WHERE id = $1`, [themeId]);
+    if (result.rows[0] === undefined) throw new NotFoundError({ message: "no such theme" });
+    return result.rows[0].key;
+  }
+
+  /**
+   * Points a slot at a freshly stored object, in its OWN short tenant transaction: the caller has already written the object, and no
+   * request transaction is held across that storage call (KAD-06). Returns the previous key for the caller to delete, or null.
+   */
+  async recordAssetKey(
+    context: TenantContext,
+    themeId: string,
+    slot: ThemeAssetSlotName,
+    key: string,
+    /** Runs in the SAME transaction once the key is recorded (the success audit row), so the row and the outcome commit or roll back together. */
+    within?: (tx: ClientBase) => Promise<void>,
+  ): Promise<string | null> {
+    const client = await this.pool.connect();
+    try {
+      return await withTenantContext(client, context, async (tx) => {
+        const before = await tx.query<{ key: string | null }>(`SELECT ${this.assetColumn(slot)} AS key FROM brand_themes WHERE id = $1 FOR UPDATE`, [themeId]);
+        if (before.rows[0] === undefined) throw new NotFoundError({ message: "no such theme" });
+        await tx.query(`UPDATE brand_themes SET ${this.assetColumn(slot)} = $2, updated_at = now() WHERE id = $1`, [themeId, key]);
+        await within?.(tx);
+        return before.rows[0].key;
+      });
+    } finally {
+      client.release();
+    }
+  }
 
   /** All of the workspace's themes, the default first. With none stored, the unsaved platform default. */
   /**
@@ -134,6 +200,19 @@ export class AgencyService {
   }
 
   /**
+   * Owner decision 71 (a) — the stored object key of a theme's light logo, for the portal to inline. Read on the same ambient transaction as
+   * `themeForPortal`, pinned to the context's workspace. null = no logo (or no such theme). The key never leaves the server.
+   */
+  async portalLogoKey(themeId: string): Promise<string | null> {
+    const { client } = this.store();
+    const result = await client.query<{ key: string | null }>(
+      `SELECT logo_light_key AS key FROM brand_themes WHERE id = $1 AND workspace_id = app.current_workspace()`,
+      [themeId],
+    );
+    return result.rows[0]?.key ?? null;
+  }
+
+  /**
    * The portal's view of a theme, by an explicit field list (default deny): the agency's mail configuration (display name,
    * Reply-To) is never part of what a portal viewer is sent, so a field added to the editor's theme later stays out of the
    * portal until it is named here.
@@ -148,9 +227,27 @@ export class AgencyService {
       color_bg: theme.color_bg,
       color_fg: theme.color_fg,
       font_family: theme.font_family,
-      logo_url: theme.logo_url,
+      // The stored logo's only route needs a workspace session and agency:branding, which an anonymous portal viewer has neither of:
+      // sending its path would be a broken image and a theme id in a URL they cannot use. So it is null HERE and PortalContextInterceptor
+      // fills it in, after its transaction, with the logo as a size-capped data: URL (owner decision 71 a; ThemeAssetsService.portalLogo).
+      logo_url: null,
       hide_nominara_brand: theme.hide_nominara_brand,
+      custom_css: this.safeCustomCss(theme),
     };
+  }
+
+  /**
+   * Defence in depth: saveTheme is the only writer today, but a seed, a support fix or a later import could put raw text in
+   * the column. The portal re-parses it against the theme's own colours and sends null when it is not acceptable as-is.
+   */
+  private safeCustomCss(theme: AgencyThemeAdmin): string | null {
+    if (theme.custom_css === null) return null;
+    const result = sanitiseCustomCss(theme.custom_css, theme);
+    if (!result.ok) {
+      this.logger.warn(`stored custom_css not servable theme_id=${theme.theme_id}`);
+      return null;
+    }
+    return result.css === "" ? null : result.css;
   }
 
 
@@ -159,7 +256,7 @@ export class AgencyService {
    * Everything is checked here, not in the editor: a direct API call must not
    * be able to save what the interface would refuse (STORY-097 scenario 8).
    */
-  async saveTheme(body: UpdateAgencyThemeRequest): Promise<AgencyThemeAdmin> {
+  async saveTheme(body: UpdateAgencyThemeRequest): Promise<SaveAgencyThemeResponse> {
     const { client, workspaceId } = this.store();
 
     if (body.font_family !== undefined && !(CURATED_FONT_FAMILIES as readonly string[]).includes(body.font_family)) {
@@ -196,6 +293,8 @@ export class AgencyService {
 
     if (body.hide_nominara_brand === true) await this.assertBrandRemovalGranted(client, workspaceId);
 
+    const style = this.sanitiseStyleInputs(workspaceId, existing, body, colors);
+
     const font = body.font_family ?? existing?.font_family ?? DEFAULT_FONT_FAMILY;
     const hide = body.hide_nominara_brand ?? existing?.hide_nominara_brand ?? false;
     const name = body.name ?? existing?.name ?? DEFAULT_THEME_NAME;
@@ -218,7 +317,7 @@ export class AgencyService {
 
     let row: ThemeRow;
     try {
-      row = await this.write(client, workspaceId, existing, { name, makeDefault, colors, font, hide, emailFromName, emailReplyTo });
+      row = await this.write(client, workspaceId, existing, { name, makeDefault, colors, font, hide, emailFromName, emailReplyTo, customCss: style.customCss, emailFooterHtml: style.emailFooterHtml });
     } catch (error) {
       // The lock above makes this unreachable between our own requests; if the index still fires (a writer that
       // bypassed this service) it is a conflict the caller can retry, never a 500.
@@ -229,33 +328,105 @@ export class AgencyService {
     }
     incrementCounter("nominara_theme_saves_total", { outcome: existing === undefined ? "created" : "updated" });
     this.logger.log(`theme saved workspace_id=${workspaceId} theme_id=${row.id}`);
-    return toTheme(row);
+    return { ...toTheme(row), dropped: style.dropped };
+  }
+
+  /**
+   * STORY-097 — the style override and the email footer are parsed and RE-SERIALISED here, on the API path, so a client that
+   * skips the editor cannot store raw input. A REFUSED construct (url(), @import, content, position:fixed, an escape sequence,
+   * oversize) rejects the whole save naming it; anything merely unrecognised is dropped, stored without it, and returned in
+   * `dropped`. An absent field keeps the stored value; an explicit null clears it. An empty result is stored as null.
+   */
+  private sanitiseStyleInputs(
+    workspaceId: string,
+    existing: ThemeRow | undefined,
+    body: UpdateAgencyThemeRequest,
+    colors: ThemeColors,
+  ): { customCss: string | null; emailFooterHtml: string | null; dropped: SaveAgencyThemeResponse["dropped"] } {
+    const dropped: SaveAgencyThemeResponse["dropped"] = { custom_css: [], email_footer_html: [] };
+    let customCss = existing?.custom_css ?? null;
+    let emailFooterHtml = existing?.email_footer_html ?? null;
+
+    if (body.custom_css !== undefined) {
+      if (body.custom_css === null) customCss = null;
+      else {
+        const result = sanitiseCustomCss(body.custom_css, colors);
+        if (!result.ok) this.refuseStyle(workspaceId, "custom_css", result.refused.map((r) => ({ construct: r.construct, message: r.message })));
+        else {
+          customCss = result.css === "" ? null : result.css;
+          dropped.custom_css = result.dropped.map((d) => ({ kind: d.kind, construct: d.construct, reason: d.reason }));
+        }
+      }
+    }
+    else if (customCss !== null) {
+      // The stored override references the theme's colours, so a colour change is judged against it too: a save that would
+      // make the existing override unreadable is refused like the override itself would be.
+      const result = sanitiseCustomCss(customCss, colors);
+      if (!result.ok) this.refuseStyle(workspaceId, "custom_css", result.refused.map((r) => ({ construct: r.construct, message: r.message })));
+    }
+    if (body.email_footer_html !== undefined) {
+      if (body.email_footer_html === null) emailFooterHtml = null;
+      else {
+        const result = sanitiseEmailFooter(body.email_footer_html);
+        if (!result.ok) this.refuseStyle(workspaceId, "email_footer_html", [{ construct: "size", message: result.reason }]);
+        else {
+          emailFooterHtml = result.html === "" ? null : result.html;
+          dropped.email_footer_html = result.dropped.map((d) => ({ construct: d.construct, reason: d.reason }));
+        }
+      }
+    }
+    const droppedCount = dropped.custom_css.length + dropped.email_footer_html.length;
+    if (droppedCount > 0) {
+      incrementCounter("nominara_theme_style_dropped_total", { input: dropped.custom_css.length > 0 ? "custom_css" : "email_footer_html" });
+      this.logger.log(`theme style input dropped workspace_id=${workspaceId} count=${String(droppedCount)}`);
+    }
+    return { customCss, emailFooterHtml, dropped };
+  }
+
+  private refuseStyle(workspaceId: string, field: string, refused: { construct: string; message: string }[]): never {
+    for (const r of refused) incrementCounter("nominara_theme_style_refusals_total", { field, construct: r.construct });
+    // Constructs only: the refused text itself is agency input and is never logged.
+    this.logger.warn(`theme style refused workspace_id=${workspaceId} field=${field} constructs=${refused.map((r) => r.construct).join("|")}`);
+    throw new ValidationFailedError({
+      message: field + " contains a construct that is not allowed: " + refused.map((r) => r.construct).join(", "),
+      details: styleRefusalDetailsSchema.parse({ issues: refused.map((r) => ({ path: [field], message: r.message })), refused }),
+    });
   }
 
   private async write(
     client: ClientBase,
     workspaceId: string,
     existing: ThemeRow | undefined,
-    v: { name: string; makeDefault: boolean; colors: ThemeColors; font: string; hide: boolean; emailFromName: string | null; emailReplyTo: string | null },
+    v: {
+      name: string;
+      makeDefault: boolean;
+      colors: ThemeColors;
+      font: string;
+      hide: boolean;
+      emailFromName: string | null;
+      emailReplyTo: string | null;
+      customCss: string | null;
+      emailFooterHtml: string | null;
+    },
   ): Promise<ThemeRow> {
-    const { name, makeDefault, colors, font, hide, emailFromName, emailReplyTo } = v;
+    const { name, makeDefault, colors, font, hide, emailFromName, emailReplyTo, customCss, emailFooterHtml } = v;
     let row: ThemeRow;
     if (existing === undefined) {
       const inserted = await client.query<ThemeRow>(
-        `INSERT INTO brand_themes (workspace_id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to)
-         VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8, $10, $11)
+        `INSERT INTO brand_themes (workspace_id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to, custom_css, email_footer_html)
+         VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8, $10, $11, $12, $13)
          RETURNING ${COLUMNS}`,
-        [name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, workspaceId, emailFromName, emailReplyTo],
+        [name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, workspaceId, emailFromName, emailReplyTo, customCss, emailFooterHtml],
       );
       row = inserted.rows[0]!;
     } else {
       const updated = await client.query<ThemeRow>(
         `UPDATE brand_themes
             SET name = $2, is_default = $3, color_primary = $4, color_accent = $5, color_bg = $6, color_fg = $7,
-                font_family = $8, hide_nominara_brand = $9, email_from_name = $10, email_reply_to = $11
+                font_family = $8, hide_nominara_brand = $9, email_from_name = $10, email_reply_to = $11, custom_css = $12, email_footer_html = $13
           WHERE id = $1
           RETURNING ${COLUMNS}`,
-        [existing.id, name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, emailFromName, emailReplyTo],
+        [existing.id, name, makeDefault, colors.color_primary, colors.color_accent, colors.color_bg, colors.color_fg, font, hide, emailFromName, emailReplyTo, customCss, emailFooterHtml],
       );
       row = updated.rows[0]!;
     }
@@ -311,6 +482,8 @@ function platformDefaultTheme(): AgencyThemeAdmin {
     hide_nominara_brand: false,
     email_from_name: null,
     email_reply_to: null,
+    custom_css: null,
+    email_footer_html: null,
   };
 }
 

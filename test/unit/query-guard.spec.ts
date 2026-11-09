@@ -38,7 +38,8 @@ describe("STORY-011 · fix pass item 11 — TENANT_TABLES is a real, generated 5
     // `downgrade_notices` (migration 0134, the downgrade email outbox).
     // 66 with STORY-068's `notification_reads` and `notification_emails` (migration 0135).
     // 67 with STORY-067's `task_verifications` (migration 0163).
-    expect(TENANT_TABLES.size).toBe(67);
+    // 68 with STORY-098's `share_token_email_codes` (migration 0169).
+    expect(TENANT_TABLES.size).toBe(68);
     for (const name of [
       "workspaces",
       "projects",

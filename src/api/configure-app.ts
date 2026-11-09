@@ -2,6 +2,7 @@ import { RequestMethod } from "@nestjs/common";
 import type { FastifyInstance } from "fastify";
 import type { NestFastifyApplication } from "@nestjs/platform-fastify";
 import { registerCookiePlugin } from "./register-cookies.js";
+import { registerRouteBodyLimits } from "./route-body-limit.js";
 import { registerRawBodyCapture } from "./stripe-raw-body.js";
 import { registerApiReference, registerOpenApiRoute } from "./register-openapi.js";
 import { loadEnv } from "../config/env.js";
@@ -36,6 +37,8 @@ export async function configureApp(app: NestFastifyApplication): Promise<void> {
   await registerCookiePlugin(app);
   // NEW-D-2 — raw bytes for routes that opt in with @RouteConfig({ rawBody: true }) and for no other route.
   registerRawBodyCapture(app.getHttpAdapter().getInstance() as unknown as FastifyInstance);
+  // STORY-097 (d.67 n) — a per-route body limit, for the theme asset upload only.
+  registerRouteBodyLimits(app.getHttpAdapter().getInstance() as unknown as FastifyInstance);
   registerOpenApiRoute(app);
   // The browsable reference over the SAME committed document — development
   // only. `/v1/openapi.json` above is public in every environment; this adds
