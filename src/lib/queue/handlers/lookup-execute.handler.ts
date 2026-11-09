@@ -36,6 +36,7 @@ import type { QueueHandlerContext } from "../handlers.js";
 import { buildCaptureEngineGate, buildSpendMeter } from "./capture-execute.handler.js";
 import { PHASES_DONE, phasedProcessor, type JobPhases, type JobProcessor } from "../worker-factory.js";
 import { createAuxAuditToolPhases, type AuxAuditToolDeps } from "./aux-audit-tool.handler.js";
+import { createSchemaBuilderUrlPhases, type SchemaBuilderUrlDeps } from "./schema-builder-url.handler.js";
 import { createCompetitorFindPhases, type CompetitorFindDeps } from "./competitor-find.handler.js";
 import { commitEntryIdFor } from "../../credits/internal-cost.js";
 import { aggregateResearch } from "../../prompt-research/aggregate.js";
@@ -83,6 +84,8 @@ export interface LookupExecuteDeps {
   readonly competitorFinder?: Pick<CompetitorFindDeps, "fetchPage">;
   /** STORY-082: test seams for the AUX audit tool half (the network and the clock). The cache seam above is shared with it. */
   readonly auxAudit?: Pick<AuxAuditToolDeps, "audit">;
+  /** STORY-083 AC5: test seams for the Schema Builder URL half (the network and the lifecycle). The cache seam above is shared with it. */
+  readonly schemaBuilderUrl?: Pick<SchemaBuilderUrlDeps, "check" | "tools">;
 }
 
 interface EngineWindow {
@@ -500,7 +503,7 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     return true;
   };
 
-  // ONE queue, four kinds of job. A STORY-081/082 job is told apart by the signed payload's `tool` ("competitor_finder", "aux_audit"), a STORY-080 job by
+  // ONE queue, five kinds of job. A STORY-081/082/083 job is told apart by the signed payload's `tool` ("competitor_finder", "aux_audit", "schema_builder"), a STORY-080 job by
   // its `kind` ("prompt_research"); a scan's payload carries neither (absent = the Visibility Scan, as every older job is). Each keeps its own phases; the
   // wrapper only remembers which one prepared the job.
   const research: JobPhases<ResearchPrepared, ResearchFetched> = { prepare: researchPrepare, run: researchRun, commit: researchCommit, recover: (_tx, job) => researchRecover(job) };
@@ -518,10 +521,23 @@ export function createLookupExecuteHandler(context: QueueHandlerContext, deps: L
     ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...deps.auxAudit,
   });
+  const schemaBuilderUrl = createSchemaBuilderUrlPhases(context, {
+    ...(deps.cache !== undefined ? { cache: deps.cache } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+    ...deps.schemaBuilderUrl,
+  });
   type Any = JobPhases<unknown, unknown>;
   const toolOf = (job: Job): unknown => (job.data as { payload?: { tool?: unknown } }).payload?.tool;
   const phasesFor = (job: Job): Any =>
-    toolOf(job) === "competitor_finder" ? (finder as Any) : toolOf(job) === "aux_audit" ? (auxAudit as Any) : isResearchJob(job) ? (research as Any) : (scan as Any);
+    toolOf(job) === "competitor_finder"
+      ? (finder as Any)
+      : toolOf(job) === "aux_audit"
+        ? (auxAudit as Any)
+        : toolOf(job) === "schema_builder"
+          ? (schemaBuilderUrl as Any)
+          : isResearchJob(job)
+            ? (research as Any)
+            : (scan as Any);
   interface Tagged {
     readonly phases: Any;
     readonly state: unknown;

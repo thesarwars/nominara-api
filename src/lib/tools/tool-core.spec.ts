@@ -160,6 +160,23 @@ describe("STORY-078 · scenario 22 - every envelope carries the not-tracked mark
   });
 });
 
+describe("STORY-083 AC5 · the did-not-check line of a URL-mode Schema Builder run", () => {
+  const headline = { sov_estimate: null, citation_count: null, sentiment_label: null, brand_present: null, aux_score: null, entities_found: null, pages_scanned: null, items_kept: null };
+
+  it("SU-P1 a URL-mode run does not say 'no live page fetch' (it fetched one), and names the one page it looked at", () => {
+    const paste = toolPresentation("schema_builder", headline).did_not_check;
+    const url = toolPresentation("schema_builder", headline, "url_check").did_not_check;
+    expect(paste).toContain("no live page fetch");
+    expect(url).not.toContain("no live page fetch");
+    expect(url).toMatch(/one page/i);
+  });
+
+  it("SU-P2 the variant changes only that tool's line, and never the other fields", () => {
+    expect(toolPresentation("aux_audit", headline, "url_check").did_not_check).toBe(toolPresentation("aux_audit", headline).did_not_check);
+    expect(toolPresentation("schema_builder", headline, "url_check")).toMatchObject({ not_tracked: true, estimated_fields: [] });
+  });
+});
+
 describe("STORY-078 · scenarios 18 and 21 - one conversion contract", () => {
   const run = (over: Record<string, unknown> = {}) => ({
     tool_key: "visibility_scan" as const,
