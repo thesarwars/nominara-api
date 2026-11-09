@@ -1,4 +1,4 @@
-import { CanActivate, ExecutionContext, Inject, Injectable, Logger } from "@nestjs/common";
+import { CanActivate, ExecutionContext, Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import type { ClientBase, Pool } from "pg";
 import { PG_POOL } from "../../db/pg-pool.js";
@@ -17,7 +17,18 @@ import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver
 import { compensateDailyCounter } from "../../lib/usage/daily-cap.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
-import { CREDITS_KEY, CREDIT_ACTIONS, CREDIT_PRICE_KEY, type CreditAction } from "../decorators/credits.decorator.js";
+import {
+  CREDITS_FROM_COMMAND_PARSE,
+  CREDITS_KEY,
+  CREDIT_ACTIONS,
+  CREDIT_PRICE_KEY,
+  type CreditAction,
+} from "../decorators/credits.decorator.js";
+import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
+import { assertMayExecute } from "../../lib/command/execute-access.js";
+import { peekParseRecord } from "../../lib/command/parse-record.js";
+import { commandExecuteRequestSchema } from "../../../contracts/command/execute-request.schema.js";
 import {
   ConflictError,
   DomainError,
@@ -143,15 +154,19 @@ export class CreditGuard implements CanActivate {
     private readonly reflector: Reflector,
     private readonly resolver: EntitlementResolver,
     @Inject(PG_POOL) private readonly pool: Pool,
+    // STORY-085: read only to resolve a command-bar parse record. Optional so a route that never uses the marker
+    // needs no cache, and so a test that builds this guard by hand is unaffected; a marker route without one fails closed.
+    @Optional() @Inject(CACHE) private readonly cache?: Cache,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
-    const action = this.reflector.getAllAndOverride<CreditAction | undefined>(CREDITS_KEY, [
-      context.getHandler(),
-      context.getClass(),
-    ]);
-    if (action === undefined) return true;
-    if (!(CREDIT_ACTIONS as readonly unknown[]).includes(action)) throw new UnknownCreditActionError(action);
+    const declared = this.reflector.getAllAndOverride<CreditAction | typeof CREDITS_FROM_COMMAND_PARSE | undefined>(
+      CREDITS_KEY,
+      [context.getHandler(), context.getClass()],
+    );
+    if (declared === undefined) return true;
+    const fromParse = declared === CREDITS_FROM_COMMAND_PARSE;
+    if (!fromParse && !(CREDIT_ACTIONS as readonly unknown[]).includes(declared)) throw new UnknownCreditActionError(declared);
 
     const request = context.switchToHttp().getRequest<CreditScopedRequest>();
     // ⚠ NO `?? request.auth?.ws` FALLBACK, AND ITS REMOVAL IS STORY-153's ONE
@@ -187,6 +202,20 @@ export class CreditGuard implements CanActivate {
       });
     }
 
+    // STORY-085: a command-bar execute names its action in the parse record. A record that prices nothing (a task)
+    // returns here: the permission was still checked above the price, and nothing is reserved.
+    let action: CreditAction;
+    let scopeRequest: CreditPreconditionRequest = request;
+    if (fromParse) {
+      const planned = await this.resolveCommandAction(request, workspaceId);
+      if (planned === null) return true;
+      action = planned.action;
+      // The deep-scan precondition reads the project from `params.id`; this route has no such segment, the parse bound it.
+      scopeRequest = { params: { id: planned.projectId } };
+    } else {
+      action = declared as CreditAction;
+    }
+
     const confirmed = this.confirmedCredits(request);
     const resolved =
       request.entitlementVersion === undefined
@@ -217,7 +246,7 @@ export class CreditGuard implements CanActivate {
       });
     }
 
-    await this.reserve(request, workspaceId, action, price, confirmed, resolved.entitlements);
+    await this.reserve(request, workspaceId, action, price, confirmed, resolved.entitlements, scopeRequest);
     return true;
   }
 
@@ -250,6 +279,7 @@ export class CreditGuard implements CanActivate {
     price: number,
     confirmed: number,
     entitlements: Readonly<Record<string, { readonly value: unknown }>>,
+    scopeRequest: CreditPreconditionRequest = request,
   ): Promise<void> {
     // A zero-priced action has nothing to reserve. Reserving 0 would write a
     // row for a spend that cannot fail and would leave the interceptor with
@@ -375,7 +405,7 @@ export class CreditGuard implements CanActivate {
         const precondition = CREDIT_PRECONDITIONS[action];
         if (precondition !== null) {
           try {
-            await precondition(tx, request);
+            await precondition(tx, scopeRequest);
           } catch (error) {
             // A domain refusal is COLLECTED, not thrown: it would roll back
             // this transaction, and the daily-cap increment has to be given
@@ -538,6 +568,46 @@ export class CreditGuard implements CanActivate {
     };
   }
 
+
+  /**
+   * STORY-085 - resolves the priced action a command-bar execute names, BEFORE anything is reserved.
+   *
+   * Reads the parse record WITHOUT consuming it: a `price_changed` refusal has to leave the id usable so the bar
+   * can re-present the confirmation. The handler consumes it, atomically, once the reservation stands. A replayed,
+   * expired, foreign or wrong-action id is refused here as the handler would refuse it, so a dead id never reserves.
+   * The underlying endpoint's permission is evaluated now, so a forbidden action never reserves either.
+   *
+   * Returns null for an action that costs nothing (the permission has still been checked).
+   */
+  private async resolveCommandAction(
+    request: CreditScopedRequest,
+    workspaceId: string,
+  ): Promise<{ action: CreditAction; projectId: string } | null> {
+    if (this.cache === undefined) throw new Error("a command-bar execute route needs the cache to resolve its parse id");
+    const body = commandExecuteRequestSchema.safeParse((request as { body?: unknown }).body);
+    // The route's own pipe reports the malformed body; here it only means there is nothing to price.
+    if (!body.success) return null;
+    const actorId = request.tenant?.actorId;
+    if (actorId === undefined) return null;
+    const read = await peekParseRecord(this.cache, cacheKeyNamespace(), body.data.parse_id, {
+      workspaceId,
+      actorId,
+      actionId: body.data.action_id,
+    });
+    // A refused id is the handler's to report (one typed 409). Pricing nothing is safe: the handler refuses it before it runs.
+    if (!read.ok) return null;
+    const projectId = read.record.project_id ?? body.data.project_id ?? null;
+    assertMayExecute(read.record, request.membership, projectId, request.session?.lastStrongAuthAt ?? null);
+    if (read.record.credit_action === null) return null;
+    if (projectId === null) {
+      // Nothing to scan. Refused before a reservation exists, for the reason the precondition is consulted here at all.
+      throw new ValidationFailedError({
+        message: "this action needs a project",
+        details: { issues: [{ path: ["project_id"], message: "the parse bound no project; send project_id" }] },
+      });
+    }
+    return { action: read.record.credit_action, projectId };
+  }
 
   /**
    * MISSING IS A 400, NOT A ZERO.

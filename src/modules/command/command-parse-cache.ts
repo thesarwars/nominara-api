@@ -10,7 +10,7 @@ import { tenantKey } from "../../lib/cache/valkey-keys.js";
  * it when a rule changes retires every cached answer the old rules gave.
  * When the trigram entity index lands it supplies the real version here.
  */
-export const PARSE_INDEX_VERSION = "grammar-1";
+export const PARSE_INDEX_VERSION = "grammar-2";
 
 export const PARSE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
