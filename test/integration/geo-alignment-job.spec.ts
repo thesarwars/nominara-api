@@ -199,6 +199,7 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
 
   it("AC job-1 - a pending session is fetched OUTSIDE a transaction, waits while any chunk or passage lacks a vector, and is READY once they are in", async () => {
     pages.set(PAGE_URL, { kind: "html", html: livePage });
+    await db.query("INSERT INTO topic_clusters (id, workspace_id, project_id, label, prompt_count) VALUES ($1,$2,$3,'Reporting tools',3)", [clusterId, workspaceId, projectId]);
     const corpusUrls = await seedCorpus();
     const id = await pendingSession();
 
@@ -213,8 +214,8 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
 
     // while it waits, the payload says pending and shows NO partial figure as final
     const waiting = await inTx((tx) => readSessionPayload(tx, id));
-    expect(waiting).toMatchObject({ status: "pending", coverage_ratio: null, recommendations: [], projection: null, draft_status: null });
-    expect(waiting.baseline_alignment).toBeNull();
+    expect(waiting).toMatchObject({ status: "pending", coverage: { coverage_ratio: null }, content: { chunks: [] }, recommendations: [], projection: null, draft_status: null });
+    expect(waiting.alignment.baseline).toBeNull();
 
     const states = await driveToEnd(id);
     expect(states.at(-1)).toBe("ready");
@@ -222,10 +223,59 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
     const ready = await inTx((tx) => readSessionPayload(tx, id));
     expect(ready.status).toBe("ready");
     expect(ready.status_reason).toBeNull();
-    expect(ready.centroid_source_count).toBe(5);
-    expect(ready.baseline_alignment).not.toBeNull();
-    expect(ready.coverage_ratio).not.toBeNull();
-    expect(ready.target_band).not.toBeNull();
+    expect(ready.centroid.source_passage_count).toBe(5);
+    expect(ready.alignment.baseline).not.toBeNull();
+    expect(ready.coverage.coverage_ratio).not.toBeNull();
+    expect(ready.alignment.target_band).not.toBeNull();
+    // review r2 (section 8): the per-chunk figures stored on content_chunks are served, the weakest is marked, and the counts agree with the ratio
+    expect(ready.content.chunks.length).toBeGreaterThan(0);
+    const stored = (await db.query("SELECT chunk_index, alignment FROM content_chunks WHERE session_id = $1 AND NOT is_draft AND alignment IS NOT NULL ORDER BY alignment, chunk_index", [id])).rows as { chunk_index: number; alignment: number }[];
+    expect(ready.content.chunks.filter((c) => c.weakest).map((c) => c.chunk_index)).toEqual([stored[0]!.chunk_index]);
+    expect(ready.content.chunks.map((c) => c.alignment).filter((a) => a !== null).length).toBe(stored.length);
+    expect(ready.coverage.required_nodes).toBeGreaterThan(0);
+    expect(ready.coverage.present_nodes! / ready.coverage.required_nodes!).toBeCloseTo(ready.coverage.coverage_ratio!, 5);
+    expect(ready.prompt_cluster).toEqual({ cluster_id: clusterId, label: "Reporting tools", prompt_count: 3, engines: ["chatgpt"] });
+    expect(ready.embedding).toEqual({ model: MODEL, dims: 1536, storage: "halfvec" });
+    expect(ready.centroid.built_at).not.toBeNull();
+    expect(ready.recommendations.length).toBeGreaterThan(0);
+    for (const r of ready.recommendations) {
+      expect(r).toMatchObject({ kind: "semantic_node", guardrail: "phrase_only", present_in_content: false });
+      expect(r.evidence[0]!.domain).toMatch(/^doc\d\.example$/);
+    }
+  }, 120_000);
+
+  it("review r2 - a finished session's results survive a second session opened in the same project and cluster", async () => {
+    pages.set(PAGE_URL, { kind: "html", html: livePage });
+    pages.set("https://brand.test/features", { kind: "html", html: sentencePage([["Features", "Role based access and webhook delivery for teams."], ["Security", "We publish an audit trail."]]) });
+    await seedCorpus();
+    const a = await pendingSession();
+    expect((await driveToEnd(a)).at(-1)).toBe("ready");
+    const before = await sessionRow(a);
+    // The concept COUNTS are read from the scope's live concepts, so they may go null once a later session moves those on; everything else is the session's own.
+    const stable = (p: Awaited<ReturnType<typeof readSessionPayload>>) => ({ ...p, coverage: { ...p.coverage, required_nodes: null, present_nodes: null } });
+    const payloadBefore = stable(await inTx((tx) => readSessionPayload(tx, a)));
+    expect(before.coverage_ratio).not.toBeNull();
+    expect(payloadBefore.recommendations.length).toBeGreaterThan(0);
+
+    // ANY user opens a second session on another page, same project and cluster; it is driven through the real extraction (step 5) and to its end.
+    const b = randomUUID();
+    await db.query(
+      `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, created_at, analysis_state)
+       VALUES ($1,$2,$3,'https://brand.test/features',$4,'{chatgpt}',$5,$6,'pending')`,
+      [b, workspaceId, projectId, clusterId, MODEL, clock],
+    );
+    expect((await advanceAlignmentSession(deps(), b)).state).toBe("waiting");
+    await drainEmbedQueue();
+    // step 5 (the real extraction of the scope's concepts) runs on this advance; B may or may not already be ready, A must be untouched either way
+    expect(["waiting", "ready"]).toContain((await advanceAlignmentSession(deps({ buildCorpus: false }), b)).state);
+    const midway = await sessionRow(a);
+    expect(midway.coverage_ratio, "the extraction does not erase another session's finished coverage").toBe(before.coverage_ratio);
+    expect(midway.recommendations).toEqual(before.recommendations);
+    expect(stable(await inTx((tx) => readSessionPayload(tx, a)))).toEqual(payloadBefore);
+
+    expect((await driveToEnd(b, { buildCorpus: false })).at(-1)).toMatch(/ready|settled/);
+    expect(stable(await inTx((tx) => readSessionPayload(tx, a))), "and not after the second session finished either").toEqual(payloadBefore);
+    expect(await inTx((tx) => readSessionPayload(tx, b))).toMatchObject({ status: "ready" });
   }, 120_000);
 
   it("AC job-1b - a redelivered open writes the page ONCE: a second open of the same session id adds no chunk and does not rewrite the live page", async () => {
@@ -270,7 +320,7 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
     const row = await sessionRow(id);
     expect([row.analysis_state, row.analysis_reason]).toEqual(["stale", "embedding_model_changed"]);
     const payload = await inTx((tx) => readSessionPayload(tx, id));
-    expect(payload).toMatchObject({ status: "stale", status_reason: "embedding_model_changed", coverage_ratio: null, recommendations: [] });
+    expect(payload).toMatchObject({ status: "stale", status_reason: "embedding_model_changed", coverage: { coverage_ratio: null }, recommendations: [] });
     // and a later advance leaves it alone
     expect(await advanceAlignmentSession(deps(), id)).toMatchObject({ state: "settled" });
   }, 60_000);
@@ -353,7 +403,7 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
     expect(row).toMatchObject({ sufficient: false, score: null, findings: [] });
     expect(String(row.suppression_reason).length).toBeGreaterThan(0);
     const payload = await inTx((tx) => readSessionPayload(tx, id));
-    expect(payload).toMatchObject({ status: "ready", baseline_alignment: null, current_alignment: null, centroid_source_count: 0 });
+    expect(payload).toMatchObject({ status: "ready", alignment: { baseline: null, current: null }, centroid: { source_passage_count: 0 } });
   }, 120_000);
 
   it("tenancy - another workspace's job cannot advance a session it does not own: the session is `gone` and unchanged", async () => {

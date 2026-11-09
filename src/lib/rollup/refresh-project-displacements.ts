@@ -478,7 +478,9 @@ async function citationGap(
  * content, and JUDGED. `present_in_content` defaults to false, so an unjudged node would read as "absent". A node is judged iff an
  * alignment of its scope has `coverage_ratio IS NOT NULL`: `analyseNodes` sets it, and `extractSemanticNodes` clears it on every
  * alignment of the scope in the transaction that resets the nodes (so a recompute of a centroid or an alignment, which touch
- * `updated_at` but not this column, cannot make a freshly extracted node look judged). Fail closed.
+ * `updated_at` but not this column, cannot make a freshly extracted node look judged). A READY alignment keeps its coverage_ratio through a
+ * later extraction (it is that session's own finished result), so the nodes are also un-judged while any alignment of the scope is still
+ * `pending`: that is the window in which the extraction has reset the nodes and the new session has not analysed them. Fail closed.
  *
  * Then three filters, in this order, none of which invents a concept:
  *   1. low confidence: a centroid built from fewer than the minimum passages keeps only priority_rank <= 3, a null rank dropped
@@ -521,7 +523,9 @@ async function loadConceptNodes(tx: ClientBase, workspaceId: string, projectId: 
     await tx.query<{ min_sources: number | null }>(
       `SELECT min(centroid_source_count)::int AS min_sources
          FROM geo_alignments
-        WHERE workspace_id = $1 AND project_id = $2 AND prompt_cluster_id IS NOT DISTINCT FROM $3 AND coverage_ratio IS NOT NULL`,
+        WHERE workspace_id = $1 AND project_id = $2 AND prompt_cluster_id IS NOT DISTINCT FROM $3 AND coverage_ratio IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM geo_alignments p
+                           WHERE p.workspace_id = $1 AND p.project_id = $2 AND p.prompt_cluster_id IS NOT DISTINCT FROM $3 AND p.analysis_state = 'pending')`,
       [workspaceId, projectId, clusterId],
     )
   ).rows[0];

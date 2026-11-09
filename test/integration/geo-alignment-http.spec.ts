@@ -291,7 +291,10 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     expect(res.statusCode, res.body).toBe(200);
     const body = dataOf<Record<string, unknown>>(res);
     expect(alignmentSessionPayloadSchema.safeParse(body).success).toBe(true);
-    expect(body).toMatchObject({ status: "pending", coverage_ratio: null, baseline_alignment: null, current_alignment: null, percentile_vs_corpus: null, target_band: null, recommendations: [], projection: null, generation: "disabled", draft_status: null });
+    expect(body).toMatchObject({
+      alignment_id: sessionId, status: "pending", alignment: { baseline: null, current: null, percentile_vs_cited_docs: null, target_band: null }, coverage: { coverage_ratio: null },
+      content: { chunks: [] }, recommendations: [], projection: null, anti_filler_policy: { generation: "disabled" }, draft_status: null,
+    });
     expect((await get(b, sessionId)).statusCode).toBe(404);
     expect((await get(a, randomUUID())).statusCode).toBe(404);
     expect((await get(a, "not-a-uuid")).statusCode).toBe(400);
@@ -308,7 +311,7 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     const draft = "# CRM\n\nReporting for teams with a SECRETDRAFTMARKER section.";
     const res = await patch(a, sessionId, { draft_content_md: draft });
     expect(res.statusCode, res.body).toBe(200);
-    expect(dataOf<Record<string, unknown>>(res)).toMatchObject({ status: "ready", draft_status: "pending", generation: "disabled" });
+    expect(dataOf<Record<string, unknown>>(res)).toMatchObject({ status: "ready", draft_status: "pending", anti_filler_policy: { generation: "disabled" } });
     const row = (await harness.db().query("SELECT draft_content_md, live_content_md, draft_state, draft_recompute_due_at FROM geo_alignments WHERE id = $1", [sessionId])).rows[0];
     expect(row.draft_content_md).toBe(draft);
     expect(row.live_content_md).toBe("# CRM\n\nReporting for teams.");
