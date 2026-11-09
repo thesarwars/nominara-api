@@ -65,6 +65,10 @@ export const agencyThemeAdminSchema = agencyThemeSchema
     email_reply_to: emailReplyToSchema.nullable(),
     /** STORY-097. The SANITISED email footer subset (never the upload); null = none. Agency editor only, like the other mail fields. */
     email_footer_html: z.string().nullable(),
+    /** STORY-097. The platform-origin path of the stored dark-mode logo (`GET /v1/themes/{id}/assets/logo_dark` streams it); null = none uploaded. Agency editor only. */
+    logo_dark_url: z.string().nullable(),
+    /** STORY-097. The platform-origin path of the stored favicon; null = none uploaded. Agency editor only. */
+    favicon_url: z.string().nullable(),
   })
   .strict();
 

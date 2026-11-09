@@ -138,6 +138,26 @@
                                 "type": "null"
                               }
                             ]
+                          },
+                          "logo_dark_url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "favicon_url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
@@ -154,7 +174,9 @@
                           "custom_css",
                           "email_from_name",
                           "email_reply_to",
-                          "email_footer_html"
+                          "email_footer_html",
+                          "logo_dark_url",
+                          "favicon_url"
                         ],
                         "additionalProperties": false
                       }
@@ -597,6 +619,26 @@
                             }
                           ]
                         },
+                        "logo_dark_url": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "favicon_url": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "dropped": {
                           "type": "object",
                           "properties": {
@@ -672,6 +714,8 @@
                         "email_from_name",
                         "email_reply_to",
                         "email_footer_html",
+                        "logo_dark_url",
+                        "favicon_url",
                         "dropped"
                       ],
                       "additionalProperties": false

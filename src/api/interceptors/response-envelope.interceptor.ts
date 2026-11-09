@@ -1,4 +1,4 @@
-import { CallHandler, ExecutionContext, Injectable, Logger, NestInterceptor } from "@nestjs/common";
+import { CallHandler, ExecutionContext, Injectable, Logger, NestInterceptor, StreamableFile } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import type { FastifyReply } from "fastify";
 import type { Observable } from "rxjs";
@@ -77,6 +77,10 @@ export class ResponseEnvelopeInterceptor implements NestInterceptor {
         // STORY-078 - a 304 Not Modified has no message body by definition (RFC 9110 section 15.4.5). Wrapping `null` in an envelope would
         // put a body on a response that must not have one and defeat the revalidation it exists for.
         if (reply.statusCode === 304) return undefined;
+
+        // STORY-097 / decision 69 (c) - a file the handler streams IS the body (an image has no JSON member to carry an envelope). Only a
+        // StreamableFile qualifies, and only a route declaring `binary` in its contract returns one; the request id header is already set above.
+        if (body instanceof StreamableFile) return body;
 
         const meta: EnvelopeMeta = {
           request_id: requestId,

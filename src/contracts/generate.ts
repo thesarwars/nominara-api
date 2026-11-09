@@ -314,7 +314,27 @@ function buildOperation(route: DiscoveredContractRoute): OpenApiOperation {
   if (parameters.length > 0) operation.parameters = parameters;
 
   const status = String(route.httpStatus);
-  if (contract.redirect === true) {
+  if (contract.binary !== undefined) {
+    // STORY-097 / decision 69 (c) - a streamed file: the 2xx body is the bytes, one binary schema per media type the route can serve.
+    if (
+      contract.binary.length === 0 ||
+      contract.responseSchema !== undefined ||
+      contract.voidResponse === true ||
+      contract.redirect === true ||
+      route.envelopeExempt ||
+      route.httpStatus < 200 ||
+      route.httpStatus > 299
+    ) {
+      throw new Error(
+        `contracts:generate - route "${contract.operationId}" declares binary media types, which requires a 2xx @HttpCode, at least one media type, ` +
+          "no @NoEnvelope(), and none of responseSchema, voidResponse or redirect.",
+      );
+    }
+    operation.responses[status] = {
+      description: `${contract.operationId} response`,
+      content: Object.fromEntries(contract.binary.map((media) => [media, { schema: { type: "string", format: "binary" } }])),
+    };
+  } else if (contract.redirect === true) {
     // STORY-181 - a redirect is its status, its `Location` header and the ordinary void envelope (`data: null`): the envelope is on every
     // response but the health probes' (section 1), and the generator refuses any other description of a redirect (a body schema would
     // document bytes the server never sends).

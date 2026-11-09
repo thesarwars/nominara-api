@@ -1,4 +1,4 @@
-import { Logger, type CallHandler, type ExecutionContext } from "@nestjs/common";
+import { Logger, StreamableFile, type CallHandler, type ExecutionContext } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
 import { of, lastValueFrom } from "rxjs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -137,6 +137,14 @@ describe("STORY-024 · ResponseEnvelopeInterceptor", () => {
   // STORY-023 and populated by nothing until now, which is how four list
   // endpoints shipped unbounded arrays while the published contract described
   // the shape that would have satisfied NFR-API-03.
+  it("[STORY-097] a streamed file (StreamableFile) is the response body itself: it is not wrapped in an envelope, and the request id is still echoed", async () => {
+    const { context, header } = contextFor(Wrapped, "11111111-1111-4111-8111-111111111111");
+    const file = new StreamableFile(Buffer.from("image-bytes"));
+    const result = await lastValueFrom(new ResponseEnvelopeInterceptor(new Reflector()).intercept(context, handlerReturning(file)));
+    expect(result).toBe(file);
+    expect(header).toHaveBeenCalledWith("x-request-id", expect.any(String));
+  });
+
   it("[STORY-078] a 304 Not Modified carries no body at all - not an envelope around null", async () => {
     const { context } = contextFor(new Wrapped(), "11111111-1111-1111-1111-111111111111");
     const notModified = { ...context, switchToHttp: () => ({ ...context.switchToHttp(), getResponse: () => ({ header: vi.fn(), statusCode: 304 }) }) } as unknown as ExecutionContext;
