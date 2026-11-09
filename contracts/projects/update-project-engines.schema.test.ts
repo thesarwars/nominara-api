@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { updateProjectEnginesRequestSchema } from "./update-project-engines.schema.js";
+import { updateProjectEnginesParamsSchema, updateProjectEnginesRequestSchema } from "./update-project-engines.schema.js";
 
 describe("PUT /projects/{id}/engines request schema", () => {
   const ok = (engines: unknown) => updateProjectEnginesRequestSchema.safeParse({ engines }).success;
@@ -18,5 +18,14 @@ describe("PUT /projects/{id}/engines request schema", () => {
     expect(ok([])).toBe(false);
     expect(ok([{ engine_key: "chatgpt" }])).toBe(false);
     expect(ok([{ engine_key: "chatgpt", enabled: true }, { engine_key: "chatgpt", weight: 2 }])).toBe(false);
+  });
+});
+
+describe("the :id of PUT /projects/{id}/engines", () => {
+  const id = "0191a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b";
+  it("accepts a lowercase uuid; refuses a non-uuid, an empty id and an extra key, so the route answers 400 rather than a uuid-cast 500", () => {
+    expect(updateProjectEnginesParamsSchema.safeParse({ id }).success).toBe(true);
+    for (const bad of ["not-a-uuid", "", "0191a2b3c4d57e6f8a9b0c1d2e3f4a5b"]) expect(updateProjectEnginesParamsSchema.safeParse({ id: bad }).success, bad).toBe(false);
+    expect(updateProjectEnginesParamsSchema.safeParse({ id, x: 1 }).success).toBe(false);
   });
 });

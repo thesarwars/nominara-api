@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // `PUT /v1/projects/{id}/engines` — a project's per-engine overrides
 // (api-specification.md, Projects & configuration; schemas/projects-and-prompts.md
@@ -53,3 +54,8 @@ export const updateProjectEnginesResponseSchema = z
 export type UpdateProjectEnginesRequest = z.infer<typeof updateProjectEnginesRequestSchema>;
 export type ProjectEngineState = z.infer<typeof projectEngineStateSchema>;
 export type UpdateProjectEnginesResponse = z.infer<typeof updateProjectEnginesResponseSchema>;
+
+// The :id of `PUT /projects/{id}/engines`. Validated at the boundary so a non-UUID is a 400, not a uuid-cast 500 deeper in.
+export const updateProjectEnginesParamsSchema = z.object({ id: lowercaseUuidSchema }).strict();
+
+export type UpdateProjectEnginesParams = z.infer<typeof updateProjectEnginesParamsSchema>;
