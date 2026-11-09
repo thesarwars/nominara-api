@@ -39,7 +39,8 @@ export interface CategoryBenchmarkRefreshResult {
   readonly removed: number;
 }
 
-const addDays = (iso: string, days: number): string => new Date(Date.parse(`${iso}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+// A date-only ISO string parses as UTC midnight, so adding whole days is exact (no DST: this is UTC arithmetic).
+const addDays = (iso: string, days: number): string => new Date(Date.parse(iso) + days * 86_400_000).toISOString().slice(0, 10);
 
 /**
  * Recomputes the aggregate for the project's CURRENT category and, after an override, its previous one. A project with no category (and no

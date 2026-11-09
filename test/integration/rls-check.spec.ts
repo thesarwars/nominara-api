@@ -73,6 +73,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0169_share_token_email_codes",
       // Owner decision 83 (c) — checkRls() expects portal_scope_source_domains, the join-scoped policy migration 0178 creates.
       "0178_portal_source_domains_policy",
+      // STORY-176 (ADR-0005) — checkRls() expects the four platform_aggregate_* policies migration 0190 creates (computeDefinerOwnerPolicies).
+      "0190_platform_metrics_aggregate",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

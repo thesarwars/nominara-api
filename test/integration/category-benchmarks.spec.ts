@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { Logger } from "@nestjs/common";
+import { trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -19,8 +22,10 @@ const ENGINE = "chatgpt";
 describe("STORY-176 · category-relative benchmarks", () => {
   let container: StartedPostgreSqlContainer;
   let db: Client;
+  const exporter = new InMemorySpanExporter();
 
   beforeAll(async () => {
+    trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18").withDatabase("nominara_test").withUsername("nominara").withPassword("nominara").start();
     db = new Client({ connectionString: container.getConnectionUri() });
     await db.connect();
@@ -377,10 +382,47 @@ describe("STORY-176 · category-relative benchmarks", () => {
       expect([await rows("crm"), await rows("banks")]).toEqual(after);
     });
 
+    it("AC4 — an override recomputes the project's WHOLE history, even a span wider than the function's 400-day limit", async () => {
+      const OLD = "2025-06-01"; // 518 days before DAY
+      const crm: Seeded[] = [];
+      for (let i = 1; i <= 20; i++) {
+        const w = await seed("crm", i);
+        await metric(w.projectId, w.workspaceId, i, ENGINE, OLD);
+        crm.push(w);
+      }
+      await refresh(["crm"], OLD, OLD);
+      await refresh(["crm"], DAY, DAY);
+      expect((await db.query("SELECT metric_date::text FROM platform_metrics WHERE category_slug = 'crm' ORDER BY 1")).rows.map((r) => r.metric_date)).toEqual([OLD, DAY]);
+
+      const moved = crm[0]!;
+      await db.query("UPDATE projects SET category_slug = 'banks' WHERE id = $1", [moved.projectId]);
+      await asTenantJob(db, moved.workspaceId, () => handler()(db, job(moved.workspaceId, { projectId: moved.projectId, reason: "category_override", previousCategorySlug: "crm" })));
+      expect(await rows("crm")).toEqual([]); // both days, at both ends of the span
+    });
+
     it("AC6 — a project with no category still rolls up and publishes nothing", async () => {
       const lone = await seed(null, 5);
       await asTenantJob(db, lone.workspaceId, () => handler()(db, job(lone.workspaceId, { projectId: lone.projectId, metricDate: DAY })));
       expect((await db.query("SELECT count(*)::int AS n FROM platform_metrics")).rows[0].n).toBe(0);
+    });
+
+    it("observability — one span, one metric and one redacted log line per recompute: the workspace id only, no slug, score or domain", async () => {
+      const all = await seedCategory("crm", 20);
+      exporter.reset();
+      const lines: string[] = [];
+      vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(typeof m === "string" ? m : JSON.stringify(m)));
+      try {
+        await asTenantJob(db, all[0]!.workspaceId, () => handler()(db, job(all[0]!.workspaceId, { projectId: all[0]!.projectId, metricDate: DAY, reason: "run_parsed" })));
+      } finally {
+        vi.restoreAllMocks();
+      }
+      const span = exporter.getFinishedSpans().find((x) => x.name === "rollup.category_recompute");
+      expect(span).toBeDefined();
+      expect(span!.attributes).toMatchObject({ "nominara.rollup.categories": 1, "nominara.rollup.groups_written": 1, "nominara.rollup.groups_removed": 0 });
+      expect(lines.some((l) => l.includes('"metric":"nominara_rollup_category_recompute_total"') && l.includes('"reason":"run_parsed"'))).toBe(true);
+      const log = lines.find((l) => l.includes("rollup.category_recompute") && l.includes('"event"'))!;
+      expect(log).toContain(all[0]!.workspaceId);
+      expect(log).not.toMatch(/crm|visibility|median|domain/);
     });
 
     it("the payload names the previous slug as a string and nothing else is accepted in its place", async () => {
