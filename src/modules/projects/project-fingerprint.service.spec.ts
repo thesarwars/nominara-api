@@ -75,6 +75,40 @@ describe("POST /projects/fingerprint · service", () => {
     expect(await pending).toMatchObject({ status: "unavailable", reason: "budget_exceeded" });
   });
 
+  it("FP-10 a name that does not resolve is an ANSWER (unavailable), not a 422, while a real address refusal stays 422", async () => {
+    const fetch = vi.fn(async () => ok(WP));
+    const nxdomain = guard(async () => {
+      throw new GuardedFetchRefusal("dns_resolution_failed", "ENOTFOUND");
+    });
+    const res = await new ProjectFingerprintService(nxdomain, fetch).fingerprint({ root_url: "https://nope.test/" });
+    expect(fingerprintResponseSchema.safeParse(res).success).toBe(true);
+    expect(res).toMatchObject({ status: "unavailable", reason: "unreachable", platform: null });
+    expect(fetch).not.toHaveBeenCalled();
+    for (const reason of ["address_not_global", "port_not_allowed", "scheme_not_allowed"] as const) {
+      const refusing = guard(async () => {
+        throw new GuardedFetchRefusal(reason);
+      });
+      await expect(new ProjectFingerprintService(refusing, fetch).fingerprint({ root_url: "http://x.test/" })).rejects.toBeInstanceOf(UnsafeTargetError);
+    }
+  });
+
+  it("FP-11 a DNS lookup that never returns shares the 8 s budget with the fetch: unavailable (budget_exceeded), and no fetch starts late", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(async () => ok(WP));
+    const pending = new ProjectFingerprintService(guard(() => new Promise(() => undefined)), fetch).fingerprint({ root_url: "https://a.test/" });
+    await vi.advanceTimersByTimeAsync(FINGERPRINT_BUDGET_MS + 1);
+    expect(await pending).toMatchObject({ status: "unavailable", reason: "budget_exceeded" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("FP-12 time spent resolving is deducted from the fetch: one deadline, not two", async () => {
+    vi.useFakeTimers();
+    const slowDns = guard(() => new Promise((resolve) => setTimeout(() => resolve({ rootDomain: "a.test" }), FINGERPRINT_BUDGET_MS - 1_000)));
+    const pending = new ProjectFingerprintService(slowDns, () => new Promise<GuardedResponse>(() => undefined)).fingerprint({ root_url: "https://a.test/" });
+    await vi.advanceTimersByTimeAsync(FINGERPRINT_BUDGET_MS + 1);
+    expect(await pending).toMatchObject({ status: "unavailable", reason: "budget_exceeded" });
+  });
+
   it("FP-7 the fetch is the guarded one and identifies itself, with a truncated body allowed (a page is evidence even when huge)", async () => {
     const fetch = vi.fn(async (_url: string, _init?: unknown) => ok(WP));
     await new ProjectFingerprintService(guard(), fetch).fingerprint({ root_url: "https://a.test/" });

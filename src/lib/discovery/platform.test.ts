@@ -52,4 +52,17 @@ describe("detectPlatform (STORY-195 · FR-ONB-04)", () => {
   it("PL-8 an unknown generator is not a platform", () => {
     expect(detectPlatform(page('<meta name="generator" content="Hugo 0.120">'))).toBeUndefined();
   });
+
+  it("PL-9 a 5 MB body of unterminated tags is read in linear time, not quadratic", () => {
+    const hostile = "<a ".repeat(Math.ceil((5 * 1024 * 1024) / 3));
+    const started = performance.now();
+    expect(detectPlatform(hostile)).toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
+  it("PL-10 only a bounded prefix is scanned, so a marker past the cap is not read", () => {
+    const filler = "x".repeat(2 * 1024 * 1024);
+    expect(detectPlatform(page('<meta name="generator" content="WordPress 6">', filler))).toEqual({ value: "wordpress", confidence: 0.95 });
+    expect(detectPlatform(`<html><body>${filler}<link href="/wp-content/a.css"></body></html>`)).toBeUndefined();
+  });
 });

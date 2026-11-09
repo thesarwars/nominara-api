@@ -45,19 +45,7 @@ export class ProjectFingerprintService {
     return tracer.startActiveSpan("projects.fingerprint", async (span) => {
       const started = performance.now();
       try {
-        // The SSRF guard resolves DNS and opens no socket: an unsafe URL is refused before anything is requested.
-        try {
-          await this.urls.validateAndNormalize(input.root_url);
-        } catch (error) {
-          if (error instanceof GuardedFetchRefusal) {
-            throw new UnsafeTargetError({ message: "this URL cannot be fetched", details: { reason: error.reason } });
-          }
-          if (error instanceof UnparsableHostError) {
-            throw new ValidationFailedError({ message: "root_url has no registrable domain", details: { issues: [{ path: ["root_url"], message: "not a domain anyone can own" }] } });
-          }
-          throw error;
-        }
-
+        // Preflight (the SSRF guard resolves DNS and opens no socket) and fetch run under ONE deadline.
         const read = await this.read(input.root_url);
         const durationMs = Math.round(performance.now() - started);
         const platform = read.kind === "html" ? detectPlatform(read.html) : undefined;
@@ -86,23 +74,42 @@ export class ProjectFingerprintService {
     });
   }
 
-  /** The root document, or why it could not be read. Never throws for a site-side problem, and never carries the underlying error's message. */
+  /**
+   * The SSRF preflight, then the root document, under ONE FINGERPRINT_BUDGET_MS deadline, or why the page could not be read. A real refusal (address, port,
+   * scheme) throws 422; a name that does not resolve is a site-side problem and an ANSWER (`unreachable`), like a dead host. Never carries an error's message.
+   */
   private async read(rootUrl: string): Promise<{ kind: "html"; html: string } | { kind: "unavailable"; reason: "budget_exceeded" | "unreachable" | "http_error" | "not_html" }> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const budget = new Promise<"budget">((resolve) => {
       timer = setTimeout(() => resolve("budget"), FINGERPRINT_BUDGET_MS);
     });
     try {
-      const attempt = this.fetchPage(rootUrl, { headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" }, truncateAtCap: true }).catch(() => "failed" as const);
+      const attempt = this.preflightThenFetch(rootUrl);
       const result = await Promise.race([attempt, budget]);
-      if (result === "budget") return { kind: "unavailable", reason: "budget_exceeded" };
-      if (result === "failed") return { kind: "unavailable", reason: "unreachable" };
-      if (result.status < 200 || result.status >= 300) return { kind: "unavailable", reason: "http_error" };
-      const type = String(Array.isArray(result.headers["content-type"]) ? result.headers["content-type"][0] : (result.headers["content-type"] ?? "")).toLowerCase();
-      if (!type.includes("html")) return { kind: "unavailable", reason: "not_html" };
-      return { kind: "html", html: result.body.toString("utf8") };
+      return result === "budget" ? { kind: "unavailable", reason: "budget_exceeded" } : result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  private async preflightThenFetch(rootUrl: string): Promise<{ kind: "html"; html: string } | { kind: "unavailable"; reason: "unreachable" | "http_error" | "not_html" }> {
+    try {
+      await this.urls.validateAndNormalize(rootUrl);
+    } catch (error) {
+      if (error instanceof GuardedFetchRefusal) {
+        if (error.reason === "dns_resolution_failed") return { kind: "unavailable", reason: "unreachable" };
+        throw new UnsafeTargetError({ message: "this URL cannot be fetched", details: { reason: error.reason } });
+      }
+      if (error instanceof UnparsableHostError) {
+        throw new ValidationFailedError({ message: "root_url has no registrable domain", details: { issues: [{ path: ["root_url"], message: "not a domain anyone can own" }] } });
+      }
+      throw error;
+    }
+    const result = await this.fetchPage(rootUrl, { headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" }, truncateAtCap: true }).catch(() => "failed" as const);
+    if (result === "failed") return { kind: "unavailable", reason: "unreachable" };
+    if (result.status < 200 || result.status >= 300) return { kind: "unavailable", reason: "http_error" };
+    const type = String(Array.isArray(result.headers["content-type"]) ? result.headers["content-type"][0] : (result.headers["content-type"] ?? "")).toLowerCase();
+    if (!type.includes("html")) return { kind: "unavailable", reason: "not_html" };
+    return { kind: "html", html: result.body.toString("utf8") };
   }
 }

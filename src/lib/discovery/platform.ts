@@ -42,7 +42,11 @@ const ASSETS: ReadonlyArray<readonly [FingerprintPlatform, RegExp]> = [
   ["hubspot", /\/_hcms\/|\.hs-sites\.com/i],
 ];
 
-const TAG_RE = /<(?:meta|link|script|img|a|iframe|source)\b[^>]*>/gi;
+// `[^<>]*` (not `[^>]*`): a tag body can hold no `<`, so an unterminated `<a <a <a ...` fails at the next `<` and the scan stays LINEAR. With `[^>]*` every
+// unterminated opener scanned to the end of the document (quadratic: 256 KB took 8.5 s), on the request thread.
+const TAG_RE = /<(?:meta|link|script|img|a|iframe|source)\b[^<>]*>/gi;
+/** Markers live in the head and early body; only this prefix is read, so the work is bounded whatever the fetcher returned. */
+export const PLATFORM_SCAN_LIMIT_CHARS = 1024 * 1024;
 const META_GENERATOR_RE = /<meta\b[^>]*>/i;
 
 function generatorOf(tag: string): string | undefined {
@@ -57,7 +61,7 @@ export function detectPlatform(html: string): PlatformReading | undefined {
     found.set(platform, Math.max(found.get(platform) ?? 0, confidence));
   };
 
-  for (const tag of html.match(TAG_RE) ?? []) {
+  for (const tag of html.slice(0, PLATFORM_SCAN_LIMIT_CHARS).match(TAG_RE) ?? []) {
     if (META_GENERATOR_RE.test(tag)) {
       const declared = generatorOf(tag);
       if (declared !== undefined) {
