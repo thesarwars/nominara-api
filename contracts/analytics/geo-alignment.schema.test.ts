@@ -19,6 +19,7 @@ const payload = {
   target_band: { low: 0.5, high: 0.7 }, percentile_vs_corpus: 20, coverage_ratio: 0.5, centroid_source_count: 9, centroid_domains: ["a.example"],
   low_confidence: false, estimate: { method: "additive_blend_estimate", confidence: "modeled", caveat: ALIGNMENT_CAVEAT },
   recommendations: [recommendation], projection: { naive_sum: 0.02, diminished_sum: 0.02, diminishing_returns_factor: 0.85 },
+  status: "ready", status_reason: null, draft_status: null,
   generation: "disabled",
 } as const;
 

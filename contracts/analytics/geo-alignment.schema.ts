@@ -107,7 +107,30 @@ export const alignmentSessionPayloadSchema = z
     estimate: alignmentEstimateSchema,
     recommendations: z.array(alignmentRecommendationSchema),
     projection: alignmentProjectionSchema.nullable(),
+    /**
+     * STORY-192. Where the session is, so an unfinished analysis can never read as a finished one:
+     *   pending  a chunk, a cited passage or a concept of the scope still lacks its vector (or the page is still being fetched)
+     *   ready    every vector is in and the figures above are final
+     *   stale    opened under an embedding model that is no longer the provider's; the reason says so and the session is not analysed
+     *   failed   the page could not be fetched, or the vectors never arrived before the deadline; the reason says which
+     * Anything but `ready` carries NO coverage, NO recommendation and NO projection: a partial figure is never shown as final.
+     */
+    status: z.enum(["pending", "ready", "stale", "failed"]),
+    status_reason: z.string().min(1).nullable(),
+    /** The state of the customer's draft recompute; null when no draft was ever saved. While `pending`, the figures predate the draft. */
+    draft_status: z.enum(["pending", "ready", "failed"]).nullable(),
     generation: z.literal("disabled"),
   })
-  .strict();
+  .strict()
+  .superRefine((p, ctx) => {
+    if (p.status !== "ready" && (p.coverage_ratio !== null || p.recommendations.length > 0 || p.projection !== null)) {
+      ctx.addIssue({ code: "custom", message: "an analysis that is not ready shows no coverage, recommendation or projection", path: ["status"] });
+    }
+    if (p.status === "ready" && p.status_reason !== null) {
+      ctx.addIssue({ code: "custom", message: "a ready session has no status reason", path: ["status_reason"] });
+    }
+    if ((p.status === "stale" || p.status === "failed") && p.status_reason === null) {
+      ctx.addIssue({ code: "custom", message: "a stale or failed session states its reason", path: ["status_reason"] });
+    }
+  });
 export type AlignmentSessionPayload = z.infer<typeof alignmentSessionPayloadSchema>;
