@@ -293,25 +293,33 @@ export async function hardDeleteProject(
 
 export const WORKSPACE_DELETION_GRACE_DAYS = 30;
 
+/**
+ * The writes of a deletion request, on a transaction that already holds the workspace row lock and carries the tenant context. Shared by
+ * `requestWorkspaceDeletion` (the system path) and DELETE /workspaces/{id} (the owner's request), so the two cannot drift. No network or
+ * storage I/O: everything here is the workspace's own rows (ADR-0003).
+ */
+export async function scheduleWorkspaceDeletion(tx: ClientBase, workspaceId: string, referenceDate: Date): Promise<Date> {
+  const executeAt = new Date(referenceDate.getTime() + WORKSPACE_DELETION_GRACE_DAYS * 86_400_000);
+  await tx.query(
+    `UPDATE workspaces
+        SET status = 'pending_deletion', deletion_requested_at = $2, deletion_execute_at = $3
+      WHERE id = $1`,
+    [workspaceId, referenceDate.toISOString(), executeAt.toISOString()],
+  );
+  await tx.query("UPDATE share_tokens SET revoked_at = now() WHERE workspace_id = $1 AND revoked_at IS NULL", [workspaceId]);
+  await tx.query("UPDATE custom_domains SET status = 'disabled' WHERE workspace_id = $1 AND status <> 'disabled'", [workspaceId]);
+  return executeAt;
+}
+
 export async function requestWorkspaceDeletion(
   client: ClientBase,
   workspaceId: string,
   referenceDate: Date = new Date(),
 ): Promise<void> {
-  const executeAt = new Date(referenceDate.getTime() + WORKSPACE_DELETION_GRACE_DAYS * 86_400_000);
   await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
     // Checkpoint-6 — bounded: a billing change may hold this row across a Stripe call.
     await lockWorkspaceBounded(tx, workspaceId, () => new WorkspaceLockBusyError(workspaceId));
-    await tx.query(
-      `UPDATE workspaces
-          SET status = 'pending_deletion', deletion_requested_at = $2, deletion_execute_at = $3
-        WHERE id = $1`,
-      [workspaceId, referenceDate.toISOString(), executeAt.toISOString()],
-    );
-    await tx.query("UPDATE share_tokens SET revoked_at = now() WHERE workspace_id = $1 AND revoked_at IS NULL", [workspaceId]);
-    await tx.query("UPDATE custom_domains SET status = 'disabled' WHERE workspace_id = $1 AND status <> 'disabled'", [
-      workspaceId,
-    ]);
+    await scheduleWorkspaceDeletion(tx, workspaceId, referenceDate);
   });
 }
 
