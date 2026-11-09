@@ -6,7 +6,7 @@ import { connectAsRole } from "./support/runtime-roles.js";
 import { isRunnableForCurrentTarget } from "./support/target-guard.js";
 
 describe("ISO-09 · portal cannot read outside its project scope, even within the same workspace", () => {
-  it.skipIf(!isRunnableForCurrentTarget("ISO-09"))("holds across all 18 PORTAL_READABLE_TABLES", async () => {
+  it.skipIf(!isRunnableForCurrentTarget("ISO-09"))("holds across all 19 PORTAL_READABLE_TABLES (source_domains by domain, decision 83 c)", async () => {
     await expect(assertIso09PortalReadScope(getAssertionContext())).resolves.toBeUndefined();
   });
 });

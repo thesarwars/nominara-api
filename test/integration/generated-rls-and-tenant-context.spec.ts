@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import {
   BREAKGLASS_ROLE,
   GLOBAL_TABLES,
+  PORTAL_JOIN_SCOPED_TABLES,
   PORTAL_READABLE_TABLES,
   RUNTIME_ROLES,
 } from "../../src/db/conventions.js";
@@ -1390,6 +1391,7 @@ describe("STORY-011 · generated RLS policies & tenant context", () => {
       "SELECT tablename FROM pg_policies WHERE schemaname = 'public' AND policyname LIKE 'portal_scope_%'",
     );
     const actual = result.rows.map((r) => r.tablename).sort();
-    expect(actual).toEqual([...PORTAL_READABLE_TABLES].sort());
+    // This database ran 0001-0006 only; the join-scoped table's portal policy is 0178's (decision 83 c), asserted by db:rls-check and ISO-09.
+    expect(actual).toEqual([...PORTAL_READABLE_TABLES].filter((table) => !(PORTAL_JOIN_SCOPED_TABLES as readonly string[]).includes(table)).sort());
   });
 });
