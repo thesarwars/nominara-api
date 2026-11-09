@@ -150,12 +150,30 @@ export const portalTasksResponseSchema = z
   })
   .strict();
 
+/**
+ * Decision 83(c) — the Sources query: the project selector (intersected with the cookie scope, like every portal read) and an
+ * optional window. The source index is computed over 7, 30 and 90 days only, so `24h` is not offered here.
+ */
+export const portalSourcesQuerySchema = z
+  .object({ project: lowercaseUuidSchema, timeframe: z.enum(["7d", "30d", "90d"]).optional() })
+  .strict();
+
+const portalSourceUrlSchema = z
+  .object({
+    url: z.string(),
+    /** Absent under hide_costs (a citation count). */
+    citations: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+
 export const portalSourceDomainSchema = z
   .object({
     domain: z.string(),
     influence: z.number().min(0).max(1),
-    citations: z.number().int().nonnegative(),
-    prompts: z.number().int().nonnegative(),
+    /** Absent under hide_costs (owner decision 83 c). */
+    citations: z.number().int().nonnegative().optional(),
+    /** Absent under hide_costs (owner decision 83 c). */
+    prompts: z.number().int().nonnegative().optional(),
     source_class: z.enum([
       "community_forum",
       "review_marketplace",
@@ -166,11 +184,14 @@ export const portalSourceDomainSchema = z
       "vendor_owned",
       "academic",
       "government",
+      "other",
     ]),
+    /** Null = not yet verified by fetching; never false by assumption. */
     brand_present: z.boolean().nullable(),
     verified_at: z.iso.datetime().nullable(),
-    gap_severity: z.enum(["critical", "high", "medium", "low", "none"]),
-    top_urls: z.array(z.object({ url: z.string(), citations: z.number().int().nonnegative() }).strict()),
+    /** Null while presence is unverified. */
+    gap_severity: z.enum(["critical", "high", "medium", "low", "none"]).nullable(),
+    top_urls: z.array(portalSourceUrlSchema),
     /** Relabelled Competitor A/B/C (or empty) under hide_competitors. */
     competitors_present: z.array(z.string()),
   })
@@ -186,6 +207,26 @@ export const portalSourcesResponseSchema = z
   })
   .strict();
 
+/** The two strict shapes the server enforces on the way out: costs visible (counts present) and hide_costs (counts absent). */
+export const portalSourcesCostsVisibleSchema = portalSourcesResponseSchema
+  .extend({
+    domains: z.array(
+      portalSourceDomainSchema
+        .extend({
+          citations: z.number().int().nonnegative(),
+          prompts: z.number().int().nonnegative(),
+          top_urls: z.array(portalSourceUrlSchema.extend({ citations: z.number().int().nonnegative() }).strict()),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+export const portalSourcesCostsHiddenSchema = portalSourcesResponseSchema
+  .extend({
+    domains: z.array(portalSourceDomainSchema.omit({ citations: true, prompts: true }).extend({ top_urls: z.array(portalSourceUrlSchema.omit({ citations: true }).strict()) }).strict()),
+  })
+  .strict();
+
 export type PortalOverviewResponse = z.infer<typeof portalOverviewResponseSchema>;
 export type PortalGrowthMapResponse = z.infer<typeof portalGrowthMapResponseSchema>;
 export type PortalGrowthMapQuery = z.infer<typeof portalProjectQuerySchema>;
@@ -194,3 +235,4 @@ export type PortalMatrixResponse = z.infer<typeof portalMatrixResponseSchema>;
 export type PortalTasksQuery = z.infer<typeof portalTasksQuerySchema>;
 export type PortalTasksResponse = z.infer<typeof portalTasksResponseSchema>;
 export type PortalSourcesResponse = z.infer<typeof portalSourcesResponseSchema>;
+export type PortalSourcesQuery = z.infer<typeof portalSourcesQuerySchema>;
