@@ -6,3 +6,4 @@ export * from "./prompt-research.schema.js";
 export * from "./competitor-finder.schema.js";
 export * from "./aux-audit.schema.js";
 export * from "./compare-runs.schema.js";
+export * from "./schema-builder.schema.js";
