@@ -32,7 +32,7 @@ function buckets(config = RATE_LIMIT_DEFAULTS, clock = { ms: Date.UTC(2026, 7, 2
 
 describe("STORY-025 · §12 transcribed exactly", () => {
   it("defines every one of the sixteen route classes, once each", () => {
-    expect(RATE_LIMIT_DEFAULTS).toHaveLength(16);
+    expect(RATE_LIMIT_DEFAULTS).toHaveLength(17);
     expect(RATE_LIMIT_DEFAULTS.map((entry) => entry.route_class).sort()).toEqual(
       [...rateLimitRouteClassSchema.options].sort(),
     );
@@ -70,6 +70,8 @@ describe("STORY-025 · §12 transcribed exactly", () => {
     ["plan_change_preview", "workspace", 60, 3_600_000],
     ["portal_session", "ip", 10, 3_600_000],
     ["public_niche_reports", "ip", 120, 3_600_000],
+    // STORY-103 - the public plans snapshot, per IP.
+    ["public_plans", "ip", 120, 3_600_000],
   ])("%s / %s is %i per %i ms", (routeClass, scope, limit, windowMs) => {
     const entry = RATE_LIMIT_DEFAULTS.find((candidate) => candidate.route_class === routeClass)!;
     const bucket = entry.buckets.find((candidate) => candidate.scope === scope && candidate.limit === limit);
@@ -93,6 +95,7 @@ describe("STORY-025 · §12 transcribed exactly", () => {
     ["plan_change_preview", 5],
     ["portal_session", 2],
     ["public_niche_reports", 1],
+    ["public_plans", 10],
   ])("%s bursts at %i", (routeClass, burst) => {
     expect(RATE_LIMIT_DEFAULTS.find((entry) => entry.route_class === routeClass)!.burst).toBe(burst);
   });

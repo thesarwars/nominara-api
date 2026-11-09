@@ -10,7 +10,7 @@ import {
 // is rounded, harmonised or inferred. Where §12 is ambiguous the ambiguity is
 // named rather than resolved silently.
 //
-// SIXTEEN classes (fifteen from §12 plus `tool_site_files`, owner decision 71(d)). STORY-025's own acceptance criteria list nine; the
+// SEVENTEEN classes (fifteen from §12 plus `tool_site_files`, owner decision 71(d), and `public_plans`, STORY-103). STORY-025's own acceptance criteria list nine; the
 // reference outranks the story, so they ship and the story text goes on
 // the hand-carried specification-fix list.
 //
@@ -174,6 +174,14 @@ export const RATE_LIMIT_DEFAULTS: RateLimitConfig = rateLimitConfigSchema.parse(
   {
     route_class: "public_niche_reports",
     burst: 1,
+    buckets: [{ scope: "ip", limit: 120, window: "rolling", window_ms: HOUR_MS }],
+  },
+  {
+    // STORY-103 - the public plans snapshot (`GET /public/plans`), unauthenticated, so per-IP like the other public class. It is a
+    // small cached global read, so it is more generous than niche reports: 120/hour per IP, with a burst of 10 for a page that
+    // loads the snapshot and the comparison together. Not a §12 row; same precedent as `tool_site_files`.
+    route_class: "public_plans",
+    burst: 10,
     buckets: [{ scope: "ip", limit: 120, window: "rolling", window_ms: HOUR_MS }],
   },
 ]);
