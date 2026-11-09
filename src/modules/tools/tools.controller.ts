@@ -9,6 +9,10 @@ import {
   compareRunsResponseSchema,
   type CompareRunsRequest,
   type CompareRunsResponse,
+  schemaBuilderRequestSchema,
+  schemaBuilderResponseSchema,
+  type SchemaBuilderRequest,
+  type SchemaBuilderResponse,
   competitorFinderAcceptedSchema,
   competitorFinderRequestSchema,
   convertToolRunRequestSchema,
@@ -72,6 +76,7 @@ import { openSseReply } from "../../api/streaming/sse-reply.js";
 import { AuxAuditToolService } from "./aux-audit.service.js";
 import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { CompareRunsService } from "./compare-runs.service.js";
+import { SchemaBuilderService } from "./schema-builder.service.js";
 import { ToolsService } from "./tools.service.js";
 import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
@@ -92,6 +97,7 @@ export class ToolsController {
     private readonly finder: CompetitorFinderService,
     private readonly auxAudit: AuxAuditToolService,
     private readonly compare: CompareRunsService,
+    private readonly schemaBuilder: SchemaBuilderService,
   ) {}
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
@@ -321,5 +327,19 @@ export class ToolsController {
   @ApiContract({ operationId: "compareToolRuns", requestSchema: compareRunsRequestSchema, responseSchema: compareRunsResponseSchema, requiresIdempotencyKey: true })
   compareRuns(@Body(new ZodValidationPipe(compareRunsRequestSchema)) body: CompareRunsRequest): Promise<CompareRunsResponse> {
     return this.compare.compare(body);
+  }
+
+  // STORY-083 (decision 78a) - the explicit Save of a browser-side Build or Check: findings only, never markup. Free, and with no path to a capture, a queue or a fetch.
+  // `lookup:execute` is the permission the reference names; rate class `writes`.
+  @Post("schema-builder")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @RateLimitClass("writes")
+  @Audit({ action: "tool_run.schema_builder_saved", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ mode: (body as SchemaBuilderResponse).mode, findings: (body as SchemaBuilderResponse).findings.length }) })
+  @ApiContract({ operationId: "saveSchemaBuilderRun", requestSchema: schemaBuilderRequestSchema, responseSchema: schemaBuilderResponseSchema, requiresIdempotencyKey: true })
+  saveSchemaBuilder(@Body(new ZodValidationPipe(schemaBuilderRequestSchema)) body: SchemaBuilderRequest): Promise<SchemaBuilderResponse> {
+    return this.schemaBuilder.save(body);
   }
 }
