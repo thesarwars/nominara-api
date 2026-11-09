@@ -13,6 +13,8 @@ import { assertIso28DefinerOwnerHoldsNoRoles } from "./assertions/iso-28-definer
 import { assertIso27MaintenanceDefinerShape } from "./assertions/iso-27-maintenance-definer-shape.js";
 import { assertIso17PartitionRlsApplied } from "./assertions/iso-17-partition-rls-applied.js";
 import { assertIso31ReportLinkTokenIsolation } from "./assertions/iso-31-report-link-token-isolation.js";
+import { assertIso32PlatformAggregateDefinerShape } from "./assertions/iso-32-platform-aggregate-definer-shape.js";
+import { assertIso33PlatformAggregateKRule } from "./assertions/iso-33-platform-aggregate-k-rule.js";
 import { getAssertionContext } from "./support/context.js";
 
 // STORY-012 Phase 1 (catalog) — order matters, ISO-06 first: the census is
@@ -103,5 +105,17 @@ describe("ISO-30 · no refused role is a member (of any kind, ADMIN-only include
 describe("ISO-31 · a report-link token never serves another workspace's object; a foreign, expired or revoked token is refused", () => {
   it("holds in row-level security alone, through the service for every (token, path workspace) pair, and in the unique token hash", async () => {
     await expect(assertIso31ReportLinkTokenIsolation(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-32 · the platform-aggregate functions are pinned SECURITY DEFINERs, counts-only, executable by the runtime roles and nobody else", () => {
+  it("holds in pg_proc", async () => {
+    await expect(assertIso32PlatformAggregateDefinerShape(getAssertionContext())).resolves.toBeUndefined();
+  });
+});
+
+describe("ISO-33 · app.refresh_platform_metrics publishes only for 20 distinct workspaces, in whole numbers, with domains that 20 workspaces cite", () => {
+  it("holds at the boundary: 19 publish nothing, 20 publish one row", async () => {
+    await expect(assertIso33PlatformAggregateKRule(getAssertionContext())).resolves.toBeUndefined();
   });
 });
