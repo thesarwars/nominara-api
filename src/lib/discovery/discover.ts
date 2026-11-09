@@ -88,6 +88,44 @@ async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T> {
 
 export const DEFAULT_DISCOVER_DEPS: DiscoverDeps = { fetch: guardedFetch, now: () => Date.now() };
 
+type PageSignals = ReturnType<typeof extractHtmlSignals>;
+type Described = NonNullable<ReturnType<typeof extractFromHtml>["description"]>;
+
+/** The description (hero copy only stands in where the page declared none) and the products (nav labels only where there is no Product schema). */
+function describeAndList(extracted: ReturnType<typeof extractFromHtml>, signals: PageSignals) {
+  let description: Described | undefined = extracted.description;
+  if (description === undefined && signals.heroCopy !== undefined) {
+    const { headline, lede } = signals.heroCopy;
+    const lead = /[.!?]$/.test(headline) ? headline : `${headline}.`;
+    description = { value: lede === undefined ? headline : `${lead} ${lede}`, confidence: CONFIDENCE.heroCopy, source: "hero copy" };
+  }
+  const products =
+    extracted.products ??
+    (signals.navProducts === undefined ? undefined : { value: signals.navProducts, confidence: CONFIDENCE.navStructure, source: "nav structure" });
+  return { description, products };
+}
+
+function classificationText(html: string, description: string | undefined, products: readonly string[] | undefined, signals: PageSignals): string {
+  return buildClassificationText({
+    title: extractPageTitle(html),
+    description,
+    hero: signals.heroCopy === undefined ? undefined : [signals.heroCopy.headline, signals.heroCopy.lede].filter((p): p is string => p !== undefined).join(". "),
+    nav: signals.navProducts,
+    products,
+  });
+}
+
+/**
+ * STORY-195 / decision 88(b): the text `discover` classifies for a page, for any other reader of the same nearest match (the pre-creation fingerprint),
+ * so the two can never read a page differently. Empty when the page gives nothing to classify.
+ */
+export function classificationTextFromHtml(html: string): string {
+  const extracted = extractFromHtml(html);
+  const signals = extractHtmlSignals(html);
+  const { description, products } = describeAndList(extracted, signals);
+  return classificationText(html, description?.value, products?.value, signals);
+}
+
 /**
  * Runs one discovery pass and returns the review payload.
  *
@@ -129,34 +167,16 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
       }
       if (!skip.has("brand_name") && brandName) put(fields, "brand_name", brandName);
 
-      // Hero copy only stands in where the page declared no description.
-      let description = extracted.description;
-      if (description === undefined && signals.heroCopy !== undefined) {
-        const { headline, lede } = signals.heroCopy;
-        const lead = /[.!?]$/.test(headline) ? headline : `${headline}.`;
-        description = { value: lede === undefined ? headline : `${lead} ${lede}`, confidence: CONFIDENCE.heroCopy, source: "hero copy" };
-      }
+      const { description, products } = describeAndList(extracted, signals);
       if (!skip.has("description") && description) put(fields, "description", description);
 
-      // Nav labels only where there is no Product schema.
-      const products =
-        extracted.products ??
-        (signals.navProducts === undefined
-          ? undefined
-          : { value: signals.navProducts, confidence: CONFIDENCE.navStructure, source: "nav structure" });
       if (!skip.has("products") && products) put(fields, "products", products);
       if (!skip.has("locale") && extracted.locale) put(fields, "locale", extracted.locale);
 
       // STORY-189 AC3/AC4 — the category, from the text just read. Not derived at all when the caller supplied it or a person decided it
       // (supplied wins). A failed or empty classification proposes NOTHING: a missing category is honest, a guessed one corrupts the benchmark.
       if (!skip.has("category") && deps.classify !== undefined) {
-        const siteText = buildClassificationText({
-          title: extractPageTitle(html),
-          description: description?.value,
-          hero: signals.heroCopy === undefined ? undefined : [signals.heroCopy.headline, signals.heroCopy.lede].filter((p): p is string => p !== undefined).join(". "),
-          nav: signals.navProducts,
-          products: products?.value,
-        });
+        const siteText = classificationText(html, description?.value, products?.value, signals);
         if (siteText !== "") {
           try {
             const remaining = Math.max(1, DISCOVERY_BUDGET_MS - (deps.now() - startedAt));

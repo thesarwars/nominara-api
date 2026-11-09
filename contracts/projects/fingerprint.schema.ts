@@ -5,10 +5,12 @@ import { z } from "zod";
 // nothing (`credits_charged` is the literal 0). It goes through the guarded fetcher and is bounded in time; a failure to read the site is an
 // ANSWER (`status: "unavailable"` with a reason), never an error, because onboarding must be submittable without it (FR-ONB-04).
 //
-// HONESTY. A suggestion is a reading of the page, never a decision: it carries a confidence and the client pre-checks it editable. What cannot be
-// derived is SAID, in `not_derived`, and never faked: the business-category taxonomy is not built (STORY-189) and `category_slug` is the benchmark
-// join key, so a guessed category would make every category-relative comparison silently wrong. `category: null` with `category` in `not_derived`
-// reads "this endpoint cannot say", where `null` alone would read "looked and found nothing".
+// HONESTY. A suggestion is a reading of the page, never a decision: it carries a confidence and the client pre-checks it editable. The category is the
+// taxonomy nearest match discovery uses (STORY-189), as a slug, and is `null` below the 0.60 low-confidence line (`LOW_CONFIDENCE_THRESHOLD`): a guessed
+// category would make every category-relative comparison silently wrong, since `category_slug` is the benchmark join key. What cannot be derived is SAID,
+// in `not_derived`, and never faked: `category` is named there when it could not be classified this time (the provider failed or the deadline passed;
+// the page was still read), and `verticals` always (the taxonomy carries none). `category: null` with `category` in `not_derived` reads "this endpoint
+// cannot say", where `null` alone reads "looked and found nothing sure enough".
 
 /** The platforms a page can be recognised as. A closed set: a platform is only named when a marker for it was found. */
 export const FINGERPRINT_PLATFORMS = ["wordpress", "shopify", "wix", "squarespace", "webflow", "framer", "ghost", "drupal", "joomla", "hubspot"] as const;
