@@ -40,6 +40,33 @@ describe("Schema Builder URL mode · the worker's check", () => {
     expect(out.result.findings.find((x) => x.rule_code === "AUX-R-008")).toMatchObject({ severity: "critical" });
   });
 
+  it("SU-2b a parse finding names its position IN THE PAGE (1-based line and column), derived from the block-relative offset and where the block starts", async () => {
+    const page = ['<!doctype html><html><head>', '<script type="application/ld+json">', '{"@context": "https://schema.org",', '  "name": "x",}', "</script></head><body><main><h1>x</h1></main></body></html>"].join("\n");
+    const out = await check(page);
+    if (out.kind !== "checked") throw new Error("expected a checked result");
+    const f = out.result.findings.find((x) => x.rule_code === "AUX-R-008")!;
+    expect(f.position).toEqual({ line: 4, column: 15 });
+    expect(f.field).toBeNull();
+    expect(schemaBuilderUrlResultSchema.safeParse(out.result).success).toBe(true);
+    // A block that starts mid-line: the column on its FIRST line is offset by where the block begins.
+    const inline = '<p>x</p><script type="application/ld+json">{"a":1,}</script>';
+    const out2 = await check(inline);
+    if (out2.kind !== "checked") throw new Error("expected a checked result");
+    expect(out2.result.findings.find((x) => x.rule_code === "AUX-R-008")!.position).toEqual({ line: 1, column: inline.indexOf("}") + 1 });
+    // The offset is relative to the UNTRIMMED block text and counts UTF-16 units: astral characters before the error do not skew it.
+    const astral = '<script type="application/ld+json">{"n":"😀😀","a":1,}</script>';
+    const out3 = await check(astral);
+    if (out3.kind !== "checked") throw new Error("expected a checked result");
+    expect(out3.result.findings.find((x) => x.rule_code === "AUX-R-008")!.position).toEqual({ line: 1, column: astral.indexOf("}") + 1 });
+  });
+
+  it("SU-2c a parse error with no recoverable offset names no position (null), never a guess", async () => {
+    const out = await check(html(ld("")));
+    if (out.kind !== "checked") throw new Error("expected a checked result");
+    const f = out.result.findings.find((x) => x.rule_code === "AUX-R-008");
+    expect(f?.position ?? null).toBeNull();
+  });
+
   it("SU-3 a page with nothing to report is `checked` with zero findings and the rules it decided: a real answer, distinct from unreachable", async () => {
     const clean = html(
       ld(JSON.stringify({ "@context": "https://schema.org", "@type": "Organization", name: "Acme", url: "https://shop.example/", logo: "https://shop.example/l.png", sameAs: ["https://x.com/acme"], description: "CRM software." })),

@@ -1,3 +1,4 @@
+import { parse, type DefaultTreeAdapterMap } from "parse5";
 import {
   SCHEMA_BUILDER_MAX_FINDINGS,
   SCHEMA_BUILDER_RULE_CODES,
@@ -46,6 +47,47 @@ function fieldOf(locator: string): string | null {
   return FIELD_RE.test(path) ? path : null;
 }
 
+type Node = DefaultTreeAdapterMap["node"];
+
+/**
+ * Where a JSON-LD parse error sits IN THE PAGE. The rule's locator carries `@<offset>`, and that offset is relative to the BLOCK: it is V8's `position` in the
+ * UNTRIMMED text `JSON.parse` was given (UTF-16 units, line breaks normalised by the HTML tokenizer), not an offset into the page. So the block's own text is
+ * found again (the Nth `application/ld+json` script, in document order, as the engine counted it), its start location is read from the parser, and the
+ * block-relative line and column are added to it. Numbers only: no text is kept. `null` when the locator carries no offset or the block cannot be found.
+ */
+function positionOf(locator: string, rawHtml: string): { line: number; column: number } | null {
+  const m = /^raw\.jsonld\[(\d+)\]@(\d+)$/.exec(locator);
+  if (m === null) return null;
+  const wanted = Number(m[1]);
+  const offset = Number(m[2]);
+  let seen = 0;
+  let found: { text: string; line: number; column: number } | null = null;
+  const visit = (node: Node): void => {
+    if (found !== null) return;
+    const el = node as { tagName?: string; attrs?: { name: string; value: string }[]; childNodes?: Node[] };
+    if (el.tagName === "script" && (el.attrs?.find((a) => a.name === "type")?.value ?? "").trim().toLowerCase() === "application/ld+json") {
+      const texts = (el.childNodes ?? []).filter((c) => c.nodeName === "#text") as Array<Node & { value: string; sourceCodeLocation?: { startLine: number; startCol: number } | null }>;
+      if (seen === wanted) {
+        const first = texts[0]?.sourceCodeLocation;
+        if (first) found = { text: texts.map((t) => t.value).join(""), line: first.startLine, column: first.startCol };
+        else seen = -1; // no location: stop matching rather than let the NEXT block answer for this one
+        return;
+      }
+      seen += 1;
+    }
+    for (const child of el.childNodes ?? []) visit(child);
+  };
+  visit(parse(rawHtml, { sourceCodeLocationInfo: true }) as Node);
+  if (found === null) return null;
+  const block = found as { text: string; line: number; column: number };
+  if (offset > block.text.length) return null;
+  const before = block.text.slice(0, offset);
+  const breaks = before.split("\n").length - 1;
+  const line = block.line + breaks;
+  const column = breaks === 0 ? block.column + offset : offset - before.lastIndexOf("\n");
+  return line <= 1_000_000 && column <= 1_000_000 ? { line, column } : null;
+}
+
 export async function checkUrlStructuredData(input: { readonly url: string; readonly catalog: readonly ToolCatalogRow[] }, deps: UrlCheckDeps = {}): Promise<UrlCheckOutcome> {
   const fetchOne = deps.fetch ?? ((url: string, init?: GuardedFetchInit) => guardedFetch(url, init));
   const timeoutMs = deps.timeoutMs ?? SCHEMA_BUILDER_URL_FETCH_TIMEOUT_MS;
@@ -68,6 +110,7 @@ export async function checkUrlStructuredData(input: { readonly url: string; read
   if (!type.includes("html")) return { kind: "unreachable", reason: "not_html" };
 
   const catalog = loadAuxCatalog(input.catalog.map((r) => ({ code: r.code, category: r.category, weight: r.weight, ruleVersion: r.rule_version, autoFixable: r.auto_fixable, thresholds: r.thresholds })));
+  const rawHtml = response.body.toString("utf8");
   const document = buildAuxDocument(
     {
       url: input.url,
@@ -75,7 +118,7 @@ export async function checkUrlStructuredData(input: { readonly url: string; read
       httpStatus: response.status,
       redirectChain: response.redirectChain ?? [],
       headers: Object.fromEntries(Object.entries(response.headers).map(([name, value]) => [name.toLowerCase(), Array.isArray(value) ? value.join(", ") : (value ?? "")])),
-      rawHtml: response.body.toString("utf8"),
+      rawHtml,
       renderedHtml: null,
       timing: { ttfbMs: response.ttfbMs ?? null, loadMs: response.loadMs ?? null },
     },
@@ -91,7 +134,7 @@ export async function checkUrlStructuredData(input: { readonly url: string; read
       // The consequence is the catalog's, never invented: a rule with none fails the check closed.
       if (row === undefined || row.rationale === null || row.rationale === "") throw new Error(`the rule catalog has no consequence for ${f.rule_code}`);
       // Key order is the order a reader meets the fields: the consequence first, the rule code a reference.
-      return { consequence: row.rationale, title: row.title, rule_code: f.rule_code as SchemaBuilderFinding["rule_code"], severity: f.severity, position: null, field: fieldOf(f.evidence.locator) };
+      return { consequence: row.rationale, title: row.title, rule_code: f.rule_code as SchemaBuilderFinding["rule_code"], severity: f.severity, position: f.rule_code === "AUX-R-008" ? positionOf(f.evidence.locator, rawHtml) : null, field: fieldOf(f.evidence.locator) };
     })
     .sort((a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity) || (a.rule_code < b.rule_code ? -1 : a.rule_code > b.rule_code ? 1 : 0));
 
