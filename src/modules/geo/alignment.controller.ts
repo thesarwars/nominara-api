@@ -1,6 +1,10 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Req } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req } from "@nestjs/common";
 import {
   alignmentIdParamSchema,
+  alignmentTargetsQuerySchema,
+  alignmentTargetsResponseSchema,
+  type AlignmentTargetsQuery,
+  type AlignmentTargetsResponse,
   alignmentSessionPayloadSchema,
   createAlignmentPatchRequestSchema,
   createAlignmentPatchResponseSchema,
@@ -54,6 +58,16 @@ export class AlignmentController {
     @Body(new ZodValidationPipe(openAlignmentRequestSchema)) body: OpenAlignmentRequest,
   ): Promise<OpenAlignmentResponse> {
     return this.service.open(body, { id: req.auth?.sub ?? null });
+  }
+
+  // What a session can be opened on (clusters, pages, the newest session per page). Declared BEFORE `:id`, so `targets` is not read as a session id.
+  @Get("targets")
+  @RequirePermission("optimizer:use")
+  @RequireFeature("optimizer.enabled")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "listGeoAlignmentTargets", querySchema: alignmentTargetsQuerySchema, responseSchema: alignmentTargetsResponseSchema })
+  targets(@Query(new ZodValidationPipe(alignmentTargetsQuerySchema)) query: AlignmentTargetsQuery): Promise<AlignmentTargetsResponse> {
+    return this.service.targets(query);
   }
 
   @Get(":id")

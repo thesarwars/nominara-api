@@ -2,7 +2,13 @@ import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase, Pool } from "pg";
 import {
+  ALIGNMENT_TARGETS_MAX_DOMAINS,
+  ALIGNMENT_TARGETS_MAX_PAGES,
+  ALIGNMENT_TARGETS_MAX_SESSIONS,
   geoAnalyzeKey,
+  type AlignmentPageSource,
+  type AlignmentTargetsQuery,
+  type AlignmentTargetsResponse,
   type AlignmentSessionPayload,
   type CreateAlignmentPatchResponse,
   type GeoAnalyzeJobInput,
@@ -86,6 +92,108 @@ export class AlignmentService {
         incrementCounter("nominara_geo_alignment_requests_total", { route: "open", outcome: "queued" });
         logger.log({ event: "geo.alignment.opened", workspace_id: workspaceId, project_id: body.project_id, session_id: sessionId });
         return { session_id: sessionId, status: "pending" as const, poll_url: `/v1/geo/alignment/${sessionId}`, credits_charged: 0 as const };
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  /**
+   * `GET /v1/geo/alignment/targets` - what a session can be opened on: the project's topic clusters, its candidate pages and the newest session per
+   * (page, cluster). Reads rows only (no fetch, no embedding, no write), so it is a plain tenant read. A page's TEXT is not returned: the specification
+   * stores it only on a session after the worker fetched it, and nothing here may fetch (KAD-06).
+   */
+  async targets(query: AlignmentTargetsQuery): Promise<AlignmentTargetsResponse> {
+    return tracer.startActiveSpan("geo.alignment.http.targets", async (span) => {
+      try {
+        const store = currentTenantStore()!;
+        const tx = store.client;
+        const projectId = query.project_id;
+
+        const project = await tx.query<{ in_scope: boolean }>(
+          `SELECT ${SCOPE_OK.replace("%P%", "id")} AS in_scope FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL`,
+          [projectId],
+        );
+        if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
+        if (!project.rows[0].in_scope) throw new ProjectOutOfScopeException();
+
+        const clusters = await tx.query<{ cluster_id: string; label: string; prompt_count: number }>(
+          "SELECT id AS cluster_id, label, prompt_count::int AS prompt_count FROM topic_clusters WHERE project_id = $1 AND workspace_id = app.current_workspace() ORDER BY label, id",
+          [projectId],
+        );
+
+        // Candidate pages, each with every place it came from. Rank orders the sources (1 root, 2 session, 3 audit); a page that is the root sorts first.
+        // A site file (robots.txt, llms.txt, a sitemap) is an audit's subject but not a page whose content can be aligned.
+        const pages = await tx.query<{ target_url: string; ranks: number[] }>(
+          `WITH cand AS (
+             SELECT root_url AS url, 1 AS rank FROM projects WHERE id = $1 AND workspace_id = app.current_workspace()
+             UNION ALL
+             SELECT target_url, 2 FROM geo_alignments WHERE project_id = $1 AND workspace_id = app.current_workspace()
+             UNION ALL
+             SELECT url, 3 FROM aux_findings
+              WHERE project_id = $1 AND workspace_id = app.current_workspace() AND url ~* '^https?://'
+                AND url !~* '/(robots\\.txt|llms(-full)?\\.txt|sitemap[^/]*\\.xml)([?#].*)?$'
+           )
+           SELECT url AS target_url, array_agg(DISTINCT rank ORDER BY rank) AS ranks
+             FROM cand GROUP BY url
+            ORDER BY min(rank), url
+            LIMIT $2`,
+          [projectId, ALIGNMENT_TARGETS_MAX_PAGES],
+        );
+        const sourceOf: readonly AlignmentPageSource[] = ["project_root", "alignment_session", "aux_audit"];
+
+        const sessions = await tx.query<{
+          session_id: string; target_url: string; cluster_id: string | null; status: "pending" | "ready" | "stale" | "failed";
+          baseline: number | null; band_low: number | null; band_high: number | null; percentile: number | null; coverage: number | null; updated_at: Date;
+        }>(
+          `SELECT * FROM (
+             SELECT DISTINCT ON (target_url, prompt_cluster_id)
+                    id AS session_id, target_url, prompt_cluster_id AS cluster_id, analysis_state AS status,
+                    baseline_alignment AS baseline, target_band_low AS band_low, target_band_high AS band_high,
+                    percentile_vs_corpus::int AS percentile, coverage_ratio AS coverage, updated_at
+               FROM geo_alignments
+              WHERE project_id = $1 AND workspace_id = app.current_workspace()
+              ORDER BY target_url, prompt_cluster_id, updated_at DESC, id DESC
+           ) newest ORDER BY updated_at DESC, session_id DESC LIMIT $2`,
+          [projectId, ALIGNMENT_TARGETS_MAX_SESSIONS],
+        );
+
+        const corpus = await tx.query<{ passages: number }>(
+          "SELECT count(*)::int AS passages FROM corpus_passages WHERE project_id = $1 AND workspace_id = app.current_workspace() AND expires_at > now()",
+          [projectId],
+        );
+        const domains = await tx.query<{ domain: string }>(
+          "SELECT DISTINCT domain FROM corpus_passages WHERE project_id = $1 AND workspace_id = app.current_workspace() AND expires_at > now() ORDER BY domain LIMIT $2",
+          [projectId, ALIGNMENT_TARGETS_MAX_DOMAINS],
+        );
+
+        incrementCounter("nominara_geo_alignment_requests_total", { route: "targets", outcome: "ok" });
+        logger.log({ event: "geo.alignment.targets_read", workspace_id: store.context.workspaceId, project_id: projectId, clusters: clusters.rows.length, pages: pages.rows.length });
+        return {
+          project_id: projectId,
+          clusters: clusters.rows,
+          pages: pages.rows.map((row) => ({ target_url: row.target_url, sources: row.ranks.map((rank) => sourceOf[rank - 1]!) })),
+          // A figure belongs to a session only once it is `ready`: a pending one's columns are not final, and an unmeasured one is null, never 0.
+          sessions: sessions.rows.map((row) => {
+            const ready = row.status === "ready";
+            return {
+              session_id: row.session_id,
+              target_url: row.target_url,
+              cluster_id: row.cluster_id,
+              status: row.status,
+              alignment: ready ? row.baseline : null,
+              target_band: ready && row.band_low !== null && row.band_high !== null ? ([row.band_low, row.band_high] as [number, number]) : null,
+              percentile_vs_cited_docs: ready ? row.percentile : null,
+              coverage_ratio: ready ? row.coverage : null,
+              updated_at: row.updated_at.toISOString(),
+            };
+          }),
+          corpus: { passages: corpus.rows[0]?.passages ?? 0, domains: domains.rows.map((row) => row.domain) },
+          credits_charged: 0 as const,
+        };
       } catch (error) {
         span.setStatus({ code: SpanStatusCode.ERROR });
         throw error;
