@@ -10,8 +10,8 @@ import {
 // is rounded, harmonised or inferred. Where §12 is ambiguous the ambiguity is
 // named rather than resolved silently.
 //
-// FIFTEEN classes. STORY-025's own acceptance criteria list nine; the
-// reference outranks the story, so fifteen ship and the story text goes on
+// SIXTEEN classes (fifteen from §12 plus `tool_site_files`, owner decision 71(d)). STORY-025's own acceptance criteria list nine; the
+// reference outranks the story, so they ship and the story text goes on
 // the hand-carried specification-fix list.
 //
 // The two columns are NOT redundant. §12 says "token buckets", so the rate
@@ -104,6 +104,16 @@ export const RATE_LIMIT_DEFAULTS: RateLimitConfig = rateLimitConfigSchema.parse(
     buckets: [
       { scope: "user", limit: 10, window: "rolling", window_ms: HOUR_MS },
       { scope: "workspace", limit: 60, window: "rolling", window_ms: HOUR_MS },
+    ],
+  },
+  {
+    // Owner decision 71(d) - the free site-files mode of the STORY-082 AUX audit tool. It crawls only the well-known files and is cached per
+    // host, so it is generous: 60/hour per user, 600/hour per workspace, burst 10. Not a §12 row; the full mode keeps project_aux_audits.
+    route_class: "tool_site_files",
+    burst: 10,
+    buckets: [
+      { scope: "user", limit: 60, window: "rolling", window_ms: HOUR_MS },
+      { scope: "workspace", limit: 600, window: "rolling", window_ms: HOUR_MS },
     ],
   },
   {

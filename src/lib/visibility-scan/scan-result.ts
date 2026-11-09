@@ -75,7 +75,7 @@ export const REDIRECT_WRAPPER_HOSTS: ReadonlySet<string> = new Set(["vertexaisea
 const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/u;
 
 /** An engine's own title for a source, when it is a bare hostname (Gemini titles a grounding chunk with the site's domain). Otherwise null. */
-function hostnameHint(title: string | null): string | null {
+export function hostnameHint(title: string | null): string | null {
   if (title === null) return null;
   const candidate = title.trim().toLowerCase().replace(/^www\./u, "");
   return HOSTNAME.test(candidate) ? candidate : null;

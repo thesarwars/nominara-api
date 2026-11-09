@@ -25,7 +25,8 @@ import { PG_POOL } from "../../db/pg-pool.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../lib/aux/audit-constants.js";
 import { AUX_AUDIT_BASE_CREDITS, AUX_AUDIT_BASE_PAGES, AUX_AUDIT_EXTRA_PAGE_CREDITS, auxAuditPrice, auxAuditPricing } from "../../lib/aux/audit-price.js";
 import { IDEMPOTENCY_REPLAY_WINDOW_HOURS, manualAuditIdentity, type ManualAuditIdentity } from "../../lib/aux/manual-audit-id.js";
-import { AUX_AUDITS_ENTITLEMENT, auxAuditsIncluded, crawlAuditIdempotencyKey } from "../../lib/aux/onboarding-audit.js";
+import { requireAuxAudits } from "../../lib/aux/plan-gate.js";
+import { crawlAuditIdempotencyKey } from "../../lib/aux/onboarding-audit.js";
 import { pageCapForPlan } from "../../lib/aux/page-selection.js";
 import { autoTopupEnqueuerFor } from "../../lib/credits/auto-topup-request.js";
 import { AUX_AUDIT_REFERENCE } from "../../lib/credits/aux-audit-refund.js";
@@ -37,6 +38,7 @@ import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
+import { findingView } from "../../lib/aux/finding-view.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
@@ -484,16 +486,11 @@ export class AuxService {
     if (planKey === undefined) throw new NotFoundError({ message: "no such project" });
 
     const resolved = await resolveEntitlements(tx, workspaceId);
-    if (!auxAuditsIncluded(resolved.entitlements)) {
-      incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "feature_not_in_plan" });
-      const lowest = await tx.query<{ key: string }>(
-        `SELECT key FROM plans WHERE (entitlements -> $1 -> 'value') NOT IN ('false'::jsonb, 'null'::jsonb) ORDER BY sort_order ASC LIMIT 1`,
-        [AUX_AUDITS_ENTITLEMENT],
-      );
-      throw new FeatureNotInPlanError({
-        message: "AUX audits are not included in this plan",
-        details: { key: AUX_AUDITS_ENTITLEMENT, min_plan: lowest.rows[0]?.key ?? "unknown" },
-      });
+    try {
+      await requireAuxAudits(tx, resolved.entitlements);
+    } catch (error) {
+      if (error instanceof FeatureNotInPlanError) incrementCounter("nominara_aux_manual_audits_requested_total", { outcome: "feature_not_in_plan" });
+      throw error;
     }
 
     const scope = body.scope ?? "key_pages";
@@ -752,19 +749,22 @@ function toFinding(row: FindingRow, patch: AuxPatch | null): AuxFinding {
     finding_id: row.id,
     audit_id: row.audit_id,
     project_id: row.project_id,
-    rule_code: row.rule_code,
-    title: row.title,
-    category: row.category ?? null,
-    severity: row.severity,
+    // STORY-082 AC8: the consequence-first fields are shaped by the renderer the AUX audit tool shares.
+    ...findingView({
+      consequence: row.consequence ?? null,
+      title: row.title,
+      rule_code: row.rule_code,
+      category: row.category ?? null,
+      severity: row.severity,
+      url: row.url,
+      affected_pages: row.affected_pages,
+      measured_value: num(row.measured_value),
+      threshold_value: num(row.threshold_value),
+      evidence: row.evidence,
+      auto_fixable: row.auto_fixable,
+      requires_human_review: row.requires_human_review,
+    }),
     status: row.status,
-    consequence: row.consequence ?? null,
-    url: row.url,
-    affected_pages: row.affected_pages,
-    measured_value: num(row.measured_value),
-    threshold_value: num(row.threshold_value),
-    evidence: row.evidence,
-    auto_fixable: row.auto_fixable,
-    requires_human_review: row.requires_human_review,
     wont_fix:
       row.status === "wont_fix" && row.wont_fix_reason !== null
         ? { reason: row.wont_fix_reason, resurfaces_at: row.wont_fix_at === null ? null : new Date(row.wont_fix_at.getTime() + WONT_FIX_RESURFACE_DAYS * 86_400_000).toISOString() }

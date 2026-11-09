@@ -18,6 +18,10 @@ import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { UrlGuard } from "../../src/lib/net/url-guard.service.js";
 import { createLookupExecuteHandler, type LookupExecuteDeps } from "../../src/lib/queue/handlers/lookup-execute.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
+import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
+import { TEST_SIGNING_KEYS } from "../support/queue-test-harness.js";
 import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
 import { VisibilityScanService } from "../../src/modules/tools/visibility-scan.service.js";
@@ -97,6 +101,8 @@ describe("STORY-079 · Visibility Scan", () => {
   let workerDeps: Partial<LookupExecuteDeps>;
   let enqueued: { workspaceId: string; payload: Record<string, unknown>; options: Record<string, unknown> }[];
   let workers: Promise<unknown>[];
+  let attemptsMade = 0;
+  let viaProcessor = false;
 
   beforeAll(async () => {
     [cacheValkey, queueValkey] = await Promise.all([startValkey(), startValkeyFixture()]);
@@ -110,6 +116,8 @@ describe("STORY-079 · Visibility Scan", () => {
     workerCache = sharedCache;
     adapters = { perplexity: async () => raw(), chatgpt: async () => raw("HubSpot is the most common choice for this.") };
     workerDeps = {};
+    attemptsMade = 0;
+    viaProcessor = false;
     enqueued = [];
     workers = [];
     // The production class lets one user spend 2 scans at once (5/min). Most scenarios here make more calls than that per user, so they run on the widest
@@ -142,7 +150,14 @@ describe("STORY-079 · Visibility Scan", () => {
       resolveAdapter: (key) => adapter(key, adapters[key] ?? (async () => { throw new CaptureFailureError("timeout", key as never); })),
       ...workerDeps,
     });
-    const job = { data: { payload: { ...payload, workspaceId } }, opts: { attempts: 3 }, attemptsMade: 0 } as unknown as Job;
+    // The REAL processor (signature check, two tenant transactions, and the recover hook on a failed attempt) when a scenario is about a failure path.
+    if (viaProcessor) {
+      const entry = QUEUE_TOPOLOGY.find((e) => e.name === "lookup.execute")!;
+      const processor = createJobProcessor(entry, { keys: TEST_SIGNING_KEYS, getClient: () => pool.connect(), releaseClient: (client) => (client as unknown as { release(): void }).release(), process: handler });
+      const envelope = signQueueJobPayload({ ...payload, workspaceId, kid: TEST_SIGNING_KEYS.current.kid } as never, TEST_SIGNING_KEYS.current.key);
+      return processor({ data: envelope, opts: { attempts: 3 }, attemptsMade } as unknown as Job);
+    }
+    const job = { data: { payload: { ...payload, workspaceId } }, opts: { attempts: 3 }, attemptsMade } as unknown as Job;
     return (async () => {
       const client = await pool.connect();
       try {
@@ -283,6 +298,23 @@ describe("STORY-079 · Visibility Scan", () => {
     const id = enqueued[0]!.payload["toolRunId"] as string;
     expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 AND entry_type = 'refund' AND credits = 10", [a.workspaceId, id])).toBe(1);
     expect((await runRow(id)).status).toBe("failed");
+  });
+
+  it("final attempt - an unexpected error escaping the run on the last delivery settles the scan failed as scan_job_failed and returns the 10 credits exactly once", async () => {
+    const a = await owner("starter");
+    attemptsMade = 2;
+    viaProcessor = true;
+    workerDeps = { now: () => { throw new Error("boom"); } };
+    const before = await available(a);
+    const res = await post(a);
+    expect(res.statusCode, res.body).toBe(200);
+    await Promise.allSettled(workers);
+    const id = enqueued[0]!.payload["toolRunId"] as string;
+    const row = await runRow(id);
+    expect(row.status).toBe("failed");
+    expect(await available(a)).toBe(before);
+    expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1 AND id = $2 AND error_code = 'scan_job_failed' AND credits_charged = 0", [a.workspaceId, id])).toBe(1);
+    expect(await count("SELECT count(*)::int AS n FROM credit_ledger WHERE workspace_id = $1 AND reference_id = $2 AND entry_type = 'refund' AND credits = 10", [a.workspaceId, id])).toBe(1);
   });
 
   it("scenario 7 - a dropped connection does not abort the run; the same Idempotency-Key reattaches, replays what landed, and charges nothing more", async () => {

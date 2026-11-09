@@ -172,7 +172,7 @@ export class VisibilityScanService {
   }
 
   /** The plan's engine set, with display names, for one workspace. */
-  private async engineSet(client: ClientBase, resolved: ResolvedEntitlementsResponse): Promise<{ engine_key: string; display_name: string }[]> {
+  async engineSet(client: ClientBase, resolved: ResolvedEntitlementsResponse): Promise<{ engine_key: string; display_name: string }[]> {
     return await toolsEngineSet(client, resolved);
   }
 
