@@ -105,7 +105,7 @@ describe("STORY-059 - alignment session payload contract", () => {
   it("review r2 - section 8 - the payload is the reference's wire shape: nested alignment, coverage, centroid, per-chunk alignment, and a recommendation with kind, guardrail and evidence[]", () => {
     const parsed = alignmentSessionPayloadSchema.parse(payload);
     expect(Object.keys(parsed).sort()).toEqual(
-      ["alignment", "alignment_id", "anti_filler_policy", "centroid", "content", "coverage", "draft_status", "embedding", "estimate", "low_confidence", "projection", "prompt_cluster", "recommendations", "status", "status_reason", "target_url"],
+      ["alignment", "alignment_id", "anti_filler_policy", "centroid", "content", "coverage", "draft_status", "embedding", "estimate", "live_content_md", "low_confidence", "projection", "prompt_cluster", "recommendations", "status", "status_reason", "target_url"],
     );
     expect(parsed.alignment.target_band).toEqual([0.5, 0.7]);
     expect(parsed.content.chunks[0]).toMatchObject({ chunk_index: 0, heading_path: ["Reporting"], token_count: 40, alignment: 0.4, weakest: true });
