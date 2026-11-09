@@ -12,3 +12,4 @@ export * from "./update-project-engines.schema.js";
 export * from "./get-project-engines.schema.js";
 export * from "./fingerprint.schema.js";
 export * from "./project-benchmark.schema.js";
+export * from "./business-categories.schema.js";
