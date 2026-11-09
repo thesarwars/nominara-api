@@ -74,6 +74,15 @@ describe("STORY-078 · scenarios 9 and 10 - what a finished run is called and ch
     expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: ["perplexity"], enginesFailed: ["chatgpt"] })).toEqual({ status: "partial", refund: false, enginesFailed: ["chatgpt"] });
   });
 
+  it("DECISION 67g - every engine answered something but a cell failed: partial, charged in full, no engine named failed", () => {
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: captureBacked, enginesFailed: [], cellsFailed: true })).toEqual({ status: "partial", refund: false, enginesFailed: [] });
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: captureBacked, enginesFailed: [], cellsFailed: false })).toEqual({ status: "completed", refund: false, enginesFailed: [] });
+  });
+
+  it("DECISION 67g - cellsFailed never softens a run that captured nothing: still failed and refunded", () => {
+    expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: [], enginesFailed: captureBacked, cellsFailed: true })).toMatchObject({ status: "failed", refund: true });
+  });
+
   it("scenario 9 - nothing captured: failed and refunded in full", () => {
     expect(deriveToolRunOutcome({ engineKeys: captureBacked, enginesSucceeded: [], enginesFailed: captureBacked })).toEqual({ status: "failed", refund: true, enginesFailed: captureBacked });
   });

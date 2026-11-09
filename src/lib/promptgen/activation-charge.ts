@@ -97,6 +97,24 @@ function wholeNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+/**
+ * `prompts.credits_per_generated`: what ONE generated prompt costs beyond the free allowance. The single reading of the price - the in-project activation charge
+ * and Prompt Research's per-prompt keep (STORY-080) both go through it, which is what makes "the tool cannot undercut in-project generation" true by construction.
+ */
+export function generatedPromptPrice(entitlements: Entitlements): number {
+  const resolved = wholeNumber(entitlements[PROMPT_PRICE_KEY]?.value);
+  if (resolved === null) {
+    // A plan that holds prompts but publishes no price is an unfinished
+    // setup, not a free tier. Charging a default would bill against a
+    // schedule nobody agreed; waving it through would give prompts away.
+    throw new PreconditionUnmetError({
+      message: `this workspace's prompt activation price resolves to "${String(entitlements[PROMPT_PRICE_KEY]?.value)}", which is not a credit figure`,
+      details: { reason: "price_not_agreed" },
+    });
+  }
+  return resolved;
+}
+
 export interface QuoteActivationInput {
   readonly projectId: string;
   /** Exactly the prompts that are leaving `archived` in this call, in request order. */
@@ -130,20 +148,7 @@ export async function quoteActivation(tx: ClientBase, input: QuoteActivationInpu
   const used = await countFreeAllowanceUsed(tx, input.projectId);
   const plan = planActivationCharge(input.candidates, allowance - used);
 
-  let price = 0;
-  if (plan.charged.length > 0) {
-    const resolved = wholeNumber(input.entitlements[PROMPT_PRICE_KEY]?.value);
-    if (resolved === null) {
-      // A plan that holds prompts but publishes no price is an unfinished
-      // setup, not a free tier. Charging a default would bill against a
-      // schedule nobody agreed; waving it through would give prompts away.
-      throw new PreconditionUnmetError({
-        message: `this workspace's prompt activation price resolves to "${String(input.entitlements[PROMPT_PRICE_KEY]?.value)}", which is not a credit figure`,
-        details: { reason: "price_not_agreed" },
-      });
-    }
-    price = resolved;
-  }
+  const price = plan.charged.length > 0 ? generatedPromptPrice(input.entitlements) : 0;
   return { ...plan, price, total: price * plan.charged.length };
 }
 

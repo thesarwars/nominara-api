@@ -18,6 +18,7 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
   let client: Client;
   let seq = 0;
   let migrationsDir: string;
+  let plansUpdate: string;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer("pgvector/pgvector:pg18")
@@ -44,6 +45,10 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
         await writeFile(path.join(migrationsDir, `${name}.${ext}.sql`), content);
       }
     }
+    // 0167 (STORY-080, decision 67 a) also publishes Free's prompts.credits_per_generated = 1 in `plans`. Its tool_runs DDL needs tables this isolated set
+    // does not carry, so only its plans UPDATE is applied after migrateUp (a migration file would change which one rolls back last): the DB-matches-TS assertion below is about the seed's final shape.
+    const keepPrice = await readFile(path.join(MIGRATIONS_DIR, "0167_prompt_research_keep_cap_and_free_price.up.sql"), "utf8");
+    plansUpdate = keepPrice.slice(keepPrice.indexOf("UPDATE plans"));
   }, 120_000);
 
   afterAll(async () => {
@@ -59,6 +64,7 @@ describe("STORY-007 · identity, tenancy & billing DDL", () => {
     await client.query("DROP SCHEMA public CASCADE");
     await client.query("CREATE SCHEMA public");
     await migrateUp(client, migrationsDir);
+    await client.query(plansUpdate);
     seq = 0;
   });
 

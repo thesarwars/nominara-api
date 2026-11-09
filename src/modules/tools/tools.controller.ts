@@ -2,6 +2,14 @@ import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Query, Re
 import type { FastifyReply } from "fastify";
 import {
   convertToolRunRequestSchema,
+  discoverPromptsRequestSchema,
+  discoverPromptsResponseSchema,
+  keepPromptsRequestSchema,
+  keepPromptsResponseSchema,
+  promptResearchEstimateQuerySchema,
+  promptResearchEstimateResponseSchema,
+  promptResearchRunAcceptedSchema,
+  promptResearchRunRequestSchema,
   convertToolRunResponseSchema,
   scanStreamCompletedSchema,
   toolRunConversionPreviewSchema,
@@ -15,6 +23,14 @@ import {
   visibilityScanRequestSchema,
   type ConvertToolRunRequest,
   type ConvertToolRunResponse,
+  type DiscoverPromptsRequest,
+  type DiscoverPromptsResponse,
+  type KeepPromptsRequest,
+  type KeepPromptsResponse,
+  type PromptResearchEstimateQuery,
+  type PromptResearchEstimateResponse,
+  type PromptResearchRunAccepted,
+  type PromptResearchRunRequest,
   type ToolRun,
   type ToolRunConversionPreview,
   type ToolRunDetail,
@@ -38,6 +54,7 @@ import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import { openSseReply } from "../../api/streaming/sse-reply.js";
 import { ToolsService } from "./tools.service.js";
+import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
 
 // A controller resolves the request, calls one service method, and returns - no logic here (coding-standards.md section 1).
@@ -52,6 +69,7 @@ export class ToolsController {
   constructor(
     private readonly service: ToolsService,
     private readonly scans: VisibilityScanService,
+    private readonly research: PromptResearchService,
   ) {}
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
@@ -89,6 +107,58 @@ export class ToolsController {
       { actorType: request.authMethod === "apiKey" ? "api_key" : "user", ip: request.ip ?? null, userAgent: userAgent ?? null, requestId: String(request.id ?? "") },
     );
     await this.scans.stream(tenant, accepted, openSseReply(reply));
+  }
+
+  // STORY-080 / FR-TL-01 - Prompt Research. Discover is free and writes nothing; Keep charges per prompt kept; Run charges per answer and is answered by the worker.
+  // Neither mode touches a project: the routes are workspace-scoped like every tool (`@ScopedByQuery()`).
+  @Get("prompt-research/estimate")
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "estimatePromptResearch", querySchema: promptResearchEstimateQuerySchema, responseSchema: promptResearchEstimateResponseSchema })
+  estimateResearch(@Query(new ZodValidationPipe(promptResearchEstimateQuerySchema)) query: PromptResearchEstimateQuery): Promise<PromptResearchEstimateResponse> {
+    return this.research.estimate(query);
+  }
+
+  @Post("prompt-research/discover")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("prompt:write")
+  @ScopedByQuery()
+  // Free and stateless, but still a POST that runs the generator: audited like every mutating route (the row records that it ran, never a debit).
+  @Audit({ action: "tool_run.prompts_discovered", resourceType: "workspace", resourceIdFrom: "workspace", afterState: (body) => ({ generated: (body as DiscoverPromptsResponse).generated }) })
+  @ApiContract({ operationId: "discoverResearchPrompts", requestSchema: discoverPromptsRequestSchema, responseSchema: discoverPromptsResponseSchema, requiresIdempotencyKey: true })
+  discoverPrompts(@Body(new ZodValidationPipe(discoverPromptsRequestSchema)) body: DiscoverPromptsRequest): Promise<DiscoverPromptsResponse> {
+    return this.research.discover(body);
+  }
+
+  @Post("prompt-research/keep")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("prompt:write")
+  @ScopedByQuery()
+  @Audit({ action: "tool_run.prompts_kept", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ kept_count: (body as KeepPromptsResponse).kept_count, credits_charged: (body as KeepPromptsResponse).credits_charged }) })
+  @ApiContract({ operationId: "keepResearchPrompts", requestSchema: keepPromptsRequestSchema, responseSchema: keepPromptsResponseSchema, requiresIdempotencyKey: true })
+  keepPrompts(
+    @Body(new ZodValidationPipe(keepPromptsRequestSchema)) body: KeepPromptsRequest,
+    @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
+  ): Promise<KeepPromptsResponse> {
+    return this.research.keep(body, confirmedCredits);
+  }
+
+  @Post("prompt-research/run")
+  @HttpCode(202)
+  @Idempotent()
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @DailyCap("lookup")
+  @RateLimitClass("capture_backed_tools")
+  @Audit({ action: "tool_run.research_started", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ prompts: (body as PromptResearchRunAccepted).prompts, answers: (body as PromptResearchRunAccepted).answers, credits: (body as PromptResearchRunAccepted).credits.charged }) })
+  @ApiContract({ operationId: "startPromptResearch", requestSchema: promptResearchRunRequestSchema, responseSchema: promptResearchRunAcceptedSchema, requiresIdempotencyKey: true })
+  runResearch(
+    @Body(new ZodValidationPipe(promptResearchRunRequestSchema)) body: PromptResearchRunRequest,
+    @Headers("x-nominara-confirmed-credits") confirmedCredits: string | undefined,
+  ): Promise<PromptResearchRunAccepted> {
+    return this.research.run(body, confirmedCredits);
   }
 
   @Get("runs")

@@ -70,7 +70,7 @@ export interface ToEngineResultInput {
 }
 
 /** Hosts that only redirect to the real source (Gemini grounding). Only a listed host is treated as a wrapper; a hostname-looking TITLE alone is never evidence of one. */
-const REDIRECT_WRAPPER_HOSTS: ReadonlySet<string> = new Set(["vertexaisearch.cloud.google.com"]);
+export const REDIRECT_WRAPPER_HOSTS: ReadonlySet<string> = new Set(["vertexaisearch.cloud.google.com"]);
 
 const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/u;
 
@@ -90,6 +90,16 @@ function sentimentOf(brandPresent: boolean, scores: readonly number[]): ScanStre
   if (!brandPresent || scores.length === 0) return { label: "absent", score: null };
   const score = Math.min(1, Math.max(-1, scores.reduce((a, b) => a + b, 0) / scores.length));
   return { label: labelFor(score), score };
+}
+
+/**
+ * STORY-080 - the real source host of one citation, or null when it is unknown: a redirect wrapper (Gemini's grounding redirect) is not fetched on the
+ * interactive path, so its host is only the engine's own title when that title is a bare hostname. The wrapper's own host is never reported as a source.
+ */
+export function citationSourceDomain(c: { readonly rawUrl: string; readonly title: string | null; readonly domain: string }): string | null {
+  const wrapper = REDIRECT_WRAPPER_HOSTS.has(hostOf(c.rawUrl));
+  if (wrapper) return hostnameHint(c.title);
+  return c.domain === "" ? null : c.domain;
 }
 
 export function toEngineResult(input: ToEngineResultInput): ScanStreamEngineResult {

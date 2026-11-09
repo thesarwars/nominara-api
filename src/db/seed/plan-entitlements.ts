@@ -33,7 +33,8 @@ const MATRIX: ReadonlyArray<readonly [string, ...EntitlementValue[]]> = [
   ["prompts.max_per_project", null, 30, 40, 50, "custom"],
   ["prompts.max_total", 0, 30, 120, 250, "uncapped"],
   ["prompts.free_at_creation", null, 10, 10, 10, 10],
-  ["prompts.credits_per_generated", null, 1, 1, 1, 1],
+  // Free is 1 too (owner decision 67a): Prompt Research Keep costs 1 credit per kept prompt from the included credits. Free has no project, so in-project generation never reads it.
+  ["prompts.credits_per_generated", 1, 1, 1, 1, 1],
   ["seats.max", 1, 3, 7, 20, "unlimited"],
   ["seats.addon_allowed", false, true, true, true, null],
   ["competitors.max_per_project", null, 10, 10, 10, "custom"],

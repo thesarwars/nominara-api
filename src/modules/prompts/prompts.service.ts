@@ -10,7 +10,7 @@ import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-e
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { l5TemplateCacheKey } from "../../lib/promptgen/cache-key.js";
 import type { Candidate } from "../../lib/promptgen/emit.js";
-import { generatePass, type TemplateCache } from "../../lib/promptgen/generate.js";
+import { DEFAULT_GENERATION_TEMPERATURE, DEFAULT_PRIORITY_SUBSET_SIZE, generatePass, type TemplateCache } from "../../lib/promptgen/generate.js";
 import { insertPromptStatement, type PromptRow } from "../../lib/promptgen/persist.js";
 import type { SlotContext } from "../../lib/promptgen/slots.js";
 import { promptTextHash } from "../../lib/promptgen/text-hash.js";
@@ -76,7 +76,7 @@ export class PromptsService {
     const generation = request.generation ?? {
       strategy: "template_first" as const,
       naturalizer_enabled: true,
-      temperature: 0.35,
+      temperature: DEFAULT_GENERATION_TEMPERATURE,
       single_batched_call: true,
     };
     const naturaliserEnabled = generation.strategy !== "template_only" && generation.naturalizer_enabled;
@@ -88,7 +88,7 @@ export class PromptsService {
       context: this.slotContext(project, request),
       existingHashes,
       batchSize: request.batch_size ?? 1,
-      prioritySubsetSize: request.options?.priority_subset_size ?? 6,
+      prioritySubsetSize: request.options?.priority_subset_size ?? DEFAULT_PRIORITY_SUBSET_SIZE,
       naturaliser: naturaliserEnabled ? this.naturaliser : null,
       temperature: generation.temperature,
       ...(this.embedder === null ? {} : { vectorDedupe: this.vectorDedupe(this.embedder, client, projectId) }),
