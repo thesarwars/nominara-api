@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 import { auxFindingSeveritySchema } from "../aux/site-file-finding.schema.js";
+import { toolRunSchema } from "./tool-run.schema.js";
 
 // STORY-084 - Compare Runs: POST /v1/tools/compare-runs (owner decision 79: it stays a POST; FR-TL-05b's "two GETs" is corrected).
 //
@@ -82,13 +83,26 @@ const auditFindingRefSchema = z
 export const auditComparisonSchema = z
   .object({
     score: z.object({ base: z.number().nullable(), compare: z.number().nullable(), delta: z.number().nullable() }).strict(),
-    /** In the base run, not in the compare run. */
+    /** In the base run, not in the compare run, and certainly not cut from the compare run's stored list. */
     resolved: z.array(auditFindingRefSchema),
     /** Same fingerprint in both runs, a worse severity in the compare run. */
     regressed: z.array(auditFindingRefSchema.extend({ base_severity: auxFindingSeveritySchema }).strict()),
-    /** In the compare run, not in the base run. */
+    /** In the compare run, not in the base run, and certainly not cut from the base run's stored list. */
     new: z.array(auditFindingRefSchema),
-    /** A stored result keeps the findings that fit 24 KB; the rest were counted, not kept. A non-zero figure means the lists are a lower bound. */
+    /**
+     * A stored result keeps the findings that fit 24 KB, in severity order; the rest were counted, not kept. A finding missing from one side's list
+     * may therefore have been cut rather than fixed (or introduced). Where a side omitted findings, a finding at or below that side's lowest kept
+     * severity is reported here, NOT as resolved or new: the comparison never claims a fix or a regression it cannot see.
+     */
+    undetermined: z
+      .object({
+        /** In the base list, absent from the compare list, and possibly cut from it (the compare run omitted findings). */
+        possibly_resolved: z.array(auditFindingRefSchema),
+        /** In the compare list, absent from the base list, and possibly cut from it (the base run omitted findings). */
+        possibly_new: z.array(auditFindingRefSchema),
+      })
+      .strict(),
+    /** The count each side omitted. Non-zero means the resolved / new lists are certain only above that side's lowest kept severity; see `undetermined`. */
     findings_omitted: z.object({ base: z.number().int().nonnegative(), compare: z.number().int().nonnegative() }).strict(),
   })
   .strict();
@@ -114,6 +128,15 @@ export const compareRunsResponseSchema = z
   })
   .strict();
 
+/** GET /v1/tools/runs/{id}/comparable - the runs this one can be compared with (FR-TL-05c): same workspace, tool and normalised input, completed or partial, not expired. */
+export const comparableRunsResponseSchema = z
+  .object({
+    run_id: z.uuid(),
+    /** Newest first, at most 50. Empty means the compare action is not available for this run. */
+    comparable: z.array(toolRunSchema),
+  })
+  .strict();
+
 /** `tool_runs.result_json` of a comparison: the two ids and the tool, never a copy of either payload. */
 export const compareRunsStoredResultSchema = z
   .object({
@@ -124,6 +147,7 @@ export const compareRunsStoredResultSchema = z
   })
   .strict();
 
+export type ComparableRunsResponse = z.infer<typeof comparableRunsResponseSchema>;
 export type CompareRunsRequest = z.infer<typeof compareRunsRequestSchema>;
 export type CompareRunsResponse = z.infer<typeof compareRunsResponseSchema>;
 export type ScanEngineDiff = z.infer<typeof scanEngineDiffSchema>;
