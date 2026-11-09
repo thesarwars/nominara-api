@@ -524,6 +524,51 @@ export class ToolsService {
     };
   }
 
+  // ---------------------------------------------------------------------------------------------------------------------------------
+  // STORY-084 - Compare Runs reads. SELECTs only: a comparison captures nothing, enqueues nothing and fetches nothing.
+  // ---------------------------------------------------------------------------------------------------------------------------------
+
+  /** AC2 - the runs comparable with this one: same workspace, same tool, same normalised input hash, only `completed` or `partial`. Served by `ix_tr_diff_pairs`. */
+  async comparableRuns(runId: string): Promise<ToolRun[]> {
+    const { client } = this.store();
+    const rows = await client.query<RunRow>(
+      `SELECT ${COLUMNS} FROM tool_runs
+        WHERE workspace_id = app.current_workspace()
+          AND (tool_key, input_hash) = (SELECT tool_key, input_hash FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1)
+          AND status IN ('completed', 'partial') AND id <> $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50`,
+      [runId],
+    );
+    return rows.rows.map(toRun);
+  }
+
+  /** Both runs of a comparison in one read, with whether their normalised input hashes agree. A run in another workspace is a 404 (RLS). */
+  async comparisonPair(baseId: string, compareId: string): Promise<{ base: ToolRunDetail; compare: ToolRunDetail; sameInput: boolean }> {
+    const { client } = this.store();
+    const found = await client.query<RunRow & { input_hash: Buffer }>(
+      `SELECT ${COLUMNS}, input_hash FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[])`,
+      [[baseId, compareId]],
+    );
+    const base = found.rows.find((r) => r.id === baseId);
+    const compare = found.rows.find((r) => r.id === compareId);
+    if (base === undefined) throw new NotFoundError({ message: "no such tool run (base_run_id)" });
+    if (compare === undefined) throw new NotFoundError({ message: "no such tool run (compare_run_id)" });
+    return { base: toDetail(base), compare: toDetail(compare), sameInput: base.input_hash.equals(compare.input_hash) };
+  }
+
+  /** AC11 - the stored comparison of exactly this ordered pair, if one exists: re-opening it is a read. */
+  async findComparison(baseId: string, compareId: string): Promise<string | null> {
+    const { client } = this.store();
+    const found = await client.query<{ id: string }>(
+      `SELECT id FROM tool_runs
+        WHERE workspace_id = app.current_workspace() AND tool_key = 'compare_runs' AND diff_base_run_id = $1 AND diff_compare_run_id = $2 AND status = 'completed'
+        ORDER BY created_at, id LIMIT 1`,
+      [baseId, compareId],
+    );
+    return found.rows[0]?.id ?? null;
+  }
+
   private store(): { client: ClientBase; workspaceId: string; actorId: string } {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ToolsService requires an active tenant context");

@@ -5,6 +5,10 @@ import {
   auxAuditToolEstimateQuerySchema,
   auxAuditToolEstimateSchema,
   auxAuditToolRequestSchema,
+  compareRunsRequestSchema,
+  compareRunsResponseSchema,
+  type CompareRunsRequest,
+  type CompareRunsResponse,
   competitorFinderAcceptedSchema,
   competitorFinderRequestSchema,
   convertToolRunRequestSchema,
@@ -67,6 +71,7 @@ import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.
 import { openSseReply } from "../../api/streaming/sse-reply.js";
 import { AuxAuditToolService } from "./aux-audit.service.js";
 import { CompetitorFinderService } from "./competitor-finder.service.js";
+import { CompareRunsService } from "./compare-runs.service.js";
 import { ToolsService } from "./tools.service.js";
 import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
@@ -86,6 +91,7 @@ export class ToolsController {
     private readonly research: PromptResearchService,
     private readonly finder: CompetitorFinderService,
     private readonly auxAudit: AuxAuditToolService,
+    private readonly compare: CompareRunsService,
   ) {}
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
@@ -302,5 +308,18 @@ export class ToolsController {
     @Body(new ZodValidationPipe(convertToolRunRequestSchema)) body: ConvertToolRunRequest,
   ): Promise<ConvertToolRunResponse> {
     return this.service.convert(id, body);
+  }
+
+  // STORY-084 (decision 79: a POST). Reads two stored runs and stores the comparison on the timeline; free, and with no path to a capture or a queue.
+  @Post("compare-runs")
+  @HttpCode(200)
+  @Idempotent()
+  @RequirePermission("lookup:read_history")
+  @ScopedByQuery()
+  @RateLimitClass("writes")
+  @Audit({ action: "tool_run.compared", resourceType: "tool_run", resourceIdFrom: "response", afterState: (body) => ({ compared_tool: (body as CompareRunsResponse).compared_tool, reopened: (body as CompareRunsResponse).reopened }) })
+  @ApiContract({ operationId: "compareToolRuns", requestSchema: compareRunsRequestSchema, responseSchema: compareRunsResponseSchema, requiresIdempotencyKey: true })
+  compareRuns(@Body(new ZodValidationPipe(compareRunsRequestSchema)) body: CompareRunsRequest): Promise<CompareRunsResponse> {
+    return this.compare.compare(body);
   }
 }
