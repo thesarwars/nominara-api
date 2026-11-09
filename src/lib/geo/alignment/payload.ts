@@ -28,17 +28,20 @@ export async function readSessionPayload(tx: ClientBase, sessionId: string): Pro
     id: string; target_url: string; prompt_cluster_id: string | null; embedding_model: string;
     baseline_alignment: number | null; current_alignment: number | null; target_band_low: number | null; target_band_high: number | null;
     percentile_vs_corpus: number | null; coverage_ratio: number | null; centroid_source_count: number; centroid_domains: string[];
-    recommendations: unknown;
+    recommendations: unknown; analysis_state: "pending" | "ready" | "stale" | "failed"; analysis_reason: string | null; draft_state: "pending" | "ready" | "failed" | null;
   }>(
     `SELECT id, target_url, prompt_cluster_id, embedding_model, baseline_alignment, current_alignment, target_band_low, target_band_high,
-            percentile_vs_corpus, coverage_ratio, centroid_source_count, centroid_domains, recommendations
+            percentile_vs_corpus, coverage_ratio, centroid_source_count, centroid_domains, recommendations, analysis_state, analysis_reason, draft_state
        FROM geo_alignments WHERE id = $1 AND workspace_id = app.current_workspace()`,
     [sessionId],
   );
   const row = result.rows[0];
   if (row === undefined) throw new NotFoundError({ message: "no such alignment session" });
 
-  const recommendations = alignmentRecommendationSchema.array().parse(row.recommendations);
+  // STORY-192: an analysis that is not READY shows no coverage, recommendation or projection, whatever an earlier step left in the columns, and no
+  // baseline (the live baseline is not taken while a chunk waits): a partial figure is never shown as final. A ready one shows everything.
+  const ready = row.analysis_state === "ready";
+  const recommendations = ready ? alignmentRecommendationSchema.array().parse(row.recommendations) : [];
   const modeled = recommendations
     .filter((r) => r.projected_gain !== null && r.priority_rank !== null)
     .sort((a, b) => a.priority_rank! - b.priority_rank!)
@@ -58,17 +61,20 @@ export async function readSessionPayload(tx: ClientBase, sessionId: string): Pro
     target_url: row.target_url,
     prompt_cluster_id: row.prompt_cluster_id,
     embedding_model: row.embedding_model,
-    baseline_alignment: row.baseline_alignment,
-    current_alignment: row.current_alignment,
+    baseline_alignment: ready ? row.baseline_alignment : null,
+    current_alignment: ready ? row.current_alignment : null,
     target_band: row.target_band_low === null || row.target_band_high === null ? null : { low: row.target_band_low, high: row.target_band_high },
     percentile_vs_corpus: row.percentile_vs_corpus,
-    coverage_ratio: row.coverage_ratio,
+    coverage_ratio: ready ? row.coverage_ratio : null,
     centroid_source_count: row.centroid_source_count,
     centroid_domains: row.centroid_domains,
     low_confidence: isLowConfidence(row.centroid_source_count),
     estimate: { method: ALIGNMENT_ESTIMATE_METHOD, confidence: "modeled", caveat: ALIGNMENT_CAVEAT },
     recommendations,
     projection,
+    status: row.analysis_state,
+    status_reason: row.analysis_reason,
+    draft_status: row.draft_state,
     generation: "disabled",
   });
 }
