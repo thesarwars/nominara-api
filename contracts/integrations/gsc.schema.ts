@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-115 - api-specification.md section 3 "Integrations": `POST /integrations/gsc/oauth/start`, `GET /integrations/gsc/oauth/callback`
 // (a GET because Google redirects the browser to it; the specification's POST is a documentation error), `GET`/`DELETE
@@ -43,7 +44,7 @@ export const GSC_SEARCH_QUERY_LABEL = "Search query (a real Google query, not an
 
 export const gscOauthStartRequestSchema = z
   .object({
-    project_id: z.string().uuid(),
+    project_id: lowercaseUuidSchema,
     /** As Search Console names it: `sc-domain:example.com` for a domain property, `https://example.com/` for a URL-prefix property. */
     property_url: z.string().min(1).max(300),
   })
