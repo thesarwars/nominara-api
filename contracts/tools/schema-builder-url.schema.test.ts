@@ -18,10 +18,16 @@ describe("POST /tools/schema-builder/url · contract", () => {
   it("SU-C3 a pending result states nothing about the page, and a checked one can hold zero findings (a real, distinct answer)", () => {
     expect(schemaBuilderUrlResultSchema.safeParse({ schema_version: 1, source: "url", state: "pending" }).success).toBe(true);
     expect(schemaBuilderUrlResultSchema.safeParse({ schema_version: 1, source: "url", state: "pending", findings: [] }).success).toBe(false);
-    const checked = { schema_version: 1, source: "url", state: "checked", mode: "check", entity_type: null, vocab_version: "aux-rules@2026.10.1", rules_evaluated: 10, findings: [], findings_omitted: 0 };
+    const checked = { schema_version: 1, source: "url", state: "checked", mode: "check", entity_type: null, vocab_version: "aux-rules@2026.10.1", rules_evaluated: 10, page_truncated: false, findings: [], findings_omitted: 0 };
     expect(schemaBuilderUrlResultSchema.safeParse(checked).success).toBe(true);
     expect(schemaBuilderUrlResultSchema.safeParse({ ...checked, findings: [finding] }).success).toBe(true);
     expect(schemaBuilderUrlResultSchema.safeParse({ ...checked, rules_evaluated: 0 }).success).toBe(true);
+  });
+  it("SU-C3b a checked result must say whether the page was cut at the response cap: absent would read as \"not truncated\"", () => {
+    const checked = { schema_version: 1, source: "url", state: "checked", mode: "check", entity_type: null, vocab_version: "aux-rules@2026.10.1", rules_evaluated: 10, page_truncated: true, findings: [], findings_omitted: 0 };
+    expect(schemaBuilderUrlResultSchema.safeParse(checked).success).toBe(true);
+    const { page_truncated: _omitted, ...without } = checked;
+    expect(schemaBuilderUrlResultSchema.safeParse(without).success).toBe(false);
   });
   it("SU-C4 an unreachable page carries a short reason and no finding", () => {
     expect(schemaBuilderUrlResultSchema.safeParse({ schema_version: 1, source: "url", state: "unreachable", reason: "http_error" }).success).toBe(true);

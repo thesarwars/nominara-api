@@ -56,8 +56,10 @@ export const schemaBuilderUrlResultSchema = z.discriminatedUnion("state", [
       entity_type: z.null(),
       /** The rule catalog's version the page was judged against (`aux-rules@<rule_version>`). */
       vocab_version: z.string().min(1),
-      /** How many rules could be decided on this page. 0 is possible and is not "no findings". */
+      /** How many structured-data rules RAN on the page (the engine reports no "could not decide", so this is the rules run, not the rules that found something). 0 is possible and is not "no findings". */
       rules_evaluated: z.number().int().nonnegative(),
+      /** True when the page was cut at the response size cap: JSON-LD past the cut was never seen, so "absent" findings may be an artefact of the cut. Always present: absent would read as "not truncated". */
+      page_truncated: z.boolean(),
       findings: z.array(schemaBuilderFindingSchema).max(SCHEMA_BUILDER_MAX_FINDINGS),
       /** Findings left out to fit the cap; counted, never dropped silently. */
       findings_omitted: z.number().int().nonnegative(),
