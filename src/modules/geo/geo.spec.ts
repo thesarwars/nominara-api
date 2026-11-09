@@ -2,6 +2,8 @@ import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
 import { Test } from "@nestjs/testing";
 import { describe, expect, it } from "vitest";
 import { GeoModule } from "./geo.module.js";
+import { AlignmentController } from "./alignment.controller.js";
+import { AlignmentService } from "./alignment.service.js";
 import { GeoController } from "./geo.controller.js";
 
 // STORY-022 — one compiles-test per scaffolded module (task 6 of this
@@ -16,6 +18,9 @@ describe("STORY-022 · GeoModule compiles", () => {
     try {
       const moduleRef = await Test.createTestingModule({ imports: [GeoModule] }).compile();
       expect(moduleRef.get(GeoController)).toBeInstanceOf(GeoController);
+      // STORY-192: the alignment routes and their service resolve (the queue producer and the AUX patch reader are wired).
+      expect(moduleRef.get(AlignmentController)).toBeInstanceOf(AlignmentController);
+      expect(moduleRef.get(AlignmentService)).toBeInstanceOf(AlignmentService);
       await moduleRef.close();
     } finally {
       process.env = originalEnv;

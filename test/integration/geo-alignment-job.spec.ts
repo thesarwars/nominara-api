@@ -15,6 +15,7 @@ import {
   advanceAlignmentDraft,
   advanceAlignmentSession,
   createAlignmentPatch,
+  openAlignmentSession,
   readSessionPayload,
   saveAlignmentDraft,
   type AdvanceDeps,
@@ -224,6 +225,23 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
     expect(ready.coverage_ratio).not.toBeNull();
     expect(ready.target_band).not.toBeNull();
   }, 120_000);
+
+  it("AC job-1b - a redelivered open writes the page ONCE: a second open of the same session id adds no chunk and does not rewrite the live page", async () => {
+    pages.set(PAGE_URL, { kind: "html", html: livePage });
+    const id = await pendingSession();
+    const input = { projectId, clusterId, targetUrl: PAGE_URL, engineKeys: ["chatgpt"], createdBy: null, sessionId: id };
+    const first = await openAlignmentSession({ ...deps(), embeddingModel: MODEL }, input);
+    expect(first.chunks).toBeGreaterThan(0);
+    const before = (await db.query("SELECT count(*)::int AS n FROM content_chunks WHERE session_id = $1", [id])).rows[0].n;
+    pages.set(PAGE_URL, { kind: "html", html: sentencePage([["Changed", "A different page on the second delivery."]]) });
+    const second = await openAlignmentSession({ ...deps(), embeddingModel: MODEL }, input);
+    expect(second.sessionId).toBe(id);
+    expect(second.embedJobs).toBe(0);
+    expect((await db.query("SELECT count(*)::int AS n FROM content_chunks WHERE session_id = $1", [id])).rows[0].n).toBe(before);
+    expect(String((await sessionRow(id)).live_content_md)).toContain("Reporting");
+    expect(String((await sessionRow(id)).live_content_md)).not.toContain("Changed");
+    expect((await db.query("SELECT count(*)::int AS n FROM geo_alignments")).rows[0].n).toBe(1);
+  }, 60_000);
 
   it("AC job-2 - no fetch, embedding or enqueue happens inside a transaction, and every advance past `ready` is a no-op", async () => {
     pages.set(PAGE_URL, { kind: "html", html: livePage });

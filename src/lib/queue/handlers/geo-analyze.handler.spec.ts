@@ -20,6 +20,7 @@ const PROJECT = "22222222-2222-4222-8222-222222222222";
 const SESSION = "33333333-3333-4333-8333-333333333333";
 
 const payload = (over: Record<string, unknown> = {}) => ({ kind: "alignment_session", projectId: PROJECT, sessionId: SESSION, attempt: 0, workspaceId: WORKSPACE, kid: "k1", ...over });
+const draftPayload = (over: Record<string, unknown> = {}) => payload({ kind: "alignment_draft", dueAt: "2026-11-09 10:00:02.123456+00", ...over });
 const jobOf = (body: Record<string, unknown>, key = KEYS.current.key): Job => ({ data: signQueueJobPayload(body as never, key) }) as unknown as Job;
 
 function harness(deps: Partial<GeoAnalyzeDeps> = {}) {
@@ -98,14 +99,14 @@ describe("STORY-192 - the geo.analyze alignment handler", () => {
   it("AC draft - waiting re-queues after the poll delay; a job that fired early re-queues for exactly the time left; a superseded or idle one queues nothing", async () => {
     const draft = (outcome: unknown) => harness({ advanceDraft: (async () => outcome) as never });
     const waiting = draft({ state: "waiting", dueInMs: null });
-    await waiting.process(jobOf(payload({ kind: "alignment_draft" })));
-    expect(waiting.requeue).toHaveBeenCalledWith(expect.objectContaining({ kind: "alignment_draft", attempt: 1 }), ALIGNMENT_JOB.pollDelayMs);
+    await waiting.process(jobOf(draftPayload()));
+    expect(waiting.requeue).toHaveBeenCalledWith(expect.objectContaining({ kind: "alignment_draft", attempt: 1, dueAt: "2026-11-09 10:00:02.123456+00" }), ALIGNMENT_JOB.pollDelayMs);
     const early = draft({ state: "not_due", dueInMs: 750 });
-    await early.process(jobOf(payload({ kind: "alignment_draft" })));
-    expect(early.requeue).toHaveBeenCalledWith(expect.objectContaining({ kind: "alignment_draft", attempt: 1 }), 750);
+    await early.process(jobOf(draftPayload()));
+    expect(early.requeue).toHaveBeenCalledWith(expect.objectContaining({ kind: "alignment_draft", attempt: 1, dueAt: "2026-11-09 10:00:02.123456+00" }), 750);
     for (const outcome of [{ state: "not_due", dueInMs: null }, { state: "idle", dueInMs: null }, { state: "ready", dueInMs: null }, { state: "failed", dueInMs: null }]) {
       const quiet = draft(outcome);
-      await quiet.process(jobOf(payload({ kind: "alignment_draft" })));
+      await quiet.process(jobOf(draftPayload()));
       expect(quiet.requeue, outcome.state).not.toHaveBeenCalled();
     }
   });

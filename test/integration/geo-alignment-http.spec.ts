@@ -317,7 +317,8 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
 
     const draftJobs = enqueue.mock.calls.filter((c) => c[0] === "geo.analyze");
     expect(draftJobs).toHaveLength(1);
-    expect(draftJobs[0]![2]).toEqual({ kind: "alignment_draft", projectId, sessionId, attempt: 0 });
+    const dueAt = (await harness.db().query("SELECT draft_recompute_due_at::text AS due FROM geo_alignments WHERE id = $1", [sessionId])).rows[0].due as string;
+    expect(draftJobs[0]![2]).toEqual({ kind: "alignment_draft", projectId, sessionId, attempt: 0, dueAt });
     expect(draftJobs[0]![3]).toMatchObject({ delayMs: 2000 });
     await vi.waitFor(() => expect(enqueue.mock.calls.some((c) => c[0] === "embed.batch")).toBe(true), { timeout: 10_000 });
 
@@ -325,6 +326,18 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     expect(audit).toHaveLength(1);
     expect(JSON.stringify(audit[0])).not.toContain("SECRETDRAFTMARKER");
     await noCharge(a);
+  }, 120_000);
+
+  it("AC draft H10b · every save of a draft queues a job with its OWN idempotency key: the queue deduplicates by key for an hour, so a shared key would drop every save after the first", async () => {
+    const a = await owner();
+    const projectId = await project(a);
+    const clusterId = await cluster(a, projectId);
+    const sessionId = await readySession(a, projectId, clusterId);
+    const enqueue = vi.spyOn(harness.app().get(QueueProducer), "enqueueTenantJob");
+    for (const text of ["first draft", "second draft", "third draft"]) expect((await patch(a, sessionId, { draft_content_md: text })).statusCode).toBe(200);
+    const keys = enqueue.mock.calls.filter((c) => c[0] === "geo.analyze").map((c) => (c[3] as { idempotencyKey: string }).idempotencyKey);
+    expect(keys).toHaveLength(3);
+    expect(new Set(keys).size).toBe(3);
   }, 120_000);
 
   it("AC draft H11 · a session that is not ready (pending) refuses a draft with 409 and stores nothing; the body is strict and bounded", async () => {

@@ -5,7 +5,7 @@ import {
   geoAnalyzeKey,
   type AlignmentSessionPayload,
   type CreateAlignmentPatchResponse,
-  type GeoAnalyzeJobPayload,
+  type GeoAnalyzeJobInput,
   type OpenAlignmentRequest,
   type OpenAlignmentResponse,
   type UpdateAlignmentDraftRequest,
@@ -81,7 +81,7 @@ export class AlignmentService {
           [sessionId, body.project_id, body.target_url, body.prompt_cluster_id, engines.rows.map((row) => row.engine_key), selectedEmbeddingModel(loadEnv()), actor.id],
         );
 
-        const job: Omit<GeoAnalyzeJobPayload, "workspaceId" | "kid"> = { kind: "alignment_session", projectId: body.project_id, sessionId, attempt: 0 };
+        const job: GeoAnalyzeJobInput = { kind: "alignment_session", projectId: body.project_id, sessionId, attempt: 0 };
         afterCommit(() => this.dispatch(workspaceId, job, 0, () => this.failSession(workspaceId, sessionId)));
 
         incrementCounter("nominara_geo_alignment_requests_total", { route: "open", outcome: "queued" });
@@ -123,7 +123,7 @@ export class AlignmentService {
         }
         const saved = await saveAlignmentDraft(tx, cl100kTokenizer, sessionId, body.draft_content_md, ALIGNMENT_JOB.draftDebounceMs);
 
-        const job: Omit<GeoAnalyzeJobPayload, "workspaceId" | "kid"> = { kind: "alignment_draft", projectId: session.project_id, sessionId, attempt: 0 };
+        const job: GeoAnalyzeJobInput = { kind: "alignment_draft", projectId: session.project_id, sessionId, attempt: 0, dueAt: saved.dueText };
         const enqueueEmbed = embedBatchEnqueuerFor(this.queues);
         afterCommit(() => {
           // The draft's vectors are asked for at once so they are usually in by the time the debounce window closes; failing open is fine, the job asks again.
@@ -168,7 +168,7 @@ export class AlignmentService {
   }
 
   /** After the commit: sign and enqueue the job. A failure is compensated, counted and logged with the error NAME only. */
-  private dispatch(workspaceId: string, job: Omit<GeoAnalyzeJobPayload, "workspaceId" | "kid">, delayMs: number, compensate: () => Promise<void>): void {
+  private dispatch(workspaceId: string, job: GeoAnalyzeJobInput, delayMs: number, compensate: () => Promise<void>): void {
     const queues = this.queues;
     const fail = (error: unknown): Promise<void> => {
       incrementCounter("nominara_geo_alignment_requests_total", { route: job.kind, outcome: "dispatch_failed" });
