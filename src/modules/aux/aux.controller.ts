@@ -3,6 +3,7 @@ import {
   auxAuditListQuerySchema,
   auxAuditSchema,
   auxFindingListQuerySchema,
+  auxFindingParamsSchema,
   auxFindingSchema,
   auxPatchSchema,
   triggerAuxAuditPreviewResponseSchema,
@@ -12,6 +13,7 @@ import {
   type AuxAudit,
   type AuxAuditListQuery,
   type AuxFinding,
+  type AuxFindingParams,
   type AuxFindingListQuery,
   type AuxPatch,
   type TriggerAuxAuditPreviewResponse,
@@ -132,9 +134,9 @@ export class AuxController {
   @RequirePermission("task:create")
   @ScopedByQuery()
   @Audit({ action: "task.created", resourceType: "task", resourceIdFrom: "response" })
-  @ApiContract({ operationId: "createTaskFromAuxFinding", requestSchema: createTaskFromFindingRequestSchema, responseSchema: taskSchema })
+  @ApiContract({ operationId: "createTaskFromAuxFinding", paramsSchema: auxFindingParamsSchema, requestSchema: createTaskFromFindingRequestSchema, responseSchema: taskSchema })
   createTaskFromFinding(
-    @Param("id") id: string,
+    @Param(new ZodValidationPipe(auxFindingParamsSchema)) { id }: AuxFindingParams,
     @Body(new ZodValidationPipe(createTaskFromFindingRequestSchema.default({}))) _body: CreateTaskFromFindingRequest,
   ): Promise<Task> {
     return this.service.createTaskFromFinding(id);
@@ -146,9 +148,9 @@ export class AuxController {
   @RequirePermission("task:create")
   @ScopedByQuery()
   @Audit({ action: "aux_finding.updated", resourceType: "aux_finding" })
-  @ApiContract({ operationId: "updateAuxFinding", requestSchema: updateAuxFindingRequestSchema, responseSchema: auxFindingSchema })
+  @ApiContract({ operationId: "updateAuxFinding", paramsSchema: auxFindingParamsSchema, requestSchema: updateAuxFindingRequestSchema, responseSchema: auxFindingSchema })
   updateFinding(
-    @Param("id") id: string,
+    @Param(new ZodValidationPipe(auxFindingParamsSchema)) { id }: AuxFindingParams,
     @Body(new ZodValidationPipe(updateAuxFindingRequestSchema)) body: UpdateAuxFindingRequest,
   ): Promise<AuxFinding> {
     return this.service.updateFinding(id, body);

@@ -13,7 +13,8 @@ import { RATE_LIMIT_CLASS_KEY } from "../../api/rate-limit/route-class.js";
 import { PROJECT_PARAM_KEY } from "../../api/decorators/project-param.decorator.js";
 import { CREDITS_KEY } from "../../api/decorators/credits.decorator.js";
 import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
-import { updateAuxFindingRequestSchema } from "../../../contracts/aux/index.js";
+import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
+import { auxFindingParamsSchema, updateAuxFindingRequestSchema } from "../../../contracts/aux/index.js";
 
 // STORY-022 — one compiles-test per scaffolded module.
 describe("STORY-022 · AuxModule compiles", () => {
@@ -185,6 +186,12 @@ describe("NEW-C-10 · controller", () => {
     expect(meta(REQUIRE_PERMISSION_KEY, "createTaskFromFinding")).toBe("task:create");
     expect(meta(IDEMPOTENT_KEY, "createTaskFromFinding")).toBeTruthy();
     expect(meta(AUDIT_METADATA_KEY, "createTaskFromFinding")).toMatchObject({ action: "task.created", resourceType: "task" });
+  });
+
+  it("[STORY-194] both /aux-findings/{id} routes validate :id, so a malformed id is a 400 and not a uuid-cast 500", () => {
+    for (const handler of ["createTaskFromFinding", "updateFinding"]) {
+      expect(meta(API_CONTRACT_KEY, handler)).toMatchObject({ paramsSchema: auxFindingParamsSchema });
+    }
   });
 
   it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the reads and the one finding action (a patch is read, never written, by a client)", () => {

@@ -102,8 +102,22 @@ export async function resolveEnabledEngines(
     -- The plan floor and the cadence predicate live in the view rather than
     -- here, which is the point: they were correct in this file and in
     -- engine-cadence.ts, and absent from the four other readers.
-    SELECT pes.engine_key, pes.sample_count, pes.cache_ttl_seconds, pes.adapter_version
+    -- DRIFT SAMPLING IS CLAMPED HERE TOO, not only on the write: plans-and-entitlements.md grants it per plan
+    -- (false / "le_20_prompts" / true). A stored sample_count above 1 is honoured only while the plan still grants it, and,
+    -- on "le_20_prompts", only while the project has at most 20 active prompts. A downgrade or a growing prompt list
+    -- therefore falls back to one sample without anything having to reset the row.
+    SELECT pes.engine_key,
+           CASE WHEN pes.sample_count <= 1 THEN pes.sample_count
+                WHEN drift.value IS NULL OR drift.value IN ('false'::jsonb, 'null'::jsonb, '0'::jsonb) THEN 1
+                WHEN drift.value = '"le_20_prompts"'::jsonb
+                     AND (SELECT count(*) FROM tracked_prompts tp
+                           WHERE tp.project_id = pes.project_id AND tp.status <> 'archived' AND tp.deleted_at IS NULL) > 20 THEN 1
+                ELSE pes.sample_count END AS sample_count,
+           pes.cache_ttl_seconds, pes.adapter_version
       FROM project_entitled_engines pes
+      LEFT JOIN workspaces drift_w ON drift_w.id = pes.workspace_id
+      LEFT JOIN plans drift_p ON drift_p.key = drift_w.plan_key
+      LEFT JOIN LATERAL (SELECT drift_p.entitlements -> 'drift_sampling.enabled' -> 'value' AS value) drift ON true
      WHERE pes.project_id = $1
        AND pes.enabled
        -- CAPTURE-READY ONLY. An engine can be entitled and still have no

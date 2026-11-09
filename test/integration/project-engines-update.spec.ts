@@ -8,7 +8,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { updateProjectEnginesResponseSchema } from "../../contracts/projects/index.js";
 import { ProjectEnginesService } from "../../src/modules/projects/project-engines.service.js";
-import { FeatureNotInPlanError, NotFoundError, UnsupportedEngineError } from "../../src/api/errors/domain-errors.js";
+import { EntitlementExceededError, FeatureNotInPlanError, NotFoundError, UnsupportedEngineError } from "../../src/api/errors/domain-errors.js";
 import type { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
@@ -186,5 +186,36 @@ describe("PUT /projects/{id}/engines", () => {
     }
     expect(logs).not.toContainEqual(expect.objectContaining({ metric: "nominara_project_engines_updated_total" }));
     expect(exporter.getFinishedSpans().find((s) => s.name === "projects.update_engines")?.status.code).toBe(2);
+  });
+
+  async function seedPrompts(count: number, status = "active"): Promise<void> {
+    for (let i = 0; i < count; i += 1) {
+      const text = `prompt ${i} ${randomUUID()}`;
+      await db.query(
+        `INSERT INTO tracked_prompts (id, workspace_id, project_id, text, text_hash, intent_archetype, funnel_stage, status)
+         VALUES ($1, $2, $3, $4, sha256($5::bytea), 'recommendation', 'consideration', $6)`,
+        [randomUUID(), workspaceId, projectId, text, Buffer.from(text, "utf8"), status],
+      );
+    }
+  }
+
+  it("PE-12 Business (le_20_prompts) may set sample_count above 1 at exactly 20 active prompts", async () => {
+    await seedPrompts(20);
+    await put([{ engine_key: "chatgpt", sample_count: 5 }]);
+    expect((await rows())[0]).toMatchObject({ sample_count: 5 });
+  });
+
+  it("PE-13 Business is refused sample_count above 1 at 21 active prompts: 403 entitlement_exceeded naming key, limit and current; nothing written; archived prompts do not count", async () => {
+    await seedPrompts(21);
+    const error = await put([{ engine_key: "chatgpt", sample_count: 2 }]).catch((e) => e);
+    expect(error).toBeInstanceOf(EntitlementExceededError);
+    expect((error as { details?: unknown }).details).toEqual({ key: "drift_sampling.enabled", limit: 20, current: 21 });
+    expect(await rows()).toEqual([]);
+    // stepping down to 1 is still allowed over the bound
+    await put([{ engine_key: "chatgpt", sample_count: 1 }]);
+    expect((await rows())[0]).toMatchObject({ sample_count: 1 });
+    await db.query("UPDATE tracked_prompts SET status = 'archived' WHERE project_id = $1 AND id IN (SELECT id FROM tracked_prompts WHERE project_id = $1 LIMIT 1)", [projectId]);
+    await put([{ engine_key: "chatgpt", sample_count: 2 }]);
+    expect((await rows())[0]).toMatchObject({ sample_count: 2 });
   });
 });

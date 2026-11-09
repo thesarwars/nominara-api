@@ -5,9 +5,10 @@ import type {
   UpdateProjectEnginesRequest,
   UpdateProjectEnginesResponse,
 } from "../../../contracts/projects/index.js";
-import { FeatureNotInPlanError, NotFoundError, UnsupportedEngineError } from "../../api/errors/domain-errors.js";
+import { EntitlementExceededError, FeatureNotInPlanError, NotFoundError, UnsupportedEngineError } from "../../api/errors/domain-errors.js";
 import { isFeatureGranted } from "../../lib/entitlements/classification.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
+import { PROMPT_OCCUPIES_SLOT } from "../../lib/entitlements/structural-usage.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
@@ -31,6 +32,9 @@ import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
 // runs in the ambient transaction. The request is applied as one unit: a refusal
 // on any entry writes none.
 const DRIFT_SAMPLING_KEY = "drift_sampling.enabled";
+// plans-and-entitlements.md: Business gets drift sampling "le_20_prompts", i.e. only while the project tracks 20 or fewer prompts.
+const DRIFT_SAMPLING_PROMPT_BOUND_VALUE = "le_20_prompts";
+const DRIFT_SAMPLING_PROMPT_BOUND = 20;
 const tracer = trace.getTracer("nominara.projects");
 
 @Injectable()
@@ -87,7 +91,8 @@ export class ProjectEnginesService {
     // the feature on a downgrade can undo what it set while it had it.
     if (input.engines.some((entry) => entry.sample_count !== undefined && entry.sample_count > 1)) {
       const resolved = await this.entitlements.resolveForWorkspace(workspaceId);
-      if (!isFeatureGranted((resolved.entitlements[DRIFT_SAMPLING_KEY]?.value ?? null) as EntitlementValue)) {
+      const driftValue = (resolved.entitlements[DRIFT_SAMPLING_KEY]?.value ?? null) as EntitlementValue;
+      if (!isFeatureGranted(driftValue)) {
         const lowest = await tx.query<{ key: string }>(
           `SELECT key FROM plans WHERE (entitlements -> $1 -> 'value') NOT IN ('false'::jsonb, 'null'::jsonb) ORDER BY sort_order ASC LIMIT 1`,
           [DRIFT_SAMPLING_KEY],
@@ -96,6 +101,21 @@ export class ProjectEnginesService {
           message: "multi-sample drift detection is not included in this plan",
           details: { key: DRIFT_SAMPLING_KEY, min_plan: lowest.rows[0]?.key ?? "unknown" },
         });
+      }
+      if (driftValue === DRIFT_SAMPLING_PROMPT_BOUND_VALUE) {
+        // The same predicate as the structural prompt count: an archived or deleted prompt occupies no slot. Capture planning
+        // re-applies this bound (resolveEnabledEngines), so a prompt added after this write cannot outrun it.
+        const count = await tx.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM tracked_prompts WHERE workspace_id = $1 AND project_id = $2 AND ${PROMPT_OCCUPIES_SLOT}`,
+          [workspaceId, projectId],
+        );
+        const current = count.rows[0]?.n ?? 0;
+        if (current > DRIFT_SAMPLING_PROMPT_BOUND) {
+          throw new EntitlementExceededError({
+            message: "multi-sample drift detection on this plan is limited to projects with 20 or fewer tracked prompts",
+            details: { key: DRIFT_SAMPLING_KEY, limit: DRIFT_SAMPLING_PROMPT_BOUND, current },
+          });
+        }
       }
     }
 
@@ -133,6 +153,7 @@ export class ProjectEnginesService {
 function reasonOf(error: unknown): string {
   if (error instanceof UnsupportedEngineError) return "unsupported_engine";
   if (error instanceof FeatureNotInPlanError) return "feature_not_in_plan";
+  if (error instanceof EntitlementExceededError) return "entitlement_exceeded";
   if (error instanceof NotFoundError) return "not_found";
   return "error";
 }

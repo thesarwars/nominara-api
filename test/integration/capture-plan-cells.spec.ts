@@ -157,6 +157,22 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     ).toHaveLength(1);
   }, 30_000);
 
+  // Review finding: the write route is not the only gate. A plan without drift sampling, or a Business project that
+  // grew past 20 active prompts after setting a sample count, must plan ONE cell per prompt, not the stored count.
+  it("clamps a stored sample_count to 1 when the plan has no drift sampling (downgrade) and past 20 prompts on le_20_prompts", async () => {
+    await addEngine("perplexity");
+    await enableForProject("perplexity", { samples: 5 });
+    await setPlan("growth");
+    expect((await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys))[0]?.sampleCount, "growth has no drift sampling").toBe(1);
+
+    await setPlan("business");
+    expect((await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys))[0]?.sampleCount, "business at 0 prompts").toBe(5);
+    for (let i = 0; i < 20; i += 1) await addPrompt(`p ${i}`);
+    expect((await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys))[0]?.sampleCount, "business at 20 prompts").toBe(5);
+    await addPrompt("p 20");
+    expect((await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys))[0]?.sampleCount, "business at 21 prompts").toBe(1);
+  }, 60_000);
+
   // A caller-supplied list narrows. It must never widen, or it becomes a way
   // to probe which engines a workspace is entitled to.
   it("an explicit engine list narrows but cannot widen past the entitlement", async () => {
