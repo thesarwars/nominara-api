@@ -19,11 +19,20 @@ const common = {
 
 export const geoAnalyzeJobPayloadSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("alignment_session"), ...common }).strict(),
-  z.object({ kind: z.literal("alignment_draft"), ...common }).strict(),
+  // `dueAt` is the draft's due time exactly as the database holds it, so every SAVE of a draft is a different job. Without it every save of a
+  // session would share one idempotency key, and the queue's deduplication window would drop the job of every save after the first.
+  z.object({ kind: z.literal("alignment_draft"), ...common, dueAt: z.string().min(1) }).strict(),
 ]);
 export type GeoAnalyzeJobPayload = z.infer<typeof geoAnalyzeJobPayloadSchema>;
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** What a producer hands the queue: the payload before it adds `workspaceId` and `kid` and signs it. */
+export type GeoAnalyzeJobInput = DistributiveOmit<GeoAnalyzeJobPayload, "workspaceId" | "kid">;
 
-/** The idempotency key of one step: `geo:{project}:{analysis}:{window}` (system-architecture.md section 4), the window being the session, kind and attempt. */
-export function geoAnalyzeKey(payload: Pick<GeoAnalyzeJobPayload, "projectId" | "sessionId" | "kind" | "attempt">): string {
-  return `geo:${payload.projectId}:alignment:${payload.sessionId}.${payload.kind}.${String(payload.attempt)}`;
+/**
+ * The idempotency key of one step: `geo:{project}:{analysis}:{window}` (system-architecture.md section 4), the window being the session, the kind,
+ * (for a draft) the save it belongs to, and the attempt: a redelivery of one step shares a key, and nothing else does.
+ */
+export function geoAnalyzeKey(payload: Pick<GeoAnalyzeJobPayload, "projectId" | "sessionId" | "kind" | "attempt"> & { readonly dueAt?: string }): string {
+  const save = payload.kind === "alignment_draft" && payload.dueAt !== undefined ? `.${payload.dueAt.replace(/[^0-9]/g, "")}` : "";
+  return `geo:${payload.projectId}:alignment:${payload.sessionId}.${payload.kind}${save}.${String(payload.attempt)}`;
 }
