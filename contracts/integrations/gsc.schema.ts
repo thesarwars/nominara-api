@@ -88,6 +88,14 @@ export const gscConnectionSchema = z
   .strict();
 export type GscConnection = z.infer<typeof gscConnectionSchema>;
 
+/**
+ * `GET /projects/{id}/gsc`: how a client finds a project's connection before it holds the connection id the `{id}` routes need. The
+ * project's ACTIVE connection, or `connection: null` when it has none (never a 404: "not connected" is an answer, not a fault). A
+ * disconnected connection is not active, so it is `null` too. Same fields as `GET /integrations/gsc/{id}`, and so no credential.
+ */
+export const gscProjectConnectionSchema = z.object({ connection: gscConnectionSchema.nullable() }).strict();
+export type GscProjectConnection = z.infer<typeof gscProjectConnectionSchema>;
+
 export const gscSyncResponseSchema = z.object({ connection_id: z.string(), queued: z.boolean() }).strict();
 export type GscSyncResponse = z.infer<typeof gscSyncResponseSchema>;
 

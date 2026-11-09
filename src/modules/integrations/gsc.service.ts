@@ -9,6 +9,7 @@ import {
   type GscOauthCallbackQuery,
   type GscOauthStartRequest,
   type GscOauthStartResponse,
+  type GscProjectConnection,
   type GscSyncResponse,
 } from "../../../contracts/integrations/index.js";
 import { API_VERSION_PREFIX } from "../../api/configure-app.js";
@@ -306,6 +307,21 @@ export class GscService {
     const row = found.rows[0];
     if (row === undefined) throw new NotFoundError({ message: "no such Search Console connection" });
     return present(row);
+  }
+
+  /** The project's ACTIVE connection, or `null`: how a client finds the id the `{id}` routes need. A project that is not this workspace's is a 404. */
+  async findForProject(projectId: string): Promise<GscProjectConnection> {
+    const { client } = this.tx();
+    const project = await client.query("SELECT 1 FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL", [projectId]);
+    if (project.rowCount === 0) throw new NotFoundError({ message: "no such project" });
+    const found = await client.query<ConnectionRow>(
+      `${SELECT_CONNECTION}
+        WHERE g.project_id = $1 AND g.workspace_id = app.current_workspace() AND g.revoked_at IS NULL
+          AND (cardinality(app.current_scope_projects()) = 0 OR g.project_id = ANY(app.current_scope_projects()))`,
+      [projectId],
+    );
+    const row = found.rows[0];
+    return { connection: row === undefined ? null : present(row) };
   }
 
   async disconnect(workspaceId: string, connectionId: string): Promise<void> {
