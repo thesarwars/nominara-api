@@ -132,4 +132,45 @@ describe("STORY-192 - the geo.analyze alignment handler", () => {
     const h = harness({ advanceSession: (async () => { throw new Error("db down"); }) as never });
     await expect(h.process(jobOf(payload()))).rejects.toThrow("db down");
   });
+  const finalJob = (body: Record<string, unknown>, attemptsMade = 3, attempts = 4): Job => ({ ...jobOf(body), attemptsMade, opts: { attempts } }) as unknown as Job;
+  const settling = (queries: { sql: string; params: unknown[] | undefined }[]) => queries.filter((q) => /UPDATE geo_alignments/.test(q.sql));
+
+  it("AC stranded - review - when the LAST retry of a session step fails the session is settled FAILED with a reason code and the job ends; an earlier failure is thrown to the ladder untouched", async () => {
+    const boom = async () => { throw new Error("db down"); };
+    const last = harness({ advanceSession: boom as never });
+    await expect(last.process(finalJob(payload()))).resolves.toBeUndefined();
+    const updates = settling(last.queries);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.sql).toMatch(/analysis_state = 'failed'/);
+    expect(updates[0]!.sql).toMatch(/analysis_state = 'pending'/); // only a still-pending session
+    expect(updates[0]!.sql).toMatch(/workspace_id = app\.current_workspace\(\)/);
+    expect(updates[0]!.params).toEqual([SESSION, "job_failed"]);
+
+    const early = harness({ advanceSession: boom as never });
+    await expect(early.process(finalJob(payload(), 2))).rejects.toThrow("db down");
+    expect(settling(early.queries)).toEqual([]);
+    const unknown = harness({ advanceSession: boom as never });
+    await expect(unknown.process(jobOf(payload()))).rejects.toThrow("db down"); // attempts not known: not final
+    expect(settling(unknown.queries)).toEqual([]);
+  });
+
+  it("AC stranded - review - the last retry of a DRAFT step fails only the draft that job belongs to (its due time), never a later save", async () => {
+    const last = harness({ advanceDraft: (async () => { throw new Error("valkey down"); }) as never });
+    await expect(last.process(finalJob(draftPayload()))).resolves.toBeUndefined();
+    const updates = settling(last.queries);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.sql).toMatch(/draft_state = 'failed'/);
+    expect(updates[0]!.sql).toMatch(/draft_recompute_due_at::text = \$2/);
+    expect(updates[0]!.params).toEqual([SESSION, "2026-11-09 10:00:02.123456+00"]);
+  });
+
+  it("AC corpus-once - review - only the FIRST step of a session builds the corpus; every later step only looks for vectors", async () => {
+    const seen: (boolean | undefined)[] = [];
+    const advanceSession = vi.fn(async (deps: { buildCorpus?: boolean }) => (seen.push(deps.buildCorpus), { state: "ready" as const, reason: null }));
+    const h = harness({ advanceSession: advanceSession as never });
+    await h.process(jobOf(payload({ attempt: 0 })));
+    await h.process(jobOf(payload({ attempt: 1 })));
+    await h.process(jobOf(payload({ attempt: 7 })));
+    expect(seen).toEqual([true, false, false]);
+  });
 });

@@ -6,7 +6,7 @@ import { geoAnalyzeJobPayloadSchema, geoAnalyzeKey, type GeoAnalyzeJobPayload } 
 import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
 import { withTenantContext } from "../../../tenancy/tenant-context.js";
 import { cl100kTokenizer } from "../../aux/tokenizer-cl100k.js";
-import { advanceAlignmentDraft, advanceAlignmentSession, ALIGNMENT_JOB, type AdvanceOutcome, type DraftOutcome } from "../../geo/alignment/index.js";
+import { advanceAlignmentDraft, advanceAlignmentSession, ALIGNMENT_JOB, failStrandedDraft, failStrandedSession, type AdvanceOutcome, type DraftOutcome } from "../../geo/alignment/index.js";
 import { createGuardedPageFetcher, type PageFetcher } from "../../geo/corpus/page-fetcher.js";
 import { embedBatchEnqueuerFor, type EnqueueEmbedBatch } from "../../embedding/prompt-embedding-request.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
@@ -30,7 +30,7 @@ import { selectedEmbeddingModel } from "./embed-batch.handler.js";
 //
 // EMBEDDING MODEL. The session is compared with `selectedEmbeddingModel(env)`, the provider's own model; a mismatch is `stale`, never waited on.
 //
-// IDEMPOTENT under at-least-once delivery: every step of the library is (a re-run of a finished session is `settled`, a re-fetch is cached, a
+// IDEMPOTENT under at-least-once delivery: every step of the library is (a re-run of a finished session is `settled`, the corpus is built on the first step only, a
 // re-recompute of an unchanged draft is `idle`), and the re-queue key is per step.
 
 const logger = new Logger("geo.analyze");
@@ -105,6 +105,9 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
             tokenizer: cl100kTokenizer,
             providerModel: deps.providerModel ?? selectedEmbeddingModel(context.env),
             enqueueEmbed,
+            // The cited pages are fetched ONCE per session, on its first step: a refused or failed page leaves no row to remember it by, so
+            // every later step only looks for vectors (and the third party is not asked again every few seconds for the whole deadline).
+            buildCorpus: payload.attempt === 0,
             ...(deps.now === undefined ? {} : { now: deps.now }),
           },
           payload.sessionId,
@@ -121,6 +124,20 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
       // to wait for: the later edit queued its own.
       if (outcome.state === "not_due" && outcome.dueInMs !== null) await requeue({ ...payload, attempt: payload.attempt + 1 }, outcome.dueInMs);
       return outcome;
+    },
+
+    // A step that failed on its LAST retry has no further job to enforce its deadline: the row is settled here, in a fresh tenant transaction, so a
+    // session (or the draft this job belongs to) is never left pending behind a spent retry ladder. An earlier failure goes to the ladder untouched.
+    async recover(tx, job, failure) {
+      const attempts = job.opts?.attempts;
+      if (attempts === undefined || (job.attemptsMade ?? 0) + 1 < attempts) return false;
+      const parsed = failure.prepared?.payload ?? geoAnalyzeJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload).data;
+      if (parsed === undefined) return false;
+      incrementCounter("nominara_geo_analyze_jobs_total", { outcome: "retries_exhausted", kind: parsed.kind });
+      logger.error({ event: "geo.analyze.retries_exhausted", workspace_id: parsed.workspaceId, session_id: parsed.sessionId, kind: parsed.kind, error: failure.error instanceof Error ? failure.error.name : "unknown" });
+      if (parsed.kind === "alignment_session") await failStrandedSession(tx, parsed.sessionId, "job_failed");
+      else await failStrandedDraft(tx, parsed.sessionId, parsed.dueAt);
+      return true;
     },
 
     async commit(_tx, { payload }, outcome) {

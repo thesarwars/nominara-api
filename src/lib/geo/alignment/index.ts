@@ -11,3 +11,4 @@ export * from "./phrases.js";
 export * from "./session.js";
 export * from "./draft.js";
 export * from "./patch.js";
+export * from "./settle.js";

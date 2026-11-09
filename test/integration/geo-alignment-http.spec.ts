@@ -286,12 +286,12 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     const clusterId = await cluster(a, projectId);
     const sessionId = await readySession(a, projectId, clusterId, "pending");
     // leave behind what a half-finished analysis would: it must not be shown
-    await harness.db().query(`UPDATE geo_alignments SET coverage_ratio = 0.5, baseline_alignment = 0.4, current_alignment = 0.4 WHERE id = $1`, [sessionId]);
+    await harness.db().query(`UPDATE geo_alignments SET coverage_ratio = 0.5, baseline_alignment = 0.4, current_alignment = 0.4, percentile_vs_corpus = 30, target_band_low = 0.5, target_band_high = 0.7 WHERE id = $1`, [sessionId]);
     const res = await get(a, sessionId);
     expect(res.statusCode, res.body).toBe(200);
     const body = dataOf<Record<string, unknown>>(res);
     expect(alignmentSessionPayloadSchema.safeParse(body).success).toBe(true);
-    expect(body).toMatchObject({ status: "pending", coverage_ratio: null, baseline_alignment: null, current_alignment: null, recommendations: [], projection: null, generation: "disabled", draft_status: null });
+    expect(body).toMatchObject({ status: "pending", coverage_ratio: null, baseline_alignment: null, current_alignment: null, percentile_vs_corpus: null, target_band: null, recommendations: [], projection: null, generation: "disabled", draft_status: null });
     expect((await get(b, sessionId)).statusCode).toBe(404);
     expect((await get(a, randomUUID())).statusCode).toBe(404);
     expect((await get(a, "not-a-uuid")).statusCode).toBe(400);
@@ -320,7 +320,9 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     const dueAt = (await harness.db().query("SELECT draft_recompute_due_at::text AS due FROM geo_alignments WHERE id = $1", [sessionId])).rows[0].due as string;
     expect(draftJobs[0]![2]).toEqual({ kind: "alignment_draft", projectId, sessionId, attempt: 0, dueAt });
     expect(draftJobs[0]![3]).toMatchObject({ delayMs: 2000 });
-    await vi.waitFor(() => expect(enqueue.mock.calls.some((c) => c[0] === "embed.batch")).toBe(true), { timeout: 10_000 });
+    // saving embeds NOTHING: the debounced job asks for the vectors, once, for the chunks that have none
+    await new Promise((r) => setTimeout(r, 300));
+    expect(enqueue.mock.calls.some((c) => c[0] === "embed.batch")).toBe(false);
 
     const audit = (await harness.db().query("SELECT after_state FROM audit_log WHERE workspace_id = $1 AND action = 'geo_alignment.draft_updated'", [a.workspaceId])).rows;
     expect(audit).toHaveLength(1);
@@ -338,6 +340,47 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     const keys = enqueue.mock.calls.filter((c) => c[0] === "geo.analyze").map((c) => (c[3] as { idempotencyKey: string }).idempotencyKey);
     expect(keys).toHaveLength(3);
     expect(new Set(keys).size).toBe(3);
+  }, 120_000);
+
+  it("AC draft H10c · review - a burst of saves enqueues no embedding request at all (the debounced recompute does), and the unchanged text keeps its row", async () => {
+    const a = await owner();
+    const projectId = await project(a);
+    const clusterId = await cluster(a, projectId);
+    const sessionId = await readySession(a, projectId, clusterId);
+    const enqueue = vi.spyOn(harness.app().get(QueueProducer), "enqueueTenantJob");
+    for (const text of ["# One\n\nfirst version", "# One\n\nsecond version", "# One\n\nthird version"]) expect((await patch(a, sessionId, { draft_content_md: text })).statusCode).toBe(200);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(enqueue.mock.calls.filter((c) => c[0] === "embed.batch")).toEqual([]);
+    expect(enqueue.mock.calls.filter((c) => c[0] === "geo.analyze")).toHaveLength(3);
+  }, 120_000);
+
+  it("AC stranded H9b · review - a GET of a session still pending long past its deadline (its job was lost) answers FAILED with the reason, and leaves a finished one alone", async () => {
+    const a = await owner();
+    const projectId = await project(a);
+    const clusterId = await cluster(a, projectId);
+    const lost = await readySession(a, projectId, clusterId, "pending");
+    const fine = await readySession(a, projectId, clusterId, "pending");
+    await harness.db().query("UPDATE geo_alignments SET created_at = now() - interval '45 minutes' WHERE id = $1", [lost]);
+    const res = await get(a, lost);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(dataOf<Record<string, unknown>>(res)).toMatchObject({ status: "failed", status_reason: "embedding_timeout" });
+    expect((await harness.db().query("SELECT analysis_state FROM geo_alignments WHERE id = $1", [lost])).rows[0].analysis_state).toBe("failed");
+    expect(dataOf<Record<string, unknown>>(await get(a, fine))).toMatchObject({ status: "pending", status_reason: null });
+    const stalled = await readySession(a, projectId, clusterId);
+    await harness.db().query("UPDATE geo_alignments SET created_at = now() - interval '2 hours' WHERE id = $1", [stalled]);
+    expect(dataOf<Record<string, unknown>>(await get(a, stalled))).toMatchObject({ status: "ready" });
+  }, 120_000);
+
+  it("AC draft H10d · review - a draft on a session pinned to another embedding model is refused at once (409 naming embedding_model_changed), and stores nothing", async () => {
+    const a = await owner();
+    const projectId = await project(a);
+    const clusterId = await cluster(a, projectId);
+    const sessionId = await readySession(a, projectId, clusterId);
+    await harness.db().query("UPDATE geo_alignments SET embedding_model = 'some-older-model' WHERE id = $1", [sessionId]);
+    const res = await patch(a, sessionId, { draft_content_md: "a draft" });
+    expect(res.statusCode, res.body).toBe(409);
+    expect(res.body).toContain("embedding_model_changed");
+    expect((await harness.db().query("SELECT draft_content_md FROM geo_alignments WHERE id = $1", [sessionId])).rows[0].draft_content_md).toBeNull();
   }, 120_000);
 
   it("AC draft H11 · a session that is not ready (pending) refuses a draft with 409 and stores nothing; the body is strict and bounded", async () => {

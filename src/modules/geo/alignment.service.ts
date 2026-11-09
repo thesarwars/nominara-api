@@ -14,8 +14,7 @@ import { ConflictError, NotFoundError, ValidationFailedError } from "../../api/e
 import { PG_POOL } from "../../db/pg-pool.js";
 import { loadEnv } from "../../config/env.js";
 import { cl100kTokenizer } from "../../lib/aux/tokenizer-cl100k.js";
-import { embedBatchEnqueuerFor } from "../../lib/embedding/prompt-embedding-request.js";
-import { ALIGNMENT_JOB, createAlignmentPatch, readSessionPayload, requestEmbeds, saveAlignmentDraft } from "../../lib/geo/alignment/index.js";
+import { ALIGNMENT_JOB, createAlignmentPatch, readSessionPayload, saveAlignmentDraft, settleOverdue } from "../../lib/geo/alignment/index.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { selectedEmbeddingModel } from "../../lib/queue/handlers/embed-batch.handler.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
@@ -100,6 +99,8 @@ export class AlignmentService {
   async get(sessionId: string): Promise<AlignmentSessionPayload> {
     const tx = currentTenantStore()!.client;
     await this.assertVisible(tx, sessionId);
+    // A session (or draft) still pending long past its deadline has lost its job: it is failed here, so the client never polls a row nothing will settle.
+    await settleOverdue(tx, sessionId);
     incrementCounter("nominara_geo_alignment_requests_total", { route: "get", outcome: "ok" });
     return readSessionPayload(tx, sessionId);
   }
@@ -121,15 +122,15 @@ export class AlignmentService {
         if (session.analysis_state !== "ready") {
           throw new ConflictError({ message: "the session is not ready: a draft can be saved once its analysis is final", details: { current_state: session.analysis_state } });
         }
+        // A draft is embedded by the provider's CURRENT model; a session pinned to another one could never find those vectors, so say so now.
+        if (session.embedding_model !== selectedEmbeddingModel(loadEnv())) {
+          throw new ConflictError({ message: "embedding_model_changed: the session was analysed under another embedding model, so a draft cannot be measured against it; open a new session", details: { current_state: session.analysis_state } });
+        }
         const saved = await saveAlignmentDraft(tx, cl100kTokenizer, sessionId, body.draft_content_md, ALIGNMENT_JOB.draftDebounceMs);
 
         const job: GeoAnalyzeJobInput = { kind: "alignment_draft", projectId: session.project_id, sessionId, attempt: 0, dueAt: saved.dueText };
-        const enqueueEmbed = embedBatchEnqueuerFor(this.queues);
-        afterCommit(() => {
-          // The draft's vectors are asked for at once so they are usually in by the time the debounce window closes; failing open is fine, the job asks again.
-          void requestEmbeds({ workspaceId, ...(enqueueEmbed === undefined ? {} : { enqueueEmbed }) }, "content_chunks", saved.chunkIds);
-          this.dispatch(workspaceId, job, ALIGNMENT_JOB.draftDebounceMs, () => this.failDraft(workspaceId, sessionId, saved.dueText));
-        });
+        // Nothing is embedded here: the vectors are asked for by the DEBOUNCED job, once, for the chunks that have none, so a burst of edits is one request.
+        afterCommit(() => this.dispatch(workspaceId, job, ALIGNMENT_JOB.draftDebounceMs, () => this.failDraft(workspaceId, sessionId, saved.dueText)));
 
         incrementCounter("nominara_geo_alignment_requests_total", { route: "update_draft", outcome: "queued" });
         const payload = await readSessionPayload(tx, sessionId);
@@ -156,9 +157,9 @@ export class AlignmentService {
   }
 
   /** The 404 (RLS makes a foreign session absent) and the scope refusal, in one read. Returns what the callers need next. */
-  private async assertVisible(tx: ClientBase, sessionId: string): Promise<{ project_id: string; analysis_state: string }> {
-    const found = await tx.query<{ project_id: string; analysis_state: string; in_scope: boolean }>(
-      `SELECT project_id, analysis_state, ${SCOPE_OK.replace("%P%", "project_id")} AS in_scope FROM geo_alignments WHERE id = $1 AND workspace_id = app.current_workspace()`,
+  private async assertVisible(tx: ClientBase, sessionId: string): Promise<{ project_id: string; analysis_state: string; embedding_model: string }> {
+    const found = await tx.query<{ project_id: string; analysis_state: string; embedding_model: string; in_scope: boolean }>(
+      `SELECT project_id, analysis_state, embedding_model, ${SCOPE_OK.replace("%P%", "project_id")} AS in_scope FROM geo_alignments WHERE id = $1 AND workspace_id = app.current_workspace()`,
       [sessionId],
     );
     const row = found.rows[0];

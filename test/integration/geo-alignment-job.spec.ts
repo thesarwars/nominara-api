@@ -7,7 +7,7 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { geoAnalysisWriteSchema } from "../../contracts/analytics/index.js";
+import { ALIGNMENT_DRAFT_P95_OBJECTIVE_MS, geoAnalysisWriteSchema } from "../../contracts/analytics/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { embedBatchPayloadSchema } from "../../src/lib/embedding/embed-batch.js";
@@ -18,6 +18,8 @@ import {
   openAlignmentSession,
   readSessionPayload,
   saveAlignmentDraft,
+  settleOverdue,
+  writeAlignmentAnalysis,
   type AdvanceDeps,
 } from "../../src/lib/geo/alignment/index.js";
 import type { PageFetcher, PageFetchResult } from "../../src/lib/geo/corpus/page-fetcher.js";
@@ -540,4 +542,173 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
     const id = await draftedSession("Reporting. We provide webhook delivery.");
     await expect(inTx((tx) => createAlignmentPatch(tx, id, null), otherWorkspaceId)).rejects.toMatchObject({ code: "not_found" });
   }, 120_000);
+
+  // ---- review fixes: the corpus is fetched once, a draft keeps its vectors, nothing stays pending, no false verdict ----------------
+
+  it("AC corpus-once - review - a cited page that is refused or fails is fetched ONCE across every waiting step, not on every poll", async () => {
+    pages.set(PAGE_URL, { kind: "html", html: livePage });
+    const urls = await seedCorpus(5);
+    pages.delete(urls[0]!); // the fake answers `failed: not_found` and leaves no live passage behind
+    const id = await pendingSession();
+    expect((await advanceAlignmentSession(deps({ buildCorpus: true }), id)).state).toBe("waiting");
+    for (let i = 0; i < 3; i += 1) {
+      expect((await advanceAlignmentSession(deps({ buildCorpus: false }), id)).state).toBe("waiting"); // vectors have not been written between these steps
+    }
+    expect(fetchCalls.filter((u) => u === urls[0]!)).toHaveLength(1);
+    expect(fetchCalls.filter((u) => u === PAGE_URL)).toHaveLength(1);
+    await drainEmbedQueue();
+    for (let i = 0; i < 4; i += 1) {
+      const outcome = await advanceAlignmentSession(deps({ buildCorpus: false }), id);
+      if (outcome.state !== "waiting") break;
+      await drainEmbedQueue();
+    }
+    expect((await sessionRow(id)).analysis_state).toBe("ready");
+    expect(fetchCalls.filter((u) => u === urls[0]!)).toHaveLength(1);
+    expect(fetchCalls.filter((u) => u === urls[1]!)).toHaveLength(1);
+  }, 120_000);
+
+  it("AC draft-keep - review - saving a draft keeps the row, and the vector, of every chunk whose text did not change; only the edited chunk is new and unembedded", async () => {
+    const id = await readySession();
+    const section = (title: string, tail: string) => `# ${title}\n\n${`Teams compare ${title.toLowerCase()} tools by export formats, audit logging, role based access and delivery. `.repeat(8)}${tail}`;
+    const first = await inTx((tx) => saveAlignmentDraft(tx, words, id, `${section("Reporting", "")}\n\n${section("Pricing", "")}`, 0));
+    expect(first.chunkIds.length).toBeGreaterThanOrEqual(2);
+    await db.query("UPDATE geo_alignments SET draft_recompute_due_at = now() - interval '1 second' WHERE id = $1", [id]);
+    for (let i = 0; i < 4; i += 1) {
+      if ((await advanceAlignmentDraft(deps(), id)).state !== "waiting") break;
+      await drainEmbedQueue();
+    }
+    const rows = async () => (await db.query("SELECT id, text, embedding IS NOT NULL AS embedded FROM content_chunks WHERE session_id = $1 AND is_draft ORDER BY chunk_index", [id])).rows as { id: string; text: string; embedded: boolean }[];
+    const before = await rows();
+    expect(before.every((r) => r.embedded)).toBe(true);
+
+    enqueued.length = 0;
+    const second = await inTx((tx) => saveAlignmentDraft(tx, words, id, `${section("Reporting", "")}\n\n${section("Pricing", "One more sentence about webhook delivery.")}`, 0));
+    const after = await rows();
+    const kept = after.filter((r) => before.some((b) => b.id === r.id));
+    expect(kept.length, "the unchanged chunk keeps its row").toBeGreaterThanOrEqual(1);
+    expect(kept.every((r) => r.embedded), "and its vector").toBe(true);
+    expect(after.filter((r) => !before.some((b) => b.id === r.id)).every((r) => !r.embedded)).toBe(true);
+    expect(after.some((r) => !before.some((b) => b.id === r.id))).toBe(true);
+    expect(second.chunkIds.length).toBe(after.length);
+    expect(enqueued, "saving embeds nothing: the debounced step asks").toEqual([]);
+    // a save with the SAME text changes no row at all
+    await inTx((tx) => saveAlignmentDraft(tx, words, id, `${section("Reporting", "")}\n\n${section("Pricing", "One more sentence about webhook delivery.")}`, 0));
+    expect((await rows()).map((r) => r.id)).toEqual(after.map((r) => r.id));
+  }, 120_000);
+
+  it("AC stranded - review - a session pending long past its deadline is failed by a read, with the reason the step would give; inside the deadline and grace it is left alone", async () => {
+    const lost = await pendingSession({ createdAt: new Date(Date.now() - 30 * 60_000 - 30_000) }); // past the deadline but within the grace: its own chain still owns it
+    expect(await inTx((tx) => settleOverdue(tx, lost))).toEqual({ session: false, draft: false });
+    const gone = await pendingSession({ createdAt: new Date(Date.now() - 32 * 60_000) });
+    expect(await inTx((tx) => settleOverdue(tx, gone))).toEqual({ session: true, draft: false });
+    expect(await sessionRow(gone)).toMatchObject({ analysis_state: "failed", analysis_reason: "page_timeout" });
+    await db.query("UPDATE geo_alignments SET live_content_md = 'x' WHERE id = $1", [lost]);
+    await db.query("UPDATE geo_alignments SET created_at = now() - interval '40 minutes' WHERE id = $1", [lost]);
+    await inTx((tx) => settleOverdue(tx, lost));
+    expect(await sessionRow(lost)).toMatchObject({ analysis_state: "failed", analysis_reason: "embedding_timeout" });
+    const payload = await inTx((tx) => readSessionPayload(tx, lost));
+    expect(payload).toMatchObject({ status: "failed", status_reason: "embedding_timeout" });
+  }, 60_000);
+
+  it("AC stranded - review - a finished session is never overwritten, a draft pending past its deadline is failed, and another workspace settles nothing", async () => {
+    const id = await readySession();
+    await db.query("UPDATE geo_alignments SET created_at = now() - interval '2 hours' WHERE id = $1", [id]);
+    expect(await inTx((tx) => settleOverdue(tx, id))).toEqual({ session: false, draft: false });
+    expect((await sessionRow(id)).analysis_state).toBe("ready");
+    await inTx((tx) => saveAlignmentDraft(tx, words, id, "a draft whose job was lost", 0));
+    await db.query("UPDATE geo_alignments SET draft_recompute_due_at = now() - interval '11 minutes' WHERE id = $1", [id]);
+    expect(await inTx((tx) => settleOverdue(tx, id), otherWorkspaceId)).toEqual({ session: false, draft: false });
+    expect((await sessionRow(id)).draft_state).toBe("pending");
+    expect(await inTx((tx) => settleOverdue(tx, id))).toEqual({ session: false, draft: true });
+    expect(await sessionRow(id)).toMatchObject({ draft_state: "failed", draft_recompute_due_at: null, analysis_state: "ready" });
+  }, 120_000);
+
+  const analysisRow = async () => (await db.query("SELECT sufficient, score, score_label, suppression_reason, findings FROM geo_analyses WHERE analysis = 'alignment'")).rows[0] as
+    { sufficient: boolean; score: number | null; score_label: string | null; suppression_reason: string | null; findings: { id: string; no_action?: boolean }[] };
+
+  it("AC analysis - review - a page that was never measured (no chunk, so no alignment) is NOT reported as having no gap: it is insufficient, with its reason", async () => {
+    const id = await readySession();
+    await db.query("UPDATE geo_alignments SET current_alignment = NULL, baseline_alignment = NULL, percentile_vs_corpus = NULL, recommendations = '[]'::jsonb WHERE id = $1", [id]);
+    await db.query("DELETE FROM content_chunks WHERE session_id = $1", [id]);
+    await inTx((tx) => writeAlignmentAnalysis(tx, id, clock));
+    const row = await analysisRow();
+    expect(row).toMatchObject({ sufficient: false, score: null, findings: [] });
+    expect(String(row.suppression_reason)).toMatch(/no readable text|could not be measured/);
+  }, 120_000);
+
+  it("AC analysis - review - a measured page with no concept missing says so; missing concepts that could not be ranked are never reported as no gap", async () => {
+    const id = await readySession();
+    await db.query("UPDATE geo_alignments SET recommendations = '[]'::jsonb WHERE id = $1", [id]);
+    await inTx((tx) => writeAlignmentAnalysis(tx, id, clock));
+    expect((await analysisRow()).findings.map((f) => f.id)).toEqual(["alignment-no-gap"]);
+    const unranked = [{
+      node_id: randomUUID(), phrase: "audit logging", node_type: "capability", corpus_doc_ratio: 0.6, projected_gain: null, priority_rank: null,
+      evidence_url: "https://doc0.example/p", evidence_snippet: "audit logging", requires_human_review: false, accuracy_warning: null, auto_insert: false,
+    }];
+    await db.query("UPDATE geo_alignments SET recommendations = $2::jsonb WHERE id = $1", [id, JSON.stringify(unranked)]);
+    await inTx((tx) => writeAlignmentAnalysis(tx, id, clock));
+    const row = await analysisRow();
+    expect(row.findings.some((f) => f.id === "alignment-no-gap")).toBe(false);
+    expect(row).toMatchObject({ sufficient: false, score: null });
+    expect(String(row.suppression_reason).length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("AC analysis - review - fewer than 8 cited passages are marked LOW CONFIDENCE on the score's own label; 8 or more are not", async () => {
+    const id = await readySession(); // 5 cited passages
+    expect((await analysisRow()).score_label).toMatch(/low confidence/i);
+    await db.query("UPDATE geo_alignments SET centroid_source_count = 7 WHERE id = $1", [id]);
+    await inTx((tx) => writeAlignmentAnalysis(tx, id, clock));
+    expect((await analysisRow()).score_label).toMatch(/low confidence/i);
+    await db.query("UPDATE geo_alignments SET centroid_source_count = 8 WHERE id = $1", [id]);
+    await inTx((tx) => writeAlignmentAnalysis(tx, id, clock));
+    const label = (await analysisRow()).score_label;
+    expect(label).toBe("Percentile among the documents engines cite");
+  }, 120_000);
+
+  it("AC draft-wait - review - a recompute that has to wait for a concept's vector leaves the READY figures as they were and asks for that vector", async () => {
+    const id = await readySession();
+    const before = await sessionRow(id);
+    expect(before.coverage_ratio).not.toBeNull();
+    await inTx((tx) => saveAlignmentDraft(tx, words, id, "We provide audit logging and webhook delivery for every account.", 0));
+    await db.query("UPDATE geo_alignments SET draft_recompute_due_at = now() - interval '1 second' WHERE id = $1", [id]);
+    expect((await advanceAlignmentDraft(deps(), id)).state).toBe("waiting");
+    await drainEmbedQueue();
+    await db.query("UPDATE semantic_nodes SET embedding = NULL WHERE project_id = $1", [projectId]); // a second session re-extracted the scope's concepts
+    const outcome = await advanceAlignmentDraft(deps(), id);
+    expect(outcome.state).toBe("waiting");
+    const after = await sessionRow(id);
+    expect(after.coverage_ratio).toBe(before.coverage_ratio);
+    expect(after.recommendations).toEqual(before.recommendations);
+    expect(after.current_alignment).toBe(before.current_alignment);
+    expect(enqueued.some((e) => e.payload.table === "semantic_nodes")).toBe(true);
+  }, 120_000);
+
+  it("AC latency - review - the in-database DRAFT RECOMPUTE (not the request) is within the 200 ms p95 objective on a realistic page and corpus, and observes its latency on a metric", async () => {
+    const id = await readySession();
+    const log = vi.spyOn(Logger.prototype, "log");
+    const sentence = "Teams compare reporting tools by export formats, audit logging, role based access and webhook delivery. ";
+    const timings: number[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      await inTx((tx) => saveAlignmentDraft(tx, words, id, `# Page ${String(i)}\n\n${sentence.repeat(60)}\n\n## Extra ${String(i)}\n\n${`Section ${String(i)} covers data residency options and SOC 2 reporting. `.repeat(20)}`, 0));
+      await db.query("UPDATE geo_alignments SET draft_recompute_due_at = now() - interval '1 second' WHERE id = $1", [id]);
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const started = performance.now();
+        const outcome = await advanceAlignmentDraft(deps(), id);
+        const elapsed = performance.now() - started;
+        if (outcome.state === "ready") {
+          timings.push(elapsed);
+          break;
+        }
+        expect(outcome.state).toBe("waiting");
+        await drainEmbedQueue();
+      }
+    }
+    expect(timings).toHaveLength(12);
+    timings.sort((x, y) => x - y);
+    const p95 = timings[Math.ceil(0.95 * timings.length) - 1]!;
+    expect(p95, `recompute p95 ${p95.toFixed(1)} ms`).toBeLessThan(ALIGNMENT_DRAFT_P95_OBJECTIVE_MS);
+    const observed = log.mock.calls.map((c) => c[0]).filter((l) => typeof l === "object" && l !== null && (l as { metric?: string }).metric === "nominara_geo_alignment_draft_recompute_seconds");
+    expect(observed).toHaveLength(12);
+    log.mockRestore();
+  }, 240_000);
 });

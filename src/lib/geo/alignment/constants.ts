@@ -36,4 +36,6 @@ export const ALIGNMENT_JOB = {
   draftDebounceMs: 2_000,
   /** A draft still waiting on its vectors this long after it was saved is `failed`. */
   draftDeadlineMs: 10 * 60_000,
+  /** A read settles a row still pending only this long AFTER its deadline, so a live chain's own check (which names the same reasons) always gets there first. */
+  settleGraceMs: 60_000,
 } as const;

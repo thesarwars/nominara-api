@@ -5,7 +5,7 @@ import { NotFoundError } from "../../../api/errors/domain-errors.js";
 import type { EnqueueEmbedBatch } from "../../embedding/prompt-embedding-request.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import { chunkDocument, type TokenCounter } from "../corpus/chunker.js";
-import { requestEmbeds } from "./advance.js";
+import { pendingNodeIds, requestEmbeds } from "./advance.js";
 import { analyseNodes } from "./analyse-nodes.js";
 import { computeAlignment } from "./compute.js";
 import { ALIGNMENT_JOB } from "./constants.js";
@@ -13,18 +13,20 @@ import { hashOf } from "./session.js";
 
 // STORY-192 / STORY-059 AC11 - the DEBOUNCED, in-database, free recompute of the customer's draft.
 //
-//   saveAlignmentDraft   in the REQUEST's transaction: store the draft, replace its chunks (chunking is pure CPU, no network) and push the
+//   saveAlignmentDraft   in the REQUEST's transaction: store the draft, update its chunks by content hash (chunking is pure CPU, no network; an unchanged
+//                        chunk keeps its vector) and push the
 //                        row's `draft_recompute_due_at` forward. Nothing is embedded or computed here, so the request answers fast
 //                        (api-specification.md: 200 ms p95) whatever the draft's size.
 //   advanceAlignmentDraft the delayed job's step. A job acts ONLY once the row is due, so a burst of edits is one recompute over the LAST
 //                        text: an earlier edit's job finds the due time moved ahead of it (`not_due`), and a redelivered job finds nothing
-//                        pending (`idle`). The debounce state is the row, so a Valkey flush loses no recompute.
+//                        pending (`idle`). The debounce state is the row, but nothing re-drives a lost job: a recompute whose job never arrives is settled FAILED by `settleOverdue` (and by the
+//                        handler when its retries are spent), and the next save starts a new one.
 //
 // LIVE AND DRAFT ARE KEPT APART. A draft recompute measures the DRAFT's chunks (`is_draft = true`) and writes `current_alignment`, the
 // coverage and the recommendations; it never touches `baseline_alignment`, `live_content_md` or a live chunk's figure (`computeAlignment`'s
 // draft branch is the one place that guarantees it, and the integration spec pins it).
 //
-// The vectors of a new draft are asked for after the commit; the step answers `waiting` until they are in, and the draft is `failed` (not
+// The vectors of a new draft are asked for by the DEBOUNCED step only (never per save: a burst of edits embeds once, and only the chunks with no vector); the step answers `waiting` until they are in, and the draft is `failed` (not
 // pending for ever) once the deadline passes. No credit is charged anywhere in this file.
 
 const tracer = trace.getTracer("nominara.geo-alignment");
@@ -48,19 +50,48 @@ export async function saveAlignmentDraft(tx: ClientBase, tokenizer: TokenCounter
   const session = found.rows[0];
   if (session === undefined) throw new NotFoundError({ message: "no such alignment session" });
 
+  // Diff by content hash: a chunk whose text did not change keeps its row - and so its vector - and only its position moves; a changed chunk is
+  // deleted and a new one inserted. Re-embedding the whole document on every save would pay the provider for text it already holds.
   const chunks = chunkDocument(markdown, tokenizer);
-  await tx.query("DELETE FROM content_chunks WHERE session_id = $1 AND is_draft AND workspace_id = app.current_workspace()", [sessionId]);
-  let chunkIds: string[] = [];
-  if (chunks.length > 0) {
+  const hashes = chunks.map((c) => hashOf(c.text).toString("hex"));
+  const existing = await tx.query<{ id: string; hash: string }>(
+    "SELECT id, encode(content_hash, 'hex') AS hash FROM content_chunks WHERE session_id = $1 AND is_draft AND workspace_id = app.current_workspace() ORDER BY chunk_index, id",
+    [sessionId],
+  );
+  const pool = new Map<string, string[]>();
+  for (const row of existing.rows) pool.set(row.hash, [...(pool.get(row.hash) ?? []), row.id]);
+  const keptIds: string[] = [];
+  const keptIndex: number[] = [];
+  const fresh: number[] = [];
+  chunks.forEach((chunk, position) => {
+    const reuse = pool.get(hashes[position]!)?.shift();
+    if (reuse === undefined) fresh.push(position);
+    else {
+      keptIds.push(reuse);
+      keptIndex.push(chunk.index);
+    }
+  });
+  const dropped = [...pool.values()].flat();
+  if (dropped.length > 0) await tx.query("DELETE FROM content_chunks WHERE id = ANY($1::uuid[]) AND workspace_id = app.current_workspace()", [dropped]);
+  if (keptIds.length > 0) {
+    await tx.query(
+      `UPDATE content_chunks c SET chunk_index = v.idx FROM unnest($1::uuid[], $2::int[]) AS v(id, idx)
+        WHERE c.id = v.id AND c.workspace_id = app.current_workspace() AND c.chunk_index <> v.idx`,
+      [keptIds, keptIndex],
+    );
+  }
+  let chunkIds: string[] = [...keptIds];
+  if (fresh.length > 0) {
     const inserted = await tx.query<{ id: string }>(
       `INSERT INTO content_chunks (workspace_id, project_id, session_id, url, chunk_index, text, token_count, content_hash, is_draft)
        SELECT app.current_workspace(), $1, $2, $3, v.idx, v.text, v.tc, decode(v.ch, 'hex'), true
          FROM unnest($4::int[], $5::text[], $6::int[], $7::text[]) AS v(idx, text, tc, ch)
        RETURNING id`,
-      [session.project_id, sessionId, session.target_url, chunks.map((c) => c.index), chunks.map((c) => c.text), chunks.map((c) => c.tokenCount), chunks.map((c) => hashOf(c.text).toString("hex"))],
+      [session.project_id, sessionId, session.target_url, fresh.map((p) => chunks[p]!.index), fresh.map((p) => chunks[p]!.text), fresh.map((p) => chunks[p]!.tokenCount), fresh.map((p) => hashes[p]!)],
     );
-    chunkIds = inserted.rows.map((row) => row.id).sort();
+    chunkIds = [...chunkIds, ...inserted.rows.map((row) => row.id)];
   }
+  chunkIds.sort();
   const due = await tx.query<{ due: string }>(
     `UPDATE geo_alignments
         SET draft_content_md = $2, draft_state = 'pending', draft_recompute_due_at = now() + make_interval(secs => $3::double precision / 1000.0), updated_at = now()
@@ -167,9 +198,15 @@ async function draftStep(deps: DraftDeps, sessionId: string): Promise<DraftOutco
     const row = locked.rows[0];
     if (row === undefined) return "gone" as const;
     if (row.draft_state !== "pending" || row.due_text !== read.due_text) return "superseded" as const;
+    // A recompute that must wait for a concept's vector writes nothing: the figures of the READY session stay as they were until it can finish.
+    await tx.query("SAVEPOINT draft_recompute");
     await computeAlignment(tx, sessionId, { draft: true });
     const summary = await analyseNodes(tx, sessionId, deps.tokenizer, { draft: true });
-    if (summary.pending) return "waiting" as const;
+    if (summary.pending) {
+      await tx.query("ROLLBACK TO SAVEPOINT draft_recompute");
+      return { waitingOn: await pendingNodeIds(tx, sessionId) };
+    }
+    await tx.query("RELEASE SAVEPOINT draft_recompute");
     await tx.query(
       `UPDATE geo_alignments SET draft_state = 'ready', draft_recompute_due_at = NULL, updated_at = now() WHERE id = $1 AND workspace_id = app.current_workspace()`,
       [sessionId],
@@ -178,5 +215,7 @@ async function draftStep(deps: DraftDeps, sessionId: string): Promise<DraftOutco
   });
   if (outcome === "gone") return { state: "gone", dueInMs: null };
   if (outcome === "superseded") return { state: "not_due", dueInMs: null };
-  return { state: outcome, dueInMs: null };
+  if (outcome === "ready") return { state: "ready", dueInMs: null };
+  await requestEmbeds(deps, "semantic_nodes", outcome.waitingOn);
+  return { state: "waiting", dueInMs: null };
 }

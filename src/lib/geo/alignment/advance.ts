@@ -47,6 +47,11 @@ export interface AdvanceDeps {
   readonly providerModel: string;
   readonly enqueueEmbed?: EnqueueEmbedBatch;
   readonly now?: () => Date;
+  /**
+   * Whether this step fetches the cited pages. Default true. The job sets it only on a session's FIRST step: `buildCorpus` remembers a URL only
+   * if it left live passages, so a refused, failed or empty page would be fetched again on every poll for the whole deadline.
+   */
+  readonly buildCorpus?: boolean;
 }
 
 export type AdvanceOutcome = { readonly state: "ready" | "waiting" | "stale" | "failed" | "settled" | "gone"; readonly reason: string | null };
@@ -141,8 +146,9 @@ async function step(deps: AdvanceDeps, sessionId: string): Promise<AdvanceOutcom
     }
   }
 
-  // ---- 3. the cited corpus: idempotent (live passages are refreshed, never re-fetched), fetched with NO transaction open ---------
-  if (session.prompt_cluster_id !== null) {
+  // ---- 3. the cited corpus: idempotent (live passages are refreshed, never re-fetched), fetched with NO transaction open. Once per session:
+  //         the job asks on the first step only (`buildCorpus`), later steps wait for vectors without touching a third party --------------
+  if (session.prompt_cluster_id !== null && deps.buildCorpus !== false) {
     const corpus = await buildCorpus(
       { workspaceId: deps.workspaceId, runInTx: deps.runInTx, fetchPage: deps.fetchPage, tokenizer: deps.tokenizer, embeddingModel: session.embedding_model, ...(deps.enqueueEmbed === undefined ? {} : { enqueueEmbed: deps.enqueueEmbed }), now: () => now },
       { projectId: session.project_id, clusterId: session.prompt_cluster_id },
@@ -193,14 +199,8 @@ async function step(deps: AdvanceDeps, sessionId: string): Promise<AdvanceOutcom
     const summary = await analyseNodes(tx, sessionId, deps.tokenizer);
     if (!summary.found) return "gone" as const;
     if (summary.pending) {
-      const nodes = await tx.query<{ id: string }>(
-        `SELECT n.id FROM semantic_nodes n JOIN geo_alignments g ON g.id = $1
-          WHERE n.workspace_id = app.current_workspace() AND g.workspace_id = app.current_workspace() AND n.project_id = g.project_id
-            AND n.prompt_cluster_id IS NOT DISTINCT FROM g.prompt_cluster_id AND n.collapsed_into_id IS NULL
-            AND (n.embedding IS NULL OR n.embedding_model IS DISTINCT FROM g.embedding_model) ORDER BY n.id`,
-        [sessionId],
-      );
-      return { pendingNodes: nodes.rows.map((r) => r.id) };
+      const pendingNodes = await pendingNodeIds(tx, sessionId);
+      return { pendingNodes };
     }
     const marked = await tx.query(
       `UPDATE geo_alignments SET analysis_state = 'ready', analysis_reason = NULL, updated_at = now()
@@ -214,6 +214,18 @@ async function step(deps: AdvanceDeps, sessionId: string): Promise<AdvanceOutcom
   if (finished === "ready") return { state: "ready", reason: null };
   await requestEmbeds(deps, "semantic_nodes", finished.pendingNodes);
   return { state: "waiting", reason: "concepts_pending" };
+}
+
+/** The scope's concepts that still lack a vector under the session's model (the ones `embed.batch` is asked for). */
+export async function pendingNodeIds(tx: ClientBase, sessionId: string): Promise<string[]> {
+  const nodes = await tx.query<{ id: string }>(
+    `SELECT n.id FROM semantic_nodes n JOIN geo_alignments g ON g.id = $1
+      WHERE n.workspace_id = app.current_workspace() AND g.workspace_id = app.current_workspace() AND n.project_id = g.project_id
+        AND n.prompt_cluster_id IS NOT DISTINCT FROM g.prompt_cluster_id AND n.collapsed_into_id IS NULL
+        AND (n.embedding IS NULL OR n.embedding_model IS DISTINCT FROM g.embedding_model) ORDER BY n.id`,
+    [sessionId],
+  );
+  return nodes.rows.map((r) => r.id);
 }
 
 /** Asks `embed.batch` for the vectors of `ids`, AFTER the transaction that found them closed. Fails open: the rows wait at `embedding IS NULL`. */
