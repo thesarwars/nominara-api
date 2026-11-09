@@ -76,6 +76,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "credit.verify",
       "domain.reverify",
       "embed.batch",
+      // STORY-115 - one slice of one Search Console connection's pull.
+      "gsc.sync",
       "identity.sweep_unverified",
       // STORY-079 - the Visibility Scan, on the dedicated interactive pool.
       "lookup.execute",
@@ -112,6 +114,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "task.generate",
       // STORY-114 - declared after task.generate and before credit.reconcile in topology.ts.
       "attribution.rollup",
+      "gsc.sync",
       "credit.reconcile",
       // STORY-100 — report.build (the cadence path of a scheduled report), declared before notify.dispatch in topology.ts.
       "report.build",

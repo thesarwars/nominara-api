@@ -21863,6 +21863,1611 @@
         }
       }
     },
+    "/v1/integrations/gsc/oauth/callback": {
+      "get": {
+        "operationId": "gscOauthCallback",
+        "responses": {
+          "200": {
+            "description": "gscOauthCallback response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "project_id": {
+                          "type": "string"
+                        },
+                        "property_url": {
+                          "type": "string"
+                        },
+                        "property_type": {
+                          "type": "string",
+                          "enum": [
+                            "domain",
+                            "url_prefix"
+                          ]
+                        },
+                        "health_status": {
+                          "type": "string",
+                          "enum": [
+                            "unknown",
+                            "healthy",
+                            "degraded",
+                            "unauthorized",
+                            "revoked"
+                          ]
+                        },
+                        "last_error": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "last_sync_date": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "last_sync_at": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "backfill_completed": {
+                          "type": "boolean"
+                        },
+                        "frontier_note": {
+                          "type": "string"
+                        },
+                        "created_at": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "project_id",
+                        "property_url",
+                        "property_type",
+                        "health_status",
+                        "last_error",
+                        "last_sync_date",
+                        "last_sync_at",
+                        "backfill_completed",
+                        "frontier_note",
+                        "created_at"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 200
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 500
+            }
+          }
+        ]
+      }
+    },
+    "/v1/integrations/gsc/oauth/start": {
+      "post": {
+        "operationId": "startGscOauth",
+        "responses": {
+          "200": {
+            "description": "startGscOauth response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "authorization_url": {
+                          "type": "string"
+                        },
+                        "state_expires_at": {
+                          "type": "string"
+                        },
+                        "property_type": {
+                          "type": "string",
+                          "enum": [
+                            "domain",
+                            "url_prefix"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "authorization_url",
+                        "state_expires_at",
+                        "property_type"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "project_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "property_url": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 300
+                  }
+                },
+                "required": [
+                  "project_id",
+                  "property_url"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/gsc/{id}": {
+      "get": {
+        "operationId": "getGscConnection",
+        "responses": {
+          "200": {
+            "description": "getGscConnection response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "project_id": {
+                          "type": "string"
+                        },
+                        "property_url": {
+                          "type": "string"
+                        },
+                        "property_type": {
+                          "type": "string",
+                          "enum": [
+                            "domain",
+                            "url_prefix"
+                          ]
+                        },
+                        "health_status": {
+                          "type": "string",
+                          "enum": [
+                            "unknown",
+                            "healthy",
+                            "degraded",
+                            "unauthorized",
+                            "revoked"
+                          ]
+                        },
+                        "last_error": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "last_sync_date": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "last_sync_at": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "backfill_completed": {
+                          "type": "boolean"
+                        },
+                        "frontier_note": {
+                          "type": "string"
+                        },
+                        "created_at": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "project_id",
+                        "property_url",
+                        "property_type",
+                        "health_status",
+                        "last_error",
+                        "last_sync_date",
+                        "last_sync_at",
+                        "backfill_completed",
+                        "frontier_note",
+                        "created_at"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "disconnectGsc",
+        "responses": {
+          "204": {
+            "description": "disconnectGsc response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "null"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/gsc/{id}/sync": {
+      "post": {
+        "operationId": "syncGsc",
+        "responses": {
+          "202": {
+            "description": "syncGsc response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "connection_id": {
+                          "type": "string"
+                        },
+                        "queued": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "connection_id",
+                        "queued"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/me": {
       "get": {
         "operationId": "getMe",
@@ -41999,6 +43604,553 @@
                 "hour",
                 "day",
                 "week"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "/v1/projects/{id}/gsc/correlation": {
+      "get": {
+        "operationId": "getGscCorrelation",
+        "responses": {
+          "200": {
+            "description": "getGscCorrelation response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "connected": {
+                          "type": "boolean"
+                        },
+                        "health_status": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "enum": [
+                                "unknown",
+                                "healthy",
+                                "degraded",
+                                "unauthorized",
+                                "revoked"
+                              ]
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "window_days": {
+                          "anyOf": [
+                            {
+                              "type": "number",
+                              "const": 7
+                            },
+                            {
+                              "type": "number",
+                              "const": 30
+                            },
+                            {
+                              "type": "number",
+                              "const": 90
+                            }
+                          ]
+                        },
+                        "window_start": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "window_end": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "frontier": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "frontier_note": {
+                          "type": "string"
+                        },
+                        "signals": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "key": {
+                                "type": "string",
+                                "enum": [
+                                  "citations",
+                                  "ai_surface_impressions",
+                                  "ai_sessions"
+                                ]
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "source": {
+                                "type": "string"
+                              },
+                              "frontier": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "limits": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "label",
+                              "source",
+                              "frontier",
+                              "limits"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "independence_note": {
+                          "type": "string"
+                        },
+                        "correlation_note": {
+                          "type": "string"
+                        },
+                        "pages": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "url": {
+                                "type": "string"
+                              },
+                              "citations": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "gsc_ai_impressions": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "ai_sessions": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "url",
+                              "citations",
+                              "gsc_ai_impressions",
+                              "ai_sessions"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "search_queries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "query": {
+                                "type": "string"
+                              },
+                              "report": {
+                                "type": "string",
+                                "const": "classic"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "impressions": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "clicks": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "match": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "prompt_id": {
+                                        "type": "string"
+                                      },
+                                      "prompt_text": {
+                                        "type": "string"
+                                      },
+                                      "method": {
+                                        "type": "string",
+                                        "const": "trigram"
+                                      },
+                                      "confidence": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": 1
+                                      },
+                                      "exact": {
+                                        "type": "boolean",
+                                        "const": false
+                                      },
+                                      "low_confidence": {
+                                        "type": "boolean"
+                                      }
+                                    },
+                                    "required": [
+                                      "prompt_id",
+                                      "prompt_text",
+                                      "method",
+                                      "confidence",
+                                      "exact",
+                                      "low_confidence"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "query",
+                              "report",
+                              "label",
+                              "impressions",
+                              "clicks",
+                              "match"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": [
+                        "connected",
+                        "health_status",
+                        "window_days",
+                        "window_start",
+                        "window_end",
+                        "frontier",
+                        "frontier_note",
+                        "signals",
+                        "independence_note",
+                        "correlation_note",
+                        "pages",
+                        "search_queries"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        },
+                        "scoring_version": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "computed_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+                        }
+                      },
+                      "required": [
+                        "request_id",
+                        "scoring_version",
+                        "computed_at"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unmodelled server-side failure — api-specification.md §2's `internal_error`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other error, as RFC 9457 problem details.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "title": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "status": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    },
+                    "detail": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "validation_failed",
+                            "unsupported_engine",
+                            "unauthenticated",
+                            "token_expired",
+                            "token_revoked",
+                            "step_up_required",
+                            "insufficient_credits",
+                            "forbidden",
+                            "workspace_mismatch",
+                            "project_out_of_scope",
+                            "entitlement_exceeded",
+                            "feature_not_in_plan",
+                            "not_found",
+                            "conflict",
+                            "idempotency_conflict",
+                            "workspace_limit_reached",
+                            "price_changed",
+                            "domain_not_verified",
+                            "precondition_unmet",
+                            "unsafe_target",
+                            "rate_limited",
+                            "quota_exceeded",
+                            "daily_limit_reached",
+                            "capture_mode_unavailable",
+                            "internal_error",
+                            "engine_unavailable",
+                            "degraded",
+                            "retention_exceeded"
+                          ]
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "details": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "remediation": {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        "request_id": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{32}$"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "request_id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "title",
+                    "status",
+                    "detail",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "timeframe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": "30d",
+              "type": "string",
+              "enum": [
+                "7d",
+                "30d",
+                "90d"
               ]
             }
           }
