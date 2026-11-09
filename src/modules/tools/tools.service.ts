@@ -2,7 +2,9 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import {
+  COMPARABLE_TOOL_KEYS,
   FREE_TOOL_KEYS,
+  type ComparableRunsResponse,
   type ConvertToolRunRequest,
   type ConvertToolRunResponse,
   type ToolKey,
@@ -528,19 +530,26 @@ export class ToolsService {
   // STORY-084 - Compare Runs reads. SELECTs only: a comparison captures nothing, enqueues nothing and fetches nothing.
   // ---------------------------------------------------------------------------------------------------------------------------------
 
-  /** AC2 - the runs comparable with this one: same workspace, same tool, same normalised input hash, only `completed` or `partial`. Served by `ix_tr_diff_pairs`. */
-  async comparableRuns(runId: string): Promise<ToolRun[]> {
+  /**
+   * AC2 / FR-TL-05c - the runs comparable with this one: same workspace, same tool, same normalised input hash, only `completed` or `partial`, and not past
+   * `expires_at` (the sweep may not have reached it yet, and the compare route refuses an expired side). Only the two comparable tools have any. Served by
+   * `ix_tr_diff_pairs`. A run that is not in this workspace is a 404 (RLS), never an empty list.
+   */
+  async comparableRuns(runId: string): Promise<ComparableRunsResponse> {
     const { client } = this.store();
+    const own = await client.query<{ tool_key: string }>(`SELECT tool_key FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1`, [runId]);
+    if (own.rows[0] === undefined) throw new NotFoundError({ message: "no such tool run" });
+    if (!(COMPARABLE_TOOL_KEYS as readonly string[]).includes(own.rows[0].tool_key)) return { run_id: runId, comparable: [] };
     const rows = await client.query<RunRow>(
       `SELECT ${COLUMNS} FROM tool_runs
         WHERE workspace_id = app.current_workspace()
           AND (tool_key, input_hash) = (SELECT tool_key, input_hash FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1)
-          AND status IN ('completed', 'partial') AND id <> $1
+          AND status IN ('completed', 'partial') AND expires_at > now() AND id <> $1
         ORDER BY created_at DESC, id DESC
         LIMIT 50`,
       [runId],
     );
-    return rows.rows.map(toRun);
+    return { run_id: runId, comparable: rows.rows.map(toRun) };
   }
 
   /** Both runs of a comparison in one read, with whether their normalised input hashes agree. A run in another workspace is a 404 (RLS). */

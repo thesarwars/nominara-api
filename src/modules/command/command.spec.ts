@@ -21,6 +21,8 @@ import { EntityIndexService } from "./entity-index.service.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { CommandExecuteService } from "./command-execute.service.js";
 import { parseCacheKey, PARSE_INDEX_VERSION } from "./command-parse-cache.js";
+import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
+import { parseRecordKey } from "../../lib/command/parse-record.js";
 
 const WS_A = "0197b2c0-0000-7000-8000-00000000000a";
 const WS_B = "0197b2c0-0000-7000-8000-00000000000b";
@@ -52,7 +54,7 @@ const callerFor = (workspaceId: string, actorId = ACTOR_1, role = "owner", proje
   lastStrongAuthAt: null,
 });
 
-const noEntities = { bindProject: async () => null } as unknown as EntityIndexService;
+const noEntities = { bindProject: async () => null, usageOf: async () => 0 } as unknown as EntityIndexService;
 const noPrice = { resolveForWorkspace: async () => ({ entitlements: {} }) } as unknown as EntitlementResolver;
 
 /** The parse service over a fake entity index and resolver; tests that need a project or a price pass their own. */
@@ -374,5 +376,72 @@ describe("STORY-085-A CP2 · metric and log are asserted directly", () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe("STORY-085 review round 1 - free text keeps the user's own casing (title, name); matching and the cache key stay normalised", () => {
+  it("a task title and a project name are stored as typed, with edge punctuation dropped", async () => {
+    const task = await makeService().parse(WS_A, "create a task called Fix Homepage FAQ for iOS.");
+    expect(task.intent).toBe("create_task");
+    expect(task.slots).toEqual({ title: "Fix Homepage FAQ for iOS" });
+    const project = await makeService().parse(WS_A, "Create a project called Acme GmbH");
+    expect(project.slots).toEqual({ name: "Acme GmbH" });
+  });
+
+  it("two spellings of one request share the cache entry and each keeps ITS OWN casing", async () => {
+    const service = makeService();
+    const first = await service.parse(WS_A, "create a task called fix faq");
+    const second = await service.parse(WS_A, "Create a task called Fix FAQ");
+    expect(first.slots).toEqual({ title: "fix faq" });
+    expect(second.cached).toBe(true);
+    expect(second.slots).toEqual({ title: "Fix FAQ" });
+  });
+
+  it("the single-use record stores the cased slot, so execute creates the task with it", async () => {
+    const cache = new InMemoryCacheAdapter();
+    const parsed = await makeService(cache).parse(WS_A, "create a task called Fix Homepage FAQ");
+    const raw = await cache.get(parseRecordKey(cacheKeyNamespace(), WS_A, parsed.parse_id));
+    expect(raw, "the parse record").toBeDefined();
+    expect(JSON.parse(raw!).slots).toEqual({ title: "Fix Homepage FAQ" });
+  });
+
+  it("slots that are not free text stay normalised (a role, a metric, an e-mail address)", async () => {
+    expect((await makeService().parse(WS_A, "Invite Jo@Example.com as Viewer")).slots).toEqual({ email: "jo@example.com", role: "viewer" });
+  });
+});
+
+describe("STORY-085 review round 1 - FR-CMD-05: an action outside the plan is returned DISABLED with the reason, per intent", () => {
+  const free = { "projects.max": { value: 0 }, "seats.max": { value: 1 }, "exports.pdf_per_cycle": { value: 0 }, "deep_scan.credits": { value: null } };
+  const growth = { "projects.max": { value: 3 }, "seats.max": { value: 7 }, "exports.pdf_per_cycle": { value: 25 }, "deep_scan.credits": { value: 200 } };
+  const resolverOf = (entitlements: Record<string, { value: unknown }>) => ({ resolveForWorkspace: async () => ({ entitlements }) }) as unknown as EntitlementResolver;
+  const usage = (n: number) => ({ bindProject: async () => null, usageOf: async () => n }) as unknown as EntityIndexService;
+  const reasonOf = async (entitlements: Record<string, { value: unknown }>, used: number, intent: CommandIntent): Promise<string | null | undefined> =>
+    (await makeService(new InMemoryCacheAdapter(), usage(used), resolverOf(entitlements)).parse(WS_A, PHRASES[intent])).actions[0]?.disabled_reason;
+
+  it("create a project on a plan with no project slot is entitlement_exceeded:projects.max (a structural limit, never feature_not_in_plan)", async () => {
+    expect(await reasonOf(free, 0, "create_project")).toBe("entitlement_exceeded:projects.max");
+  });
+  it("create a project at the ceiling is the same refusal; below it the action is enabled", async () => {
+    expect(await reasonOf(growth, 3, "create_project")).toBe("entitlement_exceeded:projects.max");
+    expect(await reasonOf(growth, 2, "create_project")).toBeNull();
+  });
+  it("invite a member at the seat ceiling is entitlement_exceeded:seats.max; with a free seat it is enabled", async () => {
+    expect(await reasonOf(free, 1, "invite_member")).toBe("entitlement_exceeded:seats.max");
+    expect(await reasonOf(growth, 6, "invite_member")).toBeNull();
+  });
+  it("build a report on a plan whose PDF allowance is 0 is feature_not_in_plan:exports.pdf_per_cycle; on a plan that has it, enabled", async () => {
+    expect(await reasonOf(free, 0, "build_report")).toBe("feature_not_in_plan:exports.pdf_per_cycle");
+    expect(await reasonOf(growth, 0, "build_report")).toBeNull();
+  });
+  it("a deep scan on a plan with no price is feature_not_in_plan:deep_scan.credits; unlimited keys (custom, unlimited) never disable", async () => {
+    expect(await reasonOf(free, 0, "run_deep_scan")).toBe("feature_not_in_plan:deep_scan.credits");
+    expect(await reasonOf({ "projects.max": { value: "custom" }, "seats.max": { value: "unlimited" } }, 999, "create_project")).toBeNull();
+    expect(await reasonOf({ "projects.max": { value: "custom" }, "seats.max": { value: "unlimited" } }, 999, "invite_member")).toBeNull();
+  });
+  it("a role refusal still comes first, and an intent with no gating key is never disabled by the plan", async () => {
+    const viewer = callerFor(WS_A, ACTOR_1, "viewer");
+    const parsed = await makeService(new InMemoryCacheAdapter(), usage(9), resolverOf(free)).parse(viewer, PHRASES.create_project);
+    expect(parsed.actions[0]?.disabled_reason).toBe("forbidden:project:create");
+    expect(await reasonOf(free, 9, "create_task")).toBeNull();
   });
 });

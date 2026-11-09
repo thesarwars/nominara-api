@@ -3,7 +3,8 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Pool } from "pg";
 import type { PublicPlansResponse } from "../../../contracts/entitlements/public-plans.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { publicEngineFrom, publicPlanFrom, type EngineRow, type PlanRow } from "../../lib/entitlements/public-plans.js";
+import { publicAddonsFrom, publicCreditPackFrom, publicEngineFrom, publicPlanFrom, type EngineRow, type PlanRow } from "../../lib/entitlements/public-plans.js";
+import { publicCreditPackRows } from "../../lib/credits/wallet.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 
 // STORY-103 (API part) - `GET /v1/public/plans`. GLOBAL data only (`plans`, `engines`: no `workspace_id`, no row-level security), read
@@ -23,17 +24,20 @@ export class PublicPlansService {
   async snapshot(nowMs: number = Date.now()): Promise<PublicPlansResponse> {
     return await tracer.startActiveSpan("entitlements.public_plans.snapshot", async (span) => {
       try {
-        const [plans, engines] = await Promise.all([
+        const [plans, engines, packs] = await Promise.all([
           this.pool.query<PlanRow>("SELECT key, display_name, currency, sort_order, entitlements FROM plans WHERE is_public ORDER BY sort_order, key"),
           this.pool.query<EngineRow>("SELECT key, display_name, cadence_by_plan FROM engines WHERE status <> 'disabled' ORDER BY key"),
+          publicCreditPackRows(this.pool),
         ]);
         const body: PublicPlansResponse = {
           plans: plans.rows.map(publicPlanFrom),
           engines: engines.rows.map(publicEngineFrom),
+          addons: { credit_packs: packs.map(publicCreditPackFrom), subscription: publicAddonsFrom(plans.rows) },
           generated_at: new Date(nowMs).toISOString(),
         };
         span.setAttribute("nominara.public_plans.plans", body.plans.length);
         span.setAttribute("nominara.public_plans.engines", body.engines.length);
+        span.setAttribute("nominara.public_plans.credit_packs", body.addons.credit_packs.length);
         incrementCounter("nominara_public_plans_served_total", { outcome: "ok" });
         logger.log({ event: "public_plans.served", plans: body.plans.length, engines: body.engines.length });
         return body;

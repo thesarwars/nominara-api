@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PUBLIC_PLANS_WITHHELD_KEYS, publicPlansResponseSchema } from "../../../contracts/entitlements/public-plans.schema.js";
 import { NOT_LIVE_KEYS, PLAN_ENTITLEMENTS } from "../../db/seed/plan-entitlements.js";
-import { publicEngineFrom, publicEntitlementsFrom, publicPlanFrom } from "./public-plans.js";
+import { publicAddonsFrom, publicCreditPackFrom, publicEngineFrom, publicEntitlementsFrom, publicPlanFrom } from "./public-plans.js";
 
 // STORY-103 (API part) - the live filter the pricing page and the in-app comparison share. Scenarios 6 and 8 (a non-live key is
 // absent, one filter for both consumers), 9 and 10 (the fair-use ceiling and a deep scan's credit price are not published) and 13
@@ -89,8 +89,38 @@ describe("STORY-103 · publicPlanFrom / publicEngineFrom", () => {
   });
 
   it("the assembled body satisfies the contract and is strict", () => {
-    const body = { plans: [publicPlanFrom({ ...ROW, entitlements: {} })], engines: [], generated_at: new Date(0).toISOString() };
+    const body = { plans: [publicPlanFrom({ ...ROW, entitlements: {} })], engines: [], addons: { credit_packs: [], subscription: [] }, generated_at: new Date(0).toISOString() };
     expect(publicPlansResponseSchema.safeParse(body).success).toBe(true);
     expect(publicPlansResponseSchema.safeParse({ ...body, extra: 1 }).success).toBe(false);
+  });
+});
+
+describe("STORY-103 review round 1 - the add-on rows (FR-CRD-15: no hardcoded price or limit on the page)", () => {
+  const live = (value: unknown) => ({ value, live: true });
+  const growth = { ...ROW, key: "growth", entitlements: { "projects.addon_allowed": live(true), "seats.addon_allowed": live(true), "projects.max": live(3), "prompts.max_per_project": live(40), "prompts.max_total": live(120), "seats.max": live(7) } };
+  const free = { ...ROW, key: "free", entitlements: { "projects.addon_allowed": live(false), "seats.addon_allowed": live(false) } };
+  const starter = { ...ROW, key: "starter", entitlements: { "projects.addon_allowed": live(false), "seats.addon_allowed": live(true), "seats.max": live(3) } };
+  const notLive = { ...ROW, key: "x", entitlements: { "projects.addon_allowed": { value: true, live: false } } };
+
+  it("the extra project is offered where its flag is live and true, with its price, and states its prompt slots (FR-CRD-05)", () => {
+    const project = publicAddonsFrom([free, starter, growth, notLive]).find((a) => a.kind === "extra_project")!;
+    expect(project).toMatchObject({ monthly_usd: "49.00", currency: "USD", available_on_plans: ["growth"] });
+    expect(project.grant_by_plan["growth"]).toMatchObject({ projects: 1, prompt_slots: 40 });
+    expect(project.grant_by_plan["growth"]!.statement).toMatch(/1 project and 40 prompt slots/);
+  });
+
+  it("the extra seat is offered on every plan whose flag is true, at its own price", () => {
+    const seat = publicAddonsFrom([free, starter, growth]).find((a) => a.kind === "extra_seat")!;
+    expect(seat).toMatchObject({ monthly_usd: "15.00", available_on_plans: ["starter", "growth"] });
+    expect(seat.grant_by_plan["starter"]).toMatchObject({ seats: 1, projects: 0, prompt_slots: 0 });
+  });
+
+  it("a malformed plan document is refused rather than published", () => {
+    expect(() => publicAddonsFrom([{ ...ROW, entitlements: { "projects.addon_allowed": true } }])).toThrow();
+  });
+
+  it("a credit pack row becomes the public shape: text price, no Stripe id", () => {
+    const pack = publicCreditPackFrom({ key: "small", display_name: "Small", credits: 500, price_usd: "25.00", currency: "USD ", min_plan_key: null, sort_order: 1, stripe_price_id: "price_x" } as never);
+    expect(pack).toEqual({ key: "small", display_name: "Small", credits: 500, price: "25.00", currency: "USD", min_plan_key: null, sort_order: 1 });
   });
 });

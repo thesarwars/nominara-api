@@ -13,12 +13,12 @@ import { PublicPlansService } from "./public-plans.service.js";
 
 // STORY-103 (API part) - `GET /public/plans`.
 
-function fakePool(plans: unknown[], engines: unknown[]): { pool: Pool; queries: string[] } {
+function fakePool(plans: unknown[], engines: unknown[], packs: unknown[] = []): { pool: Pool; queries: string[] } {
   const queries: string[] = [];
   const pool = {
     query: (text: string) => {
       queries.push(text);
-      return Promise.resolve({ rows: /FROM\s+plans/iu.test(text) ? plans : engines });
+      return Promise.resolve({ rows: /FROM\s+plans/iu.test(text) ? plans : /FROM\s+credit_packs/iu.test(text) ? packs : engines });
     },
   } as unknown as Pool;
   return { pool, queries };
@@ -33,19 +33,24 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("STORY-103 · PublicPlansService", () => {
   it("STORY-103 #1 answers a contract-valid snapshot from the global plans and engines tables, with cadence_by_plan", async () => {
-    const { pool, queries } = fakePool([GROWTH], [{ key: "gemini", display_name: "Gemini", cadence_by_plan: { growth: { full: 8 } } }]);
+    const pack = { key: "small", display_name: "Small", credits: 500, price_usd: "25.00", currency: "USD", min_plan_key: null, sort_order: 1 };
+    const { pool, queries } = fakePool([GROWTH], [{ key: "gemini", display_name: "Gemini", cadence_by_plan: { growth: { full: 8 } } }], [pack]);
     const body = await new PublicPlansService(pool).snapshot(Date.UTC(2026, 10, 9));
     expect(publicPlansResponseSchema.safeParse(body).success).toBe(true);
     expect(body.plans[0]!.entitlements).toEqual({ "price.monthly_usd": 7919 });
     expect(body.engines).toEqual([{ engine_key: "gemini", display_name: "Gemini", cadence_by_plan: { growth: { full: 8 } } }]);
     expect(body.generated_at).toBe("2026-11-09T00:00:00.000Z");
-    expect(queries).toHaveLength(2);
+    expect(body.addons.credit_packs).toEqual([{ key: "small", display_name: "Small", credits: 500, price: "25.00", currency: "USD", min_plan_key: null, sort_order: 1 }]);
+    expect(body.addons.subscription.map((a) => a.kind)).toEqual(["extra_project", "extra_seat"]);
+    expect(queries).toHaveLength(3);
   });
 
   it("reads only public plans and non-disabled engines, in a stable order, with no tenant column", async () => {
     const { pool, queries } = fakePool([], []);
     await new PublicPlansService(pool).snapshot();
-    const [plansSql, enginesSql] = queries.map((q) => q.replace(/\s+/gu, " "));
+    const [plansSql, enginesSql, packsSql] = queries.map((q) => q.replace(/\s+/gu, " "));
+    expect(packsSql).toMatch(/FROM credit_packs WHERE is_public/iu);
+    expect(packsSql).not.toMatch(/stripe/iu);
     expect(plansSql).toMatch(/WHERE is_public/iu);
     expect(plansSql).toMatch(/ORDER BY sort_order, key/iu);
     expect(enginesSql).toMatch(/status <> 'disabled'/iu);

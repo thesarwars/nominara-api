@@ -131,11 +131,30 @@ export function diffScanResults(base: { readonly engines: readonly ScanEngineRow
 const fingerprint = (f: FindingLike): string => [f.rule_code, f.url ?? ""].join("|");
 const refOf = (f: FindingLike): { rule_code: string; title: string; severity: Severity; url: string | null } => ({ rule_code: f.rule_code, title: f.title, severity: f.severity, url: f.url });
 
+/**
+ * The most severe rank a finding missing from `side`'s stored list may have and still have been CUT rather than absent. A stored audit keeps its findings
+ * in severity order until the 24 KB budget is spent, so when `findings_omitted > 0` everything at or below the lowest kept severity may have been cut
+ * (ties inside one severity are cut arbitrarily), while anything strictly above it would have been kept. -1 means nothing could have been cut; a side
+ * that kept no finding but omitted some could have cut anything.
+ */
+function cutCeiling(side: AuditSide): number {
+  if (side.findings_omitted === 0) return -1;
+  if (side.findings.length === 0) return Number.POSITIVE_INFINITY;
+  return Math.min(...side.findings.map((f) => SEVERITY_ORDER[f.severity]));
+}
+
 export function diffAuditResults(base: AuditSide, compare: AuditSide): AuditComparison {
   const baseBy = new Map(base.findings.map((f) => [fingerprint(f), f]));
   const compareBy = new Map(compare.findings.map((f) => [fingerprint(f), f]));
-  const resolved = base.findings.filter((f) => !compareBy.has(fingerprint(f))).map(refOf);
-  const fresh = compare.findings.filter((f) => !baseBy.has(fingerprint(f))).map(refOf);
+  // A finding absent from one side's list is only "resolved" / "new" if that side could not have cut it: the comparison never claims a fix it cannot see.
+  const compareCut = cutCeiling(compare);
+  const baseCut = cutCeiling(base);
+  const missingFromCompare = base.findings.filter((f) => !compareBy.has(fingerprint(f)));
+  const missingFromBase = compare.findings.filter((f) => !baseBy.has(fingerprint(f)));
+  const resolved = missingFromCompare.filter((f) => SEVERITY_ORDER[f.severity] > compareCut).map(refOf);
+  const possiblyResolved = missingFromCompare.filter((f) => SEVERITY_ORDER[f.severity] <= compareCut).map(refOf);
+  const fresh = missingFromBase.filter((f) => SEVERITY_ORDER[f.severity] > baseCut).map(refOf);
+  const possiblyNew = missingFromBase.filter((f) => SEVERITY_ORDER[f.severity] <= baseCut).map(refOf);
   const regressed = compare.findings.flatMap((f) => {
     const earlier = baseBy.get(fingerprint(f));
     return earlier !== undefined && SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[earlier.severity] ? [{ ...refOf(f), base_severity: earlier.severity }] : [];
@@ -145,6 +164,7 @@ export function diffAuditResults(base: AuditSide, compare: AuditSide): AuditComp
     resolved,
     regressed,
     new: fresh,
+    undetermined: { possibly_resolved: possiblyResolved, possibly_new: possiblyNew },
     findings_omitted: { base: base.findings_omitted, compare: compare.findings_omitted },
   };
 }

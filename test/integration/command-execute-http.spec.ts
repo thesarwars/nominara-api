@@ -294,6 +294,73 @@ describe("STORY-085 · the command bar's execute and entity index, over HTTP", (
     expect((await books(s)).ledger).toEqual(before.ledger);
   });
 
+  // The bar is never a privilege path: a deep scan through it draws on the SAME `project_runs` allowance as POST /projects/{id}/runs (api-specification
+  // section 12: 6/hour per user, 30/hour per workspace, burst 2), on top of `command_execute`. Without it the bar allowed 20 scans a minute.
+  const directRun = (who: CookieTokens, projectId: string, confirmed: number | null = PRICE) =>
+    harness.app().inject({
+      method: "POST",
+      url: apiUrl(`/projects/${projectId}/runs`),
+      headers: headers(who, { "idempotency-key": uuidV7(), ...(confirmed === null ? {} : { "x-nominara-confirmed-credits": String(confirmed) }) }),
+      payload: {},
+    });
+
+  it("STORY-085 review round 1 · project_runs exhausted through the DIRECT route: the bar's deep scan is 429 too, nothing reserved, no run, the parse id not spent", async () => {
+    const s = await scenario();
+    const p = await parse(s.owner, "run deep scan on acme");
+    const body = { parse_id: p.parse_id, action_id: p.actions[0]!.action_id };
+    // Missing confirmed header: a 400 AFTER the rate limiter has counted the request, so this drains the allowance without spending a credit.
+    let drained = false;
+    for (let i = 0; i < 10 && !drained; i += 1) drained = (await directRun(s.owner, s.projectId, null)).statusCode === 429;
+    expect(drained, "the direct route reached its project_runs limit").toBe(true);
+    const before = await books(s);
+
+    const res = await execute(s.owner, body);
+    expect(res.statusCode, res.body).toBe(429);
+    expect(res.json()).toMatchObject({ error: { code: "rate_limited" } });
+    expect(res.headers["retry-after"]).toBeDefined();
+    expect(await books(s), "nothing reserved, no run").toEqual(before);
+    // A 429 is not a spent id: asking again is still the rate limit, not "unknown or already used".
+    expect((await execute(s.owner, body)).statusCode).toBe(429);
+  });
+
+  it("STORY-085 review round 1 · bar scans and direct scans share one allowance: after two bar scans (burst 2) the third is 429, and so is the direct route", async () => {
+    const s = await scenario();
+    for (let i = 0; i < 2; i += 1) {
+      const p = await parse(s.owner, "run deep scan on acme");
+      const res = await execute(s.owner, { parse_id: p.parse_id, action_id: p.actions[0]!.action_id });
+      expect(res.statusCode, `bar scan ${String(i + 1)}: ${res.body}`).toBe(200);
+    }
+    const settled = await books(s);
+    const third = await parse(s.owner, "run deep scan on acme");
+    const blocked = await execute(s.owner, { parse_id: third.parse_id, action_id: third.actions[0]!.action_id });
+    expect(blocked.statusCode, blocked.body).toBe(429);
+    expect(await books(s)).toEqual(settled);
+    expect((await directRun(s.owner, s.projectId)).statusCode).toBe(429);
+  });
+
+  it("STORY-085 review round 1 · a task through the bar does not draw on project_runs", async () => {
+    const s = await scenario();
+    for (let i = 0; i < 4; i += 1) {
+      const p = await parse(s.owner, `create a task called Task ${String(i)}`);
+      const res = await execute(s.owner, { parse_id: p.parse_id, action_id: p.actions[0]!.action_id, project_id: s.projectId }, { confirmed: null });
+      expect(res.statusCode, res.body).toBe(200);
+    }
+    const p = await parse(s.owner, "run deep scan on acme");
+    expect((await execute(s.owner, { parse_id: p.parse_id, action_id: p.actions[0]!.action_id })).statusCode).toBe(200);
+  });
+
+  it("STORY-085 review round 1 (FR-CMD-05) · on Free the plan-limited intents come back DISABLED with the reason: projects.max, seats.max, the PDF export; on Growth they are enabled", async () => {
+    const free = await scenario({ plan: "free" });
+    const reasons = async (s: Scenario) => ({
+      project: (await parse(s.owner, "create a project called Acme GmbH")).actions[0]!.disabled_reason,
+      invite: (await parse(s.owner, "invite jo@example.com as viewer")).actions[0]!.disabled_reason,
+      report: (await parse(s.owner, "build a report for acme")).actions[0]!.disabled_reason,
+    });
+    expect(await reasons(free)).toEqual({ project: "entitlement_exceeded:projects.max", invite: "entitlement_exceeded:seats.max", report: "feature_not_in_plan:exports.pdf_per_cycle" });
+    const growth = await scenario();
+    expect(await reasons(growth)).toEqual({ project: null, invite: null, report: null });
+  });
+
   it("STORY-085 · a parse id is bound to its user: a colleague presenting it is 409 and the owner can still use it", async () => {
     const s = await scenario();
     const colleague = await member(s, "analyst");
@@ -314,14 +381,14 @@ describe("STORY-085 · the command bar's execute and entity index, over HTTP", (
 
   it("STORY-085 · a task through the bar: created on the chosen project, free (no header, no ledger row), audited as the command bar", async () => {
     const s = await scenario();
-    const p = await parse(s.owner, "create a task to fix schema markup");
+    const p = await parse(s.owner, "Create a task called Fix Schema Markup on iOS.");
     expect(p.actions[0]).toMatchObject({ handling: "execute", credit_estimate: null });
     const res = await execute(s.owner, { parse_id: p.parse_id, action_id: p.actions[0]!.action_id, project_id: s.projectId }, { confirmed: null });
     expect(res.statusCode, res.body).toBe(200);
     const data = (res.json() as { data: { resource: { type: string; id: string }; credits_charged: number } }).data;
     expect(data).toMatchObject({ resource: { type: "task" }, credits_charged: 0 });
     const task = await harness.db().query(`SELECT project_id, origin, title FROM tasks WHERE id = $1`, [data.resource.id]);
-    expect(task.rows[0]).toMatchObject({ project_id: s.projectId, origin: "manual", title: "fix schema markup" });
+    expect(task.rows[0]).toMatchObject({ project_id: s.projectId, origin: "manual", title: "Fix Schema Markup on iOS" });
     expect((await books(s)).ledger.filter((r) => (r as { action_code: string }).action_code === "manual_scan")).toEqual([]);
     expect((await auditRows(s, "command.executed"))[0]!.after_state).toMatchObject({ origin: "command_bar", intent: "create_task" });
   });

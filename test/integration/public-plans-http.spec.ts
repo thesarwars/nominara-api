@@ -48,6 +48,30 @@ describe("STORY-103 · GET /v1/public/plans over HTTP", () => {
     expect("integrations.gsc" in after.plans.find((p) => p.key === "business")!.entitlements).toBe(true);
   });
 
+  it("STORY-103 review round 1 (AC1, FR-CRD-15) · the body carries the add-on rows from live data: public credit packs, and the extra project / extra seat with price, plans and grant", async () => {
+    const body = dataOf<PublicPlansResponse>(await get());
+    expect(publicPlansResponseSchema.safeParse(body).success).toBe(true);
+    const packs = (await harness.db().query<{ key: string; credits: number; price_usd: string }>("SELECT key, credits, price_usd::text FROM credit_packs WHERE is_public ORDER BY sort_order, credits, key")).rows;
+    expect(packs.length).toBeGreaterThan(0);
+    expect(body.addons.credit_packs.map((p) => [p.key, p.credits, p.price])).toEqual(packs.map((p) => [p.key, p.credits, p.price_usd]));
+    expect(JSON.stringify(body.addons)).not.toContain("stripe");
+
+    const project = body.addons.subscription.find((a) => a.kind === "extra_project")!;
+    expect(project).toMatchObject({ monthly_usd: "49.00", currency: "USD", available_on_plans: ["growth", "business"] });
+    expect(project.grant_by_plan["growth"]!.statement).toMatch(/1 project and 40 prompt slots/);
+    const seat = body.addons.subscription.find((a) => a.kind === "extra_seat")!;
+    expect(seat).toMatchObject({ monthly_usd: "15.00", available_on_plans: ["starter", "growth", "business"] });
+  });
+
+  it("STORY-103 review round 1 · a non-public credit pack is absent, and flipping the plan flag in data changes the add-on rows with no code change", async () => {
+    const [first] = (await harness.db().query<{ key: string }>("SELECT key FROM credit_packs WHERE is_public ORDER BY sort_order, credits, key LIMIT 1")).rows;
+    await harness.db().query("UPDATE credit_packs SET is_public = false WHERE key = $1", [first!.key]);
+    await harness.db().query(`UPDATE plans SET entitlements = jsonb_set(entitlements, '{projects.addon_allowed,value}', 'false') WHERE key = 'business'`);
+    const body = dataOf<PublicPlansResponse>(await get());
+    expect(body.addons.credit_packs.map((p) => p.key)).not.toContain(first!.key);
+    expect(body.addons.subscription.find((a) => a.kind === "extra_project")!.available_on_plans).toEqual(["growth"]);
+  });
+
   it("STORY-103 #9/#10 the fair-use ceiling and a deep scan's credit price are never in the body, on any plan", async () => {
     const response = await get();
     const text = response.body;

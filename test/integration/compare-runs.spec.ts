@@ -134,6 +134,8 @@ describe("STORY-084 · Compare Runs", () => {
       headers: { cookie: a.cookie, [CSRF_HEADER_NAME]: a.csrf, "content-type": "application/json", ...(key === null ? {} : { "idempotency-key": key }) },
       payload: payload as object,
     });
+  const comparable = (a: Actor, runId: string) =>
+    harness.app().inject({ method: "GET", url: apiUrl(`/tools/runs/${runId}/comparable`), headers: { cookie: a.cookie } });
   const compare = (a: Actor, base: string, other: string) => post(a, { base_run_id: base, compare_run_id: other });
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
   const wallet = async (workspaceId: string) =>
@@ -163,9 +165,13 @@ describe("STORY-084 · Compare Runs", () => {
     await stored(a, scanInput({ queryText: "other query" }), scanResult([])); // other input
     await stored(a, auditInput(), auditResult(50, [])); // other tool
     await stored(b, scanInput(), scanResult([])); // other workspace
-    const offered = await inTenant(a, () => tools().comparableRuns(one));
-    expect(offered.map((r) => r.id).sort()).toEqual([two, partial].sort());
-    expect(offered.every((r) => r.status === "completed" || r.status === "partial")).toBe(true);
+    // Over HTTP (STORY-084 review round 1): the client can only ask which runs are comparable through a route.
+    const asked = await comparable(a, one);
+    expect(asked.statusCode, asked.body).toBe(200);
+    const offered = (asked.json() as { data: { run_id: string; comparable: Array<{ id: string; status: string }> } }).data;
+    expect(offered.run_id).toBe(one);
+    expect(offered.comparable.map((r) => r.id).sort()).toEqual([two, partial].sort());
+    expect(offered.comparable.every((r) => r.status === "completed" || r.status === "partial")).toBe(true);
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -179,6 +185,28 @@ describe("STORY-084 · Compare Runs", () => {
     } finally {
       client.release();
     }
+  });
+
+  it("scenario 2 (review round 1) - a run past its expires_at that the sweep has not reached is NOT offered (the compare route would refuse it), an unknown run is 404, and another tenant's run is 404", async () => {
+    const a = await owner();
+    const b = await owner();
+    const one = await stored(a, scanInput(), scanResult([engineRow("perplexity")]));
+    const live = await stored(a, scanInput(), scanResult([engineRow("perplexity")]));
+    const lapsed = await stored(a, scanInput(), scanResult([engineRow("perplexity")]));
+    await harness.db().query("UPDATE tool_runs SET expires_at = now() - interval '1 minute' WHERE id = $1", [lapsed]);
+    const offered = (await comparable(a, one)).json() as { data: { comparable: Array<{ id: string }> } };
+    expect(offered.data.comparable.map((r) => r.id)).toEqual([live]);
+    expect((await comparable(a, uuidV7())).statusCode).toBe(404);
+    expect((await comparable(b, one)).statusCode).toBe(404);
+    expect((await comparable({ ...a, cookie: "" }, one)).statusCode).toBe(401);
+  });
+
+  it("scenario 2 (review round 1) - a run of a tool that cannot be compared has an empty list, not an error", async () => {
+    const a = await owner();
+    const run = await stored(a, { toolKey: "competitor_finder", brandUrl: "https://acme.test", engineKeys: ["perplexity"], credits: 0 }, null);
+    const res = await comparable(a, run);
+    expect(res.statusCode, res.body).toBe(200);
+    expect((res.json() as { data: { comparable: unknown[] } }).data.comparable).toEqual([]);
   });
 
   it("scenario 3 - two different tools are refused, naming the mismatch", async () => {

@@ -6,6 +6,8 @@ import {
   type EntityIndexKind,
   type EntityIndexResponse,
 } from "../../../contracts/command/entity-index.schema.js";
+import type { StructuralLimitKey } from "../../lib/entitlements/classification.js";
+import { countStructural } from "../../lib/entitlements/structural-usage.js";
 import { evaluatePermission } from "../../tenancy/permission-matrix.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import type { CommandCaller } from "./command-caller.js";
@@ -31,6 +33,16 @@ interface Row {
 
 @Injectable()
 export class EntityIndexService {
+  /**
+   * How much of a structural limit the workspace uses now (FR-CMD-05's disabled reason): the same count the creation guards enforce, in this
+   * request's own tenant transaction.
+   */
+  async usageOf(caller: CommandCaller, key: StructuralLimitKey): Promise<number> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("EntityIndexService requires an active tenant context");
+    return await countStructural(store.client, key, caller.workspaceId);
+  }
+
   async read(caller: CommandCaller): Promise<EntityIndexResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("EntityIndexService requires an active tenant context");

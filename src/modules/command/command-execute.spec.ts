@@ -61,7 +61,7 @@ function rig(options: { price?: number | null | string; visibleProjects?: Record
   const createTask = vi.fn(async () => ({ id: TASK }));
   return {
     cache,
-    parser: new CommandService(cache, { bindProject } as unknown as EntityIndexService, resolver),
+    parser: new CommandService(cache, { bindProject, usageOf: async () => 0 } as unknown as EntityIndexService, resolver),
     executor: new CommandExecuteService(cache, { trigger } as never, { createTask } as never),
     trigger,
     createTask,
@@ -234,6 +234,16 @@ describe("STORY-085 · what execute runs, and what it only opens", () => {
     const done = await r.executor.execute(caller(), { parse_id: task.parse_id, action_id: task.action_id, project_id: ACME });
     expect(r.createTask).toHaveBeenCalledWith(ACME, { title: "fix schema markup" });
     expect(done.response).toEqual({ outcome: "executed", intent: "create_task", resource: { type: "task", id: TASK }, target: null, credits_charged: 0 });
+  });
+
+  it("STORY-085 review round 1 - the task is created with the title as the user typed it, and a project screen is prefilled with the name as typed", async () => {
+    const r = rig();
+    const task = await parsed(r, "Create a task called Fix Homepage FAQ for iOS.");
+    await r.executor.execute(caller(), { parse_id: task.parse_id, action_id: task.action_id, project_id: ACME });
+    expect(r.createTask).toHaveBeenLastCalledWith(ACME, { title: "Fix Homepage FAQ for iOS" });
+    const project = await parsed(r, "create a project called Acme GmbH");
+    const opened = await r.executor.execute(caller(), { parse_id: project.parse_id, action_id: project.action_id });
+    expect(opened.response.target).toEqual({ screen: "projects.new", prefill: { name: "Acme GmbH" } });
   });
 
   it.each<[CommandIntent, string, string]>([

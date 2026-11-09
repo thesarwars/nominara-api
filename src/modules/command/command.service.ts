@@ -12,11 +12,12 @@ import {
   storeParseRecord,
   type ParseRecord,
 } from "../../lib/command/parse-record.js";
+import { planGateReason, structuralKeyFor } from "../../lib/command/plan-gate.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { CommandCaller } from "./command-caller.js";
-import { ACTIONS, matchGrammar, normalizeQuery, SUGGESTIONS } from "./command-grammar.js";
+import { ACTIONS, freeTextSlots, matchGrammar, normalizeQuery, SUGGESTIONS } from "./command-grammar.js";
 import { PARSE_CACHE_TTL_MS, PARSE_INDEX_VERSION, parseCacheKey } from "./command-parse-cache.js";
 import { EntityIndexService } from "./entity-index.service.js";
 
@@ -59,7 +60,7 @@ export class CommandService {
 
     // 2. Everything that depends on WHO is asking, AFTER the cache read.
     const parseId = uuidV7();
-    const response = await this.personalise(caller, parseId, body, hit !== null);
+    const response = await this.personalise(caller, parseId, body, hit !== null, query);
 
     const outcome = body.candidates.length > 0 ? "ambiguous" : body.intent === UNRESOLVED_INTENT ? "unresolved" : "resolved";
     incrementCounter("nominara_command_parse_total", { outcome, cached: String(hit !== null) });
@@ -73,9 +74,13 @@ export class CommandService {
   private async personalise(
     caller: CommandCaller,
     parseId: string,
-    body: ParseBody,
+    cachedBody: ParseBody,
     cached: boolean,
+    query: string,
   ): Promise<CommandParseResponse> {
+    // The cache holds the NORMALISED slots (every caller of the workspace shares the entry); the free-text ones are re-read from THIS caller's own
+    // words, so a task title or project name is stored and prefilled exactly as typed.
+    const body: ParseBody = cachedBody.intent === UNRESOLVED_INTENT ? cachedBody : { ...cachedBody, slots: { ...cachedBody.slots, ...freeTextSlots(cachedBody.intent, query) } };
     const action = body.actions[0];
     if (action === undefined || body.intent === UNRESOLVED_INTENT) {
       // No action was offered (unresolved or ambiguous): nothing to bind, price or consume, so no record is stored.
@@ -87,13 +92,19 @@ export class CommandService {
     const entities = bound === null ? [] : [{ slot: "project", kind: "project" as const, id: bound.id, name: bound.name }];
 
     const creditAction = body.intent === "run_deep_scan" ? ("deep_scan" as const) : null;
-    const credits = creditAction === null ? null : await this.priceOf(caller.workspaceId, creditAction);
+    const resolved = await this.resolver.resolveForWorkspace(caller.workspaceId);
+    const credits = creditAction === null ? null : priceIn(resolved.entitlements, creditAction);
+    // The plan gate for the other intents (one table: plan-gate.ts). The count is read only for a structural limit, and only once the role allows it.
+    const roleReason = disabledReasonFor(action.required_permission, caller.membership);
+    const structuralKey = roleReason === null ? structuralKeyFor(action.kind) : null;
+    const used = structuralKey === null ? 0 : await this.entities.usageOf(caller, structuralKey);
 
     // Forbidden first (the role), then the plan: a plan that sells no price for the action is `feature_not_in_plan`
     // (FR-CMD-05), the same refusal the underlying route raises (`deepScanPriceOrThrow`).
     const disabledReason =
-      disabledReasonFor(action.required_permission, caller.membership) ??
-      (creditAction !== null && credits === null ? `feature_not_in_plan:${creditAction}.credits` : null);
+      roleReason ??
+      (creditAction !== null && credits === null ? `feature_not_in_plan:${creditAction}.credits` : null) ??
+      planGateReason(action.kind, resolved.entitlements, used);
     const personal = { ...action, disabled_reason: disabledReason, credit_estimate: credits === null ? null : { credits } };
 
     const record: ParseRecord = {
@@ -113,13 +124,6 @@ export class CommandService {
     await storeParseRecord(this.cache, cacheKeyNamespace(), parseId, record);
 
     return { ...body, actions: [personal], parse_id: parseId, entities, cached };
-  }
-
-  /** The plan's exact figure for an action, the same entitlement the credit guard confirms against; null when the plan prices none. */
-  private async priceOf(workspaceId: string, action: "deep_scan"): Promise<number | null> {
-    const resolved = await this.resolver.resolveForWorkspace(workspaceId);
-    const value = resolved.entitlements[`${action}.credits`]?.value ?? null;
-    return typeof value === "number" ? value : null;
   }
 
   private async readCached(key: string): Promise<ParseBody | null> {
@@ -179,3 +183,9 @@ export class CommandService {
   }
 }
 
+
+/** The plan's exact figure for an action, the same entitlement the credit guard confirms against; null when the plan prices none. */
+function priceIn(entitlements: Readonly<Record<string, { readonly value: unknown }>>, action: "deep_scan"): number | null {
+  const value = entitlements[`${action}.credits`]?.value ?? null;
+  return typeof value === "number" ? value : null;
+}

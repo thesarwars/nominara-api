@@ -118,6 +118,27 @@ export function normalizeQuery(query: string): string {
     .replace(/^[\s?!.,;:]+|[\s?!.,;:]+$/g, "");
 }
 
+/** The slots that are the user's own words (a task title, a project name): stored and prefilled as typed, never lower-cased. */
+const FREE_TEXT_SLOTS: ReadonlySet<string> = new Set(["title", "name"]);
+
+/**
+ * The free-text slots of `intent` as the user TYPED them. The grammar matches the lower-cased text (and the cache keys on it), so the cased words
+ * are recovered per caller from the original query: the same rules, case-insensitively, over the same whitespace and edge-punctuation clean-up.
+ * Only `title` and `name` are returned; every other slot stays normalised.
+ */
+export function freeTextSlots(intent: CommandIntent, query: string): Record<string, string> {
+  const typed = query.replace(/\s+/g, " ").replace(/^[\s?!.,;:]+|[\s?!.,;:]+$/g, "");
+  const out: Record<string, string> = {};
+  for (const rule of RULES[intent]) {
+    const found = new RegExp(rule.pattern.source, "i").exec(typed);
+    if (found === null) continue;
+    const slots = bind(rule, found.slice(1));
+    for (const [name, value] of Object.entries(slots)) if (FREE_TEXT_SLOTS.has(name)) out[name] = value;
+    if (Object.keys(out).length > 0) break;
+  }
+  return out;
+}
+
 function bind(rule: Rule, groups: readonly (string | undefined)[]): Record<string, string> {
   const slots: Record<string, string> = {};
   rule.slots.forEach((name, index) => {

@@ -131,6 +131,43 @@ describe("STORY-084 · scenario 6 - an audit comparison: resolved, regressed, ne
   });
 });
 
+describe("STORY-084 review round 1 - a finding cut from a stored list is not a finding fixed", () => {
+  it("compare side omitted findings: a low-severity base finding missing from it is undetermined, not resolved; a higher one is still resolved", () => {
+    // The site got worse: new high findings pushed the (still present) low R2 out of the compare run's 24 KB budget.
+    const base: AuditSide = { score: 80, findings_omitted: 0, findings: [finding("R1", "high"), finding("R2", "low")] };
+    const compare: AuditSide = { score: 50, findings_omitted: 4, findings: [finding("R5", "critical"), finding("R6", "critical"), finding("R7", "high")] };
+    const out = diffAuditResults(base, compare);
+    expect(out.resolved).toEqual([]); // R1 is high, equal to the lowest kept severity: it could have been cut
+    expect(out.undetermined.possibly_resolved.map((f) => f.rule_code).sort()).toEqual(["R1", "R2"]);
+  });
+
+  it("a base finding strictly above the lowest kept severity of the compare side was certainly kept if present: it IS resolved", () => {
+    const base: AuditSide = { score: 80, findings_omitted: 0, findings: [finding("R1", "critical"), finding("R2", "low")] };
+    const compare: AuditSide = { score: 50, findings_omitted: 2, findings: [finding("R5", "high"), finding("R6", "medium")] };
+    const out = diffAuditResults(base, compare);
+    expect(out.resolved.map((f) => f.rule_code)).toEqual(["R1"]);
+    expect(out.undetermined.possibly_resolved.map((f) => f.rule_code)).toEqual(["R2"]);
+  });
+
+  it("base side omitted findings: a compare finding at or below the base's lowest kept severity is possibly new, not new", () => {
+    const base: AuditSide = { score: 50, findings_omitted: 3, findings: [finding("R1", "critical"), finding("R2", "medium")] };
+    const compare: AuditSide = { score: 50, findings_omitted: 0, findings: [finding("R1", "critical"), finding("R3", "low"), finding("R4", "high")] };
+    const out = diffAuditResults(base, compare);
+    expect(out.new.map((f) => f.rule_code)).toEqual(["R4"]);
+    expect(out.undetermined.possibly_new.map((f) => f.rule_code)).toEqual(["R3"]);
+  });
+
+  it("a side that kept nothing but omitted some leaves every missing finding undetermined; omitted 0 keeps the old certain lists", () => {
+    const base: AuditSide = { score: 1, findings_omitted: 0, findings: [finding("R1", "critical")] };
+    const out = diffAuditResults(base, { score: 1, findings_omitted: 5, findings: [] });
+    expect(out.resolved).toEqual([]);
+    expect(out.undetermined.possibly_resolved.map((f) => f.rule_code)).toEqual(["R1"]);
+    const certain = diffAuditResults(base, { score: 1, findings_omitted: 0, findings: [] });
+    expect(certain.resolved.map((f) => f.rule_code)).toEqual(["R1"]);
+    expect(certain.undetermined).toEqual({ possibly_resolved: [], possibly_new: [] });
+  });
+});
+
 describe("STORY-084 · scenario 12 - the result states what it is", () => {
   it("scenario 12 - the statement says two moments, not a trend, and the schema pins it", () => {
     expect(COMPARE_RUNS_STATEMENT).toMatch(/two saved moments, not a trend/);

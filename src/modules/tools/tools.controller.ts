@@ -5,8 +5,10 @@ import {
   auxAuditToolEstimateQuerySchema,
   auxAuditToolEstimateSchema,
   auxAuditToolRequestSchema,
+  comparableRunsResponseSchema,
   compareRunsRequestSchema,
   compareRunsResponseSchema,
+  type ComparableRunsResponse,
   type CompareRunsRequest,
   type CompareRunsResponse,
   schemaBuilderRequestSchema,
@@ -314,6 +316,16 @@ export class ToolsController {
     @Body(new ZodValidationPipe(convertToolRunRequestSchema)) body: ConvertToolRunRequest,
   ): Promise<ConvertToolRunResponse> {
     return this.service.convert(id, body);
+  }
+
+  // STORY-084 AC2 / FR-TL-05c - which runs this one can be compared with: the client offers Compare only where the list is non-empty. A free read of the
+  // stored index (`ix_tr_diff_pairs`); an expired run is not offered, and a run outside the workspace is a 404.
+  @Get("runs/:id/comparable")
+  @RequirePermission("lookup:read_history")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "listComparableToolRuns", responseSchema: comparableRunsResponseSchema })
+  comparable(@Param("id", idPipe) id: string): Promise<ComparableRunsResponse> {
+    return this.service.comparableRuns(id);
   }
 
   // STORY-084 (decision 79: a POST). Reads two stored runs and stores the comparison on the timeline; free, and with no path to a capture or a queue.
