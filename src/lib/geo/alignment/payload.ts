@@ -61,12 +61,12 @@ export async function readSessionPayload(tx: ClientBase, sessionId: string): Pro
     id: string; project_id: string; target_url: string; prompt_cluster_id: string | null; engine_keys: string[]; embedding_model: string; embedding_dims: number;
     baseline_alignment: number | null; current_alignment: number | null; target_band_low: number | null; target_band_high: number | null;
     percentile_vs_corpus: number | null; coverage_ratio: number | null; centroid_source_count: number; centroid_domains: string[];
-    recommendations: unknown; analysis_state: "pending" | "ready" | "stale" | "failed"; analysis_reason: string | null; draft_state: "pending" | "ready" | "failed" | null;
+    recommendations: unknown; analysis_state: "pending" | "ready" | "stale" | "failed"; analysis_reason: string | null; draft_state: "pending" | "ready" | "failed" | null; live_content_md: string | null;
     cluster_label: string | null; cluster_prompt_count: number | null;
   }>(
     `SELECT g.id, g.project_id, g.target_url, g.prompt_cluster_id, g.engine_keys, g.embedding_model, g.embedding_dims, g.baseline_alignment, g.current_alignment,
             g.target_band_low, g.target_band_high, g.percentile_vs_corpus, g.coverage_ratio, g.centroid_source_count, g.centroid_domains, g.recommendations,
-            g.analysis_state, g.analysis_reason, g.draft_state, tc.label AS cluster_label, tc.prompt_count AS cluster_prompt_count
+            g.analysis_state, g.analysis_reason, g.draft_state, g.live_content_md, tc.label AS cluster_label, tc.prompt_count AS cluster_prompt_count
        FROM geo_alignments g
        LEFT JOIN topic_clusters tc ON tc.id = g.prompt_cluster_id AND tc.workspace_id = app.current_workspace()
       WHERE g.id = $1 AND g.workspace_id = app.current_workspace()`,
@@ -134,6 +134,8 @@ export async function readSessionPayload(tx: ClientBase, sessionId: string): Pro
     status: row.analysis_state,
     status_reason: row.analysis_reason,
     draft_status: row.draft_state,
+    // Decision 92 (the draft prefill): the LIVE page text, only once the analysis is final; null before a page was fetched. Never the draft.
+    live_content_md: ready ? row.live_content_md : null,
   });
 }
 
