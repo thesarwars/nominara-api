@@ -209,8 +209,9 @@ describe("G12 · the schedule table matches the reference", () => {
       .map((s) => s.queue)
       .filter((queue) => handlerFor(queue) === undefined);
 
-    // `topic.cluster` left this list with STORY-047: it has a handler now (and is tenant-scoped, so see the next test).
-    expect(datedAndInert.sort()).toEqual(["geo.analyze"]);
+    // `topic.cluster` left this list with STORY-047: it has a handler now (and is tenant-scoped, so see the next test). `geo.analyze` left it with STORY-192
+    // (a handler for the alignment session; it is tenant-scoped, so a bare daily tick is still refused).
+    expect(datedAndInert.sort()).toEqual([]);
     expect(inertQueueNames()).toEqual(expect.arrayContaining(datedAndInert));
   });
 
@@ -234,11 +235,12 @@ describe("G12 · the schedule table matches the reference", () => {
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
     const schedulable = dated.filter((queue) => handlerFor(queue) !== undefined && !topologyFor(queue).tenantScoped);
 
-    expect(inert.sort()).toEqual(["geo.analyze"]);
+    expect(inert.sort()).toEqual([]);
     // STORY-047: `topic.cluster` has a handler and is tenant-scoped, so a bare tick is refused for it; its producer is the sweep.
     // STORY-114: `attribution.rollup` has a handler and is tenant-scoped; its producer is a per-project sweep, not a bare tick.
     // STORY-115: `gsc.sync` has a handler and is tenant-scoped; its producers are the manual route, the callback and the job's own continuation.
-    expect(tenantScoped.sort()).toEqual(["attribution.rollup", "capture.plan", "gsc.sync", "rollup.metric_daily", "topic.cluster"]);
+    // STORY-192: `geo.analyze` likewise: its handler runs alignment jobs signed by the routes, never a bare tick.
+    expect(tenantScoped.sort()).toEqual(["attribution.rollup", "capture.plan", "geo.analyze", "gsc.sync", "rollup.metric_daily", "topic.cluster"]);
     expect(schedulable.sort()).toEqual([
       "audit.verify",
       "credit.housekeeping",
