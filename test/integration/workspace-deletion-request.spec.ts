@@ -269,4 +269,19 @@ describe("DELETE /workspaces/{id} · workspace deletion request over HTTP", () =
     }
     expect((await stateOf(owner.workspaceId)).status).toBe("pending_deletion");
   });
+
+  // ---- decision 83(b): a legal hold does not refuse the request; the purge is what skips a held workspace ----------------------
+
+  it("DELETE-13 a workspace under a legal hold still accepts the request (202, pending_deletion); the hold, not the request, is what stops the purge", async () => {
+    const owner = await ownerWithWorkspace();
+    const [a, b] = [await newUser(), await newUser()];
+    await db().query(
+      `INSERT INTO legal_holds (scope, scope_id, workspace_id, reason, requested_by, approved_by, expires_at) VALUES ('workspace',$1,$1,'Hold on the whole workspace',$2,$3, now() + interval '5 days')`,
+      [owner.workspaceId, a, b],
+    );
+    const res = await del(owner, { confirm_slug: await slugOf(owner.workspaceId) });
+    expect(res.statusCode, res.body).toBe(202);
+    expect((await stateOf(owner.workspaceId)).status).toBe("pending_deletion");
+    expect((await db().query("SELECT 1 FROM legal_holds WHERE scope_id = $1 AND released_at IS NULL", [owner.workspaceId])).rowCount).toBe(1);
+  });
 });
