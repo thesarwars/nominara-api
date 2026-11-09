@@ -10,8 +10,12 @@
 --       forward and queues a delayed job; a job acts only once the column is due and clears it, so a burst of edits is one recompute over
 --       the LAST text, and a redelivered or superseded job finds nothing due and does nothing. NULL draft_state = no draft was ever saved.
 --       Kept in the row (not in the queue or the cache) so the answer survives a Valkey flush and the state is one statement from RLS.
+--
+-- THE DEFAULT IS 'ready', and the request that opens a session says 'pending' EXPLICITLY. A session that exists before this migration, or that the
+-- STORY-059 library inserts itself (no request, no job), was analysed synchronously by its caller: nothing is waiting for it, so 'pending' would be
+-- false for every one of them. Only the request path creates a row that a job will advance, and it is the one place that names the state.
 ALTER TABLE geo_alignments
-  ADD COLUMN analysis_state text NOT NULL DEFAULT 'pending',
+  ADD COLUMN analysis_state text NOT NULL DEFAULT 'ready',
   ADD COLUMN analysis_reason text,
   ADD COLUMN draft_state text,
   ADD COLUMN draft_recompute_due_at timestamptz;

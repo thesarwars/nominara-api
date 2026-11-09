@@ -142,8 +142,8 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
   async function pendingSession(over: { model?: string; createdAt?: Date } = {}): Promise<string> {
     const id = randomUUID();
     await db.query(
-      `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, created_at)
-       VALUES ($1,$2,$3,$4,$5,'{chatgpt}',$6,$7)`,
+      `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, created_at, analysis_state)
+       VALUES ($1,$2,$3,$4,$5,'{chatgpt}',$6,$7,'pending')`,
       [id, workspaceId, projectId, PAGE_URL, clusterId, over.model ?? MODEL, over.createdAt ?? clock],
     );
     return id;

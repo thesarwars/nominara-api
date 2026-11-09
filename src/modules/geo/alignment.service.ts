@@ -76,8 +76,8 @@ export class AlignmentService {
         const engines = await tx.query<{ engine_key: string }>("SELECT engine_key FROM project_engines WHERE project_id = $1 AND workspace_id = app.current_workspace() AND enabled ORDER BY engine_key", [body.project_id]);
         const sessionId = uuidV7();
         await tx.query(
-          `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, created_by)
-           VALUES ($1, app.current_workspace(), $2, $3, $4, $5::text[], $6, $7)`,
+          `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, created_by, analysis_state)
+           VALUES ($1, app.current_workspace(), $2, $3, $4, $5::text[], $6, $7, 'pending')`,
           [sessionId, body.project_id, body.target_url, body.prompt_cluster_id, engines.rows.map((row) => row.engine_key), selectedEmbeddingModel(loadEnv()), actor.id],
         );
 
