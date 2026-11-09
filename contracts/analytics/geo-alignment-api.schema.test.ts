@@ -51,6 +51,10 @@ describe("STORY-192 - the alignment HTTP contracts", () => {
     expect(openAlignmentRequestSchema.safeParse({ ...ok, engine_keys: ["gemini"] }).success).toBe(false);
     expect(openAlignmentRequestSchema.safeParse({ ...ok, target_url: "not a url" }).success).toBe(false);
     expect(openAlignmentRequestSchema.safeParse({ project_id: uuid, target_url: ok.target_url }).success).toBe(false);
+    for (const target_url of ["ftp://brand.test/p", "file:///etc/passwd", "javascript:alert(1)", "data:text/html,x"]) {
+      expect(openAlignmentRequestSchema.safeParse({ ...ok, target_url }).success, target_url).toBe(false);
+    }
+    expect(openAlignmentRequestSchema.safeParse({ ...ok, target_url: "HTTP://brand.test/p" }).success).toBe(true);
   });
 
   it("AC open - charges nothing: the 202 says pending, carries a poll pointer and 0 credits", () => {
