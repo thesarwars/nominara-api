@@ -29,6 +29,9 @@ const logger = new Logger("tools.schema-builder-url");
 /** The result a Schema Builder run must carry from its first write (the table requires it); it says nothing about the page. */
 const PENDING_RESULT: SchemaBuilderUrlResult = { schema_version: 1, source: "url", state: "pending" };
 
+/** What a run that never reached the worker stores instead of `pending`: nothing was checked, so it says so. */
+const NOT_CHECKED: SchemaBuilderUrlResult = { schema_version: 1, source: "url", state: "unreachable", reason: "unreachable" };
+
 @Injectable()
 export class SchemaBuilderUrlService {
   constructor(
@@ -84,7 +87,7 @@ export class SchemaBuilderUrlService {
     const client = await this.pool.connect();
     try {
       await withTenantContext(client, tenant, async () => {
-        await this.tools.finishRun(runId, { failed: true, errorCode: "schema_builder_not_queued" });
+        await this.tools.finishRun(runId, { failed: true, errorCode: "schema_builder_not_queued", result: NOT_CHECKED });
       });
     } catch (error) {
       logger.error({ event: "tools.schema_builder_url.abandon_failed", workspace_id: tenant.workspaceId, run_id: runId, error: error instanceof Error ? error.name : "unknown" });

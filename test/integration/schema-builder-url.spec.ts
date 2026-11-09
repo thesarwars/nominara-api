@@ -225,7 +225,7 @@ describe("STORY-083 AC5 · Schema Builder URL mode", () => {
     const res = await start(a, { url: PAGE_URL });
     expect(res.statusCode, res.body).toBe(202);
     const id = data<{ tool_run_id: string }>(res).tool_run_id;
-    await vi.waitFor(async () => expect(await row(id)).toMatchObject({ status: "failed", error_code: "schema_builder_not_queued" }), { timeout: 5000 });
+    await vi.waitFor(async () => expect(await row(id)).toMatchObject({ status: "failed", error_code: "schema_builder_not_queued", result_json: { schema_version: 1, source: "url", state: "unreachable", reason: "unreachable" } }), { timeout: 5000 });
   });
 
   it("SU-I9 another workspace cannot read the run (404), and the worker's prepare under the wrong workspace finds no run and does nothing", async () => {

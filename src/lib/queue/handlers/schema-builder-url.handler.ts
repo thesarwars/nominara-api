@@ -51,6 +51,9 @@ function isFinalAttempt(job: Job): boolean {
   return attempts !== undefined && (job.attemptsMade ?? 0) + 1 >= attempts;
 }
 
+/** What a run that failed before the page was judged stores: nothing was checked, so it says so (never the `pending` placeholder). */
+const NOT_CHECKED: SchemaBuilderUrlResult = { schema_version: 1, source: "url", state: "unreachable", reason: "unreachable" };
+
 export function createSchemaBuilderUrlPhases(context: QueueHandlerContext, deps: SchemaBuilderUrlDeps = {}): JobPhases<Prepared, Fetched> {
   const now = deps.now ?? ((): Date => new Date());
   let cacheReady: Promise<Cache> | undefined;
@@ -128,7 +131,7 @@ export function createSchemaBuilderUrlPhases(context: QueueHandlerContext, deps:
   const recover = async (_tx: ClientBase, job: Job): Promise<boolean> => {
     if (!isFinalAttempt(job)) return false;
     const payload = schemaBuilderUrlJobPayloadSchema.parse((job.data as { payload: unknown }).payload);
-    await (await tools()).finishRun(payload.toolRunId, { failed: true, errorCode: "schema_builder_job_failed" });
+    await (await tools()).finishRun(payload.toolRunId, { failed: true, errorCode: "schema_builder_job_failed", result: NOT_CHECKED });
     logger.warn({ event: "tools.schema_builder_url.job_failed", run_id: payload.toolRunId });
     return true;
   };

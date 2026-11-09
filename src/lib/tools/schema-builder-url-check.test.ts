@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCHEMA_BUILDER_RULE_CODES, schemaBuilderUrlResultSchema } from "../../../contracts/tools/index.js";
 import { CATALOG_ROWS } from "../../../test/support/aux-rules.js";
 import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../net/guarded-fetch.js";
+import { AUX_RULES } from "../aux/rules/index.js";
 import { checkUrlStructuredData, SCHEMA_BUILDER_URL_FETCH_TIMEOUT_MS } from "./schema-builder-url-check.js";
 import type { ToolCatalogRow } from "./aux-audit-run.js";
 
@@ -75,6 +76,25 @@ describe("Schema Builder URL mode · the worker's check", () => {
     if (out.kind !== "checked") throw new Error("expected a checked result");
     expect(out.result.rules_evaluated).toBeGreaterThan(0);
     expect(out.result.findings.filter((f) => f.rule_code === "AUX-R-008" || f.rule_code === "AUX-R-009")).toEqual([]);
+  });
+
+  it("SU-3b a page cut at the response cap is RECORDED as truncated, so a block past the cap is never read as missing; an untruncated page says false", async () => {
+    const cut = await check(async () => reply(html(PRODUCT_NO_PRICE), { truncated: true }));
+    if (cut.kind !== "checked") throw new Error("expected a checked result");
+    expect(cut.result.page_truncated).toBe(true);
+    const whole = await check(html(PRODUCT_NO_PRICE));
+    if (whole.kind !== "checked") throw new Error("expected a checked result");
+    expect(whole.result.page_truncated).toBe(false);
+  });
+
+  it("SU-3c rules_evaluated is the number of structured-data rules that RAN on the page: the same on a page with no markup as on one with findings, and never the findings count", async () => {
+    const ran = AUX_RULES.filter((r) => (SCHEMA_BUILDER_RULE_CODES as readonly string[]).includes(r.code)).length;
+    const bare = await check(html(""));
+    const broken = await check(html(PRODUCT_NO_PRICE + BROKEN));
+    if (bare.kind !== "checked" || broken.kind !== "checked") throw new Error("expected checked results");
+    expect(bare.result.rules_evaluated).toBe(ran);
+    expect(broken.result.rules_evaluated).toBe(ran);
+    expect(broken.result.findings.length).not.toBe(ran);
   });
 
   it("SU-4 only the structured-data rules run: every finding's rule is one the Schema Builder accepts, and the held AUX-R-013 never appears", async () => {

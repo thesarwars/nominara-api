@@ -86,6 +86,9 @@ describe("STORY-083 AC5 · the Schema Builder URL worker", () => {
     expect(h.finished).toHaveLength(0);
     expect(await h.phases.recover!(h.tx, job({ attemptsMade: 2, attempts: 3 }), { error: new Error("x"), phase: "run" })).toBe(true);
     expect(h.finished[0]).toMatchObject({ id: RUN, finish: { failed: true, errorCode: "schema_builder_job_failed" } });
+    // A failed run never keeps the placeholder: `pending` states nothing, and a settled run must state something.
+    const result = schemaBuilderUrlResultSchema.parse(h.finished[0]!.finish["result"]);
+    expect(result.state).not.toBe("pending");
   });
 
   it("SH-5 a payload for another tool is refused at parse, never run as a URL check", async () => {

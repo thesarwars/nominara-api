@@ -149,6 +149,7 @@ export async function checkUrlStructuredData(input: { readonly url: string; read
       entity_type: null,
       vocab_version: `aux-rules@${ruleVersion}`,
       rules_evaluated: rules.length,
+      page_truncated: response.truncated === true,
       findings: findings.slice(0, SCHEMA_BUILDER_MAX_FINDINGS),
       findings_omitted: Math.max(0, findings.length - SCHEMA_BUILDER_MAX_FINDINGS),
     },
