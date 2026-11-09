@@ -126,6 +126,9 @@ export const alignmentSessionPayloadSchema = z
     if (p.status !== "ready" && (p.coverage_ratio !== null || p.recommendations.length > 0 || p.projection !== null)) {
       ctx.addIssue({ code: "custom", message: "an analysis that is not ready shows no coverage, recommendation or projection", path: ["status"] });
     }
+    if (p.status !== "ready" && (p.baseline_alignment !== null || p.current_alignment !== null || p.percentile_vs_corpus !== null || p.target_band !== null)) {
+      ctx.addIssue({ code: "custom", message: "an analysis that is not ready shows no baseline, current alignment, percentile or target band", path: ["status"] });
+    }
     if (p.status === "ready" && p.status_reason !== null) {
       ctx.addIssue({ code: "custom", message: "a ready session has no status reason", path: ["status_reason"] });
     }

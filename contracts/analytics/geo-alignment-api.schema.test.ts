@@ -22,17 +22,30 @@ const ready = {
   status: "ready", status_reason: null, draft_status: null, generation: "disabled",
 } as const;
 
+/** What a session that is not ready may carry: nothing measured. */
+const UNMEASURED = { baseline_alignment: null, current_alignment: null, percentile_vs_corpus: null, target_band: null, coverage_ratio: null, recommendations: [], projection: null } as const;
+
 describe("STORY-192 - the alignment HTTP contracts", () => {
   it("AC pending - a pending session never carries a coverage, a recommendation or a projection as if final", () => {
-    const pending = { ...ready, status: "pending", coverage_ratio: null, recommendations: [], projection: null };
+    const pending = { ...ready, status: "pending", ...UNMEASURED };
     expect(alignmentSessionPayloadSchema.safeParse(pending).success).toBe(true);
     expect(alignmentSessionPayloadSchema.safeParse({ ...pending, coverage_ratio: 0.5 }).success).toBe(false);
     expect(alignmentSessionPayloadSchema.safeParse({ ...pending, recommendations: [recommendation] }).success).toBe(false);
     expect(alignmentSessionPayloadSchema.safeParse({ ...pending, projection: ready.projection }).success).toBe(false);
   });
 
+  it("AC pending - review - no measured figure (baseline, current, percentile, band) is shown before the session is ready, whatever its state", () => {
+    for (const status of ["pending", "stale", "failed"] as const) {
+      const quiet = { ...ready, status, status_reason: status === "pending" ? null : "x", ...UNMEASURED };
+      expect(alignmentSessionPayloadSchema.safeParse(quiet).success, status).toBe(true);
+      for (const figure of [{ baseline_alignment: 0.4 }, { current_alignment: 0.4 }, { percentile_vs_corpus: 20 }, { target_band: { low: 0.5, high: 0.7 } }]) {
+        expect(alignmentSessionPayloadSchema.safeParse({ ...quiet, ...figure }).success, `${status} ${Object.keys(figure)[0]!}`).toBe(false);
+      }
+    }
+  });
+
   it("AC model mismatch - a stale or failed session states its reason, and a ready one states none", () => {
-    const quiet = { ...ready, coverage_ratio: null, recommendations: [], projection: null };
+    const quiet = { ...ready, ...UNMEASURED };
     expect(alignmentSessionPayloadSchema.safeParse({ ...quiet, status: "stale", status_reason: "embedding_model_changed" }).success).toBe(true);
     expect(alignmentSessionPayloadSchema.safeParse({ ...quiet, status: "stale", status_reason: null }).success).toBe(false);
     expect(alignmentSessionPayloadSchema.safeParse({ ...quiet, status: "failed", status_reason: null }).success).toBe(false);
