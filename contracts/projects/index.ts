@@ -9,3 +9,4 @@ export * from "./rename-topic-request.schema.js";
 export * from "./competitor-track.schema.js";
 export * from "./topic-cluster-job.schema.js";
 export * from "./update-project-engines.schema.js";
+export * from "./get-project-engines.schema.js";
