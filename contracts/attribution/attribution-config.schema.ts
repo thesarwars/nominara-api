@@ -28,7 +28,7 @@ export const MAX_REFERRER_LENGTH = 2048;
 /** The beacon body is a few hundred bytes. Anything near this is not a beacon, and Fastify refuses it with 413 before parsing. */
 export const INGEST_BODY_LIMIT_BYTES = 8 * 1024;
 
-/** An origin is `scheme://host[:port]` and nothing more: no path, query, fragment or credentials. Compared exactly, case-folded. */
+/** An origin is `scheme://host[:port]` and nothing more: no path, query, fragment or credentials. Stored case-folded, because ingest compares the request's lowercased Origin exactly. */
 export const originSchema = z
   .string()
   .max(300)
@@ -39,7 +39,8 @@ export const originSchema = z
       return (url.protocol === "https:" || url.protocol === "http:") && url.origin === value.toLowerCase();
     },
     { message: "must be an origin such as https://example.com (scheme, host and optional port only)" },
-  );
+  )
+  .transform((value) => value.toLowerCase());
 
 const conversionEventsSchema = z.array(z.string().min(1).max(MAX_CONVERSION_EVENT_NAME_LENGTH)).max(MAX_CONVERSION_EVENTS);
 
