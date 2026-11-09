@@ -21,6 +21,7 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
   embed: ["embed.batch", "topic.cluster"],
   rollup: [
     "rollup.metric_daily",
+    "rollup.category_benchmark",
     "displacement.detect",
     "geo.analyze",
     "task.generate",
