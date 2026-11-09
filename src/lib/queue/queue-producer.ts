@@ -33,6 +33,8 @@ const TOPOLOGY_BY_NAME = new Map<string, QueueTopologyEntry>(QUEUE_TOPOLOGY.map(
 export interface EnqueueTenantJobOptions {
   readonly idempotencyKey: string;
   readonly priorityVariant?: PriorityVariant;
+  /** STORY-192: run the job this many ms from now (the draft debounce window, and a poll for vectors). */
+  readonly delayMs?: number;
 }
 
 /** A queue name that is not in the topology — a typo, or a name removed from §4. */
@@ -76,6 +78,7 @@ export class QueueProducer implements OnModuleDestroy {
     return enqueueJob(this.queueFor(entry), entry, envelope, {
       idempotencyKey: options.idempotencyKey,
       ...(options.priorityVariant !== undefined ? { priorityVariant: options.priorityVariant } : {}),
+      ...(options.delayMs !== undefined ? { delayMs: options.delayMs } : {}),
     });
   }
 

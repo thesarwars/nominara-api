@@ -863,6 +863,20 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(await conceptGap()).toEqual([]);
   });
 
+  it("review r2 (STORY-192) · a finished alignment keeps its coverage when a later session opens, so a PENDING alignment of the scope un-judges the nodes: no gap is claimed from nodes the extraction reset", async () => {
+    await inCluster(clusterId);
+    await node("page already has this", {});
+    await analysed();
+    // The second session's extraction reset the nodes to absent but did not touch the FINISHED alignment's coverage_ratio; its own row is still pending.
+    await db.query(
+      `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, analysis_state)
+       VALUES ($1,$2,'https://acme.com/other',$3,'{gemini}','m','pending')`,
+      [workspaceId, projectId, clusterId],
+    );
+    await lossWithConcepts();
+    expect(await conceptGap()).toEqual([]);
+  });
+
   it("STORY-057 review 2 · the concept read waits out an in-flight extraction of the scope: a commit between the judged check and the node read cannot leave a stale diagnosis", async () => {
     await inCluster(clusterId);
     await node("page already has this", {});

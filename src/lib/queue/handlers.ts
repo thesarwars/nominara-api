@@ -6,6 +6,7 @@ import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-e
 import { createBillingDowngradeNoticeHandler } from "./handlers/billing-downgrade-notice.handler.js";
 import { createGscSyncHandler } from "./handlers/gsc-sync.handler.js";
 import { createEmbedBatchHandler } from "./handlers/embed-batch.handler.js";
+import { createGeoAnalyzeHandler } from "./handlers/geo-analyze.handler.js";
 import { createTopicClusterHandler } from "./handlers/topic-cluster.handler.js";
 import { createLookupExecuteHandler } from "./handlers/lookup-execute.handler.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
@@ -119,6 +120,10 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  *
  * `gsc.sync` lands with STORY-115: one slice of one Search Console connection (backfill and incremental are one watermark loop). Tenant-scoped, so the
  * registrar will not tick it as a bare cron; its producers are the manual sync route, the callback and the job itself (a continuation).
+ * `geo.analyze` lands with STORY-192 for the ALIGNMENT SESSION only: the processor behind POST /geo/alignment (a step of opening a session) and
+ * PATCH /geo/alignment/{id} (the debounced draft recompute). Its producers are those two routes and the job itself, re-queueing delayed while it
+ * waits for vectors. The daily GEO analyses still run inside the rollup (`refreshProjectGeo`); a `geo.analyze` payload that is not an alignment job is
+ * ignored, not retried.
  *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
@@ -127,6 +132,7 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  */
 export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "crawl.discover": (context) => createCrawlDiscoverHandler(context),
+  "geo.analyze": (context) => createGeoAnalyzeHandler(context),
   "capture.plan": (context) => createCapturePlanHandler(context),
   "crawl.audit": (context) => createCrawlAuditHandler(context),
   "capture.execute": (context) => createCaptureExecuteHandler(context),

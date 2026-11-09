@@ -24,9 +24,9 @@ import { extractReadable } from "../corpus/readable.js";
 // The session pins `embedding_model` (the corpus and the centroid are read under it), and a chunk is stored WITHOUT a vector or a
 // model: embed.batch writes both together.
 //
-// WIRING. This is a library with no production caller yet: the route, its permission and the job processor that binds a tenant
-// transaction (after verifying the job's HMAC), the provider's model, STORY-050's cl100k counter and the guarded fetcher are the
-// follow-up the story report lists.
+// WIRING (STORY-192). The `geo.analyze` job (src/lib/queue/handlers/geo-analyze.handler.ts) calls this through `advanceAlignmentSession`, after
+// verifying the job's HMAC, with the transaction runner bound to `withTenantContext`, STORY-050's cl100k counter, the guarded fetcher and the
+// provider's model. The request (POST /geo/alignment) creates the pending row first and passes its id as `sessionId`.
 
 const tracer = trace.getTracer("nominara.geo-alignment");
 const logger = new Logger("geo.alignment");
@@ -48,6 +48,12 @@ export interface OpenSessionInput {
   readonly targetUrl: string;
   readonly engineKeys: readonly string[];
   readonly createdBy: string | null;
+  /**
+   * STORY-192: the id of a session the REQUEST already created (pending, no live content), so the caller had an id to hand back and poll.
+   * The fetched page is then written onto that row instead of inserting a new one, and a second delivery that finds the page already
+   * written adds nothing (it returns the same id with no chunks). Absent = the library inserts the session itself (STORY-059).
+   */
+  readonly sessionId?: string;
 }
 
 export interface OpenSessionResult {
@@ -72,7 +78,7 @@ export async function openAlignmentSession(deps: AlignmentDeps, input: OpenSessi
   });
 }
 
-const hashOf = (text: string): Buffer => createHash("sha256").update(text.replace(/\s+/g, " ").trim(), "utf8").digest();
+export const hashOf = (text: string): Buffer => createHash("sha256").update(text.replace(/\s+/g, " ").trim(), "utf8").digest();
 
 async function run(deps: AlignmentDeps, input: OpenSessionInput): Promise<OpenSessionResult> {
   const page = await deps.fetchPage(input.targetUrl);
@@ -87,13 +93,26 @@ async function run(deps: AlignmentDeps, input: OpenSessionInput): Promise<OpenSe
   const chunks = chunkDocument(markdown, deps.tokenizer);
 
   const written = await deps.runInTx(async (tx) => {
-    const session = await tx.query<{ id: string }>(
-      `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, live_content_md, created_by)
-       SELECT p.workspace_id, p.id, $2, $3, $4::text[], $5, $6, $7
-         FROM projects p WHERE p.id = $1 AND p.workspace_id = app.current_workspace() AND p.deleted_at IS NULL
-       RETURNING id`,
-      [input.projectId, input.targetUrl, input.clusterId, [...input.engineKeys], deps.embeddingModel, markdown, input.createdBy],
-    );
+    if (input.sessionId !== undefined) {
+      // The row exists (the request made it). Write the page onto it ONCE: a redelivery finds it written and adds no chunk.
+      const written = await tx.query<{ id: string }>(
+        `UPDATE geo_alignments g SET live_content_md = $2, updated_at = now()
+          WHERE g.id = $1 AND g.workspace_id = app.current_workspace() AND g.live_content_md IS NULL AND g.analysis_state = 'pending'
+          RETURNING g.id`,
+        [input.sessionId, markdown],
+      );
+      if (written.rows[0] === undefined) return { sessionId: input.sessionId, ids: [] as string[] };
+    }
+    const session =
+      input.sessionId !== undefined
+        ? { rows: [{ id: input.sessionId }] }
+        : await tx.query<{ id: string }>(
+            `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, live_content_md, created_by)
+             SELECT p.workspace_id, p.id, $2, $3, $4::text[], $5, $6, $7
+               FROM projects p WHERE p.id = $1 AND p.workspace_id = app.current_workspace() AND p.deleted_at IS NULL
+             RETURNING id`,
+            [input.projectId, input.targetUrl, input.clusterId, [...input.engineKeys], deps.embeddingModel, markdown, input.createdBy],
+          );
     const sessionId = session.rows[0]?.id;
     if (sessionId === undefined) throw new ValidationFailedError({ message: "no such project", details: { issues: [{ path: ["project_id"], message: "no such project" }] } });
     if (chunks.length === 0) return { sessionId, ids: [] as string[] };

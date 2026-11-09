@@ -276,7 +276,7 @@ describe("G12 · reconcileSchedules", () => {
 });
 
 describe("STORY-140 AC11 · the owner's crons meet the registrar", () => {
-  it("geo.analyze carries a cron but has no handler, and gsc.sync and topic.cluster have one but are tenant-scoped (STORY-115, STORY-047): a bare tick is refused for all three and nothing is scheduled", async () => {
+  it("geo.analyze (STORY-192), gsc.sync (STORY-115) and topic.cluster (STORY-047) all have a handler but are tenant-scoped: a bare tick is refused for all three and nothing is scheduled", async () => {
     const queue = fakeQueue();
 
     const result = await reconcileSchedules(
@@ -289,9 +289,11 @@ describe("STORY-140 AC11 · the owner's crons meet the registrar", () => {
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
     expect(result.scheduled).toEqual([]);
-    expect([...result.skippedInert].sort()).toEqual(["geo.analyze"]);
-    // Its producer is the topic-cluster sweep (src/lib/topics/sweep.ts), not a bare repeatable.
-    expect([...result.skippedTenantScoped].sort()).toEqual(["gsc.sync", "topic.cluster"]);
+    expect([...result.skippedInert].sort()).toEqual([]);
+    // topic.cluster's producer is the topic-cluster sweep (src/lib/topics/sweep.ts), not a bare repeatable. gsc.sync's producers are the manual route, the
+    // callback and the job itself. geo.analyze (STORY-192) has a handler for the ALIGNMENT session only; its producers are the /geo/alignment routes and
+    // the job itself, so a bare daily tick would be an unsigned payload: refused.
+    expect([...result.skippedTenantScoped].sort()).toEqual(["geo.analyze", "gsc.sync", "topic.cluster"]);
   });
 
   it("STORY-140 AC11 · crawl.audit and report.build never get a scheduler registered, whatever the registrar is given", async () => {

@@ -672,7 +672,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(payload.projection!.diminished_sum).toBeCloseTo(gains[0]! + 0.85 * gains[1]! + 0.85 ** 2 * gains[2]!, 6);
     expect(payload.projection!.diminished_sum).toBeLessThan(naive);
     expect(payload.projection!.diminishing_returns_factor).toBe(0.85);
-    expect(Object.keys(payload.projection!).sort(), "chunk gains are not page units: no projected page alignment").toEqual(["diminished_sum", "diminishing_returns_factor", "naive_sum"]);
+    expect(Object.keys(payload.projection!).sort(), "chunk gains are not page units: no projected page alignment").toEqual(["caveat", "confidence", "diminished_sum", "diminishing_returns_factor", "method", "naive_sum"]);
   }, 60_000);
 
   it("scenario 9 - a session with no modeled gain has no projection at all (null, not zeros)", async () => {
@@ -697,10 +697,10 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     const payload = await inTx((tx) => readSessionPayload(tx, session));
     expect(alignmentSessionPayloadSchema.safeParse(payload).success).toBe(true);
     expect(payload.estimate).toMatchObject({ method: "additive_blend_estimate", confidence: "modeled" });
-    expect(payload.generation).toBe("disabled");
-    expect(payload.centroid_source_count).toBe(5);
+    expect(payload.anti_filler_policy.generation).toBe("disabled");
+    expect(payload.centroid.source_passage_count).toBe(5);
     expect(payload.low_confidence).toBe(true); // 5 < 8
-    expect(payload.target_band).not.toBeNull();
+    expect(payload.alignment.target_band).not.toBeNull();
   }, 60_000);
 
   it("scenario 12 - AC13 - a compliance node carries the review flag and a warning and is never auto-inserted", async () => {
@@ -714,11 +714,11 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     const payload = await inTx((tx) => readSessionPayload(tx, session));
     const compliance = payload.recommendations.find((r) => r.phrase === "soc 2 report")!;
     expect(compliance.requires_human_review).toBe(true);
-    expect(compliance.accuracy_warning).toMatch(/true of your/i);
+    expect(compliance.warning).toMatch(/true of your/i);
     expect(payload.recommendations.every((r) => r.auto_insert === false)).toBe(true);
     const plain = payload.recommendations.find((r) => r.phrase === "audit logging tools")!;
     expect(plain.requires_human_review).toBe(false);
-    expect(plain.accuracy_warning).toBeNull();
+    expect(plain.warning).toBeNull();
   }, 60_000);
 
   it("scenario 12 - the review flag follows the node's TYPE, not only the stored column: a claim-bearing node whose flag was never set is still flagged and warned", async () => {
@@ -727,7 +727,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     await inTx((tx) => analyseNodes(tx, session, words));
     const payload = await inTx((tx) => readSessionPayload(tx, session));
     expect(payload.recommendations[0]!.requires_human_review).toBe(true);
-    expect(payload.recommendations[0]!.accuracy_warning).not.toBeNull();
+    expect(payload.recommendations[0]!.warning).not.toBeNull();
     expect((await nodeByPhrase("per seat pricing")).requires_human_review).toBe(true);
   }, 60_000);
 
@@ -1015,24 +1015,28 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await nodeByPhrase("alpha beta gamma delta")).projected_gain as number).toBeCloseTo(expectedGain(unit(chunkRaw), c, unit(phraseRaw), 4, 100), 3);
   }, 60_000);
 
-  it("STORY-057 review 1 - a re-extraction clears coverage_ratio and recommendations on every alignment of the scope (the 'judged' signal)", async () => {
+  it("STORY-057 review 1 - a re-extraction clears coverage_ratio and recommendations on every UNFINISHED alignment of the scope (the 'judged' signal), and leaves a READY one its own result (review r2)", async () => {
     await seedTexts(corpusTexts(10, (i) => `Filler sentence number ${String(i)} here. We provide audit logging for every account.`));
     const session = await addSession();
     const sibling = await addSession();
+    const finished = await addSession();
     await extractSemanticNodes(deps(), session);
     await drainEmbedQueue();
-    for (const id of [session, sibling]) {
+    await db.query("UPDATE geo_alignments SET analysis_state = 'pending' WHERE id = ANY($1::uuid[])", [[session, sibling]]);
+    for (const id of [session, sibling, finished]) {
       await db.query(`UPDATE geo_alignments SET coverage_ratio = 0.5, recommendations = '[{"x":1}]'::jsonb WHERE id = $1`, [id]);
     }
     const stamp = async (id: string): Promise<number> => ((await sessionRow(id)).updated_at as Date).getTime();
     const stampsBefore = [await stamp(session), await stamp(sibling)];
+    const finishedBefore = await sessionRow(finished);
     await extractSemanticNodes(deps(), session);
     for (const [i, id] of [session, sibling].entries()) {
       expect(await stamp(id), "the reset bumps updated_at so the GEO panel sees the change").toBeGreaterThan(stampsBefore[i]!);
       const row = await sessionRow(id);
-      expect(row.coverage_ratio, "no alignment of the scope still claims a judgement").toBeNull();
+      expect(row.coverage_ratio, "no unfinished alignment of the scope still claims a judgement").toBeNull();
       expect(row.recommendations).toEqual([]);
     }
+    expect(await sessionRow(finished), "a ready session's finished result is not erased by another session's extraction").toEqual(finishedBefore);
   }, 60_000);
 
   it("review round 2 - AC5 - a re-extraction keeps the vector of a phrase that did not change and requests only the new ones", async () => {
@@ -1174,7 +1178,7 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect(await inTx((tx) => analyseNodes(tx, session, words))).toMatchObject({ pending: true });
     const payload = await inTx((tx) => readSessionPayload(tx, session));
     expect(payload.recommendations, "the old snapshot is not served while the scope is pending").toEqual([]);
-    expect(payload.coverage_ratio).toBeNull();
+    expect(payload.coverage.coverage_ratio).toBeNull();
   }, 60_000);
 
   it("review round 4 - the database refuses a keeper of another project, or of another tenant", async () => {

@@ -112,6 +112,15 @@ function isRetryable(cause: unknown): boolean {
   return !(cause instanceof EmbeddingProviderError) || cause.retryable;
 }
 
+/**
+ * STORY-192 - the model of the provider this process would embed with. The alignment job and the route that opens a session read it HERE
+ * because the provider, its adapters and its selector are importable from this file only (NFR-ARCH-01); the model is a string, so no provider
+ * object leaves the file. A session is pinned to this value when it opens, and is stale if it ever differs from it.
+ */
+export function selectedEmbeddingModel(env: Parameters<typeof selectEmbeddingProvider>[0]): string {
+  return selectEmbeddingProvider(env).model;
+}
+
 export interface EmbedBatchDeps {
   /** Injected in tests; production selects from env on first use. */
   readonly provider?: EmbeddingProvider;

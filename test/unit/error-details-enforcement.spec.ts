@@ -74,12 +74,12 @@ describe("STORY-024 · AC2 — a code's details shape is enforced at compile tim
   // because four other throw sites (a missing If-Match, prompt generation not
   // ready, a result document with no parse, ...) belong to other stories and
   // commit no reason; they must keep compiling untouched.
-  it("STORY-034 · precondition_unmet takes an optional `details.reason` of exactly the two deep-scan values and STORY-184's two plan-change values", () => {
+  it("STORY-034 · precondition_unmet takes an optional `details.reason` of exactly the two deep-scan values, STORY-184's two plan-change values and STORY-192's three alignment-patch values", () => {
     expect(() => new PreconditionUnmetError()).not.toThrow();
     expect(() => new PreconditionUnmetError({ message: "no reason given" })).not.toThrow();
     expect(() => new PreconditionUnmetError({ details: { reason: "price_not_agreed" } })).not.toThrow();
     expect(() => new PreconditionUnmetError({ details: { reason: "no_capturable_scope" } })).not.toThrow();
-    expect(PRECONDITION_UNMET_REASONS).toEqual(["price_not_agreed", "no_capturable_scope", "payment_failed", "cancel_in_portal"]);
+    expect(PRECONDITION_UNMET_REASONS).toEqual(["price_not_agreed", "no_capturable_scope", "payment_failed", "cancel_in_portal", "session_not_ready", "no_draft", "draft_not_ready"]);
     expect(preconditionUnmetDetailsSchema.safeParse({}).success, "reason is optional").toBe(true);
     expect(preconditionUnmetDetailsSchema.safeParse({ reason: "stale" }).success).toBe(false);
     expect(errorDetailsSchemaByCode.precondition_unmet).toBe(preconditionUnmetDetailsSchema);

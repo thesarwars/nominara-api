@@ -1,3 +1,5 @@
+export * from "./advance.js";
+export * from "./analysis.js";
 export * from "./analyse-nodes.js";
 export * from "./compute.js";
 export * from "./constants.js";
@@ -7,3 +9,6 @@ export * from "./node-types.js";
 export * from "./payload.js";
 export * from "./phrases.js";
 export * from "./session.js";
+export * from "./draft.js";
+export * from "./patch.js";
+export * from "./settle.js";

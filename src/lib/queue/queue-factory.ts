@@ -69,6 +69,8 @@ export interface EnqueueOptions {
   readonly priorityVariant?: PriorityVariant;
   /** Overrides the dedup ttl (ms) — tests use a short one; production defaults to the queue's own removeOnComplete.age window. */
   readonly dedupTtlMs?: number;
+  /** STORY-192: the job becomes runnable this many ms from now (BullMQ's `delay`). Absent or 0 = runnable at once. */
+  readonly delayMs?: number;
 }
 
 /**
@@ -93,5 +95,6 @@ export async function enqueueJob(queue: Queue, entry: QueueTopologyEntry, data: 
   if (entry.retry.delaysMs.length > 0) {
     jobOptions.backoff = { type: "custom" };
   }
+  if (options.delayMs !== undefined && options.delayMs > 0) jobOptions.delay = Math.ceil(options.delayMs);
   return queue.add(entry.name, data, jobOptions);
 }

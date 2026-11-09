@@ -25,3 +25,17 @@ export const ALIGNMENT = {
   /** The embedding columns are halfvec(1536) (STORY-133). */
   dimensions: 1536,
 } as const;
+
+// STORY-192 - the timings of the alignment job. None is in the reference, so every one is a BUILDER CHOICE reported to the owner.
+export const ALIGNMENT_JOB = {
+  /** How long a job waits before it looks again for vectors `embed.batch` has not written yet. */
+  pollDelayMs: 5_000,
+  /** A session still waiting on vectors this long after it was opened is `failed` (`embedding_timeout`), never left `pending` for ever. */
+  sessionDeadlineMs: 30 * 60_000,
+  /** A burst of draft edits is ONE recompute, this long after the LAST edit (the debounce window). */
+  draftDebounceMs: 2_000,
+  /** A draft still waiting on its vectors this long after it was saved is `failed`. */
+  draftDeadlineMs: 10 * 60_000,
+  /** A read settles a row still pending only this long AFTER its deadline, so a live chain's own check (which names the same reasons) always gets there first. */
+  settleGraceMs: 60_000,
+} as const;

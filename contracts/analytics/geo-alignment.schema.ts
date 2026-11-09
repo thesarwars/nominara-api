@@ -8,7 +8,7 @@ import { z } from "zod";
 //    and the caveat. A reader cannot receive a gain without the label that qualifies it, because there is no field it could arrive
 //    in without it. NFR-OPT-02 forbids any wording implying a ranking guarantee; `ALIGNMENT_CAVEAT` is the only sentence, and a unit
 //    test scans this module and the alignment library for the banned wording.
-//  - `generation` is the literal "disabled" (AC12). There is no editor and no generation endpoint; the literal is what a contract
+//  - `anti_filler_policy.generation` is the literal "disabled" (AC12). There is no editor and no generation endpoint; the literal is what a contract
 //    test asserts, so the day someone adds one it is a build failure rather than a quiet erosion.
 //  - Compliance, metric and pricing nodes carry `requires_human_review: true` and an `accuracy_warning`, and `auto_insert` is the
 //    literal `false` on EVERY recommendation (AC13). A claim-bearing node is never inserted by the product.
@@ -44,6 +44,10 @@ export const alignmentEstimateSchema = z
   })
   .strict();
 
+/**
+ * The recommendation as STORED in `geo_alignments.recommendations` (jsonb: every jsonb column has a zod schema). `analyseNodes` writes it and
+ * the analysis layer reads it; the WIRE shape (`alignmentRecommendationWireSchema`) is derived from it.
+ */
 export const alignmentRecommendationSchema = z
   .object({
     node_id: z.string().uuid(),
@@ -85,29 +89,145 @@ export const alignmentProjectionSchema = z
     /** Gains weighted by 0.85^(i-1) for the i-th ranked node. */
     diminished_sum: z.number(),
     diminishing_returns_factor: z.literal(0.85),
+    method: z.literal(ALIGNMENT_ESTIMATE_METHOD),
+    confidence: z.literal("modeled"),
+    caveat: z.literal(ALIGNMENT_CAVEAT),
   })
   .strict();
 
-export const alignmentSessionPayloadSchema = z
+/** api-specification.md section 8: one cited source of a recommendation. */
+export const alignmentEvidenceSchema = z.object({ domain: z.string().min(1), url: z.string().min(1), snippet: z.string().min(1) }).strict();
+
+/**
+ * api-specification.md section 8 - a recommendation as the client reads it.
+ *
+ * ONLY `kind: "semantic_node"` is served. The reference also names `structure` and `jsonld` recommendations; no code produces them yet, so
+ * the kind is a literal rather than an enum a reader would have to handle and never receive. Adding them is a new variant, not a loosening.
+ * `severity` is `null`: the reference shows the field but states no rule that yields it (section 7 ranks by `priority_rank`), and a band
+ * invented here would read as a measurement. `guardrail` is `phrase_only` for a node: a phrase to consider, never prose.
+ */
+export const alignmentRecommendationWireSchema = z
   .object({
-    session_id: z.string().uuid(),
-    target_url: z.string().min(1),
-    prompt_cluster_id: z.string().uuid().nullable(),
-    embedding_model: z.string().min(1),
-    /** Token-weighted alignment of the live page (and, once a draft exists, of the draft). Null before it is measured. */
-    baseline_alignment: z.number().nullable(),
-    current_alignment: z.number().nullable(),
-    /** The empirical band [p50, p85] of the cited documents' own alignment; null with no cited document. */
-    target_band: z.object({ low: z.number(), high: z.number() }).strict().nullable(),
-    percentile_vs_corpus: z.number().int().min(0).max(100).nullable(),
-    coverage_ratio: z.number().min(0).max(1).nullable(),
-    centroid_source_count: z.number().int().nonnegative(),
-    centroid_domains: z.array(z.string()),
-    low_confidence: z.boolean(),
-    estimate: alignmentEstimateSchema,
-    recommendations: z.array(alignmentRecommendationSchema),
-    projection: alignmentProjectionSchema.nullable(),
-    generation: z.literal("disabled"),
+    id: z.string().min(1),
+    kind: z.literal("semantic_node"),
+    node_id: z.string().uuid(),
+    node_type: semanticNodeTypeSchema,
+    phrase: z.string().min(1),
+    severity: z.null(),
+    corpus_doc_ratio: z.number().min(0).max(1),
+    present_in_content: z.boolean(),
+    projected_gain: z.number().nullable(),
+    priority_rank: z.number().int().min(1).nullable(),
+    guardrail: z.literal("phrase_only"),
+    requires_human_review: z.boolean(),
+    /** Present exactly when review is required. */
+    warning: z.string().min(1).nullable(),
+    /** At least one: a recommendation with no source is not a recommendation. */
+    evidence: z.array(alignmentEvidenceSchema).min(1),
+    /** Never true: a claim-bearing concept is the customer's to add, if it is true of them. */
+    auto_insert: z.literal(false),
+  })
+  .strict()
+  .superRefine((r, ctx) => {
+    if (r.requires_human_review !== (r.warning !== null)) {
+      ctx.addIssue({ code: "custom", message: "a node that requires review carries a warning, and only such a node does", path: ["warning"] });
+    }
+    if (CLAIM_BEARING_NODE_TYPES.includes(r.node_type) && !r.requires_human_review) {
+      ctx.addIssue({ code: "custom", message: "a compliance, metric or pricing_term node always requires human review", path: ["requires_human_review"] });
+    }
+  });
+export type AlignmentRecommendationWire = z.infer<typeof alignmentRecommendationWireSchema>;
+
+/** One chunk of the page the alignment was measured on (the live page, or the draft once its recompute is ready). */
+export const alignmentChunkSchema = z
+  .object({
+    chunk_index: z.number().int().nonnegative(),
+    heading_path: z.array(z.string()),
+    token_count: z.number().int().nonnegative(),
+    /** Null for a chunk whose alignment was not measured; never 0. */
+    alignment: z.number().nullable(),
+    /** The lowest-aligned MEASURED chunk (the first by index on a tie); false for every chunk when none was measured. */
+    weakest: z.boolean(),
   })
   .strict();
+
+/**
+ * api-specification.md section 8 - the alignment session payload, as `GET /v1/geo/alignment/{id}` and `PATCH` return it.
+ *
+ * ADDITIONS to the reference's example (kept, because a client needs them): `status` is the session's state (`pending|ready|stale|failed`, not
+ * the example's `open`), with `status_reason` and `draft_status`; `low_confidence`; the top-level `estimate` label; and `auto_insert` per
+ * recommendation. NOT SERVED: the example's `projection.if_all_applied` (a PAGE alignment after every change) - chunk gains are not page
+ * units, so the projection carries the two chunk-unit sums only (see `alignmentProjectionSchema`).
+ */
+export const alignmentSessionPayloadSchema = z
+  .object({
+    alignment_id: z.string().uuid(),
+    target_url: z.string().min(1),
+    prompt_cluster: z
+      .object({ cluster_id: z.string().uuid(), label: z.string(), prompt_count: z.number().int().nonnegative(), engines: z.array(z.string()) })
+      .strict()
+      .nullable(),
+    embedding: z.object({ model: z.string().min(1), dims: z.number().int().positive(), storage: z.literal("halfvec") }).strict(),
+    centroid: z
+      .object({
+        source_passage_count: z.number().int().nonnegative(),
+        source_domains: z.array(z.string()),
+        /** When the newest passage of the centroid was fetched; null when it has none. */
+        built_at: z.string().datetime().nullable(),
+      })
+      .strict(),
+    alignment: z
+      .object({
+        /** Token-weighted alignment of the live page (and `current`, once a draft exists, of the draft). Null before it is measured. */
+        baseline: z.number().nullable(),
+        current: z.number().nullable(),
+        /** The empirical band [p50, p85] of the cited documents' own alignment; null with no cited document. */
+        target_band: z.tuple([z.number(), z.number()]).nullable(),
+        percentile_vs_cited_docs: z.number().int().min(0).max(100).nullable(),
+      })
+      .strict(),
+    coverage: z
+      .object({
+        /** The scope's live concepts, counted only while they still describe THIS session (null once a later session moved them on). */
+        required_nodes: z.number().int().nonnegative().nullable(),
+        present_nodes: z.number().int().nonnegative().nullable(),
+        coverage_ratio: z.number().min(0).max(1).nullable(),
+      })
+      .strict(),
+    content: z.object({ chunks: z.array(alignmentChunkSchema) }).strict(),
+    low_confidence: z.boolean(),
+    estimate: alignmentEstimateSchema,
+    recommendations: z.array(alignmentRecommendationWireSchema),
+    projection: alignmentProjectionSchema.nullable(),
+    anti_filler_policy: z
+      .object({ generation: z.literal("disabled"), explanation: z.literal("Nominara returns phrases, structures, and schema - never generated prose.") })
+      .strict(),
+    /**
+     * STORY-192. Where the session is, so an unfinished analysis can never read as a finished one:
+     *   pending  a chunk, a cited passage or a concept of the scope still lacks its vector (or the page is still being fetched)
+     *   ready    every vector is in and the figures above are final
+     *   stale    opened under an embedding model that is no longer the provider's; the reason says so and the session is not analysed
+     *   failed   the page could not be fetched, or the vectors never arrived before the deadline; the reason says which
+     * Anything but `ready` carries NO coverage, NO recommendation, NO chunk and NO projection: a partial figure is never shown as final.
+     */
+    status: z.enum(["pending", "ready", "stale", "failed"]),
+    status_reason: z.string().min(1).nullable(),
+    /** The state of the customer's draft recompute; null when no draft was ever saved. While `pending`, the figures predate the draft. */
+    draft_status: z.enum(["pending", "ready", "failed"]).nullable(),
+  })
+  .strict()
+  .superRefine((p, ctx) => {
+    if (p.status !== "ready" && (p.coverage.coverage_ratio !== null || p.coverage.required_nodes !== null || p.coverage.present_nodes !== null || p.recommendations.length > 0 || p.projection !== null || p.content.chunks.length > 0)) {
+      ctx.addIssue({ code: "custom", message: "an analysis that is not ready shows no coverage, chunk, recommendation or projection", path: ["status"] });
+    }
+    if (p.status !== "ready" && (p.alignment.baseline !== null || p.alignment.current !== null || p.alignment.percentile_vs_cited_docs !== null || p.alignment.target_band !== null)) {
+      ctx.addIssue({ code: "custom", message: "an analysis that is not ready shows no baseline, current alignment, percentile or target band", path: ["status"] });
+    }
+    if (p.status === "ready" && p.status_reason !== null) {
+      ctx.addIssue({ code: "custom", message: "a ready session has no status reason", path: ["status_reason"] });
+    }
+    if ((p.status === "stale" || p.status === "failed") && p.status_reason === null) {
+      ctx.addIssue({ code: "custom", message: "a stale or failed session states its reason", path: ["status_reason"] });
+    }
+  });
 export type AlignmentSessionPayload = z.infer<typeof alignmentSessionPayloadSchema>;

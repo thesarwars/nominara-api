@@ -7,5 +7,7 @@ import { AuxService } from "./aux.service.js";
 @Module({
   controllers: [AuxController],
   providers: [AuxService],
+  // STORY-192: the alignment routes read a patch back through the service that owns the patch reader.
+  exports: [AuxService],
 })
 export class AuxModule {}
