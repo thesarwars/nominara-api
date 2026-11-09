@@ -19,6 +19,9 @@ export type AttributionStatus = (typeof ATTRIBUTION_STATUSES)[number];
 /** `attribution_daily.referrer_class` CHECK. `unattributed_direct` is a first-class class, never dropped (NFR-ANL-09). */
 export const REFERRER_CLASSES = ["chatgpt", "perplexity", "gemini", "claude", "copilot", "meta_ai", "other_ai", "unattributed_direct"] as const;
 export type ReferrerClass = (typeof REFERRER_CLASSES)[number];
+/** The classes a tab may carry to a later conversion: the AI engines only (never the unattributed floor). */
+export const AI_SOURCE_CLASSES = ["chatgpt", "perplexity", "gemini", "claude", "copilot", "meta_ai", "other_ai"] as const;
+export type AiSourceClass = (typeof AI_SOURCE_CLASSES)[number];
 
 export const MAX_ALLOWED_ORIGINS = 20;
 export const MAX_CONVERSION_EVENTS = 20;

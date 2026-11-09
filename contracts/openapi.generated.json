@@ -21550,6 +21550,18 @@
                         },
                         "conversion_counted": {
                           "type": "boolean"
+                        },
+                        "source_class": {
+                          "type": "string",
+                          "enum": [
+                            "chatgpt",
+                            "perplexity",
+                            "gemini",
+                            "claude",
+                            "copilot",
+                            "meta_ai",
+                            "other_ai"
+                          ]
                         }
                       },
                       "required": [
@@ -21831,6 +21843,18 @@
                   "referrer": {
                     "type": "string",
                     "maxLength": 2048
+                  },
+                  "source_class": {
+                    "type": "string",
+                    "enum": [
+                      "chatgpt",
+                      "perplexity",
+                      "gemini",
+                      "claude",
+                      "copilot",
+                      "meta_ai",
+                      "other_ai"
+                    ]
                   },
                   "conversion": {
                     "type": "object",
