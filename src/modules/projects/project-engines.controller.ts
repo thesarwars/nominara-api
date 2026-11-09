@@ -1,7 +1,9 @@
 import { Body, Controller, HttpCode, Param, Put, Req } from "@nestjs/common";
 import {
+  updateProjectEnginesParamsSchema,
   updateProjectEnginesRequestSchema,
   updateProjectEnginesResponseSchema,
+  type UpdateProjectEnginesParams,
   type UpdateProjectEnginesRequest,
   type UpdateProjectEnginesResponse,
 } from "../../../contracts/projects/index.js";
@@ -27,12 +29,13 @@ export class ProjectEnginesController {
   @Audit({ action: "project.engines_updated", resourceType: "project" })
   @ApiContract({
     operationId: "updateProjectEngines",
+    paramsSchema: updateProjectEnginesParamsSchema,
     requestSchema: updateProjectEnginesRequestSchema,
     responseSchema: updateProjectEnginesResponseSchema,
   })
   update(
     @Req() req: RbacScopedRequest,
-    @Param("id") projectId: string,
+    @Param(new ZodValidationPipe(updateProjectEnginesParamsSchema)) { id: projectId }: UpdateProjectEnginesParams,
     @Body(new ZodValidationPipe(updateProjectEnginesRequestSchema)) body: UpdateProjectEnginesRequest,
   ): Promise<UpdateProjectEnginesResponse> {
     return this.engines.update(req.tenant!.workspaceId, projectId, body);
