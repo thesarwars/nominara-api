@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { isAllowed, parseRobots } from "../robots.js";
+import { isAllowed, parseRobots } from "../../net/robots.js";
 import { evaluateRobotsTxt } from "../site-files.js";
 import { PatchRejectedError } from "./types.js";
 import { VERIFICATION_BOUNDS, assertAccessNotReduced, buildRobotsPatch, finaliseRobotsPatch } from "./robots-directive.js";

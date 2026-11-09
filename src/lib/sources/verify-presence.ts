@@ -1,5 +1,6 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
+import { CrawlRefusal } from "../net/crawl-gate.js";
 import { GuardedFetchRefusal, type GuardedResponse } from "../net/guarded-fetch.js";
 import { normalize } from "../parser/normalize.js";
 import { matchEntities, type AliasEntry } from "../parser/entity-matcher.js";
@@ -107,7 +108,7 @@ export interface BrandForMatching {
   readonly negativeAliases: readonly string[];
 }
 
-export type PresenceFailure = "http_status" | "fetch_error" | "refused" | "not_text" | "no_aliases";
+export type PresenceFailure = "http_status" | "fetch_error" | "refused" | "robots_disallowed" | "not_text" | "no_aliases";
 export type PresenceOutcome = { readonly status: "present" } | { readonly status: "absent" } | { readonly status: "failed"; readonly reason: PresenceFailure };
 
 export type PresenceFetcher = (url: string) => Promise<GuardedResponse>;
@@ -158,6 +159,8 @@ export async function verifyUrlPresence(url: string, brand: BrandForMatching, fe
   try {
     response = await fetch(url);
   } catch (error) {
+    // Decision 70(d): a path the site's robots.txt disallows is final (retrying changes nothing); an unreadable robots.txt is a transient fetch error.
+    if (error instanceof CrawlRefusal && error.reason === "robots_disallowed") return { status: "failed", reason: "robots_disallowed" };
     return { status: "failed", reason: error instanceof GuardedFetchRefusal ? "refused" : "fetch_error" };
   }
   if (response.status < 200 || response.status >= 300) return { status: "failed", reason: "http_status" };

@@ -3,6 +3,7 @@ import {
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   ListObjectVersionsCommand,
   PutObjectCommand,
   S3Client,
@@ -12,7 +13,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Logger } from "@nestjs/common";
 import { DegradedError, NotFoundError } from "../../api/errors/domain-errors.js";
 import type { StorageConfig } from "./storage-config.js";
-import type { ObjectHead, ObjectStoragePort, PrefixDeletingPort, PutObjectRequest, StorageBucketName } from "./storage.port.js";
+import type { KeyListingPort, ObjectHead, ObjectStoragePort, PrefixDeletingPort, PutObjectRequest, StorageBucketName } from "./storage.port.js";
 
 // Group C item 3 - the S3 adapter. One adapter for AWS S3 and LocalStack alike: the difference is `endpoint`,
 // `forcePathStyle` and the credentials, all from StorageConfig.
@@ -40,7 +41,7 @@ function isMissing(error: unknown): boolean {
 export const S3_REQUEST_TIMEOUT_MS = 20_000;
 export const S3_CONNECTION_TIMEOUT_MS = 3_000;
 
-export class S3Adapter implements ObjectStoragePort, PrefixDeletingPort {
+export class S3Adapter implements ObjectStoragePort, PrefixDeletingPort, KeyListingPort {
   private readonly client: S3Client;
 
   constructor(
@@ -127,6 +128,20 @@ export class S3Adapter implements ObjectStoragePort, PrefixDeletingPort {
       if (page.IsTruncated !== true) return removed;
       keyMarker = page.NextKeyMarker;
       versionIdMarker = page.NextVersionIdMarker;
+    }
+  }
+
+  /** STORY-111: the purge journal's read side. A failure is `DegradedError`, never an empty list: a journal that cannot be read must not look empty. */
+  async listKeys(bucket: StorageBucketName, prefix: string): Promise<string[]> {
+    if (prefix.length < 2) throw new Error("listKeys needs a non-empty prefix");
+    const Bucket = this.bucketName(bucket);
+    const keys: string[] = [];
+    let token: string | undefined;
+    for (;;) {
+      const page = await this.send(() => this.client.send(new ListObjectsV2Command({ Bucket, Prefix: prefix, ...(token !== undefined ? { ContinuationToken: token } : {}) })));
+      for (const object of page.Contents ?? []) if (object.Key !== undefined) keys.push(object.Key);
+      if (page.IsTruncated !== true || page.NextContinuationToken === undefined) return keys;
+      token = page.NextContinuationToken;
     }
   }
 

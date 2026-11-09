@@ -1,4 +1,5 @@
 import type { ClientBase } from "pg";
+import { minimiseWindow } from "../compliance/minimise.js";
 import {
   type DataSource,
   type GeoAnalysisWrite,
@@ -116,7 +117,7 @@ function nearestCitation(x: SentimentMentionInput): SentimentMention["citation"]
 }
 
 function toMention(x: SentimentMentionInput): SentimentMention {
-  const text = x.text === null ? null : x.text.slice(x.evidenceStart, x.evidenceEnd).slice(0, MAX_EVIDENCE_TEXT);
+  const text = x.text === null ? null : minimiseWindow(x.text, x.evidenceStart, x.evidenceEnd).slice(0, MAX_EVIDENCE_TEXT);
   return {
     result_id: x.resultId,
     engine: x.engine,

@@ -8,7 +8,7 @@
 // migration breaks the build in every service that reads it.
 
 import { sql } from "drizzle-orm";
-import { bigint, inet, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { bigint, inet, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { bytea } from "./columns.js";
 
 export const auditChainMarks = pgTable("audit_chain_marks", {
@@ -40,6 +40,20 @@ export const auditLog = pgTable("audit_log", {
   rowHash: bytea("row_hash").notNull(),
 });
 
+export const legalHolds = pgTable("legal_holds", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  scope: text("scope").notNull(),
+  scopeId: uuid("scope_id").notNull(),
+  workspaceId: uuid("workspace_id").notNull(),
+  reason: text("reason").notNull(),
+  requestedBy: uuid("requested_by").notNull(),
+  approvedBy: uuid("approved_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  releasedAt: timestamp("released_at", { withTimezone: true }),
+  releaseReason: text("release_reason"),
+});
+
 export const purgeFailures = pgTable("purge_failures", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   scope: text("scope").notNull(),
@@ -50,4 +64,27 @@ export const purgeFailures = pgTable("purge_failures", {
   resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   resolvedBy: uuid("resolved_by"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
+export const purgeRuns = pgTable("purge_runs", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }).notNull(),
+  projectsPurged: integer("projects_purged").notNull(),
+  workspacesPurged: integer("workspaces_purged").notNull(),
+  skippedExportLock: integer("skipped_export_lock").notNull(),
+  skippedLegalHold: integer("skipped_legal_hold").notNull(),
+  failed: integer("failed").notNull(),
+  status: text("status").notNull(),
+});
+
+export const subjectErasureQueue = pgTable("subject_erasure_queue", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  requestId: uuid("request_id").notNull(),
+  userId: uuid("user_id"),
+  requestedBy: uuid("requested_by"),
+  heldWorkspaceCount: integer("held_workspace_count").notNull(),
+  status: text("status").notNull().default(sql`'pending'::text`),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
 });

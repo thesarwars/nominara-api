@@ -6,7 +6,7 @@ import { toRegistrableDomain } from "../net/registrable-domain.js";
 import { NOMINARA_USER_AGENT } from "../net/user-agent.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "./politeness.js";
 import { createRenderRequestGuard, RendererUnavailable, type Renderer } from "./renderer.js";
-import { CRAWL_AGENT, isAllowed, type ParsedRobots } from "./robots.js";
+import { CRAWL_AGENT, isAllowed, type ParsedRobots } from "../net/robots.js";
 import { sanitiseText } from "./sanitise.js";
 
 // STORY-049 AC6 / AC7 / AC11 / AC12 — the page stage: for each selected page, a RAW fetch and a RENDERED fetch, both

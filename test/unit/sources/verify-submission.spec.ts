@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { CrawlRefusal } from "../../../src/lib/net/crawl-gate.js";
 import { GuardedFetchRefusal, type GuardedResponse } from "../../../src/lib/net/guarded-fetch.js";
 import { decodeLoosely, fetchSubmission, urlEchoesBrand, type SubmissionPlan } from "../../../src/lib/sources/verify-submission.js";
 
@@ -463,5 +464,14 @@ describe("STORY-055 · fetchSubmission", () => {
       for (const n of found) expect(n).toMatch(/^[a-z]{8,}$/u);
       expect(new Set(found).size).toBe(3);
     });
+  });
+});
+
+describe("decision 70(d) - a submitted URL robots.txt disallows", () => {
+  it("is not fetched and is answered `unreachable` (the existing reason), for the page and for the canary", async () => {
+    const refuse = vi.fn().mockRejectedValue(new CrawlRefusal("robots_disallowed"));
+    await expect(fetchSubmission(plan(), refuse)).resolves.toEqual({ status: "unverified", reason: "unreachable" });
+    const canary = vi.fn().mockResolvedValueOnce(res("Acme Analytics")).mockRejectedValueOnce(new CrawlRefusal("robots_disallowed"));
+    await expect(fetchSubmission(plan({ url: "https://reviews.dev/acme-analytics" }), canary)).resolves.toEqual({ status: "unverified", reason: "unreachable" });
   });
 });

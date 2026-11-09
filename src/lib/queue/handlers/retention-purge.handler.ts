@@ -3,6 +3,9 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { runDailyPurgeCycle } from "../../../workers/rollup/retention.js";
+import { executePendingErasures } from "../../compliance/subject-request.js";
+import { PurgeJournal } from "../../compliance/purge-journal.js";
+import { S3JournalStore, writeComplianceExports } from "../../compliance/storage-adapters.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
 import { deleteWorkspaceReports } from "../../storage/workspace-purge.js";
@@ -72,19 +75,34 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
       // not configured the hook is absent, so the files would be left: say so, loudly, every run.
       const storage = resolveStorageConfig(context.env);
       if (storage === null) logger.warn({ event: "report_objects_not_deleted", reason: "storage_unconfigured" });
+      // STORY-111: with no object storage there is NO purge journal and NO compliance export. Said loudly every run; a workspace purge then
+      // fails and is recorded (no exporter), and `db:purge-check` blocks the release train if that stays unresolved.
+      if (storage === null) logger.warn({ event: "purge_journal_unavailable", reason: "storage_unconfigured" });
       const adapter = storage === null ? undefined : new S3Adapter(storage);
       const result = await runDailyPurgeCycle(client, {
+        ...(storage !== null && adapter !== undefined
+          ? {
+              journal: new PurgeJournal(new S3JournalStore(adapter), storage.keyEnv),
+              exporterFor: (workspaceId: string) => writeComplianceExports(adapter, storage.keyEnv, workspaceId),
+            }
+          : {}),
         ...(storage !== null && adapter !== undefined
           ? { deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => void (await deleteWorkspaceReports(adapter, storage.keyEnv, workspaceId)) }
           : {}),
       });
 
+      // Decision 68b: the nightly job also runs the erasures a legal hold had deferred, for holds that lapsed (the cycle above recorded them).
+      const queued = await executePendingErasures(client);
+      if (queued.executed + queued.blocked + queued.stillHeld > 0) logger.log({ event: "queued_erasures", ...queued });
+
       incrementCounter("nominara_retention_purge_runs_total");
       // Counts only: a project or workspace ID in a log line is a deletion record that belongs in the purge journal.
       logger.log(
         `retention purge: ${String(result.projectsPurged.length)} project(s) and ${String(result.workspacesPurged.length)} workspace(s) purged, ` +
-          `${String(result.skipped.length)} skipped`,
+          `${String(result.skipped.length)} skipped, ${String(result.held.length)} held, ${String(result.failed)} failed`,
       );
+      // STORY-111: a held subject is REPORTED (a counter per hold is in the cycle), and any failure is an alert-worthy signal.
+      if (result.failed > 0) logger.error({ event: "retention_purge_failures", failed: result.failed });
     } finally {
       if (held && !(await releaseAdvisorySessionLock(client, lockKey))) {
         logger.error("retention purge lock was not held at release — the lock key or the connection changed under us");

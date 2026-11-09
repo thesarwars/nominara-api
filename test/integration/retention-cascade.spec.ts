@@ -968,12 +968,13 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
   // collectComplianceExport, like the cross-tenant discovery functions
   // above, issues its SELECT with no tenant context set — stays on the
   // privileged `client` (see retention.ts's PRIVILEGE CONTRACT comment).
-  it("collectComplianceExport reads exactly the workspace's own audit_log + credit_ledger rows", async () => {
+  it("collectComplianceExport reads exactly the workspace's own audit log and FINANCIAL records (ledger, invoices, subscription state, add-ons, purchases)", async () => {
     const workspaceId = await createWorkspace();
     const userId = await createUser();
     await insertAuditLog(workspaceId, userId);
     const records = await collectComplianceExport(client, workspaceId);
-    expect(records.map((r) => r.table).sort()).toEqual(["audit_log", "credit_ledger"]);
+    // data-model.md §7: the financial records are the ledger, invoices and subscription state; STORY-111 review round 1 added the last four (the cascade deletes them).
+    expect(records.map((r) => r.table).sort()).toEqual(["audit_log", "credit_ledger", "credit_purchases", "invoices", "subscription_addons", "subscriptions"]);
   });
 
   it("widen · workspace-level deletion execution racing a still-open project-level export honors the lock", async () => {

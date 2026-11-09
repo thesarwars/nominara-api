@@ -80,3 +80,28 @@ describe("S3Adapter · a stalled store cannot hold its caller for ever", () => {
     }
   }, 20_000);
 });
+
+// STORY-111 - the purge journal's read side.
+describe("S3Adapter.listKeys (STORY-111)", () => {
+  it("pages through ListObjectsV2 and returns every key under the prefix", async () => {
+    const { ListObjectsV2Command, S3Client } = await import("@aws-sdk/client-s3");
+    const { vi } = await import("vitest");
+    const seen: Array<Record<string, unknown>> = [];
+    const spy = vi.spyOn(S3Client.prototype, "send").mockImplementation((async (command: unknown) => {
+      if (!(command instanceof ListObjectsV2Command)) return {};
+      seen.push(command.input as unknown as Record<string, unknown>);
+      return seen.length === 1
+        ? { Contents: [{ Key: "purge-journal/t/a.json" }], IsTruncated: true, NextContinuationToken: "tok" }
+        : { Contents: [{ Key: "purge-journal/t/b.json" }], IsTruncated: false };
+    }) as never);
+    const { S3Adapter } = await import("./s3.adapter.js");
+    const { resolveStorageConfig } = await import("./storage-config.js");
+    const config = resolveStorageConfig({ NODE_ENV: "test", STORAGE_BUCKET_RAW: "raw-b", STORAGE_BUCKET_REPORTS: "reports-b", STORAGE_SSE: "AES256" } as never)!;
+    const keys = await new S3Adapter(config).listKeys("raw", "purge-journal/t/");
+    expect(keys).toEqual(["purge-journal/t/a.json", "purge-journal/t/b.json"]);
+    expect(seen[0]).toMatchObject({ Bucket: "raw-b", Prefix: "purge-journal/t/" });
+    expect(seen[1]).toMatchObject({ ContinuationToken: "tok" });
+    spy.mockRestore();
+    await expect(new S3Adapter(config).listKeys("raw", "")).rejects.toThrow(/non-empty prefix/);
+  });
+});

@@ -298,7 +298,18 @@ describe("STORY-055 / STORY-049 AC7 - the seeding fetches identify themselves", 
       releaseClient: h.releaseClient,
       process: createSourceVerifyPresenceHandler(h.context, { now: () => JOB_NOW }),
     })(job({}));
-    expect(mocked).toHaveBeenCalledTimes(1);
-    expect(mocked.mock.calls[0]![1]).toMatchObject({ headers });
+    // Decision 70(d): the default fetcher is the ROBOTS-GATED one, so the host's robots.txt is asked first, as NominaraBot.
+    expect(mocked.mock.calls.map((call) => call[0])).toEqual([expect.stringMatching(/\/robots\.txt$/), expect.not.stringMatching(/\/robots\.txt$/)]);
+    expect(mocked.mock.calls[0]![1]).toMatchObject({ headers: { "user-agent": NOMINARA_USER_AGENT } });
+    expect(mocked.mock.calls[1]![1]).toMatchObject({ headers });
+  });
+
+  it("70d - the default fetcher refuses a path robots.txt disallows: the page is never requested", async () => {
+    const mocked = vi.mocked(guardedFetch);
+    mocked.mockReset();
+    mocked.mockImplementation(async (url) => (String(url).endsWith("/robots.txt") ? ({ ...page(""), body: Buffer.from("User-agent: NominaraBot\nDisallow: /"), headers: { "content-type": "text/plain" } }) : page("Acme Analytics")));
+    const fetch = identifiedFetcher();
+    await expect(fetch("https://blocked-by-robots.example/wiki/Acme")).rejects.toMatchObject({ reason: "robots_disallowed" });
+    expect(mocked.mock.calls.map((call) => call[0])).toEqual(["https://blocked-by-robots.example/robots.txt"]);
   });
 });

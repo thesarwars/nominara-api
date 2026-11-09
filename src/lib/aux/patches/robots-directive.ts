@@ -1,4 +1,4 @@
-import { isAllowed, parseRobots, type ParsedRobots, type RobotsRule } from "../robots.js";
+import { isAllowed, parseRobots, type ParsedRobots, type RobotsRule } from "../../net/robots.js";
 import { AI_CRAWLER_AGENTS, evaluateRobotsTxt } from "../site-files.js";
 import { unifiedDiff } from "./diff.js";
 import { sha256Tag } from "./precondition.js";

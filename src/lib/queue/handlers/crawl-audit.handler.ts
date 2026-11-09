@@ -35,7 +35,7 @@ import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "../../aux
 import { pageCapForPlan, selectPages, type SelectionScope } from "../../aux/page-selection.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../../aux/politeness.js";
 import { unavailableRenderer, type Renderer } from "../../aux/renderer.js";
-import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../../aux/robots.js";
+import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../../net/robots.js";
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../aux/audit-constants.js";
 import { failManualAudit } from "../../aux/fail-manual-audit.js";
 import { refundAuxAuditCharge } from "../../credits/aux-audit-refund.js";

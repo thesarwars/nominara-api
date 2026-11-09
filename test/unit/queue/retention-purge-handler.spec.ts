@@ -12,8 +12,9 @@ const state = vi.hoisted(() => ({
   cycleCalls: 0,
   cycleOptions: undefined as { deleteWorkspaceObjects?: (id: string) => Promise<void> } | undefined,
   cycleThrows: false,
-  result: { projectsPurged: ["p1", "p2"] as string[], workspacesPurged: [] as string[], skipped: [] as { scope: string; scopeId: string; reason: string }[] },
+  result: { projectsPurged: ["p1", "p2"] as string[], workspacesPurged: [] as string[], skipped: [] as { scope: string; scopeId: string; reason: string }[], held: [] as unknown[], failed: 0 },
   unlocked: 0,
+  queueRuns: 0,
 }));
 
 vi.mock("../../../src/db/client.js", () => ({
@@ -32,6 +33,12 @@ vi.mock("../../../src/lib/queue/locks.js", async () => {
     releaseAdvisorySessionLock: vi.fn(async () => { state.unlocked += 1; return true; }),
   };
 });
+vi.mock("../../../src/lib/compliance/subject-request.js", () => ({
+  executePendingErasures: vi.fn(async () => {
+    state.queueRuns += 1;
+    return { executed: 0, blocked: 0, stillHeld: 0 };
+  }),
+}));
 vi.mock("../../../src/workers/rollup/retention.js", () => ({
   runDailyPurgeCycle: vi.fn(async (_client: unknown, options?: { deleteWorkspaceObjects?: (id: string) => Promise<void> }) => {
     state.cycleCalls += 1;
@@ -56,9 +63,10 @@ beforeEach(() => {
   state.clients.length = 0;
   state.locked = true;
   state.cycleCalls = 0;
+  state.queueRuns = 0;
   state.cycleOptions = undefined;
   state.cycleThrows = false;
-  state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: [], skipped: [] };
+  state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: [], skipped: [], held: [], failed: 0 };
   state.unlocked = 0;
 });
 afterEach(() => vi.restoreAllMocks());
@@ -96,6 +104,16 @@ describe("retention.purge — enabled", () => {
     expect(state.unlocked).toBe(1);
   });
 
+  it("S23 (decision 68b) runs the queued erasures after the purge cycle on the same connection; a yielding tick runs none", async () => {
+    vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    await run("true");
+    expect(state.queueRuns).toBe(1);
+    state.locked = false;
+    vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    await run("true");
+    expect(state.queueRuns).toBe(1);
+  });
+
   it("YIELDS when another replica holds the lock: nothing is purged", async () => {
     state.locked = false;
     vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
@@ -107,7 +125,7 @@ describe("retention.purge — enabled", () => {
   });
 
   it("counts projects and workspaces purged and what was skipped — IDs never appear in the log line", async () => {
-    state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: ["w1"], skipped: [{ scope: "project", scopeId: "p3", reason: "export-lock-held" }] };
+    state.result = { projectsPurged: ["p1", "p2"], workspacesPurged: ["w1"], skipped: [{ scope: "project", scopeId: "p3", reason: "export-lock-held" }], held: [], failed: 0 };
     const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
     await run("true");
     const line = log.mock.calls.map((call) => (typeof call[0] === "string" ? call[0] : "")).find((text) => text.includes("retention purge"));
@@ -141,5 +159,37 @@ describe("retention.purge - STORY-180 r5: workspace erasure deletes the workspac
     await createRetentionPurgeHandler(withStorage({}))({} as never, tick);
     expect(state.cycleOptions?.deleteWorkspaceObjects).toBeUndefined();
     expect(JSON.stringify(warn.mock.calls)).toContain("report_objects_not_deleted");
+  });
+});
+
+describe("retention.purge - STORY-111: the journal and the compliance exports", () => {
+  const storageEnv = { STORAGE_BUCKET_RAW: "raw-b", STORAGE_BUCKET_REPORTS: "reports-b", STORAGE_KEY_ENV: "prod", STORAGE_SSE: "AES256" };
+  const withStorage = (extra: Record<string, string>) =>
+    ({ pool: {} as never, env: { DATABASE_URL: "postgres://owner@direct/db", RETENTION_PURGE_ENABLED: "true", ...extra } }) as unknown as QueueHandlerContext;
+
+  it("hands the cycle a purge journal and a compliance exporter when object storage is configured", async () => {
+    await createRetentionPurgeHandler(withStorage(storageEnv))({} as never, tick);
+    const options = state.cycleOptions as { journal?: unknown; exporterFor?: unknown } | undefined;
+    expect(options?.journal).toBeDefined();
+    expect(typeof options?.exporterFor).toBe("function");
+  });
+
+  it("with object storage NOT configured there is no journal, and the handler says so every run", async () => {
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    await createRetentionPurgeHandler(withStorage({}))({} as never, tick);
+    expect((state.cycleOptions as { journal?: unknown } | undefined)?.journal).toBeUndefined();
+    expect(JSON.stringify(warn.mock.calls)).toContain("purge_journal_unavailable");
+  });
+
+  it("reports held subjects and failures in counts only, and logs an error when a cycle recorded a failure", async () => {
+    state.result = { projectsPurged: [], workspacesPurged: [], skipped: [], held: [{ scope: "project", scopeId: "p9", reason: "legal-hold" }], failed: 2 } as never;
+    const log = vi.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+    await run("true");
+    const line = log.mock.calls.map((c) => (typeof c[0] === "string" ? c[0] : "")).find((t) => t.includes("retention purge"));
+    expect(line).toContain("1 held");
+    expect(line).toContain("2 failed");
+    expect(line).not.toMatch(/\bp9\b/u);
+    expect(JSON.stringify(error.mock.calls)).toContain("retention_purge_failures");
   });
 });

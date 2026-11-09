@@ -3,7 +3,8 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
-import { guardedFetch, type GuardedResponse } from "../../net/guarded-fetch.js";
+import { crawlGatedFetch } from "../../net/crawl-gate.js";
+import type { GuardedFetchInit, GuardedResponse } from "../../net/guarded-fetch.js";
 import { NOMINARA_USER_AGENT } from "../../net/user-agent.js";
 import {
   commitPresenceRun,
@@ -108,9 +109,13 @@ function fetchSubmissionTraced(plan: SubmissionPlan, fetch: SubmissionFetcher): 
 /**
  * STORY-055 (review r7) / STORY-049 AC7 - every fetch this job makes (the submission's page and canary, the seeded target, the periodic
  * presence page) identifies itself. Wikipedia and Reddit answered 403 to an anonymous request and 200 to this one.
+ *
+ * Owner decision 70(d): a fetch that identifies as NominaraBot also keeps to the target host's robots.txt and per-host request
+ * budget, so the DEFAULT underneath is the shared crawl gate (`crawlGatedFetch`), which wraps the SSRF-guarded fetcher. Called from
+ * the `run` phase only: no transaction is open while robots.txt or the page is fetched.
  */
 export function identifiedFetcher(
-  guarded: (url: string, init: Parameters<typeof guardedFetch>[1]) => Promise<GuardedResponse> = guardedFetch,
+  guarded: (url: string, init: GuardedFetchInit) => Promise<GuardedResponse> = crawlGatedFetch,
 ): (url: string, init?: { readonly followRedirect?: (nextUrl: string) => boolean; readonly headers?: Readonly<Record<string, string>> }) => Promise<GuardedResponse> {
   // A caller's headers survive; ours win on the two that identify the crawler.
   return (url, init) => guarded(url, { ...init, headers: { ...init?.headers, "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" } });
@@ -118,7 +123,7 @@ export function identifiedFetcher(
 
 export function createSourceVerifyPresenceHandler(context: QueueHandlerContext, deps: SourceVerifyPresenceDeps = {}): JobProcessor {
   const logger = new Logger("source.verify_presence");
-  const fetch: SubmissionFetcher = deps.fetch ?? identifiedFetcher((url, init) => guardedFetch(url, init));
+  const fetch: SubmissionFetcher = deps.fetch ?? identifiedFetcher();
   const clock = deps.now ?? (() => new Date());
   // Built on the first submission job, not at boot: a worker group without a reachable cache must still boot (as task.generate's).
   let publisher: RealtimePublisher | undefined;
