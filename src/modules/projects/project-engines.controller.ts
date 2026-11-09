@@ -1,5 +1,9 @@
-import { Body, Controller, HttpCode, Param, Put, Req } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Put, Req } from "@nestjs/common";
 import {
+  getProjectEnginesParamsSchema,
+  getProjectEnginesResponseSchema,
+  type GetProjectEnginesParams,
+  type GetProjectEnginesResponse,
   updateProjectEnginesParamsSchema,
   updateProjectEnginesRequestSchema,
   updateProjectEnginesResponseSchema,
@@ -21,6 +25,18 @@ import { ProjectEnginesService } from "./project-engines.service.js";
 @Controller("projects/:id/engines")
 export class ProjectEnginesController {
   constructor(private readonly engines: ProjectEnginesService) {}
+
+  // `GET` — the saved overrides plus the effective set. The PUT's permission: whoever may change the engines may read what they are.
+  @Get()
+  @RequirePermission("project:update")
+  @ProjectParam("id")
+  @ApiContract({ operationId: "getProjectEngines", paramsSchema: getProjectEnginesParamsSchema, responseSchema: getProjectEnginesResponseSchema })
+  read(
+    @Req() req: RbacScopedRequest,
+    @Param(new ZodValidationPipe(getProjectEnginesParamsSchema)) { id: projectId }: GetProjectEnginesParams,
+  ): Promise<GetProjectEnginesResponse> {
+    return this.engines.read(req.tenant!.workspaceId, projectId);
+  }
 
   @Put()
   @HttpCode(200)
