@@ -35946,6 +35946,307 @@
                         "measured_floor_note": {
                           "type": "string"
                         },
+                        "totals": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "ai_sessions": {
+                                  "type": "object",
+                                  "properties": {
+                                    "current": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "prior": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "delta": {
+                                      "type": "integer",
+                                      "minimum": -9007199254740991,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "delta_pct": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "current",
+                                    "prior",
+                                    "delta",
+                                    "delta_pct"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "conversions": {
+                                  "type": "object",
+                                  "properties": {
+                                    "current": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "prior": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "delta": {
+                                      "type": "integer",
+                                      "minimum": -9007199254740991,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "delta_pct": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "current",
+                                    "prior",
+                                    "delta",
+                                    "delta_pct"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "conversion_rate": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number",
+                                      "minimum": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "conversion_rate_prior": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number",
+                                      "minimum": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "by_engine": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "referrer_class": {
+                                        "type": "string",
+                                        "enum": [
+                                          "chatgpt",
+                                          "perplexity",
+                                          "gemini",
+                                          "claude",
+                                          "copilot",
+                                          "meta_ai",
+                                          "other_ai"
+                                        ]
+                                      },
+                                      "sessions": {
+                                        "type": "object",
+                                        "properties": {
+                                          "current": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "prior": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "delta": {
+                                            "type": "integer",
+                                            "minimum": -9007199254740991,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "delta_pct": {
+                                            "anyOf": [
+                                              {
+                                                "type": "number"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "required": [
+                                          "current",
+                                          "prior",
+                                          "delta",
+                                          "delta_pct"
+                                        ],
+                                        "additionalProperties": false
+                                      },
+                                      "conversions": {
+                                        "type": "object",
+                                        "properties": {
+                                          "current": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "prior": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "delta": {
+                                            "type": "integer",
+                                            "minimum": -9007199254740991,
+                                            "maximum": 9007199254740991
+                                          },
+                                          "delta_pct": {
+                                            "anyOf": [
+                                              {
+                                                "type": "number"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "required": [
+                                          "current",
+                                          "prior",
+                                          "delta",
+                                          "delta_pct"
+                                        ],
+                                        "additionalProperties": false
+                                      }
+                                    },
+                                    "required": [
+                                      "referrer_class",
+                                      "sessions",
+                                      "conversions"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "unattributed": {
+                                  "type": "object",
+                                  "properties": {
+                                    "sessions": {
+                                      "type": "object",
+                                      "properties": {
+                                        "current": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "prior": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "delta": {
+                                          "type": "integer",
+                                          "minimum": -9007199254740991,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "delta_pct": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "current",
+                                        "prior",
+                                        "delta",
+                                        "delta_pct"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    "conversions": {
+                                      "type": "object",
+                                      "properties": {
+                                        "current": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "prior": {
+                                          "type": "integer",
+                                          "minimum": 0,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "delta": {
+                                          "type": "integer",
+                                          "minimum": -9007199254740991,
+                                          "maximum": 9007199254740991
+                                        },
+                                        "delta_pct": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "current",
+                                        "prior",
+                                        "delta",
+                                        "delta_pct"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  },
+                                  "required": [
+                                    "sessions",
+                                    "conversions"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "required": [
+                                "ai_sessions",
+                                "conversions",
+                                "conversion_rate",
+                                "conversion_rate_prior",
+                                "by_engine",
+                                "unattributed"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "rows": {
                           "type": "array",
                           "items": {
@@ -36064,6 +36365,7 @@
                         "gsc_connected",
                         "substitution_candidates",
                         "measured_floor_note",
+                        "totals",
                         "rows"
                       ],
                       "additionalProperties": false

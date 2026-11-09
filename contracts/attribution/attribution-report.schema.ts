@@ -52,6 +52,45 @@ export const attributionRowSchema = z.object({
 });
 export type AttributionRow = z.infer<typeof attributionRowSchema>;
 
+/** `attribution_daily.referrer_class` CHECK: a referrer taxonomy, NOT the engine set (it has no Google surface; it adds `other_ai` and the stripped class). */
+export const ATTRIBUTION_AI_REFERRER_CLASSES = ["chatgpt", "perplexity", "gemini", "claude", "copilot", "meta_ai", "other_ai"] as const;
+export type AttributionAiReferrerClass = (typeof ATTRIBUTION_AI_REFERRER_CLASSES)[number];
+
+/** One measured count for the window and for the window before it, so the movement is read off one object. Both are counts, never estimates. */
+export const attributionFigureSchema = z.object({
+  current: z.number().int().min(0),
+  prior: z.number().int().min(0),
+  /** `current - prior`. */
+  delta: z.number().int(),
+  /** `delta / prior`; `null` when `prior` is 0, because a change from nothing has no percentage and a zero would read as "flat". */
+  delta_pct: z.number().nullable(),
+});
+export type AttributionFigure = z.infer<typeof attributionFigureSchema>;
+
+export const attributionEngineBreakdownSchema = z.object({
+  referrer_class: z.enum(ATTRIBUTION_AI_REFERRER_CLASSES),
+  sessions: attributionFigureSchema,
+  conversions: attributionFigureSchema,
+});
+export type AttributionEngineBreakdown = z.infer<typeof attributionEngineBreakdownSchema>;
+
+/**
+ * The project-wide figures of the window the rows describe (STORY-116 F1/F2), read from the beacon's daily counts over the SAME window
+ * and prior window as the rollup. Every value is a measured count or a ratio of two; nothing is scaled, so the AI figures are a floor.
+ * `unattributed` is the sessions whose referrer was stripped: displayed beside the AI figures and NEVER added into them.
+ */
+export const attributionTotalsSchema = z.object({
+  ai_sessions: attributionFigureSchema,
+  conversions: attributionFigureSchema,
+  /** `conversions / ai_sessions`; `null` when there were no AI sessions, never 0. */
+  conversion_rate: z.number().min(0).nullable(),
+  conversion_rate_prior: z.number().min(0).nullable(),
+  /** Every AI referrer class, in a fixed order; a class with no sessions is a measured 0. */
+  by_engine: z.array(attributionEngineBreakdownSchema),
+  unattributed: z.object({ sessions: attributionFigureSchema, conversions: attributionFigureSchema }),
+});
+export type AttributionTotals = z.infer<typeof attributionTotalsSchema>;
+
 export const attributionReportSchema = z.object({
   window_days: z.union([z.literal(7), z.literal(30), z.literal(90)]),
   /** The first day of the window the rows describe, `YYYY-MM-DD`; `null` when no rollup has been computed yet. */
@@ -62,6 +101,8 @@ export const attributionReportSchema = z.object({
   /** How many rows are substitution candidates, so the interface can lead with them. */
   substitution_candidates: z.number().int().min(0),
   measured_floor_note: z.string(),
+  /** `null` until a rollup window has been computed (there is no window to total), never zeros. Not narrowed by the `pattern` filter. */
+  totals: attributionTotalsSchema.nullable(),
   rows: z.array(attributionRowSchema),
 });
 export type AttributionReport = z.infer<typeof attributionReportSchema>;

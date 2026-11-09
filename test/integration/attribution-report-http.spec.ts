@@ -62,7 +62,7 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
 
   async function project(workspaceId: string): Promise<string> {
     const id = uuidV7();
-    await db().query("INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'P',$3,'https://shop.example.com','shop.example.com')", [id, workspaceId, `p-${id.slice(0, 8)}`]);
+    await db().query("INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'P',$3,'https://shop.example.com','shop.example.com')", [id, workspaceId, `p-${id}`]);
     return id;
   }
 
@@ -103,7 +103,16 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
   const get = (a: Actor, query = "") => harness.app().inject({ method: "GET", url: url(a, query), headers: { cookie: a.cookie } });
   const data = <T>(res: { json(): unknown }): T => (res.json() as { data: T }).data;
   interface Row { url: string; pattern: string; flagged: boolean; note: string | null; conversion_rate: number | null; gsc_ai_impressions: number | null; organic_clicks: number | null; ai_sessions: number }
-  interface Report { window_days: number; window_start: string | null; gsc_connected: boolean; substitution_candidates: number; measured_floor_note: string; rows: Row[] }
+  interface Fig { current: number; prior: number; delta: number; delta_pct: number | null }
+  interface Totals {
+    ai_sessions: Fig;
+    conversions: Fig;
+    conversion_rate: number | null;
+    conversion_rate_prior: number | null;
+    by_engine: Array<{ referrer_class: string; sessions: Fig; conversions: Fig }>;
+    unattributed: { sessions: Fig; conversions: Fig };
+  }
+  interface Report { window_days: number; window_start: string | null; gsc_connected: boolean; substitution_candidates: number; measured_floor_note: string; rows: Row[]; totals: Totals | null }
 
   async function seed(a: Actor, path: string, over: Record<string, unknown> = {}, windowStart = "2026-10-15", windowDays = 30): Promise<void> {
     const landing = `https://shop.example.com${path}`;
@@ -112,6 +121,16 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
       `INSERT INTO attribution_url_rollup (workspace_id, project_id, window_start, window_days, landing_url_hash, landing_url, citations, citations_prior, ai_sessions, ai_sessions_prior, conversions, cvr, gsc_ai_impressions, organic_clicks, pattern)
        VALUES ($1,$2,$3,$4,sha256(convert_to($5::text,'UTF8')),$5::text,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [a.workspaceId, a.projectId, windowStart, windowDays, landing, r.citations, r.citations_prior, r.ai_sessions, r.ai_sessions_prior, r.conversions, r.cvr, r.gsc_ai_impressions, r.organic_clicks, r.pattern],
+    );
+  }
+
+
+  async function daily(a: Actor, date: string, referrerClass: string, sessions: number, conversions = 0, path = "/p", project = a.projectId): Promise<void> {
+    const landing = `https://shop.example.com${path}`;
+    await db().query(
+      `INSERT INTO attribution_daily (workspace_id, project_id, metric_date, landing_url_hash, landing_url, referrer_class, sessions, conversions, country, device)
+       VALUES ($1,$2,$3,sha256(convert_to($4::text,'UTF8')),$4::text,$5,$6,$7,'ZZ','desktop')`,
+      [a.workspaceId, project, date, landing, referrerClass, sessions, conversions],
     );
   }
 
@@ -173,5 +192,74 @@ describe("STORY-114 - GET /projects/{id}/attribution", () => {
     const a = await owner();
     const b = await owner();
     expect((await get({ ...a, projectId: b.projectId })).statusCode).toBe(404);
+  }, 120_000);
+  // STORY-116 F1 / F2 - window 2026-10-15 for 30 days: current 10-15..11-13, prior 09-15..10-14.
+  it("STORY-116 F1 - totals, deltas, conversion rate and the per-engine breakdown are the measured counts of the window and its prior", async () => {
+    const a = await owner();
+    await seed(a, "/p");
+    await daily(a, "2026-10-20", "chatgpt", 60, 6);
+    await daily(a, "2026-10-21", "chatgpt", 40, 4, "/q");
+    await daily(a, "2026-11-13", "perplexity", 20, 0);
+    await daily(a, "2026-09-15", "chatgpt", 50, 5);
+    await daily(a, "2026-10-14", "other_ai", 50, 0);
+    const totals = data<Report>(await get(a)).totals!;
+    expect(totals.ai_sessions).toEqual({ current: 120, prior: 100, delta: 20, delta_pct: 0.2 });
+    expect(totals.conversions).toEqual({ current: 10, prior: 5, delta: 5, delta_pct: 1 });
+    expect(totals.conversion_rate).toBeCloseTo(10 / 120, 6);
+    expect(totals.conversion_rate_prior).toBeCloseTo(5 / 100, 6);
+    expect(totals.by_engine.map((e) => e.referrer_class)).toEqual(["chatgpt", "perplexity", "gemini", "claude", "copilot", "meta_ai", "other_ai"]);
+    const by = new Map(totals.by_engine.map((e) => [e.referrer_class, e]));
+    expect(by.get("chatgpt")).toMatchObject({ sessions: { current: 100, prior: 50 }, conversions: { current: 10, prior: 5 } });
+    expect(by.get("perplexity")!.sessions).toEqual({ current: 20, prior: 0, delta: 20, delta_pct: null });
+    expect(by.get("other_ai")!.sessions).toEqual({ current: 0, prior: 50, delta: -50, delta_pct: -1 });
+    expect(by.get("gemini")!.sessions).toEqual({ current: 0, prior: 0, delta: 0, delta_pct: null });
+  }, 120_000);
+
+  it("STORY-116 F2 - the unattributed class is displayed beside the AI figures and never added into them", async () => {
+    const a = await owner();
+    await seed(a, "/p");
+    await daily(a, "2026-10-20", "chatgpt", 30, 3);
+    await daily(a, "2026-10-20", "unattributed_direct", 500, 25);
+    await daily(a, "2026-10-01", "unattributed_direct", 400, 10);
+    const totals = data<Report>(await get(a)).totals!;
+    expect(totals.ai_sessions.current).toBe(30);
+    expect(totals.conversions.current).toBe(3);
+    expect(totals.unattributed.sessions).toEqual({ current: 500, prior: 400, delta: 100, delta_pct: 0.25 });
+    expect(totals.unattributed.conversions).toEqual({ current: 25, prior: 10, delta: 15, delta_pct: 1.5 });
+    expect(totals.by_engine.map((e) => e.referrer_class)).not.toContain("unattributed_direct");
+    expect(data<Report>(await get(a)).measured_floor_note).toBe(MEASURED_FLOOR_COPY);
+  }, 120_000);
+
+  it("STORY-116 F1 - null stays null: no computed window means no totals, zero sessions means no rate, a zero prior means no percentage", async () => {
+    const a = await owner();
+    await daily(a, "2026-10-20", "chatgpt", 10, 1);
+    expect(data<Report>(await get(a)).totals).toBeNull();
+    await seed(a, "/p");
+    const none = await owner();
+    await seed(none, "/p");
+    const empty = data<Report>(await get(none)).totals!;
+    expect(empty.ai_sessions).toEqual({ current: 0, prior: 0, delta: 0, delta_pct: null });
+    expect(empty.conversion_rate).toBeNull();
+    expect(empty.conversion_rate_prior).toBeNull();
+    expect(empty.unattributed.sessions).toEqual({ current: 0, prior: 0, delta: 0, delta_pct: null });
+    const sessionsButNoConversions = await owner();
+    await seed(sessionsButNoConversions, "/p");
+    await daily(sessionsButNoConversions, "2026-10-20", "claude", 8, 0);
+    expect(data<Report>(await get(sessionsButNoConversions)).totals!.conversion_rate).toBe(0);
+  }, 120_000);
+
+  it("STORY-116 F1 - totals cover the project's whole window, not the pattern filter, and never another project, workspace or window", async () => {
+    const a = await owner();
+    await seed(a, "/p", { pattern: "ai_only" });
+    await daily(a, "2026-10-20", "chatgpt", 10);
+    await daily(a, "2026-11-14", "chatgpt", 999);
+    await daily(a, "2026-09-14", "chatgpt", 999);
+    const other = await owner();
+    await seed(other, "/p");
+    await daily(other, "2026-10-20", "chatgpt", 777);
+    const sibling = await project(a.workspaceId);
+    await daily(a, "2026-10-20", "chatgpt", 555, 0, "/p", sibling);
+    expect(data<Report>(await get(a, "?pattern=invisible_both")).totals!.ai_sessions).toEqual({ current: 10, prior: 0, delta: 10, delta_pct: null });
+    expect(data<Report>(await get(a, "?timeframe=7d")).totals).toBeNull();
   }, 120_000);
 });
