@@ -53,7 +53,15 @@ const SELECT_CONFIG = `
 
 function snippetFor(token: string): string {
   const base = loadEnv().OAUTH_REDIRECT_BASE_URL.replace(/\/+$/, "");
-  return `<script>fetch("${base}/v1/ingest/attribution",{method:"POST",keepalive:true,headers:{"content-type":"application/json"},body:JSON.stringify({site_token:"${token}",landing_url:location.href,referrer:document.referrer})})</script>`;
+  // The tab keeps ONLY the AI source class the server answered for the landing, in sessionStorage (gone when the tab closes; no cookie, no
+  // visitor id), and sends it with later events so a conversion on a later page still counts for the AI source (decision 86).
+  const code =
+    `(function(){var u="${base}/v1/ingest/attribution",t="${token}",k="nominara_src";` +
+    `function p(b){b.site_token=t;b.landing_url=location.href;b.referrer=document.referrer;try{var c=sessionStorage.getItem(k);if(c)b.source_class=c}catch(e){}` +
+    `return fetch(u,{method:"POST",keepalive:true,headers:{"content-type":"application/json"},body:JSON.stringify(b)})}` +
+    `p({}).then(function(r){return r.json()}).then(function(j){var c=j&&j.data&&j.data.source_class;if(c)try{sessionStorage.setItem(k,c)}catch(e){}}).catch(function(){});` +
+    `window.nominaraConversion=function(n,v){p({conversion:{name:n,value:v}})}})()`;
+  return `<script>${code}</script>`;
 }
 
 function present(row: ConfigRow): AttributionConfig {

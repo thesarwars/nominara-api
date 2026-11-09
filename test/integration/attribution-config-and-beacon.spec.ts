@@ -223,6 +223,92 @@ describe("STORY-113 - attribution configuration and beacon", () => {
     expect(rows[0]).toMatchObject({ sessions: 1, conversions: 1, conversion_value: "19.50" });
   }, 120_000);
 
+  // ---- decision 86: the tab's AI source class, carried to a later conversion ----
+  const THANKS = "https://shop.example.com/signup/thanks";
+  const sameSite = (token: string, over: Record<string, unknown> = {}) => event(token, { landing_url: THANKS, referrer: "https://shop.example.com/pricing", ...over });
+
+  it("STORY-113 S3b - a listed conversion whose referrer is same-site counts for the class the tab carried: a conversion, never a session", async () => {
+    const { actor, token } = await connected();
+    const res = await beacon(sameSite(token, { source_class: "chatgpt", conversion: { name: "signup", value: 10 } }));
+    expect(data<{ recorded: boolean; conversion_counted: boolean }>(res)).toMatchObject({ recorded: true, conversion_counted: true });
+    const rows = await dailyRows(actor.projectId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ referrer_class: "chatgpt", sessions: 0, conversions: 1, conversion_value: "10.00" });
+  }, 120_000);
+
+  it("STORY-113 S3c - an empty referrer (a stripped one) also takes the carried class for a listed conversion", async () => {
+    const { actor, token } = await connected();
+    const res = await beacon(sameSite(token, { referrer: "", source_class: "gemini", conversion: { name: "signup" } }));
+    expect(data<{ conversion_counted: boolean }>(res).conversion_counted).toBe(true);
+    expect((await dailyRows(actor.projectId))[0]).toMatchObject({ referrer_class: "gemini", sessions: 0, conversions: 1 });
+  }, 120_000);
+
+  it("STORY-113 S3d - a claimed class never turns a pageview into an AI session", async () => {
+    const { actor, token } = await connected();
+    const same = await beacon(sameSite(token, { source_class: "chatgpt" }));
+    expect(data<{ recorded: boolean }>(same).recorded).toBe(false);
+    const empty = await beacon(sameSite(token, { referrer: "", source_class: "chatgpt" }));
+    expect(empty.statusCode).toBe(202);
+    expect((await dailyRows(actor.projectId)).filter((r) => r.referrer_class === "chatgpt")).toHaveLength(0);
+  }, 120_000);
+
+  it("STORY-113 S3e - a claimed class does not override a real AI referrer, and an unlisted conversion or a foreign non-AI referrer takes nothing from it", async () => {
+    const { actor, token } = await connected();
+    await beacon(event(token, { referrer: "https://perplexity.ai/", source_class: "chatgpt", conversion: { name: "signup" } }));
+    const unlisted = await beacon(sameSite(token, { source_class: "chatgpt", conversion: { name: "other_goal" } }));
+    expect(data<{ conversion_counted: boolean }>(unlisted).conversion_counted).toBe(false);
+    const foreign = await beacon(sameSite(token, { referrer: "https://www.google.com/", source_class: "chatgpt", conversion: { name: "signup" } }));
+    expect(data<{ conversion_counted: boolean }>(foreign).conversion_counted).toBe(false);
+    const rows = await dailyRows(actor.projectId);
+    expect(rows.map((r) => r.referrer_class)).toEqual(["perplexity"]);
+    expect(rows[0]).toMatchObject({ sessions: 0, conversions: 1 });
+  }, 120_000);
+
+  it("STORY-113 S3f - the class is a closed enum: the unattributed floor, an unknown name and a non-string are a 400", async () => {
+    const { token } = await connected();
+    for (const bad of ["unattributed_direct", "evil", "", 5, null]) {
+      const res = await beacon(sameSite(token, { source_class: bad, conversion: { name: "signup" } }));
+      expect(res.statusCode, String(bad)).toBe(400);
+    }
+  }, 120_000);
+
+  it("STORY-113 S3g - an AI-referred landing answers its class for the snippet to keep; a direct visit answers none", async () => {
+    const { token } = await connected();
+    expect(data<{ source_class?: string }>(await beacon(event(token))).source_class).toBe("chatgpt");
+    expect(data<{ source_class?: string }>(await beacon(event(token, { referrer: "" , landing_url: "https://shop.example.com/guide" }))).source_class).toBeUndefined();
+  }, 120_000);
+
+  it("STORY-113 S3h - the snippet keeps the class in sessionStorage only: no cookie, no localStorage, no visitor id", async () => {
+    const { config } = await connected();
+    expect(config.snippet).toContain("sessionStorage");
+    expect(config.snippet).not.toMatch(/document\.cookie|localStorage|visitor/i);
+  }, 120_000);
+
+  it("STORY-113 S4c - captures EVERY write of a class-carrying conversion: only the two attribution tables, and nothing per-visitor in any parameter", async () => {
+    const { token } = await connected();
+    const statements: Array<{ text: string; values: unknown[] }> = [];
+    const original = Client.prototype.query as (...args: unknown[]) => unknown;
+    vi.spyOn(Client.prototype, "query").mockImplementation(function (this: Client, ...args: unknown[]) {
+      const first = args[0];
+      const text = typeof first === "string" ? first : ((first as { text?: string })?.text ?? "");
+      const values = (typeof first === "string" ? args[1] : (first as { values?: unknown[] })?.values) as unknown[] | undefined;
+      statements.push({ text, values: Array.isArray(values) ? values : [] });
+      return original.apply(this, args);
+    } as never);
+    const res = await beacon(sameSite(token, { source_class: "claude", conversion: { name: "signup" } }), { cookie: "sid=SESSION-COOKIE-VALUE", "x-forwarded-for": "203.0.113.77" });
+    expect(res.statusCode, res.body).toBe(202);
+    const writes = statements.filter((st) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(st.text));
+    expect(writes.length).toBeGreaterThan(0);
+    for (const write of writes) {
+      expect(write.text, write.text).toMatch(/\b(attribution_daily|attribution_configs)\b/);
+      for (const value of write.values) {
+        const flat = Buffer.isBuffer(value) ? "" : String(value);
+        for (const forbidden of ["203.0.113.77", "127.0.0.1", "TestAgent", "SESSION-COOKIE-VALUE", token, "/pricing"]) expect(flat).not.toContain(forbidden);
+      }
+    }
+    expect(res.headers["set-cookie"]).toBeUndefined();
+  }, 120_000);
+
   it("STORY-113 S4 - captures EVERY write during ingest: only the two attribution tables, and no address, agent, cookie or token in any parameter", async () => {
     const { token } = await connected();
     const statements: Array<{ text: string; values: unknown[] }> = [];

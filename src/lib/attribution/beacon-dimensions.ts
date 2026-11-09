@@ -41,7 +41,7 @@ const siteHost = (host: string): string => host.toLowerCase().replace(/\.$/, "")
  * click, and it must be decided BEFORE the host is classified: a customer whose domain is itself a `.ai` one would otherwise count every
  * internal page view as an `other_ai` session. It is also decided before `utm_source`, which a site's own links can carry along.
  */
-function isSameSite(referrer: string, landingUrl: string): boolean {
+export function isSameSite(referrer: string, landingUrl: string): boolean {
   return URL.canParse(referrer) && URL.canParse(landingUrl) && siteHost(new URL(referrer).hostname) === siteHost(new URL(landingUrl).hostname);
 }
 

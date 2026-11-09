@@ -4,7 +4,7 @@ import type { Pool } from "pg";
 import type { IngestAttributionRequest, IngestAttributionResponse } from "../../../contracts/attribution/index.js";
 import { NotFoundError, RateLimitedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { classifyReferrer, countryFromHeader, deviceFromUserAgent, InvalidLandingUrlError, normalizeLanding, withoutQueryAndFragment } from "../../lib/attribution/beacon-dimensions.js";
+import { classifyReferrer, countryFromHeader, deviceFromUserAgent, InvalidLandingUrlError, isSameSite, normalizeLanding, withoutQueryAndFragment } from "../../lib/attribution/beacon-dimensions.js";
 import { hashSiteToken, workspaceOfSiteToken } from "../../lib/attribution/site-token.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
@@ -117,12 +117,18 @@ export class AttributionIngestService {
 
     await this.limit(workspaceId, config.id);
 
-    const referrerClass = classifyReferrer(body.referrer, body.landing_url);
+    const classified = classifyReferrer(body.referrer, body.landing_url);
     // A conversion event is NOT a session: the landing beacon already counted the visit, so a conversion adds its count and value and
     // nothing else (otherwise one visitor who converts is two sessions and the conversion rate is understated). A conversion the
     // configuration does not list stores nothing at all.
     const isConversionEvent = body.conversion !== undefined;
     const counted = body.conversion !== undefined && config.conversion_events.includes(body.conversion.name);
+    // The class the tab carried (decision 86) is honoured for a LISTED CONVERSION only, and only where the referrer says nothing of its own:
+    // same-site (a later page of the visit) or empty. It never makes a pageview a session and never overrides a real AI referrer.
+    const referrerEmpty = (body.referrer?.trim() ?? "") === "";
+    const carried =
+      counted && body.source_class !== undefined && ((referrerEmpty && classified === "unattributed_direct") || (classified === "non_ai" && isSameSite(body.referrer?.trim() ?? "", body.landing_url)));
+    const referrerClass = carried ? body.source_class! : classified;
     const written = await this.record(workspaceId, config.id, tokenHash, {
       landing,
       referrerClass,
@@ -132,7 +138,13 @@ export class AttributionIngestService {
       device: deviceFromUserAgent(facts.userAgent),
     });
     if (!written) throw neutralRefusal();
-    return { accepted: true, recorded: referrerClass !== "non_ai", conversion_counted: counted && referrerClass !== "non_ai" };
+    const sourceClass = classified === "non_ai" || classified === "unattributed_direct" ? undefined : classified;
+    return {
+      accepted: true,
+      recorded: referrerClass !== "non_ai",
+      conversion_counted: counted && referrerClass !== "non_ai",
+      ...(sourceClass === undefined ? {} : { source_class: sourceClass }),
+    };
   }
 
   /** The configuration this token names: active, `script`-method, in a live workspace and a live project. Read-only. */
