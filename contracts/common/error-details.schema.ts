@@ -309,7 +309,20 @@ export const unsafeTargetDetailsSchema = z.object({ reason: z.string().min(1) })
 //   payment_failed        STORY-184: an upgrade's charge was declined or needs the customer present (3-D Secure);
 //                         Stripe applied nothing and nothing changed
 //   cancel_in_portal      STORY-184: the target is Free — a cancellation at period end, done in the billing portal
-export const PRECONDITION_UNMET_REASONS = ["price_not_agreed", "no_capturable_scope", "payment_failed", "cancel_in_portal"] as const;
+//   session_not_ready     STORY-192, POST /geo/alignment/{id}/patch: the alignment session is not `ready` (still pending, stale or failed),
+//                         so there is no final analysis to cut a patch from
+//   no_draft              STORY-192: the session has no saved draft; the patch is the customer's own draft, so there is nothing to cut
+//   draft_not_ready       STORY-192: the draft was saved after the last measurement or its vectors have not arrived; a patch is never
+//                         cut from text that was not measured
+export const PRECONDITION_UNMET_REASONS = [
+  "price_not_agreed",
+  "no_capturable_scope",
+  "payment_failed",
+  "cancel_in_portal",
+  "session_not_ready",
+  "no_draft",
+  "draft_not_ready",
+] as const;
 
 export const preconditionUnmetDetailsSchema = z
   .object({ reason: z.enum(PRECONDITION_UNMET_REASONS).optional() })
