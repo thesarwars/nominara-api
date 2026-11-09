@@ -210,27 +210,17 @@ describe("STORY-113 - attribution configuration and beacon", () => {
 
   // ---- ingest ----
 
-  it("STORY-113 S3 - resolves the configuration by token hash, checks the origin and upserts the daily counter", async () => {
+  it("STORY-113 S3 - a conversion is counted with its value and is never a second session; one the configuration does not list is not counted", async () => {
     const { actor, token } = await connected();
-    const first = await beacon(event(token));
-    expect(first.statusCode, first.body).toBe(202);
-    expect(data<{ accepted: boolean; recorded: boolean }>(first)).toMatchObject({ accepted: true, recorded: true });
-    await beacon(event(token));
-    const rows = await dailyRows(actor.projectId);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ referrer_class: "chatgpt", sessions: 2, conversions: 0, country: "DE", device: "desktop" });
-    expect((rows[0]!.landing_url_hash as Buffer).equals(sha256("https://shop.example.com/guide"))).toBe(true);
-  }, 120_000);
-
-  it("STORY-113 S3 - a conversion whose name the configuration lists is counted with its value; one it does not list is not", async () => {
-    const { actor, token } = await connected();
+    await beacon(event(token)); // the landing: one session
     const counted = await beacon(event(token, { conversion: { name: "signup", value: 19.5 } }));
     expect(data<{ conversion_counted: boolean }>(counted).conversion_counted).toBe(true);
     const unlisted = await beacon(event(token, { conversion: { name: "something_else", value: 5 } }));
     expect(unlisted.statusCode).toBe(202);
     expect(data<{ conversion_counted: boolean }>(unlisted).conversion_counted).toBe(false);
     const rows = await dailyRows(actor.projectId);
-    expect(rows[0]).toMatchObject({ sessions: 2, conversions: 1, conversion_value: "19.50" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ sessions: 1, conversions: 1, conversion_value: "19.50" });
   }, 120_000);
 
   it("STORY-113 S4 - captures EVERY write during ingest: only the two attribution tables, and no address, agent, cookie or token in any parameter", async () => {
@@ -261,6 +251,31 @@ describe("STORY-113 - attribution configuration and beacon", () => {
     }
     // And the response sets no cookie.
     expect(res.headers["set-cookie"]).toBeUndefined();
+  }, 120_000);
+
+  it("STORY-113 S4b - a direct visit to a URL carrying a secret or an address in its query stores neither: the query and fragment are dropped at ingest", async () => {
+    const { actor, token } = await connected();
+    const statements: Array<{ values: unknown[] }> = [];
+    const original = Client.prototype.query as (...args: unknown[]) => unknown;
+    vi.spyOn(Client.prototype, "query").mockImplementation(function (this: Client, ...args: unknown[]) {
+      const first = args[0];
+      const values = (typeof first === "string" ? args[1] : (first as { values?: unknown[] })?.values) as unknown[] | undefined;
+      statements.push({ values: Array.isArray(values) ? values : [] });
+      return original.apply(this, args);
+    } as never);
+    const res = await beacon(event(token, { landing_url: "https://shop.example.com/reset?token=SECRET123&email=a@b.com#frag-secret", referrer: "" }));
+    expect(res.statusCode, res.body).toBe(202);
+    for (const statement of statements) {
+      for (const value of statement.values) {
+        const flat = Buffer.isBuffer(value) ? "" : String(value);
+        expect(flat).not.toContain("SECRET123");
+        expect(flat).not.toContain("a@b.com");
+        expect(flat).not.toContain("frag-secret");
+      }
+    }
+    vi.restoreAllMocks();
+    const row = (await dailyRows(actor.projectId))[0]!;
+    expect(row).toMatchObject({ landing_url: "https://shop.example.com/reset", referrer_class: "unattributed_direct" });
   }, 120_000);
 
   it("STORY-113 S5 - schema inspection: no column exists for a visitor, session, cookie, fingerprint, address or agent", async () => {
@@ -305,6 +320,15 @@ describe("STORY-113 - attribution configuration and beacon", () => {
     expect(noOrigin.statusCode).toBe(404);
     expect(await dailyRows(actor.projectId)).toHaveLength(0);
     expect((await beacon(event("nat_not-a-real-token"))).statusCode).toBe(404);
+  }, 120_000);
+
+  it("STORY-113 S9b - an origin typed in capitals is stored case-folded, so the beacon from that site is accepted rather than refused forever", async () => {
+    const a = await owner();
+    const created = await create(a, { method: "script", allowed_origins: ["https://Shop.Example.com"] });
+    expect(created.statusCode, created.body).toBe(201);
+    const token = data<Config>(created).site_token;
+    expect((await db().query("SELECT allowed_origins FROM attribution_configs WHERE project_id = $1", [a.projectId])).rows[0].allowed_origins).toEqual(["https://shop.example.com"]);
+    expect((await beacon(event(token))).statusCode).toBe(202);
   }, 120_000);
 
   it("STORY-113 - the preflight answers without a token and names only POST and content-type", async () => {

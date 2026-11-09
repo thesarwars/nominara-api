@@ -80,24 +80,34 @@ export async function rollUpWindow(tx: ClientBase, spec: WindowSpec, timezone: s
     [spec.projectId, spec.windowStart, endExclusive, priorStart],
   );
 
-  // "Connected" is a live, un-revoked connection. Without one the columns are null for every row: unknown, never zero.
-  const connected = await tx.query<{ connected: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM gsc_connections g WHERE g.workspace_id = app.current_workspace() AND g.project_id = $1 AND g.revoked_at IS NULL) AS connected`,
+  // WHAT SEARCH CONSOLE HAS MEASURED, NOT WHETHER IT IS CONNECTED. A live connection that has never synced, or whose watermark is before
+  // the window, has measured nothing: its figures are unknown (null), never a zero, because a zero reads as "no impressions" and lets
+  // `classifyUrl` call a page AI-only on no evidence. So a figure is known only when `last_sync_date` (the frontier: Google lags the
+  // calendar by days) reaches into the window, and it is counted only up to that frontier. Within it, a URL with no row is a real zero.
+  // `gsc_connections` has ONE watermark for two reports, so AI-surface impressions are additionally known only when the last sync was not
+  // recorded as unable to serve that report: the classic watermark never implies AI-surface coverage.
+  const coverage = await tx.query<{ synced_through: string | null; ai_surface_served: boolean }>(
+    `SELECT g.last_sync_date::text AS synced_through, (g.last_error IS DISTINCT FROM 'ai_surface_report_unavailable') AS ai_surface_served
+       FROM gsc_connections g
+      WHERE g.workspace_id = app.current_workspace() AND g.project_id = $1 AND g.revoked_at IS NULL
+      ORDER BY g.last_sync_date DESC NULLS LAST LIMIT 1`,
     [spec.projectId],
   );
+  const syncedThrough = coverage.rows[0]?.synced_through ?? null;
+  const windowHasCoverage = syncedThrough !== null && syncedThrough >= spec.windowStart;
   let impressions: Array<{ url: string; value: number }> | null = null;
   let clicks: Array<{ url: string; value: number }> | null = null;
-  if (connected.rows[0]?.connected === true) {
+  if (windowHasCoverage) {
     const search = await tx.query<{ report: string; url: string; impressions: number; clicks: number }>(
       `SELECT g.report, g.page_url AS url, sum(g.impressions)::int AS impressions, sum(g.clicks)::int AS clicks
          FROM gsc_daily g
         WHERE g.workspace_id = app.current_workspace() AND g.project_id = $1 AND g.dimension = 'page' AND g.page_url IS NOT NULL
-          AND g.metric_date >= $2::date AND g.metric_date < $3::date
+          AND g.metric_date >= $2::date AND g.metric_date < $3::date AND g.metric_date <= $4::date
         GROUP BY g.report, g.page_url`,
-      [spec.projectId, spec.windowStart, endExclusive],
+      [spec.projectId, spec.windowStart, endExclusive, syncedThrough],
     );
-    impressions = search.rows.filter((r) => r.report === "ai_surface").map((r) => ({ url: r.url, value: r.impressions }));
     clicks = search.rows.filter((r) => r.report === "classic").map((r) => ({ url: r.url, value: r.clicks }));
+    if (coverage.rows[0]?.ai_surface_served === true) impressions = search.rows.filter((r) => r.report === "ai_surface").map((r) => ({ url: r.url, value: r.impressions }));
   }
 
   const rows = joinWindow({

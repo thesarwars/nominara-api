@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyReferrer, countryFromHeader, deviceFromUserAgent, InvalidLandingUrlError, normalizeLanding, UNKNOWN_COUNTRY } from "./beacon-dimensions.js";
+import { classifyReferrer, countryFromHeader, deviceFromUserAgent, InvalidLandingUrlError, normalizeLanding, withoutQueryAndFragment, UNKNOWN_COUNTRY } from "./beacon-dimensions.js";
 
 const LANDING = "https://shop.example.com/guide";
 
@@ -40,6 +40,28 @@ describe("STORY-113 - referrer classification (AC: documented classes, other_ai,
   it("the landing URL's utm_source names the engine when the referrer was stripped", () => {
     expect(classifyReferrer("", "https://shop.example.com/guide?utm_source=chatgpt.com")).toBe("chatgpt");
     expect(classifyReferrer("", "https://shop.example.com/guide?utm_source=newsletter")).toBe("unattributed_direct");
+  });
+});
+
+describe("STORY-113 - the site's own navigation is never an AI referral", () => {
+  it("a referrer on the landing page's own host is not an AI session, even when the customer's domain is a .ai one", () => {
+    expect(classifyReferrer("https://acme.ai/pricing", "https://acme.ai/guide")).toBe("non_ai");
+    expect(classifyReferrer("https://www.acme.ai/", "https://acme.ai/guide")).toBe("non_ai");
+    expect(classifyReferrer("https://ACME.ai/", "https://www.acme.ai/guide")).toBe("non_ai");
+    expect(classifyReferrer("https://app.acme.ai/", "https://acme.ai/guide")).toBe("other_ai"); // a different host is still classified
+    expect(classifyReferrer("https://some-new-engine.ai/chat", "https://acme.ai/guide")).toBe("other_ai");
+  });
+
+  it("a same-site referral does not fall through to a utm_source left on the URL", () => {
+    expect(classifyReferrer("https://shop.example.com/a", "https://shop.example.com/b?utm_source=chatgpt.com")).toBe("non_ai");
+  });
+});
+
+describe("STORY-113 - visitor-specific parts of a landing URL are never kept", () => {
+  it("drops the whole query and the fragment, keeping scheme, host, port and path", () => {
+    expect(withoutQueryAndFragment("https://shop.example.com/reset?token=SECRET&email=a@b.com#x")).toBe("https://shop.example.com/reset");
+    expect(withoutQueryAndFragment("https://shop.example.com:8443/a/b?x=1")).toBe("https://shop.example.com:8443/a/b");
+    expect(withoutQueryAndFragment("not a url")).toBe("not a url");
   });
 });
 

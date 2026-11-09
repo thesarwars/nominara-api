@@ -34,6 +34,17 @@ function classifyHost(rawHost: string): ReferrerClass | undefined {
   return undefined;
 }
 
+const siteHost = (host: string): string => host.toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
+
+/**
+ * The site's own navigation is never an AI referral. A referrer on the landing page's own host (ignoring case and `www.`) is an internal
+ * click, and it must be decided BEFORE the host is classified: a customer whose domain is itself a `.ai` one would otherwise count every
+ * internal page view as an `other_ai` session. It is also decided before `utm_source`, which a site's own links can carry along.
+ */
+function isSameSite(referrer: string, landingUrl: string): boolean {
+  return URL.canParse(referrer) && URL.canParse(landingUrl) && siteHost(new URL(referrer).hostname) === siteHost(new URL(landingUrl).hostname);
+}
+
 /**
  * Referrer host first; the landing URL's `utm_source` second (an engine that strips the referrer often still tags the link).
  * An empty or unparsable referrer is the unattributed class - stored and displayed, never dropped (NFR-ANL-09). A referrer that
@@ -41,6 +52,7 @@ function classifyHost(rawHost: string): ReferrerClass | undefined {
  */
 export function classifyReferrer(referrer: string | undefined, landingUrl: string): ClassifiedReferrer {
   const trimmed = referrer?.trim() ?? "";
+  if (trimmed !== "" && isSameSite(trimmed, landingUrl)) return "non_ai";
   if (trimmed !== "" && URL.canParse(trimmed)) {
     const fromReferrer = classifyHost(new URL(trimmed).hostname);
     if (fromReferrer !== undefined) return fromReferrer;
@@ -61,6 +73,20 @@ export class InvalidLandingUrlError extends Error {
     super("landing_url must be an absolute http or https URL");
     this.name = "InvalidLandingUrlError";
   }
+}
+
+/**
+ * The landing URL without its query and fragment. A query can carry anything a visitor was sent (a reset token, an address), the snippet
+ * posts `location.href` whole, and the product's privacy posture is that nothing visitor-specific is stored. Applied to the stored URL at
+ * ingest AND to every source's URL in the rollup's join (rollup-join.ts), so the join still meets on one key. A string that is not a URL is
+ * returned as it came, for `normalizeLanding` to refuse.
+ */
+export function withoutQueryAndFragment(raw: string): string {
+  if (!URL.canParse(raw)) return raw;
+  const url = new URL(raw);
+  url.search = "";
+  url.hash = "";
+  return url.toString();
 }
 
 /** The same normalisation and hash `citation_facts.url_hash` carries, so the two sides join exactly (STORY-114). */

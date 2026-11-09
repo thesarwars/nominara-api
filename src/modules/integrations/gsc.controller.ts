@@ -26,7 +26,7 @@ import { GSC_STATE_TTL_MS } from "./gsc-oauth-state.js";
 import { GscService } from "./gsc.service.js";
 
 // STORY-115 - `/integrations/gsc/*`. No logic here: each handler resolves the request and calls one service method.
-//   start     `workspace:update`, plan must include Search Console. Sets the browser-binding cookie the callback checks.
+//   start     `workspace:update` and a fresh step-up (api-specification.md marks the route), plan must include Search Console. Sets the browser-binding cookie the callback checks.
 //   callback  PUBLIC and tenant-less, because Google redirects the browser here (a GET; the specification's POST is a documentation
 //             error). The signed state names the workspace; the binding cookie proves the browser.
 //   get       `project:read`, narrowed to the caller's projects by the service's query.
@@ -49,7 +49,7 @@ export class GscController {
     @Res({ passthrough: true }) reply: FastifyReply,
     @Body(new ZodValidationPipe(gscOauthStartRequestSchema)) body: GscOauthStartRequest,
   ): Promise<GscOauthStartResponse> {
-    const result = await this.gsc.start(req.tenant!.workspaceId, req.tenant!.actorId, body);
+    const result = await this.gsc.start(req.tenant!.workspaceId, req.tenant!.actorId, req.session?.lastStrongAuthAt ?? null, body);
     setOauthBindingCookie(reply, result.bindingValue, GSC_STATE_TTL_MS / 1000);
     return result.body;
   }

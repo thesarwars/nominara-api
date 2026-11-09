@@ -108,3 +108,16 @@ describe("STORY-114 - determinism", () => {
     expect(a).toEqual(b);
   });
 });
+
+describe("STORY-114 - a query never splits or hides a page (the beacon keeps none)", () => {
+  it("a citation URL with a query meets the beacon's query-less landing URL on one row", () => {
+    const rows = joinWindow({
+      citations: [{ url: "https://shop.example.com/guide?id=5&ref=home", current: 2, prior: 0 }],
+      sessions: [{ url: "https://shop.example.com/guide", sessions: 40, sessionsPrior: 0, conversions: 0 }],
+      impressions: null,
+      clicks: null,
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ url: "https://shop.example.com/guide", citations: 2, aiSessions: 40 });
+  });
+});

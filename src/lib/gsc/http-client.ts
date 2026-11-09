@@ -45,10 +45,24 @@ function credentials(): { clientId: string; clientSecret: string } {
   return { clientId: env.GOOGLE_OAUTH_CLIENT_ID, clientSecret: env.GOOGLE_OAUTH_CLIENT_SECRET };
 }
 
-/** 401 / 403 on a token is a credential problem; 429 is quota; the rest is the source misbehaving. */
-function failureFor(status: number): Error {
+/** Google's own words for "a limit is spent" in a 403 body, across the classic (`errors[].reason`) and the newer (`status`, `details[].reason`) shapes. */
+const LIMIT_REASON = /rate.?limit|quota|limit.?exceeded|resource.?exhausted/i;
+
+/**
+ * 401 is a credential problem; 429 is quota; a 403 is read by its REASON, because Google answers both "this account no longer has access to
+ * the property" and "a usage limit is spent" with it. Lost access is a credential problem (the sync stops and the customer is told), a spent
+ * limit degrades and resumes. A 403 whose body cannot be read is treated as lost access, which is the safe side: it stops the sync and asks
+ * the customer to reconnect, rather than retrying a forbidden call forever. The rest is the source misbehaving.
+ */
+async function failureFor(response: Response): Promise<Error> {
+  const status = response.status;
   if (status === 401) return new GscUnauthorizedError();
   if (status === 429) return new GscQuotaError();
+  if (status === 403) {
+    const body = (await response.json().catch(() => ({}))) as { error?: { status?: unknown; errors?: Array<{ reason?: unknown }>; details?: Array<{ reason?: unknown }> } };
+    const reasons = [body.error?.status, ...(body.error?.errors ?? []).map((e) => e.reason), ...(body.error?.details ?? []).map((d) => d.reason)];
+    return reasons.some((reason) => typeof reason === "string" && LIMIT_REASON.test(reason)) ? new GscQuotaError() : new GscUnauthorizedError();
+  }
   return new GscSourceError(`http_${status}`);
 }
 
@@ -73,7 +87,7 @@ export class HttpGscClient implements GscClient {
       // `invalid_grant` is a revoked or expired grant. Any other 400 is a request we built wrong, not a customer problem.
       throw body.error === "invalid_grant" ? new GscUnauthorizedError() : new GscSourceError("token_request_rejected");
     }
-    if (!response.ok) throw failureFor(response.status);
+    if (!response.ok) throw await failureFor(response);
     return (await response.json()) as { access_token?: string; refresh_token?: string; expires_in?: number; scope?: string };
   }
 
@@ -96,7 +110,7 @@ export class HttpGscClient implements GscClient {
 
   async listProperties(accessToken: string): Promise<readonly GscPropertyListing[]> {
     const response = await this.doFetch(SITES_ENDPOINT, { headers: { authorization: `Bearer ${accessToken}` } });
-    if (!response.ok) throw failureFor(response.status);
+    if (!response.ok) throw await failureFor(response);
     const body = (await response.json()) as { siteEntry?: Array<{ siteUrl?: string; permissionLevel?: string }> };
     return (body.siteEntry ?? []).flatMap((entry) => (entry.siteUrl === undefined ? [] : [{ siteUrl: entry.siteUrl, permissionLevel: entry.permissionLevel ?? "" }]));
   }
@@ -117,7 +131,7 @@ export class HttpGscClient implements GscClient {
           dataState: "final",
         }),
       });
-      if (!response.ok) throw failureFor(response.status);
+      if (!response.ok) throw await failureFor(response);
       const body = (await response.json()) as { rows?: Array<{ keys: string[]; clicks: number; impressions: number; ctr: number; position: number }> };
       const page = body.rows ?? [];
       for (const row of page) {

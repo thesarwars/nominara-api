@@ -10,6 +10,7 @@ import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { createAttributionRollupHandler } from "../../src/lib/queue/handlers/attribution-rollup.handler.js";
 import { QUEUE_HANDLERS } from "../../src/lib/queue/handlers.js";
 import { URL_NORMALISATION_VERSION } from "../../src/lib/attribution/url-normalisation.js";
+import { gscJobKey, rollupJobKey, runAttributionSweep } from "../../src/lib/attribution/sweep.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
@@ -66,8 +67,12 @@ describe("STORY-114 - attribution rollup", () => {
       [workspaceId, projectId, date, url, opts.referrer ?? "chatgpt", count, opts.conversions ?? 0],
     );
   }
-  async function connectSearchConsole(): Promise<void> {
-    await db.query("INSERT INTO gsc_connections (workspace_id, project_id, property_url, property_type, credentials_enc, dek_id, scopes) VALUES ($1,$2,'sc-domain:shop.example.com','domain','x','k',ARRAY['readonly'])", [workspaceId, projectId]);
+  /** `syncedThrough` is the watermark (`last_sync_date`); `null` is a connection that has never synced. */
+  async function connectSearchConsole(syncedThrough: string | null = day(START, 30), lastError: string | null = null): Promise<void> {
+    await db.query(
+      "INSERT INTO gsc_connections (workspace_id, project_id, property_url, property_type, credentials_enc, dek_id, scopes, last_sync_date, last_error) VALUES ($1,$2,'sc-domain:shop.example.com','domain','x','k',ARRAY['readonly'],$3::date,$4)",
+      [workspaceId, projectId, syncedThrough, lastError],
+    );
   }
   async function search(report: "ai_surface" | "classic", url: string, date: string, figures: { impressions?: number; clicks?: number }): Promise<void> {
     await db.query(
@@ -188,7 +193,7 @@ describe("STORY-114 - attribution rollup", () => {
     expect(byUrl.get("https://shop.example.com/old")).toMatchObject({ pattern: "invisible_both", citations: 0, ai_sessions: 0, ai_sessions_prior: 5 });
   });
 
-  it("STORY-114 S16 - with Search Console unconnected the columns are null and no AI-only claim is made; connected-and-empty is a measured zero", async () => {
+  it("STORY-114 S16 - with Search Console unconnected the columns are null and no AI-only claim is made; a synced frontier with no row for the URL is a measured zero", async () => {
     await cite(PAGE, day(START, 1), 2);
     await sessions(PAGE, day(START, 1), 45);
     await run();
@@ -196,6 +201,37 @@ describe("STORY-114 - attribution rollup", () => {
     await connectSearchConsole();
     await run();
     expect((await rollup())[0]).toMatchObject({ gsc_ai_impressions: 0, organic_clicks: 0, pattern: "ai_only" });
+  });
+
+  it("STORY-114 S16b - a connected but NEVER-SYNCED project is unknown, not zero: null columns and no AI-only claim", async () => {
+    await cite(PAGE, day(START, 1), 2);
+    await sessions(PAGE, day(START, 1), 45);
+    await connectSearchConsole(null);
+    await run();
+    const row = (await rollup())[0]!;
+    expect(row).toMatchObject({ gsc_ai_impressions: null, organic_clicks: null });
+    expect(row.pattern).not.toBe("ai_only");
+  });
+
+  it("STORY-114 S16c - a window wholly past the Search Console frontier is unknown; a partly covered one counts only up to the frontier", async () => {
+    await cite(PAGE, day(START, 1), 2);
+    await sessions(PAGE, day(START, 1), 45);
+    await connectSearchConsole(day(START, -1));
+    await run();
+    expect((await rollup())[0]).toMatchObject({ gsc_ai_impressions: null, organic_clicks: null });
+    await db.query("UPDATE gsc_connections SET last_sync_date = $1::date WHERE project_id = $2", [day(START, 2), projectId]);
+    await search("classic", PAGE, day(START, 2), { clicks: 7 });
+    await search("classic", PAGE, day(START, 5), { clicks: 100 }); // after the frontier: never counted
+    await run();
+    expect((await rollup())[0]).toMatchObject({ organic_clicks: 7 });
+  });
+
+  it("STORY-114 S16d - classic coverage never implies AI-surface coverage: with the AI-surface report unavailable impressions stay null while clicks are measured", async () => {
+    await cite(PAGE, day(START, 1), 2);
+    await sessions(PAGE, day(START, 1), 45);
+    await connectSearchConsole(day(START, 30), "ai_surface_report_unavailable");
+    await run();
+    expect((await rollup())[0]).toMatchObject({ gsc_ai_impressions: null, organic_clicks: 0 });
   });
 
   it("STORY-114 S17 - every stored figure is a measured count; the prior window is never copied into the current one", async () => {
@@ -285,5 +321,70 @@ describe("STORY-114 - attribution rollup", () => {
     await cite(PAGE, day(START, 1), 1);
     await run();
     expect((await rollup())[0]).toMatchObject({ ai_sessions: 0 });
+  });
+
+  // ---- the producers: nothing else ever enqueues these two jobs ----
+  describe("the sweep that produces attribution.rollup and gsc.sync", () => {
+    type Sent = { queue: string; workspaceId: string; payload: Record<string, unknown>; key: string };
+    const NOON = new Date("2026-11-09T12:30:00Z");
+    const collect = (sent: Sent[]) => async (queue: string, workspaceId: string, payload: Record<string, unknown>, options: { idempotencyKey: string }) => void sent.push({ queue, workspaceId, payload, key: options.idempotencyKey });
+    async function beaconConfig(status: string): Promise<void> {
+      await db.query(
+        "INSERT INTO attribution_configs (workspace_id, project_id, method, site_token, site_token_hash, allowed_origins, status) VALUES ($1,$2,'script',$3,sha256(convert_to($3,'UTF8')),ARRAY['https://shop.example.com'],$4)",
+        [workspaceId, projectId, `nat_${randomUUID()}`, status],
+      );
+    }
+    const connectionId = async (): Promise<string> => (await db.query("SELECT id FROM gsc_connections WHERE project_id = $1", [projectId])).rows[0].id as string;
+
+    it("STORY-114 - a project with a receiving configuration is enqueued hourly under a signed-tenant key; a pending or disabled one is not", async () => {
+      const sent: Sent[] = [];
+      await beaconConfig("pending");
+      expect((await runAttributionSweep(db, collect(sent) as never, NOON)).rollupDue).toBe(0);
+      await db.query("UPDATE attribution_configs SET status = 'receiving'");
+      const result = await runAttributionSweep(db, collect(sent) as never, NOON);
+      expect(result).toMatchObject({ status: "complete", rollupDue: 1, enqueued: 1 });
+      expect(sent).toEqual([{ queue: "attribution.rollup", workspaceId, payload: { projectId }, key: rollupJobKey(projectId, NOON) }]);
+      expect(rollupJobKey(projectId, NOON)).not.toBe(rollupJobKey(projectId, new Date("2026-11-09T13:00:00Z")));
+      await db.query("UPDATE attribution_configs SET status = 'disabled'");
+      sent.length = 0;
+      expect((await runAttributionSweep(db, collect(sent) as never, NOON)).rollupDue).toBe(0);
+    });
+
+    it("STORY-115 - a live connection is enqueued daily from 04:00 UTC under the manual route's own key; not before, not twice, not once revoked", async () => {
+      await connectSearchConsole(null);
+      const sent: Sent[] = [];
+      expect((await runAttributionSweep(db, collect(sent) as never, new Date("2026-11-09T03:59:00Z"))).gscDue).toBe(0);
+      const id = await connectionId();
+      await runAttributionSweep(db, collect(sent) as never, NOON);
+      expect(sent).toEqual([{ queue: "gsc.sync", workspaceId, payload: { connectionId: id }, key: gscJobKey(id, NOON) }]);
+      expect(gscJobKey(id, NOON)).toBe(`gsc:${id}:2026-11-09`);
+      // Already committed since 04:00 today: not due. Committed yesterday: due again.
+      await db.query("UPDATE gsc_connections SET last_sync_at = $1::timestamptz", ["2026-11-09T04:10:00Z"]);
+      sent.length = 0;
+      expect((await runAttributionSweep(db, collect(sent) as never, NOON)).gscDue).toBe(0);
+      await db.query("UPDATE gsc_connections SET last_sync_at = $1::timestamptz", ["2026-11-08T04:10:00Z"]);
+      expect((await runAttributionSweep(db, collect(sent) as never, NOON)).gscDue).toBe(1);
+      for (const health of ["unauthorized", "revoked"]) {
+        await db.query("UPDATE gsc_connections SET health_status = $1", [health]);
+        expect((await runAttributionSweep(db, collect(sent) as never, NOON)).gscDue, health).toBe(0);
+      }
+      await db.query("UPDATE gsc_connections SET health_status = 'degraded'");
+      expect((await runAttributionSweep(db, collect(sent) as never, NOON)).gscDue).toBe(1);
+      await db.query("UPDATE gsc_connections SET revoked_at = now()");
+      expect((await runAttributionSweep(db, collect(sent) as never, NOON)).gscDue).toBe(0);
+    });
+
+    it("STORY-114 - one failed enqueue is counted and the pass is partial; the other job is still sent", async () => {
+      await beaconConfig("receiving");
+      await connectSearchConsole(null);
+      const sent: Sent[] = [];
+      const flaky = async (queue: string, workspaceId2: string, payload: Record<string, unknown>, options: { idempotencyKey: string }): Promise<void> => {
+        if (queue === "attribution.rollup") throw new Error("queue down");
+        await collect(sent)(queue, workspaceId2, payload, options);
+      };
+      const result = await runAttributionSweep(db, flaky as never, NOON);
+      expect(result).toMatchObject({ status: "partial", failed: 1, enqueued: 1 });
+      expect(sent.map((s) => s.queue)).toEqual(["gsc.sync"]);
+    });
   });
 });

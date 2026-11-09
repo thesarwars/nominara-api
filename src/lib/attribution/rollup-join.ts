@@ -1,8 +1,12 @@
 import type { AttributionPattern } from "../../../contracts/attribution/index.js";
+import { withoutQueryAndFragment } from "./beacon-dimensions.js";
 import { classifyUrl } from "./pattern-classifier.js";
 import { joinUrlKey } from "./url-normalisation.js";
 
 // STORY-114 J1-J5 - the join of one window's four sources, per URL, before it is written. Pure: no clock, no I/O, no model.
+//
+// THE QUERY IS NOT PART OF THE KEY. The beacon stores no query (a query can carry a visitor's token or address: beacon-dimensions.ts), so
+// each source's URL is cut to scheme, host and path before it is keyed, and a cited `/guide?id=5` meets the beacon's `/guide`.
 //
 // EVERY SOURCE IS KEYED BY `joinUrlKey` ON ITS URL STRING - the one shared normalisation - so a trailing slash, a host in capitals, a
 // default port or a tracking parameter on either side lands on the same row instead of splitting one page into several.
@@ -10,8 +14,8 @@ import { joinUrlKey } from "./url-normalisation.js";
 // NOTHING IS EXTRAPOLATED (NFR-ANL-09): every output count is a sum of measured integers, the prior window is carried beside the
 // current one and never substituted for it, and the only derived figure is the conversion rate.
 //
-// `impressions` and `clicks` are `null` when Search Console is not connected: the output columns are then `null`, not 0.
-// A CONNECTED source with no figure for a URL is a measured zero.
+// `impressions` and `clicks` are `null` when Search Console has not MEASURED the window (not connected, never synced, or not reaching the
+// window): the output columns are then `null`, not 0. A source that HAS measured it, with no figure for a URL, is a measured zero.
 
 export interface CitationSource {
   readonly url: string;
@@ -65,7 +69,7 @@ interface Acc {
 export function joinWindow(input: JoinInput): JoinedRow[] {
   const byKey = new Map<string, Acc>();
   const slot = (raw: string): Acc | undefined => {
-    const key = joinUrlKey(raw);
+    const key = joinUrlKey(withoutQueryAndFragment(raw));
     if (key === null) return undefined;
     const id = key.hash.toString("hex");
     let acc = byKey.get(id);

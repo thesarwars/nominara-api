@@ -39,9 +39,11 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // STOPS WHEN THE CREDENTIAL IS GONE. A connection that is `unauthorized` or `revoked` is skipped in `prepare` with no call to Google.
 // Its synced rows are never deleted.
 //
-// DEGRADES, DOES NOT FAIL. A spent quota, or a report the source cannot serve, is SETTLED in `recover`: health becomes `degraded` with a
-// reason code, the watermark does not move, and the job ends cleanly so nothing is dead-lettered and no project is affected. Any other
-// failure rides the queue's retry ladder.
+// DEGRADES, DOES NOT FAIL. A spent quota is SETTLED in `recover`: health becomes `degraded` with a reason code, the watermark does not
+// move, and the job ends cleanly so nothing is dead-lettered and no project is affected. A report the source cannot serve (today, the
+// AI-surface report) is NOT a reason to lose the others: the classic datasets are committed, the connection is `degraded` with the reason,
+// and the AI-surface rows stay absent. `gsc_connections` has one watermark, so that reason on the row is what tells the rollup the
+// watermark does NOT cover AI-surface impressions (attribution-rollup.ts). Any other failure rides the queue's retry ladder.
 //
 // NEVER LOGS a token, a property, a URL or a query: workspace and connection ids, counts and reason codes only.
 
@@ -51,6 +53,7 @@ const logger = new Logger("gsc.sync");
 const payloadSchema = z.object({ workspaceId: z.string().uuid(), kid: z.string(), connectionId: z.string().uuid() }).strict();
 
 const INSERT_CHUNK = 5_000;
+const AI_SURFACE_UNAVAILABLE = "ai_surface_report_unavailable";
 
 interface Prepared {
   readonly workspaceId: string;
@@ -64,7 +67,10 @@ interface Prepared {
 }
 
 interface Fetched {
-  readonly aiPages: readonly GscReportRow[];
+  /** `null` when the source cannot serve the AI-surface report: that dataset is then left exactly as it was, never emptied. */
+  readonly aiPages: readonly GscReportRow[] | null;
+  /** The reason code to record as the connection's degraded cause when the pull was only partly possible; `null` when everything was served. */
+  readonly degradedReason: string | null;
   readonly classicPages: readonly GscReportRow[];
   readonly classicQueries: readonly GscReportRow[];
   readonly refreshed: { readonly accessToken: string; readonly expiresInSeconds: number } | null;
@@ -153,11 +159,21 @@ export function createGscSyncHandler(context: QueueHandlerContext, deps: GscSync
             accessToken = refreshed.accessToken;
           }
           const base = { accessToken, property: prepared.property, startDate: prepared.plan.from, endDate: prepared.plan.to };
-          const aiPages = await google().fetchReport({ ...base, report: "ai_surface", dimension: "page" });
+          // THE AI-SURFACE REPORT MUST NOT TAKE THE CLASSIC DATA DOWN WITH IT. A source that cannot serve it (the adapter has no confirmed
+          // request for it yet) costs only that dataset: it is left absent, the connection is recorded as degraded with the reason, and the
+          // classic pulls below are still made and committed. Any other failure of this call still fails the slice as before.
+          let aiPages: readonly GscReportRow[] | null = null;
+          let degradedReason: string | null = null;
+          try {
+            aiPages = await google().fetchReport({ ...base, report: "ai_surface", dimension: "page" });
+          } catch (error) {
+            if (!(error instanceof GscSourceError && error.reason === AI_SURFACE_UNAVAILABLE)) throw error;
+            degradedReason = AI_SURFACE_UNAVAILABLE;
+          }
           const classicPages = await google().fetchReport({ ...base, report: "classic", dimension: "page" });
           const classicQueries = await google().fetchReport({ ...base, report: "classic", dimension: "query" });
           span.setAttribute("gsc.slice_days", 1 + (Date.parse(prepared.plan.to) - Date.parse(prepared.plan.from)) / 86_400_000);
-          return { aiPages, classicPages, classicQueries, refreshed };
+          return { aiPages, degradedReason, classicPages, classicQueries, refreshed };
         } catch (error) {
           span.setStatus({ code: SpanStatusCode.ERROR });
           throw error;
@@ -187,6 +203,8 @@ export function createGscSyncHandler(context: QueueHandlerContext, deps: GscSync
         ["classic", "page", fetched.classicPages],
         ["classic", "query", fetched.classicQueries],
       ] as const) {
+        // No AI-surface answer means no AI-surface write: neither the delete nor the insert runs, so earlier rows stay.
+        if (source === null) continue;
         const built = toDailyRows(dimension, source);
         dropped += built.dropped;
         // The slice is the contract: a row outside it is not stored, so the delete below and the insert always cover the same days.
@@ -222,19 +240,20 @@ export function createGscSyncHandler(context: QueueHandlerContext, deps: GscSync
       // The watermark never moves back, and never past the slice's own end, which sync-plan.ts holds at or before the frontier.
       await tx.query(
         `UPDATE gsc_connections
-            SET last_sync_date = GREATEST(coalesce(last_sync_date, $2::date), $2::date), last_sync_at = now(), health_status = 'healthy', last_error = NULL,
+            SET last_sync_date = GREATEST(coalesce(last_sync_date, $2::date), $2::date), last_sync_at = now(),
+                health_status = CASE WHEN $6::text IS NULL THEN 'healthy' ELSE 'degraded' END, last_error = $6::text,
                 backfill_completed = backfill_completed OR $3::boolean,
                 credentials_enc = coalesce($4, credentials_enc),
                 token_expires_at = CASE WHEN $5::int IS NULL THEN token_expires_at ELSE now() + make_interval(secs => $5::int) END
           WHERE id = $1 AND workspace_id = app.current_workspace()`,
-        [prepared.connectionId, to, !prepared.plan.more, sealedAccess, fetched.refreshed?.expiresInSeconds ?? null],
+        [prepared.connectionId, to, !prepared.plan.more, sealedAccess, fetched.refreshed?.expiresInSeconds ?? null, fetched.degradedReason],
       );
 
       if (prepared.plan.more) {
         afterCommit(() => {
           void enqueue("gsc.sync", prepared.workspaceId, { connectionId: prepared.connectionId }, { idempotencyKey: `gsc:${prepared.connectionId}:${to}` }).catch((error: unknown) => {
             incrementCounter("nominara_gsc_sync_enqueue_failed_total");
-            // The next daily run continues from the stored watermark, so a lost continuation delays the backfill and loses nothing.
+            // The daily sweep (src/lib/attribution/sweep.ts) re-enqueues from the stored watermark, so a lost continuation delays the backfill by up to a day and loses nothing.
             logger.warn({ event: "gsc.sync.continuation_not_enqueued", workspace_id: prepared.workspaceId, connection_id: prepared.connectionId, error: error instanceof Error ? error.name : "unknown" });
           });
         });
@@ -260,7 +279,6 @@ export function createGscSyncHandler(context: QueueHandlerContext, deps: GscSync
         return true;
       }
       if (error instanceof GscQuotaError) return degrade(tx, payload.workspaceId, payload.connectionId, "quota_exhausted");
-      if (error instanceof GscSourceError && error.reason === "ai_surface_report_unavailable") return degrade(tx, payload.workspaceId, payload.connectionId, error.reason);
       return false;
     },
   });

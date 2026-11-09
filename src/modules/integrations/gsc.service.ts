@@ -28,6 +28,7 @@ import { GSC_CLIENT, GscQuotaError, GscSourceError, GscUnauthorizedError, type G
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { assertStepUpFresh } from "../../tenancy/step-up.js";
 import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { GSC_STATE_TTL_MS, signGscState, verifyGscState } from "./gsc-oauth-state.js";
@@ -117,7 +118,9 @@ export class GscService {
   }
 
   // ---- start --------------------------------------------------------------------------------------------------------------------
-  async start(workspaceId: string, actorId: string, input: GscOauthStartRequest): Promise<{ readonly body: GscOauthStartResponse; readonly bindingValue: string }> {
+  async start(workspaceId: string, actorId: string, lastStrongAuthAt: Date | null, input: GscOauthStartRequest): Promise<{ readonly body: GscOauthStartResponse; readonly bindingValue: string }> {
+    // The specification marks this route as requiring step-up: attaching a Google property starts a pull of that property's data.
+    assertStepUpFresh(lastStrongAuthAt);
     const property = parseGscProperty(input.property_url);
     if (property === null) throw invalid("property_url must be a Search Console property: sc-domain:example.com or an https:// URL prefix", "property_url");
     const { client } = this.tx();
@@ -183,7 +186,9 @@ export class GscService {
           if (error instanceof GscUnauthorizedError) throw refused();
           throw new DegradedError({ message: "Google could not be reached to complete the connection" });
         }
-        if (!held.some((listed) => parseGscProperty(listed.siteUrl)?.normalised === property.normalised)) {
+        // `siteUnverifiedUser` is a listing the account does not actually hold: Google refuses its reports with a 403, so it would connect
+        // and then fail on the first pull. Refused here, with the other cases where the property is not really the customer's.
+        if (!held.some((listed) => parseGscProperty(listed.siteUrl)?.normalised === property.normalised && listed.permissionLevel !== "siteUnverifiedUser")) {
           outcome = "property_not_held";
           throw refused();
         }
@@ -279,7 +284,7 @@ export class GscService {
     }
   }
 
-  /** After COMMIT. A lost enqueue only delays the first sync: the daily cadence picks the connection up, so it is logged and counted, never thrown. */
+  /** After COMMIT. A lost enqueue only delays the first sync: the daily sweep (src/lib/attribution/sweep.ts) picks the connection up, so it is logged and counted, never thrown. */
   private enqueueSync(workspaceId: string, connectionId: string, day: string): void {
     afterCommit(() => {
       void this.queues.enqueueTenantJob("gsc.sync", workspaceId, { connectionId }, { idempotencyKey: `gsc:${connectionId}:${day}` }).catch((error: unknown) => {

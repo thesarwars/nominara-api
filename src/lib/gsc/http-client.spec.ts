@@ -26,6 +26,18 @@ describe("STORY-115 authorisation request", () => {
     await expect(new HttpGscClient(reply(401)).listProperties("t")).rejects.toBeInstanceOf(GscUnauthorizedError);
   });
 
+  it("S115-12f: a 403 is read by its reason: lost access is a credential problem, a spent limit is quota, never a retry-forever source error", async () => {
+    const forbidden = (reason: string, status = "PERMISSION_DENIED"): typeof fetch => reply(403, { error: { code: 403, status, errors: [{ reason }], details: [{ reason }] } });
+    await expect(new HttpGscClient(forbidden("forbidden")).fetchReport(request)).rejects.toBeInstanceOf(GscUnauthorizedError);
+    await expect(new HttpGscClient(forbidden("insufficientPermissions")).fetchReport(request)).rejects.toBeInstanceOf(GscUnauthorizedError);
+    await expect(new HttpGscClient(reply(403, "not json")).fetchReport(request)).rejects.toBeInstanceOf(GscUnauthorizedError);
+    await expect(new HttpGscClient(forbidden("rateLimitExceeded")).fetchReport(request)).rejects.toBeInstanceOf(GscQuotaError);
+    await expect(new HttpGscClient(forbidden("userRateLimitExceeded")).fetchReport(request)).rejects.toBeInstanceOf(GscQuotaError);
+    await expect(new HttpGscClient(forbidden("dailyLimitExceeded")).fetchReport(request)).rejects.toBeInstanceOf(GscQuotaError);
+    await expect(new HttpGscClient(forbidden("RATE_LIMIT_EXCEEDED", "RESOURCE_EXHAUSTED")).fetchReport(request)).rejects.toBeInstanceOf(GscQuotaError);
+    await expect(new HttpGscClient(forbidden("forbidden")).listProperties("t")).rejects.toBeInstanceOf(GscUnauthorizedError);
+  });
+
   it("S115-12d: the AI-surface report is not guessed at: it raises its own reason, and asks Google nothing", async () => {
     const asked = vi.fn();
     const client = new HttpGscClient((async () => (asked(), new Response("{}"))) as unknown as typeof fetch);

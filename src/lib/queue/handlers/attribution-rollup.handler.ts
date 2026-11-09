@@ -24,8 +24,8 @@ import type { JobProcessor } from "../worker-factory.js";
 // `rebuild: true` is the REBUILD PATH a normalisation change requires (url-normalisation.ts): it first deletes every rollup row of the
 // project, whatever key it was built under, then recomputes from the sources, re-keying each URL string with the current normalisation.
 //
-// No network call (KAD-06): Postgres only. The producer (the hourly sweep over projects with a receiving configuration) is not part
-// of this story; a job is sent by whatever enqueues `attribution.rollup`.
+// No network call (KAD-06): Postgres only. The producer is the hourly sweep over projects with a receiving configuration
+// (src/lib/attribution/sweep.ts), run by the worker's report group.
 
 const tracer = trace.getTracer("nominara-api");
 

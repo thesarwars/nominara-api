@@ -150,7 +150,7 @@ describe("STORY-115 - Search Console", () => {
     );
     return id;
   }
-  async function owner(plan: "growth" | "starter" = "growth"): Promise<Actor> {
+  async function owner(plan: "growth" | "starter" = "growth", stepUp = true): Promise<Actor> {
     const userId = await newUser();
     const tokens = await sessions.createSession(userId);
     const created = await harness.app().inject({
@@ -168,6 +168,7 @@ describe("STORY-115 - Search Console", () => {
       client.release();
     }
     const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, 2);
+    if (stepUp) await sessions.recordStrongAuth(tokens.sid, "webauthn");
     return { workspaceId, userId, projectId: await project(workspaceId), cookie: cookieOf(entered), csrf: entered.csrfToken };
   }
   async function viewer(workspaceId: string): Promise<Actor> {
@@ -308,6 +309,26 @@ describe("STORY-115 - Search Console", () => {
       expect((await callback(state, binding)).statusCode).toBe(200);
       // A second use of the same grant meets the one-active-connection rule.
       expect((await callback(state, binding)).statusCode).toBe(409);
+    });
+
+    it("S115-5g - starting needs a fresh step-up: a stale session is 401 step_up_required and nothing is signed", async () => {
+      const a = await owner("growth", false);
+      const res = await start(a, { project_id: a.projectId, property_url: "sc-domain:shop.example.com" });
+      expect(res.statusCode, res.body).toBe(401);
+      expect((res.json() as { error: { code: string } }).error.code).toBe("step_up_required");
+      expect(res.cookies.find((c) => c.name === OAUTH_BINDING_COOKIE_NAME)).toBeUndefined();
+    });
+
+    it("S115-2c - a listing the account holds only as an unverified user is refused at the callback and nothing is stored", async () => {
+      const a = await owner();
+      google.properties = [{ siteUrl: "sc-domain:shop.example.com", permissionLevel: "siteUnverifiedUser" }];
+      const started = await start(a, { project_id: a.projectId, property_url: "sc-domain:shop.example.com" });
+      expect(started.statusCode, started.body).toBe(200);
+      const url = new URL(data<{ authorization_url: string }>(started).authorization_url);
+      const binding = started.cookies.find((c) => c.name === OAUTH_BINDING_COOKIE_NAME)?.value;
+      const done = await callback(url.searchParams.get("state")!, binding);
+      expect(done.statusCode).toBeGreaterThanOrEqual(400);
+      expect(await gscRows(a)).toHaveLength(0);
     });
 
     it("S115-5c - a viewer cannot start, read the sync or disconnect: 403 naming the permission", async () => {
@@ -507,13 +528,16 @@ describe("STORY-115 - Search Console", () => {
       expect(await gscRows(a)).toMatchObject([{ health_status: "healthy", last_error: null }]);
     });
 
-    it("S115-12b - a report the source cannot serve degrades with its own reason rather than failing the project", async () => {
+    it("S115-12b - a report the source cannot serve degrades with its own reason, and the classic data it CAN serve is still stored", async () => {
       const a = await owner();
       const c = await connect(a);
       google.onReport = (request) => (request.report === "ai_surface" ? new GscSourceError("ai_surface_report_unavailable") : defaultRows(request));
       await expect(runSync(a, c.id)).resolves.toBeUndefined();
       expect(await gscRows(a)).toMatchObject([{ health_status: "degraded", last_error: "ai_surface_report_unavailable" }]);
-      expect(await dailyCount(a)).toBe(0);
+      expect((await gscRows(a))[0]!.last_sync_date).not.toBeNull();
+      expect(await dailyCount(a)).toBeGreaterThan(0);
+      const byReport = (await db().query("SELECT report, count(*)::int AS n FROM gsc_daily WHERE project_id = $1 GROUP BY report", [a.projectId])).rows as Array<{ report: string; n: number }>;
+      expect(byReport.map((r) => r.report)).toEqual(["classic"]);
     });
 
     it("S115-6d - a revoked credential sets health, notifies, stops syncing, and keeps the historical data", async () => {

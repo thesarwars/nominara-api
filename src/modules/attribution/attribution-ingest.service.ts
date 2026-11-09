@@ -4,7 +4,7 @@ import type { Pool } from "pg";
 import type { IngestAttributionRequest, IngestAttributionResponse } from "../../../contracts/attribution/index.js";
 import { NotFoundError, RateLimitedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
-import { classifyReferrer, countryFromHeader, deviceFromUserAgent, InvalidLandingUrlError, normalizeLanding } from "../../lib/attribution/beacon-dimensions.js";
+import { classifyReferrer, countryFromHeader, deviceFromUserAgent, InvalidLandingUrlError, normalizeLanding, withoutQueryAndFragment } from "../../lib/attribution/beacon-dimensions.js";
 import { hashSiteToken, workspaceOfSiteToken } from "../../lib/attribution/site-token.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
@@ -97,7 +97,9 @@ export class AttributionIngestService {
     // Reject what is wrong with the PAYLOAD before any write, so a refusal leaves nothing behind.
     let landing: { url: string; hash: Buffer };
     try {
-      landing = normalizeLanding(body.landing_url);
+      // The query and fragment are cut BEFORE anything is hashed or stored: the snippet posts `location.href`, and a query can carry a
+      // visitor's token or address. (The raw URL is still read, below, for its `utm_source` - read, never kept.)
+      landing = normalizeLanding(withoutQueryAndFragment(body.landing_url));
     } catch (error) {
       if (error instanceof InvalidLandingUrlError) throw new ValidationFailedError({ message: error.message, details: { issues: [{ path: ["landing_url"], message: error.message }] } });
       throw error;
@@ -116,10 +118,15 @@ export class AttributionIngestService {
     await this.limit(workspaceId, config.id);
 
     const referrerClass = classifyReferrer(body.referrer, body.landing_url);
+    // A conversion event is NOT a session: the landing beacon already counted the visit, so a conversion adds its count and value and
+    // nothing else (otherwise one visitor who converts is two sessions and the conversion rate is understated). A conversion the
+    // configuration does not list stores nothing at all.
+    const isConversionEvent = body.conversion !== undefined;
     const counted = body.conversion !== undefined && config.conversion_events.includes(body.conversion.name);
     const written = await this.record(workspaceId, config.id, tokenHash, {
       landing,
       referrerClass,
+      isConversionEvent,
       conversion: counted ? body.conversion : undefined,
       country: countryFromHeader(facts.countryHeader),
       device: deviceFromUserAgent(facts.userAgent),
@@ -167,25 +174,25 @@ export class AttributionIngestService {
     workspaceId: string,
     configId: string,
     tokenHash: Buffer,
-    event: { landing: { url: string; hash: Buffer }; referrerClass: string; conversion: { name: string; value?: number | undefined } | undefined; country: string; device: string },
+    event: { landing: { url: string; hash: Buffer }; referrerClass: string; isConversionEvent: boolean; conversion: { name: string; value?: number | undefined } | undefined; country: string; device: string },
   ): Promise<boolean> {
     const client = await this.pool.connect();
     try {
       return await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
-        if (event.referrerClass !== "non_ai") {
+        if (event.referrerClass !== "non_ai" && (!event.isConversionEvent || event.conversion !== undefined)) {
           const upsert = await tx.query(
             `INSERT INTO attribution_daily (workspace_id, project_id, metric_date, landing_url_hash, landing_url, referrer_class,
                                             sessions, conversions, conversion_value, country, device)
-             SELECT c.workspace_id, c.project_id, (now() AT TIME ZONE 'UTC')::date, $3, $4, $5, 1, $6, $7, $8, $9
+             SELECT c.workspace_id, c.project_id, (now() AT TIME ZONE 'UTC')::date, $3, $4, $5, $11::int, $6, $7, $8, $9
                FROM attribution_configs c
                JOIN projects p ON p.id = c.project_id AND p.workspace_id = c.workspace_id AND p.deleted_at IS NULL
               WHERE c.id = $1 AND c.workspace_id = $2 AND c.site_token_hash = $10 AND c.status <> 'disabled'
              ON CONFLICT (project_id, metric_date, landing_url_hash, referrer_class, country, device)
-             DO UPDATE SET sessions = attribution_daily.sessions + 1,
+             DO UPDATE SET sessions = attribution_daily.sessions + EXCLUDED.sessions,
                            conversions = attribution_daily.conversions + EXCLUDED.conversions,
                            conversion_value = attribution_daily.conversion_value + EXCLUDED.conversion_value,
                            ingested_at = now()`,
-            [configId, workspaceId, event.landing.hash, event.landing.url, event.referrerClass, event.conversion === undefined ? 0 : 1, (event.conversion?.value ?? 0).toFixed(2), event.country, event.device, tokenHash],
+            [configId, workspaceId, event.landing.hash, event.landing.url, event.referrerClass, event.conversion === undefined ? 0 : 1, (event.conversion?.value ?? 0).toFixed(2), event.country, event.device, tokenHash, event.isConversionEvent ? 0 : 1],
           );
           if (upsert.rowCount === 0) return false;
         }
