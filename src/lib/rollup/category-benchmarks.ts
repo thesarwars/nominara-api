@@ -1,115 +1,143 @@
-import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
-import type { ClientBase } from "pg";
-import { projectBenchmarkResponseSchema, topSourceDomainsSchema, type ProjectBenchmarkResponse } from "../../../contracts/projects/index.js";
+import type { ClientBase, Pool, PoolClient } from "pg";
+import { WORKSPACE_COUNT_BAND, projectBenchmarkResponseSchema, topSourceDomainsSchema, type ProjectBenchmarkResponse } from "../../../contracts/projects/index.js";
+import { SCORING_VERSION } from "../scoring/index.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
 // STORY-176 — category-relative benchmarks.
 //
-// WRITE. `refreshCategoryBenchmarks` asks `app.refresh_platform_metrics` (migration 0190, ADR-0005) to recompute `platform_metrics` for a project's
-// category. The aggregate crosses the tenant boundary, so it is NOT computed here: a job inside one workspace's context sees one workspace. The
-// function is the one place that reads other workspaces' rows (named columns only) and it returns two counts. What this file adds is WHICH
-// categories and days to recompute, so that a category override moves a project out of the old slug and into the new one (AC4).
+// WRITE. A NIGHTLY job (`rollup.category_benchmark`) asks `app.apply_benchmark_membership` to move projects whose category changed into it (at most once per
+// 7 days each), then asks `app.refresh_platform_metrics` (migration 0190, ADR-0005) to recompute `platform_metrics` for each category over the last
+// `BENCHMARK_WINDOW_DAYS` days. The aggregate crosses the tenant boundary, so it is NOT computed inside any workspace's rollup: a job inside one workspace's
+// context sees one workspace, and a category-wide recompute inside a tenant's transaction would hold its lock until that tenant committed (decision 93).
+// A category override therefore moves nothing at once; the batch applies it. See the migration header for the differencing hazard this closes.
 //
 // READ. `readProjectBenchmark` answers the benchmark of the project's category from `platform_metrics`, a global table with no workspace column. A
-// category with fewer than 20 contributing workspaces has no row, and that is answered as NULL, never as zeros (decision 91, AC2).
+// category with fewer than 20 contributing workspaces has no row, a row older than the batch window is not served, and both answer NULL, never zeros (decision 91, AC2).
 
 /** NFR-SEC-05 / decision 88(d): distinct contributing workspaces. The SQL function holds the same number as `c_min_workspaces`; the integration spec pins both at the boundary. */
 export const MIN_BENCHMARK_WORKSPACES = 20;
 
-/** The function refuses a wider range; a longer history is recomputed in windows of this many days. */
-const FUNCTION_MAX_DAYS = 400;
+/** Decision 93: published figures are whole numbers and the count is a band. The SQL rounds; the contract's `z.number().int()` refuses anything else on the wire. */
+export const BENCHMARK_WORKSPACE_BAND = WORKSPACE_COUNT_BAND;
 
-const logger = new Logger("category-benchmarks");
+/**
+ * The nightly batch recomputes the last this-many UTC days (ending today), and the read path serves nothing older. One number for both, so a figure that
+ * the batch no longer maintains is never shown: a category that has fallen below 20 stops answering within a window, instead of keeping old figures.
+ * A project's category change waits for the batch and then for a 7-day cooldown (`app.apply_benchmark_membership` holds that constant).
+ */
+export const BENCHMARK_WINDOW_DAYS = 7;
 
-export interface CategoryBenchmarkRefreshInput {
-  readonly workspaceId: string;
-  readonly projectId: string;
-  /** The workspace-local days the rollup just recomputed. */
-  readonly dates: readonly string[];
-  /** The job's reason (a label for the metric). */
-  readonly reason: string | undefined;
-  /** The slug the project held before a category override. The recompute removes the project from it. */
-  readonly previousCategorySlug?: string | undefined;
-}
-
-export interface CategoryBenchmarkRefreshResult {
-  readonly categories: number;
-  readonly written: number;
-  readonly removed: number;
-}
+/** Bounds on one category's recompute: it takes a lock per category, and a tenant's request never waits behind it (it is its own job). */
+export const BENCHMARK_LOCK_TIMEOUT_MS = 5_000;
+export const BENCHMARK_STATEMENT_TIMEOUT_MS = 120_000;
 
 // A date-only ISO string parses as UTC midnight, so adding whole days is exact (no DST: this is UTC arithmetic).
 const addDays = (iso: string, days: number): string => new Date(Date.parse(iso) + days * 86_400_000).toISOString().slice(0, 10);
 
+/** The days the nightly batch recomputes and the read path serves: the last `BENCHMARK_WINDOW_DAYS` UTC days ending on `now`'s. */
+export function benchmarkWindow(now: Date): { from: string; to: string } {
+  const to = now.toISOString().slice(0, 10);
+  return { from: addDays(to, -(BENCHMARK_WINDOW_DAYS - 1)), to };
+}
+
+export interface CategoryRefreshOptions {
+  readonly now: Date;
+  readonly scoringVersion?: string;
+  readonly lockTimeoutMs?: number;
+  readonly statementTimeoutMs?: number;
+}
+
+export interface CategoryRefreshResult {
+  readonly written: number;
+  readonly removed: number;
+}
+
 /**
- * Recomputes the aggregate for the project's CURRENT category and, after an override, its previous one. A project with no category (and no
- * previous one) rolls up as before and contributes to nothing: `categories: 0`.
- *
- * After an override the whole span of the project's metric history is recomputed, because every day it ever contributed to the old slug must lose it.
- * Idempotent: the function recomputes from current data, so a redelivered job lands the same state.
- *
- * Runs in the job's tenant transaction. Its own queries carry `workspace_id = app.current_workspace()`; the cross-tenant read is the function's.
+ * The nightly membership step: every project's benchmark category moves to the category it holds now, at most once per 7 days. One short transaction of
+ * its own, on a pool connection, with transaction-local timeouts. Returns the number of projects moved (a count, never which).
  */
-export async function refreshCategoryBenchmarks(tx: ClientBase, input: CategoryBenchmarkRefreshInput): Promise<CategoryBenchmarkRefreshResult> {
-  return trace.getTracer("nominara.rollup").startActiveSpan("rollup.category_recompute", async (span) => {
+export async function applyBenchmarkMembership(pool: Pool, options: Pick<CategoryRefreshOptions, "lockTimeoutMs" | "statementTimeoutMs"> = {}): Promise<number> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
     try {
-      const project = await tx.query<{ category_slug: string | null }>(
-        "SELECT category_slug FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL",
-        [input.projectId],
-      );
-      const categories = [...new Set([project.rows[0]?.category_slug, input.previousCategorySlug].filter((c): c is string => c !== null && c !== undefined))];
-      if (categories.length === 0) return { categories: 0, written: 0, removed: 0 };
+      await setLocalTimeouts(client, options);
+      const result = await client.query<{ projects_moved: number }>("SELECT projects_moved FROM app.apply_benchmark_membership()");
+      await client.query("COMMIT");
+      return result.rows[0]?.projects_moved ?? 0;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
 
-      const override = input.previousCategorySlug !== undefined;
-      const days = [...input.dates];
-      if (override) {
-        const span_ = await tx.query<{ first: string | null; last: string | null }>(
-          `SELECT min(metric_date)::text AS first, max(metric_date)::text AS last
-             FROM metric_daily
-            WHERE project_id = $1 AND workspace_id = app.current_workspace() AND entity_type = 'brand'`,
-          [input.projectId],
+/** `set_config(..., is_local => true)`: both limits die with the transaction, so a pooled session never carries them to the next caller. */
+async function setLocalTimeouts(client: Pick<PoolClient, "query">, options: Pick<CategoryRefreshOptions, "lockTimeoutMs" | "statementTimeoutMs">): Promise<void> {
+  await client.query("SELECT set_config('lock_timeout', $1, true)", [String(options.lockTimeoutMs ?? BENCHMARK_LOCK_TIMEOUT_MS)]);
+  await client.query("SELECT set_config('statement_timeout', $1, true)", [String(options.statementTimeoutMs ?? BENCHMARK_STATEMENT_TIMEOUT_MS)]);
+}
+
+/**
+ * Recomputes ONE category's aggregate over the batch window, in its own short transaction (decision 93 / M6): not a step of any workspace's rollup, so
+ * a failure here can never roll a tenant's rollup back and the category lock is never held across a tenant's transaction. The function reads other
+ * workspaces' rows (named columns only) and returns two counts; this adds WHICH category and days, and the bounds.
+ *
+ * Idempotent: the function recomputes from current data, so a redelivered or repeated job lands the same state.
+ */
+export async function refreshCategoryBenchmark(pool: Pool, category: string, options: CategoryRefreshOptions): Promise<CategoryRefreshResult> {
+  return trace.getTracer("nominara.rollup").startActiveSpan("rollup.category_recompute", async (span) => {
+    const client = await pool.connect();
+    try {
+      const { from, to } = benchmarkWindow(options.now);
+      await client.query("BEGIN");
+      try {
+        await setLocalTimeouts(client, options);
+        const result = await client.query<{ groups_written: number; groups_removed: number }>(
+          "SELECT groups_written, groups_removed FROM app.refresh_platform_metrics($1::date, $2::date, $3::text[], $4::text)",
+          [from, to, [category], options.scoringVersion ?? SCORING_VERSION],
         );
-        const { first, last } = span_.rows[0] ?? { first: null, last: null };
-        if (first !== null) days.push(first);
-        if (last !== null) days.push(last);
+        await client.query("COMMIT");
+        const written = result.rows[0]?.groups_written ?? 0;
+        const removed = result.rows[0]?.groups_removed ?? 0;
+        span.setAttribute("nominara.rollup.groups_written", written);
+        span.setAttribute("nominara.rollup.groups_removed", removed);
+        incrementCounter("nominara_rollup_category_recompute_total", { reason: "nightly" });
+        return { written, removed };
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
       }
-      if (days.length === 0) return { categories: categories.length, written: 0, removed: 0 };
-
-      const sorted = days.sort();
-      const to = sorted[sorted.length - 1]!;
-      let written = 0;
-      let removed = 0;
-      for (let from = sorted[0]!; from <= to; from = addDays(from, FUNCTION_MAX_DAYS + 1)) {
-        const windowEnd = addDays(from, FUNCTION_MAX_DAYS) < to ? addDays(from, FUNCTION_MAX_DAYS) : to;
-        const result = await tx.query<{ groups_written: number; groups_removed: number }>(
-          "SELECT groups_written, groups_removed FROM app.refresh_platform_metrics($1::date, $2::date, $3::text[])",
-          [from, windowEnd, categories],
-        );
-        written += result.rows[0]?.groups_written ?? 0;
-        removed += result.rows[0]?.groups_removed ?? 0;
-      }
-
-      span.setAttribute("nominara.rollup.categories", categories.length);
-      span.setAttribute("nominara.rollup.groups_written", written);
-      span.setAttribute("nominara.rollup.groups_removed", removed);
-      incrementCounter("nominara_rollup_category_recompute_total", { reason: input.reason ?? "rollup" });
-      // The workspace id and the project id only: no slug, no score, nothing of another workspace's (which this job never sees).
-      logger.log({ event: "rollup.category_recompute", workspace_id: input.workspaceId, project_id: input.projectId, categories: categories.length, groups_written: written, groups_removed: removed });
-      return { categories: categories.length, written, removed };
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });
       throw error;
     } finally {
+      client.release();
       span.end();
     }
   });
 }
 
+/**
+ * The categories the nightly batch recomputes: the whole taxonomy, and any category that still has a published row but is no longer in it (a value that
+ * predates the taxonomy), so such a row is re-evaluated and removed rather than left to age. Both tables are global and readable by every runtime role.
+ */
+export async function listBenchmarkCategories(pool: Pool): Promise<string[]> {
+  const result = await pool.query<{ slug: string }>(
+    `SELECT slug FROM business_categories
+     UNION
+     SELECT category_slug FROM platform_metrics
+     ORDER BY 1`,
+  );
+  return result.rows.map((r) => r.slug);
+}
+
 interface BenchmarkRow {
   engine_key: string;
   metric_date: string;
-  sample_size: number;
   median_visibility: string;
   p25_visibility: string;
   p75_visibility: string;
@@ -119,10 +147,10 @@ interface BenchmarkRow {
 
 /**
  * The project's category benchmark, or `undefined` when the project is not visible to this workspace (so the caller answers 404, and a
- * project in another workspace is indistinguishable from none). `engines: null` means no aggregate exists: too few contributing workspaces,
- * or no category. Never an empty list and never zeros.
+ * project in another workspace is indistinguishable from none). `engines: null` means no aggregate is served: too few contributing workspaces, a row
+ * older than the batch window, or no category. Never an empty list and never zeros. `now` is injectable for tests.
  */
-export async function readProjectBenchmark(tx: Pick<ClientBase, "query">, projectId: string): Promise<ProjectBenchmarkResponse | undefined> {
+export async function readProjectBenchmark(tx: Pick<ClientBase, "query">, projectId: string, now: Date = new Date()): Promise<ProjectBenchmarkResponse | undefined> {
   const project = await tx.query<{ category_slug: string | null }>(
     "SELECT category_slug FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL",
     [projectId],
@@ -131,24 +159,26 @@ export async function readProjectBenchmark(tx: Pick<ClientBase, "query">, projec
   if (row === undefined) return undefined;
   if (row.category_slug === null) return { project_id: projectId, category_slug: null, engines: null };
 
-  // `platform_metrics` is global: no workspace predicate exists or applies. Each engine's newest day.
+  // `platform_metrics` is global: no workspace predicate exists or applies. Each engine's newest day, and only within the window the nightly batch maintains.
+  const { from } = benchmarkWindow(now);
   const published = await tx.query<BenchmarkRow>(
-    `SELECT DISTINCT ON (engine_key) engine_key, metric_date::text AS metric_date, sample_size,
+    `SELECT DISTINCT ON (engine_key) engine_key, metric_date::text AS metric_date,
             median_visibility::text, p25_visibility::text, p75_visibility::text, median_aux_score::text, top_source_domains
        FROM platform_metrics
-      WHERE category_slug = $1
+      WHERE category_slug = $1 AND metric_date >= $2::date
       ORDER BY engine_key, metric_date DESC`,
-    [row.category_slug],
+    [row.category_slug, from],
   );
   if (published.rows.length === 0) return { project_id: projectId, category_slug: row.category_slug, engines: null };
 
+  // The exact `sample_size` is not even selected: it is never published. Every row has at least 20 workspaces, and the only band is "20+".
   return projectBenchmarkResponseSchema.parse({
     project_id: projectId,
     category_slug: row.category_slug,
     engines: published.rows.map((r) => ({
       engine_key: r.engine_key,
       metric_date: r.metric_date,
-      sample_size: r.sample_size,
+      workspace_count_band: BENCHMARK_WORKSPACE_BAND,
       median_visibility: Number(r.median_visibility),
       p25_visibility: Number(r.p25_visibility),
       p75_visibility: Number(r.p75_visibility),

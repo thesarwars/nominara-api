@@ -50,13 +50,27 @@ describe("GET /projects/{id}/benchmark · service", () => {
     expect(queries.some((q) => q.sql.includes("platform_metrics"))).toBe(false);
   });
 
-  it("carries a published aggregate through with numbers, not strings", async () => {
+  it("carries a published aggregate through with whole numbers and the band, never the exact workspace count (decision 93)", async () => {
     clientAnswering([{ category_slug: "crm" }], [
-      { engine_key: "chatgpt", metric_date: "2026-11-01", sample_size: 23, median_visibility: "41.250", p25_visibility: "30.000", p75_visibility: "52.500", median_aux_score: "66.000", top_source_domains: [{ domain: "g2.com", context_weight: 0.2 }] },
+      { engine_key: "chatgpt", metric_date: "2026-11-01", sample_size: 23, median_visibility: "41.000", p25_visibility: "30.000", p75_visibility: "53.000", median_aux_score: "66.000", top_source_domains: [{ domain: "g2.com" }] },
     ]);
     const result = await new ProjectBenchmarkService().read(ID);
-    expect(result.engines![0]).toMatchObject({ engine_key: "chatgpt", sample_size: 23, median_visibility: 41.25, p75_visibility: 52.5 });
+    expect(result.engines![0]).toEqual({ engine_key: "chatgpt", metric_date: "2026-11-01", workspace_count_band: "20+", median_visibility: 41, p25_visibility: 30, p75_visibility: 53, median_aux_score: 66, top_source_domains: [{ domain: "g2.com" }] });
+    expect(JSON.stringify(result)).not.toMatch(/sample_size|23/);
     expect(incrementCounter).toHaveBeenCalledWith("nominara_project_benchmark_reads_total", { outcome: "published" });
+  });
+
+  it("reads only rows inside the nightly batch window (7 days ending today, UTC), so a category that fell below 20 is not shown with old figures", async () => {
+    vi.useFakeTimers({ now: new Date("2026-11-08T12:00:00Z"), toFake: ["Date"] });
+    try {
+      const queries = clientAnswering([{ category_slug: "crm" }], []);
+      await new ProjectBenchmarkService().read(ID);
+      const read = queries.find((q) => q.sql.includes("FROM platform_metrics"))!;
+      expect(read.sql).toMatch(/metric_date\s*>=\s*\$2/);
+      expect(read.params).toEqual(["crm", "2026-11-02"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a project this workspace cannot see is a 404 (the read carries workspace_id = app.current_workspace())", async () => {

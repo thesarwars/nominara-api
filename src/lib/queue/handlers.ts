@@ -28,6 +28,7 @@ import { createReportBuildHandler } from "./handlers/report-build.handler.js";
 import { createCrawlAuditHandler } from "./handlers/crawl-audit.handler.js";
 import { createDomainReverifyHandler } from "./handlers/domain-reverify.handler.js";
 import { createTaskResurfaceHandler } from "./handlers/task-resurface.handler.js";
+import { createRollupCategoryBenchmarkHandler } from "./handlers/rollup-category-benchmark.handler.js";
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { createSourceVerifyPresenceHandler } from "./handlers/source-verify-presence.handler.js";
@@ -163,6 +164,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "topic.cluster": (context) => createTopicClusterHandler(context),
   "attribution.rollup": (context) => createAttributionRollupHandler(context),
   "gsc.sync": (context) => createGscSyncHandler(context),
+  "rollup.category_benchmark": (context) => createRollupCategoryBenchmarkHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

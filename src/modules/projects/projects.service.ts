@@ -456,7 +456,6 @@ export class ProjectsService {
     const assignments: string[] = [];
     const params: unknown[] = [projectId];
     let categoryChanged = false;
-    let newCategory: string | undefined;
 
     for (const [name, decision] of Object.entries(input.fields ?? {})) {
       const field = name as ConfirmableField;
@@ -478,10 +477,7 @@ export class ProjectsService {
       assignments.push(`${COLUMN_FOR_FIELD[field]} = $${String(params.length + 1)}`);
       params.push(value);
 
-      if (field === "category" && value !== existing.rows[0]!.category_slug) {
-        categoryChanged = true;
-        newCategory = typeof value === "string" ? value : undefined;
-      }
+      if (field === "category" && value !== existing.rows[0]!.category_slug) categoryChanged = true;
 
       // AC3/AC4 — accepting records that it was applied; overriding also
       // records that a HUMAN decided, which is what re-discovery reads.
@@ -519,7 +515,7 @@ export class ProjectsService {
 
     // AC9 — overriding the category must not leave everything derived from it
     // stale. `rollup.metric_daily` is the job that recomputes it.
-    if (categoryChanged) this.requestRecompute(workspaceId, projectId, existing.rows[0]!.category_slug, newCategory);
+    if (categoryChanged) this.requestRecompute(workspaceId, projectId);
 
     // STORY-043 AC12 — the top-up. A URL-only project's first discovery pass had no brand, category or verticals to fill the prompt
     // templates from; the confirmed values are what it was waiting for. AFTER the columns above are written (the generator reads the
@@ -605,7 +601,7 @@ export class ProjectsService {
    * in the log, that the recomputation was skipped rather than silently
    * dropping the requirement.
    */
-  private requestRecompute(workspaceId: string, projectId: string, previousCategory: string | null, newCategory: string | undefined): void {
+  private requestRecompute(workspaceId: string, projectId: string): void {
     if (handlerFor("rollup.metric_daily") === undefined) {
       this.logger.warn(
         `project ${projectId}: category changed but rollup.metric_daily has no handler yet — ` +
@@ -615,11 +611,10 @@ export class ProjectsService {
     }
     afterCommit(() => {
       void this.queues
-        // STORY-176 AC4 — names the slug the project left, so the recompute removes it from that slug's contribution. The key carries both slugs
-        // and the time: each override is its own recompute (a repeat of an earlier A-to-B must not be swallowed by that job's key), and a
-        // redelivery of one job is idempotent in the handler.
-        .enqueueTenantJob("rollup.metric_daily", workspaceId, { projectId, reason: "category_override", ...(previousCategory === null ? {} : { previousCategorySlug: previousCategory }) }, {
-          idempotencyKey: `rollup:${projectId}:category-override:${previousCategory ?? "none"}>${newCategory ?? "none"}:${String(Date.now())}`,
+        // The project's OWN rollup (its derived figures). Its contribution to the cross-workspace benchmark is NOT recomputed here: membership moves at the
+        // nightly batch (STORY-176, decision 93), so an override cannot be followed by an immediate read of the effect.
+        .enqueueTenantJob("rollup.metric_daily", workspaceId, { projectId, reason: "category_override" }, {
+          idempotencyKey: `rollup:${projectId}:category-override`,
         })
         .catch((error: unknown) => {
           this.logger.error(`failed to enqueue recompute for project ${projectId}: ${String(error)}`);

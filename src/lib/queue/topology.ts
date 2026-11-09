@@ -532,6 +532,21 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "creditver:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // NOT IN §4 EITHER - STORY-176 / OWNER DECISION 93 (2026-11-09). The cross-workspace benchmark (`platform_metrics`) was recomputed inside every tenant's own
+  // rollup transaction, holding a category-wide advisory lock until that tenant committed, and a category override recomputed it at once (so two workspaces of
+  // one attacker could difference the figures). It is now a nightly batch of its own: category membership moves here and only here, then each category is
+  // recomputed in its own short transaction. Not tenant-scoped (no workspace to name; the cross-tenant read is inside two SECURITY DEFINER functions the
+  // runtime role may execute). One job per UTC day (the idempotency key), advisory-locked single-flight. A queue of its own so a DLQ entry names the job.
+  {
+    name: "rollup.category_benchmark",
+    producer: "cron daily (STORY-176, decision 93; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "catbench:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

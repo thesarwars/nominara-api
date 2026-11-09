@@ -65,7 +65,7 @@ describe("STORY-189 AC2 · an unknown category is a 422, not a 500", () => {
     await expect(new ProjectsService(queues, resolver, urlGuard).create(WS, ACTOR, { root_url: "https://acme.example" }, 1)).rejects.toBe(otherFkViolation);
   });
 
-  describe("STORY-176 AC4 — a category override tells the rollup which slug the project left", () => {
+  describe("STORY-176 · decision 93 — a category override recomputes nothing benchmark-wise", () => {
     const DISCOVERED = { discovery_status: "completed", fields: { category: { value: "banks", confidence: 0.9, source: "s", user_edited: false } }, low_confidence_fields: [], competitors_proposed: [], prompts_generated: [], prompts_free_remaining: 0, credits_charged: 0, duration_ms: 1 };
     const confirmWith = async (held: string | null, body: Parameters<ProjectsService["confirmDiscovery"]>[2]) => {
       const fired: (() => void)[] = [];
@@ -79,30 +79,15 @@ describe("STORY-189 AC2 · an unknown category is a 422, not a 500", () => {
       await Promise.resolve();
     };
 
-    it("enqueues rollup.metric_daily with reason category_override and the previous slug", async () => {
+    it("still enqueues the project's own rollup (its derived values), naming no previous slug: membership moves only at the nightly batch", async () => {
       await confirmWith("crm", { fields: { category: { decision: "override", value: "banks" } } });
-      expect(queues.enqueueTenantJob).toHaveBeenCalledWith(
-        "rollup.metric_daily",
-        WS,
-        { projectId: "p1", reason: "category_override", previousCategorySlug: "crm" },
-        expect.objectContaining({ idempotencyKey: expect.stringMatching(/^rollup:p1:category-override:crm>banks:/) }),
-      );
+      expect(queues.enqueueTenantJob).toHaveBeenCalledTimes(1);
+      expect(queues.enqueueTenantJob).toHaveBeenCalledWith("rollup.metric_daily", WS, { projectId: "p1", reason: "category_override" }, { idempotencyKey: "rollup:p1:category-override" });
     });
 
-    it("a project that held no category before names no previous slug (it left nothing)", async () => {
+    it("the same for a project that held no category", async () => {
       await confirmWith(null, { fields: { category: { decision: "override", value: "banks" } } });
-      const payload = vi.mocked(queues.enqueueTenantJob).mock.calls[0]![2] as Record<string, unknown>;
-      expect(payload).toEqual({ projectId: "p1", reason: "category_override" });
-      expect("previousCategorySlug" in payload).toBe(false);
-    });
-
-    it("two overrides of one project are two distinct jobs, so the second is never swallowed by the first's key", async () => {
-      await confirmWith("crm", { fields: { category: { decision: "override", value: "banks" } } });
-      const first = (vi.mocked(queues.enqueueTenantJob).mock.calls[0]![3] as { idempotencyKey: string }).idempotencyKey;
-      await new Promise((r) => setTimeout(r, 2));
-      await confirmWith("crm", { fields: { category: { decision: "override", value: "banks" } } });
-      const second = (vi.mocked(queues.enqueueTenantJob).mock.calls[0]![3] as { idempotencyKey: string }).idempotencyKey;
-      expect(second).not.toBe(first);
+      expect(vi.mocked(queues.enqueueTenantJob).mock.calls[0]![2]).toEqual({ projectId: "p1", reason: "category_override" });
     });
   });
 });
