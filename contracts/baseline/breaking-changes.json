@@ -412,7 +412,9 @@
           "email_from_name",
           "email_reply_to",
           "custom_css",
-          "email_footer_html"
+          "email_footer_html",
+          "logo_dark_url",
+          "favicon_url"
         ]
       }
     },

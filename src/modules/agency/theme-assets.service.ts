@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { Injectable, Logger } from "@nestjs/common";
+import { PassThrough } from "node:stream";
+import { Injectable, Logger, StreamableFile } from "@nestjs/common";
+import type { FastifyReply } from "fastify";
 import {
   styleRefusalDetailsSchema,
+  THEME_ASSET_MEDIA_TYPES,
   type ThemeAssetFetchParams,
   type ThemeAssetParams,
   type UploadThemeAssetRequest,
@@ -28,10 +31,9 @@ import { AgencyService, themeAssetPath } from "./agency.service.js";
 // never points at a missing object; a failed write fails the response (503/500), it is never swallowed. The superseded object is
 // deleted last and best-effort (an orphan is a leak of a few KB, never a broken theme).
 //
-// The stored file is served by a route on the platform's own origin that answers 302 to a short presign (60 s), minted fresh on every
-// fetch. The theme carries the platform path, never the key, the bucket host or the URL.
+// The stored file is served by a route on the platform's own origin that STREAMS the bytes (owner decision 69 (c); see stream() below).
+// The theme carries the platform path, never the key, the bucket host or the URL.
 
-export const THEME_ASSET_URL_SECONDS = 60;
 /** The portal's logo cache: how many distinct stored logos are kept in memory (each at most 256 KB as bytes, a third more as a data URL). */
 export const PORTAL_LOGO_CACHE_ENTRIES = 64;
 /** After a storage failure the portal serves no logo for this long without asking storage again, so an outage does not add a timeout to every request. */
@@ -191,16 +193,52 @@ export class ThemeAssetsService {
     };
   }
 
-  /** Looks the key up on the ambient client, then presigns once the request transaction has ended (no connection held over the SDK call). */
-  async resolve(params: ThemeAssetFetchParams, setLocation: (url: string) => void): Promise<void> {
+  /**
+   * Owner decision 69 (c) - the stored image, STREAMED from the platform origin (the route answers 200 with the bytes; there is no
+   * redirect and so no storage host in the portal's or the editor's content policy).
+   *
+   * The key is looked up on the ambient client (RLS scopes the theme to the caller's workspace: a foreign theme is 404). The object
+   * is read AFTER the request transaction has committed and released its connection (afterTransaction, ADR-0003), through the
+   * workspace-BOUND store, which refuses any key outside the workspace, so a forged row cannot make this route serve another
+   * tenant's file. The bytes are re-checked with the upload's own validator and the Content-Type is the one the BYTES decide, never a
+   * stored or declared value: an object swapped or corrupted after upload is not served (fail closed, 503), and a storage failure
+   * fails the response, it is never an empty 200. At most 256 KB (logos) or 100 KB (favicon) is ever held in memory.
+   */
+  async stream(params: ThemeAssetFetchParams, reply: FastifyReply): Promise<StreamableFile> {
     const key = await this.agency.assetKey(params.id, params.slot);
     if (key === null) throw new NotFoundError({ message: "no such asset" });
     if (!isStoredObjectKey(key)) throw new DegradedError({ message: "the asset is not available" });
+    const workspaceId = currentTenantStore()?.context.workspaceId ?? null;
     const bound = this.objects.bind();
+    const body = new PassThrough();
     const registered = afterTransaction(async () => {
-      setLocation(await bound.presignGetStored("reports", key, { expiresInSeconds: THEME_ASSET_URL_SECONDS }));
-      incrementCounter("nominara_theme_asset_fetches_total", { slot: params.slot });
+      let outcome = "error";
+      try {
+        const bytes = new Uint8Array(await bound.getStored("reports", key));
+        let contentType: ThemeAssetType | null = null;
+        for (const type of THEME_ASSET_MEDIA_TYPES) {
+          if (validateThemeAsset(params.slot, type, bytes).ok) {
+            contentType = type;
+            break;
+          }
+        }
+        if (contentType === null) {
+          outcome = "invalid_bytes";
+          throw new DegradedError({ message: "the asset is not available" });
+        }
+        reply.header("content-type", contentType);
+        reply.header("content-length", String(bytes.length));
+        body.end(Buffer.from(bytes));
+        outcome = "served";
+      } catch (error) {
+        body.destroy();
+        throw error;
+      } finally {
+        incrementCounter("nominara_theme_asset_fetches_total", { slot: params.slot, outcome });
+        logger.log({ span: "agency.theme_asset_fetch", workspace_id: workspaceId, slot: params.slot, outcome });
+      }
     });
     if (!registered) throw new Error("ThemeAssetsService requires a request transaction to run after");
+    return new StreamableFile(body);
   }
 }

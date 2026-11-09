@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Header, HttpCode, Param, Post, Req, Res } from "@nestjs/common";
+import { Body, Controller, Get, Header, HttpCode, Param, Post, Req, Res, type StreamableFile } from "@nestjs/common";
 import { RouteConfig } from "@nestjs/platform-fastify";
 import type { FastifyReply } from "fastify";
 import type { AuditableRequest } from "../../api/interceptors/audit.interceptor.js";
 import {
   MAX_THEME_ASSET_BASE64_LENGTH,
+  THEME_ASSET_MEDIA_TYPES,
   themeAssetFetchParamsSchema,
   themeAssetParamsSchema,
   uploadThemeAssetRequestSchema,
@@ -19,7 +20,7 @@ import { RequirePermission } from "../../api/decorators/require-permission.decor
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ThemeAssetsService } from "./theme-assets.service.js";
 
-// STORY-097 · owner decision 67 (n) — logo and favicon upload, and the platform-origin route that serves them.
+// STORY-097 · owner decision 67 (n) — logo and favicon upload, and the platform-origin route that streams them.
 // The body limit is this route's own (a 1 MiB image is ~1.4 MB of base64, above Fastify's 1 MiB default): see src/api/route-body-limit.ts.
 @Controller("themes")
 export class ThemeAssetsController {
@@ -46,14 +47,18 @@ export class ThemeAssetsController {
     return this.service.upload(params, body, req);
   }
 
-  // The Location is a short-lived credential: never cached, never leaked in a Referer.
+  // Owner decision 69 (c): the bytes are streamed from the platform origin (no redirect, no storage host). `private, no-store` because the
+  // path stays the same when the logo is replaced; nosniff and a locked-down CSP because the body is agency-supplied (an image the
+  // validator accepted, but never trusted to render anything else if it were opened as a document).
   @Get(":id/assets/:slot")
-  @HttpCode(302)
+  @HttpCode(200)
   @RequirePermission("agency:branding")
-  @Header("Cache-Control", "no-store")
+  @Header("Cache-Control", "private, no-store")
   @Header("Referrer-Policy", "no-referrer")
-  @ApiContract({ operationId: "fetchThemeAsset", paramsSchema: themeAssetFetchParamsSchema, redirect: true })
-  async fetch(@Param(new ZodValidationPipe(themeAssetFetchParamsSchema)) params: ThemeAssetFetchParams, @Res({ passthrough: true }) reply: FastifyReply): Promise<void> {
-    await this.service.resolve(params, (url) => void reply.header("location", url));
+  @Header("X-Content-Type-Options", "nosniff")
+  @Header("Content-Security-Policy", "default-src 'none'; sandbox")
+  @ApiContract({ operationId: "fetchThemeAsset", paramsSchema: themeAssetFetchParamsSchema, binary: THEME_ASSET_MEDIA_TYPES })
+  fetch(@Param(new ZodValidationPipe(themeAssetFetchParamsSchema)) params: ThemeAssetFetchParams, @Res({ passthrough: true }) reply: FastifyReply): Promise<StreamableFile> {
+    return this.service.stream(params, reply);
   }
 }
