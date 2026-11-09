@@ -199,8 +199,26 @@ describe("STORY-114 - attribution rollup", () => {
     await run();
     expect((await rollup())[0]).toMatchObject({ gsc_ai_impressions: null, organic_clicks: null, pattern: "dual_visibility" });
     await connectSearchConsole();
+    await search("ai_surface", "https://shop.example.com/elsewhere", day(START, 2), { impressions: 3 }); // proof the AI-surface report was served
     await run();
-    expect((await rollup())[0]).toMatchObject({ gsc_ai_impressions: 0, organic_clicks: 0, pattern: "ai_only" });
+    expect((await rollup()).find((r) => r.landing_url === PAGE)).toMatchObject({ gsc_ai_impressions: 0, organic_clicks: 0, pattern: "ai_only" });
+  });
+
+  // The AI-surface report is known only on POSITIVE evidence (a stored ai_surface row), never inferred from `last_error`, which other
+  // paths overwrite: a spent quota, a revoked grant and a re-authorisation each replace the 'unavailable' reason.
+  it.each([
+    ["quota_exhausted", "quota_exhausted"],
+    ["credential_revoked", "credential_revoked"],
+    ["re-authorised (last_error cleared)", null],
+  ])("STORY-114 S16e - with no AI-surface row ever stored, impressions stay null after %s, never a measured zero", async (_name, lastError) => {
+    await cite(PAGE, day(START, 1), 2);
+    await sessions(PAGE, day(START, 1), 45);
+    await connectSearchConsole(day(START, 30), lastError);
+    await search("classic", PAGE, day(START, 2), { clicks: 4 });
+    await run();
+    const row = (await rollup())[0]!;
+    expect(row).toMatchObject({ gsc_ai_impressions: null, organic_clicks: 4 });
+    expect(row.pattern).not.toBe("ai_only");
   });
 
   it("STORY-114 S16b - a connected but NEVER-SYNCED project is unknown, not zero: null columns and no AI-only claim", async () => {

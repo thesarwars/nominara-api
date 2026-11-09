@@ -15,6 +15,7 @@ import {
   type GscSignal,
 } from "../../../contracts/integrations/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { withoutQueryAndFragment } from "../../lib/attribution/beacon-dimensions.js";
 import { joinUrlKey } from "../../lib/attribution/url-normalisation.js";
 import { matchQueryToPrompt } from "../../lib/gsc/query-match.js";
 import { addDays } from "../../lib/gsc/sync-plan.js";
@@ -52,7 +53,7 @@ interface UrlFigure {
 function foldByKey(rows: readonly UrlFigure[]): Map<string, { url: string; n: number }> {
   const out = new Map<string, { url: string; n: number }>();
   for (const row of rows) {
-    const key = joinUrlKey(row.url);
+    const key = joinUrlKey(withoutQueryAndFragment(row.url));
     if (key === null) continue;
     const id = key.hash.toString("hex");
     const existing = out.get(id);
@@ -62,10 +63,10 @@ function foldByKey(rows: readonly UrlFigure[]): Map<string, { url: string; n: nu
   return out;
 }
 
-function signals(frontier: string | null): GscSignal[] {
+function signals(frontier: string | null, aiSurfaceFrontier: string | null): GscSignal[] {
   return [
     { key: "citations", label: "Citations of your pages in AI answers", source: "Nominara captures on the engines it tracks", frontier, limits: GSC_CITATIONS_LIMIT_COPY },
-    { key: "ai_surface_impressions", label: "Links shown in Google AI Overviews and AI Mode", source: "Google Search Console, generative AI performance report", frontier, limits: GSC_AI_IMPRESSIONS_LIMIT_COPY },
+    { key: "ai_surface_impressions", label: "Links shown in Google AI Overviews and AI Mode", source: "Google Search Console, generative AI performance report", frontier: aiSurfaceFrontier, limits: GSC_AI_IMPRESSIONS_LIMIT_COPY },
     { key: "ai_sessions", label: "Sessions arriving from AI answers", source: "Nominara's first-party referral beacon on your site", frontier, limits: GSC_SESSIONS_LIMIT_COPY },
   ];
 }
@@ -91,7 +92,7 @@ export class GscCorrelationService {
         const conn = connection.rows[0];
         const frontier = conn?.last_sync_date ?? null;
         if (conn === undefined || frontier === null) {
-          return { ...base, connected: conn !== undefined, health_status: conn?.health_status ?? null, window_start: null, window_end: null, frontier: null, signals: signals(null), pages: [], search_queries: [] };
+          return { ...base, connected: conn !== undefined, health_status: conn?.health_status ?? null, window_start: null, window_end: null, frontier: null, signals: signals(null, null), pages: [], search_queries: [] };
         }
         const end = frontier;
         const start = addDays(end, -(windowDays - 1));
@@ -131,6 +132,12 @@ export class GscCorrelationService {
 
         const cited = foldByKey(citations.rows);
         const shown = foldByKey(impressions.rows);
+        // The AI-surface report claims a frontier only when a row of it was actually stored: the connection's one watermark is advanced by
+        // the classic report, so it says nothing about the AI-surface one.
+        const aiSurfaceServed = await tx.query(
+          "SELECT 1 FROM gsc_daily WHERE workspace_id = app.current_workspace() AND project_id = $1 AND report = 'ai_surface' AND metric_date <= $2::date LIMIT 1",
+          [projectId, end],
+        );
         const visits = sessions === null ? null : foldByKey(sessions.rows);
         const ids = new Set<string>([...cited.keys(), ...shown.keys()]);
         const pages: GscCorrelationPage[] = [...ids]
@@ -187,7 +194,7 @@ export class GscCorrelationService {
         incrementCounter("nominara_gsc_correlation_reads_total", { window_days: String(windowDays) });
         // Counts only: never a URL, a query or a workspace name.
         logger.log({ event: "gsc.correlation.read", window_days: windowDays, pages: pages.length, queries: search_queries.length, queries_joined: joined });
-        return { ...base, connected: true, health_status: conn.health_status, window_start: start, window_end: end, frontier, signals: signals(frontier), pages, search_queries };
+        return { ...base, connected: true, health_status: conn.health_status, window_start: start, window_end: end, frontier, signals: signals(frontier, aiSurfaceServed.rowCount === 0 ? null : frontier), pages, search_queries };
       } catch (error) {
         span.setStatus({ code: SpanStatusCode.ERROR });
         throw error;

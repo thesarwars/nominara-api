@@ -786,6 +786,37 @@ describe("STORY-115 - Search Console", () => {
       expect(Object.keys(row).sort()).toEqual(["ai_sessions", "citations", "gsc_ai_impressions", "url"]);
     });
 
+    it("S115-18b - with no AI-surface row ever stored the AI-surface signal claims no frontier, however healthy the connection", async () => {
+      const a = await owner();
+      const frontier = availableThrough(today());
+      await seedConnection(a, frontier);
+      await cite(a, PAGE, addDays(frontier, -1), 2);
+      const body = data<Correlation>(await read(a));
+      expect(body.signals.find((s) => s.key === "ai_surface_impressions")).toMatchObject({ frontier: null });
+      expect(body.signals.find((s) => s.key === "citations")).toMatchObject({ frontier });
+      expect(body.pages[0]!.gsc_ai_impressions).toBeNull();
+    });
+
+    it("S115-14b - a query on a cited or reported page does not split it from the beacon's query-free row: one page, the real session count", async () => {
+      const a = await owner();
+      const frontier = availableThrough(today());
+      await seedConnection(a, frontier);
+      await cite(a, "https://shop.example.com/guide?id=5", addDays(frontier, -1), 2);
+      await gsc(a, "ai_surface", "page", addDays(frontier, -1), "https://shop.example.com/guide?id=6", { impressions: 10 });
+      await db().query(
+        `INSERT INTO attribution_configs (id, workspace_id, project_id, method, site_token, site_token_hash, allowed_origins, status) VALUES ($1,$2,$3,'script','tok',sha256(convert_to($4::text,'UTF8')),ARRAY['https://shop.example.com'],'receiving')`,
+        [uuidV7(), a.workspaceId, a.projectId, uuidV7()],
+      );
+      await db().query(
+        `INSERT INTO attribution_daily (workspace_id, project_id, metric_date, landing_url_hash, landing_url, referrer_class, sessions, conversions, country, device)
+         VALUES ($1,$2,$3,sha256(convert_to($4::text,'UTF8')),$4::text,'chatgpt',50,0,'ZZ','desktop')`,
+        [a.workspaceId, a.projectId, addDays(frontier, -1), PAGE],
+      );
+      const pages = data<Correlation>(await read(a)).pages;
+      expect(pages).toHaveLength(1);
+      expect(pages[0]).toMatchObject({ url: PAGE, citations: 2, gsc_ai_impressions: 10, ai_sessions: 50 });
+    });
+
     it("S115-20b - sessions are null without a beacon and a number with one; they never include unattributed direct", async () => {
       const a = await owner();
       const frontier = availableThrough(today());

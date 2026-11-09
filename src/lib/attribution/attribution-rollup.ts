@@ -84,10 +84,14 @@ export async function rollUpWindow(tx: ClientBase, spec: WindowSpec, timezone: s
   // the window, has measured nothing: its figures are unknown (null), never a zero, because a zero reads as "no impressions" and lets
   // `classifyUrl` call a page AI-only on no evidence. So a figure is known only when `last_sync_date` (the frontier: Google lags the
   // calendar by days) reaches into the window, and it is counted only up to that frontier. Within it, a URL with no row is a real zero.
-  // `gsc_connections` has ONE watermark for two reports, so AI-surface impressions are additionally known only when the last sync was not
-  // recorded as unable to serve that report: the classic watermark never implies AI-surface coverage.
+  // `gsc_connections` has ONE watermark for two reports, and `last_error` is a single last-event slot that a spent quota, a revoked grant
+  // or a re-authorisation overwrite, so neither says whether the AI-surface report was ever pulled. AI-surface impressions are therefore
+  // known only on POSITIVE evidence: a stored `ai_surface` row up to the frontier. The classic watermark never implies AI-surface coverage.
   const coverage = await tx.query<{ synced_through: string | null; ai_surface_served: boolean }>(
-    `SELECT g.last_sync_date::text AS synced_through, (g.last_error IS DISTINCT FROM 'ai_surface_report_unavailable') AS ai_surface_served
+    `SELECT g.last_sync_date::text AS synced_through,
+            EXISTS (SELECT 1 FROM gsc_daily d
+                     WHERE d.workspace_id = app.current_workspace() AND d.project_id = g.project_id AND d.report = 'ai_surface'
+                       AND d.metric_date <= g.last_sync_date) AS ai_surface_served
        FROM gsc_connections g
       WHERE g.workspace_id = app.current_workspace() AND g.project_id = $1 AND g.revoked_at IS NULL
       ORDER BY g.last_sync_date DESC NULLS LAST LIMIT 1`,
