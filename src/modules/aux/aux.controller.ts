@@ -19,6 +19,7 @@ import {
   type TriggerAuxAuditResponse,
   type UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
+import { createTaskFromFindingRequestSchema, taskSchema, type CreateTaskFromFindingRequest, type Task } from "../../../contracts/tasks/index.js";
 import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
@@ -121,6 +122,22 @@ export class AuxController {
   @ApiContract({ operationId: "getAuxPatch", responseSchema: auxPatchSchema })
   getPatch(@Param("id") id: string): Promise<AuxPatch> {
     return this.service.getPatch(id);
+  }
+
+  // `POST /aux-findings/{id}/create-task`, `task:create` (STORY-194 AC5). Idempotent: a replayed key returns the first response, and
+  // the service never makes a second open task for one finding. The URL names a finding: scope is enforced by the service.
+  @Post("aux-findings/:id/create-task")
+  @HttpCode(201)
+  @Idempotent()
+  @RequirePermission("task:create")
+  @ScopedByQuery()
+  @Audit({ action: "task.created", resourceType: "task", resourceIdFrom: "response" })
+  @ApiContract({ operationId: "createTaskFromAuxFinding", requestSchema: createTaskFromFindingRequestSchema, responseSchema: taskSchema })
+  createTaskFromFinding(
+    @Param("id") id: string,
+    @Body(new ZodValidationPipe(createTaskFromFindingRequestSchema.default({}))) _body: CreateTaskFromFindingRequest,
+  ): Promise<Task> {
+    return this.service.createTaskFromFinding(id);
   }
 
   // The URL names a finding, not a project: scope is enforced by the service

@@ -35,6 +35,9 @@ import { debitInTransaction, includedGrantOf } from "../../lib/credits/debit.js"
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { acquireAdvisoryXactLock } from "../../lib/queue/locks.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { taskFingerprint } from "../../lib/taskgen/fingerprint.js";
+import { TasksService } from "../tasks/tasks.service.js";
+import type { Task } from "../../../contracts/tasks/index.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -54,10 +57,8 @@ import { afterCommit, currentTenantStore, withTenantContext } from "../../tenanc
 // predicate (`app.current_scope_projects()`) is the in-depth layer for a scoped
 // manager or viewer, copied from TasksService.
 //
-// NOT HERE: `POST /aux-findings/{id}/create-task`. It needs the Track B
-// task-insert helper (a finding-sourced task insert with the dedupe fingerprint
-// and short_ref); until that lands, writing a second task-insert path here is
-// the thing the plan forbids.
+// `POST /aux-findings/{id}/create-task` reads the finding here and hands the insert to TasksService.createGeneratedTask:
+// `tasks` has one owning service, so there is no second task-insert path in this module.
 
 const SCOPE_OK = `(cardinality(app.current_scope_projects()) = 0 OR %P% = ANY(app.current_scope_projects()))`;
 
@@ -127,6 +128,7 @@ export class AuxService {
   constructor(
     @Optional() @Inject(PG_POOL) private readonly pool?: Pool,
     @Optional() private readonly queues?: QueueProducer,
+    @Optional() private readonly tasks?: TasksService,
   ) {}
 
   private readonly logger = new Logger(AuxService.name);
@@ -245,6 +247,90 @@ export class AuxService {
     const read = await client.query<FindingRow>(`${FINDING_SELECT} WHERE f.id = $1`, [findingId]);
     const row = read.rows[0]!;
     return toFinding(row, (await this.latestPatches(row.project_id, [row.id])).get(row.id) ?? null);
+  }
+
+  /**
+   * `POST /v1/aux-findings/{id}/create-task` — manual promotion of a finding to a task (STORY-194 AC5).
+   *
+   * NO DUPLICATE. The task is made by `TasksService.createGeneratedTask`, which returns an OPEN task that already has the
+   * fingerprint untouched. The fingerprint is the one the generator gives this finding (`taskFingerprint(rule, project, finding
+   * fingerprint)`) when an enabled `aux_finding` rule covers the finding's rule code, so a promotion and the generator's task for
+   * the same finding are one task whichever came first; with no such rule it is derived from the finding alone. An open task
+   * already linked to the finding by `source_finding_id` is returned as well, whatever its fingerprint. A `done` task does not
+   * block a new one, as with the generator.
+   *
+   * The finding's own status is not changed and no impact is claimed (0, as for any manual task). Ambient transaction, no network.
+   */
+  async createTaskFromFinding(findingId: string): Promise<Task> {
+    if (this.tasks === undefined) throw new Error("AuxService was built without TasksService");
+    const store = currentTenantStore()!;
+    const client = store.client;
+    return tracer.startActiveSpan("aux.create_task_from_finding", async (span) => {
+      try {
+        const found = await client.query<{ id: string; project_id: string; rule_code: string; title: string; url: string | null; fingerprint: Buffer; consequence: string | null; in_scope: boolean }>(
+          `SELECT f.id, f.project_id, f.rule_code, f.title, f.url, f.fingerprint, c.rationale AS consequence,
+                  ${SCOPE_OK.replace("%P%", "f.project_id")} AS in_scope
+             FROM aux_findings f
+             JOIN projects p ON p.id = f.project_id AND p.deleted_at IS NULL
+             LEFT JOIN aux_rule_catalog c ON c.code = f.rule_code
+            WHERE f.id = $1`,
+          [findingId],
+        );
+        const finding = found.rows[0];
+        if (finding === undefined) throw new NotFoundError({ message: "no such finding" });
+        if (!finding.in_scope) throw new ProjectOutOfScopeException();
+
+        const rule = await client.query<{ code: string; category: "content" | "technical" | "authority" | "monitoring"; default_priority: number; effort_band: "xs" | "s" | "m" | "l" | "xl" }>(
+          `SELECT code, category, default_priority, effort_band FROM task_generation_rules
+            WHERE enabled AND trigger_kind = 'aux_finding' AND condition ->> 'kind' = 'aux_finding' AND condition ->> 'aux_rule_code' = $1
+            ORDER BY code LIMIT 1`,
+          [finding.rule_code],
+        );
+        const covering = rule.rows[0];
+        const fingerprintHex = Buffer.from(finding.fingerprint).toString("hex");
+
+        // Serialise two promotions of one finding, so the loser finds the winner's task.
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`aux-finding-task:${finding.id}`]);
+        const linked = await client.query<{ id: string }>(
+          `SELECT id FROM tasks WHERE source_finding_id = $1 AND status <> 'done' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`,
+          [finding.id],
+        );
+        let task: Task;
+        let outcome: "created" | "existing";
+        if (linked.rows[0] !== undefined) {
+          task = await this.tasks!.readTaskById(linked.rows[0].id);
+          outcome = "existing";
+        } else {
+          const result = await this.tasks!.createGeneratedTask({
+            projectId: finding.project_id,
+            kind: covering?.category ?? "technical",
+            origin: "manual",
+            ruleCode: covering?.code ?? null,
+            fingerprint: taskFingerprint(covering?.code ?? "aux_finding_manual", finding.project_id, fingerprintHex),
+            title: finding.title,
+            description: finding.consequence ?? "",
+            sourceDisplacementId: null,
+            sourceDomainId: null,
+            affectedUrl: finding.url,
+            generation: {
+              sourceFindingId: finding.id,
+              ...(covering === undefined ? {} : { priority: covering.default_priority, effortBand: covering.effort_band }),
+            },
+          });
+          task = result.task;
+          outcome = result.created ? "created" : "existing";
+        }
+        incrementCounter("nominara_aux_finding_tasks_total", { outcome });
+        // Workspace, finding and task IDs only — never the finding's title or URL.
+        this.logger.log({ message: "aux finding promoted to task", workspace_id: store.context.workspaceId, finding_id: finding.id, task_id: task.id, outcome });
+        return task;
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
   }
 
   /**
