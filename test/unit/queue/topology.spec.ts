@@ -341,6 +341,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "email in downgrade_notices inside its transaction (keyed by the Stripe event id or the operator's ticket) and enqueues one signed tenant job after " +
       "commit; the worker sends it with no transaction open (ADR-0003). §4's table allocates no queue to it. A queue of its own so a DLQ entry names it.",
   },
+  "billing.cancel_on_deletion": {
+    workerGroup: "rollup",
+    because:
+      "Decision 83(a) (2026-11-09): deleting a workspace sets its Stripe subscription to cancel at period end (no refund), so it is not billed through the grace period. " +
+      "A Stripe call may never be made on a request path (KAD-06), so the deletion request enqueues one signed tenant job after commit; the worker reads the live " +
+      "subscription. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed.",
+  },
   "credit.housekeeping": {
     workerGroup: "rollup",
     because:

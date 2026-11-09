@@ -41,6 +41,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "billing.customer_email",
     // STORY-077 (owner decision 2026-10-23) — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "billing.downgrade_notice",
+    // Decision 83(a) (2026-11-09) — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "billing.cancel_on_deletion",
     // STORY-064 AC5 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "task.resurface",
     // STORY-013 AC6 / AC14 / AC16 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.

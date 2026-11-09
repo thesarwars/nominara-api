@@ -72,6 +72,16 @@ export class StripeSubscriptionHandler implements StripeEventHandler {
       this.logger.warn({ message: "stripe webhook refused as retryable: the workspace is busy with another billing change", event_id: event.id, workspace_id: workspaceId });
       return new DegradedError({ message: "billing is busy: retry shortly" });
     });
+    // Decision 83(a): deleting a workspace makes Stripe send `customer.subscription.updated` (cancel_at_period_end) and, at the period
+    // end, `.deleted`. `applyPlanChange` refuses a pending_deletion workspace (it is locked and about to be purged), and a thrown
+    // refusal is a 500 that Stripe retries for days. Acknowledge instead: nothing is reconciled for a workspace that is going away.
+    // Only SUBSCRIPTION events are skipped here; a credit-pack payment that settles inside the grace is still processed.
+    const lifecycle = await tx.query<{ status: string }>("SELECT status FROM workspaces WHERE id = $1", [workspaceId]);
+    if (lifecycle.rows[0]?.status === "pending_deletion") {
+      incrementCounter("nominara_billing_subscription_reconcile_total", { outcome: "workspace_pending_deletion" });
+      this.logger.warn({ message: "stripe subscription not reconciled: the workspace is pending deletion", event_id: event.id, workspace_id: workspaceId });
+      return;
+    }
     // ⚠ THE STALE-FETCH CHECK COMES BEFORE THE PRICE VERDICT (STORY-184). A fetch taken before a newer event committed
     // describes a subscription as it WAS - for an in-app upgrade, the old plan at the old price with no intent (the intent
     // was spent when the new plan was adopted) - and judged first it reads as a relabel and raises a false mismatch alarm

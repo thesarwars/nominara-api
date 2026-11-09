@@ -404,6 +404,22 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "dgnotice:{workspace}:{request}:{kind}",
     tenantScoped: true,
   },
+  // ⚠ A QUEUE §4 DOES NOT CONTAIN, added by the same precedent and approved by the owner (decision 83(a), 2026-11-09): deleting a
+  // workspace must stop its Stripe subscription renewing. The deletion request commits, then enqueues ONE signed tenant job; the
+  // handler sets `cancel_at_period_end` (no immediate cancel, no refund) with no transaction open (KAD-06 / ADR-0003). Setting a
+  // boolean is idempotent, so redelivery is safe; the ladder is long (about 8.5 minutes) because this is money, and a job that
+  // still fails lands in the DLQ, which alerts, with the 30-day grace left to replay it before the purge. One request per
+  // workspace (a `pending_deletion` workspace refuses a second), hence the key.
+  {
+    name: "billing.cancel_on_deletion",
+    producer: "workspace deletion request, after commit (decision 83(a); not in §4)",
+    workerGroup: "rollup",
+    concurrency: 2,
+    retry: { delaysMs: doubling(8) },
+    priority: 6,
+    idempotencyKeyPattern: "delcancel:{workspace}",
+    tenantScoped: true,
+  },
   // ⚠ THE FIFTH QUEUE §4 DOES NOT CONTAIN, added by the same precedent. STORY-076 AC4 / STORY-071 AC10: purchased
   // credits expire FIFO twelve months after purchase (`plans-and-entitlements.md` §5) and `credit_daily_counters` rows
   // older than 35 days are purged nightly (`schemas/billing-and-credits.md`). `expireCredits` and `purgeDailyCounters`

@@ -304,6 +304,14 @@ export interface StripeGateway {
   updateCustomerBillingEmail(input: { readonly customerId: string; readonly email: string }): Promise<void>;
 
   /**
+   * Decision 83(a) — sets `cancel_at_period_end` on a subscription: access continues to the period end, then it ends. NOT an
+   * immediate cancel, and nothing is refunded or prorated. Setting a boolean is idempotent, so NO idempotency key is sent
+   * (a key on a toggle makes Stripe replay the stored response without re-applying it). Writes NOTHING local: the local flag
+   * changes when the webhook reconciles. Throws `StripeUpstreamError`.
+   */
+  setSubscriptionCancelAtPeriodEnd(input: { readonly subscriptionId: string }): Promise<void>;
+
+  /**
    * STORY-076b — set an add-on item's quantity with proration (creating the
    * item when there is none). Throws `StripeUpstreamError`. Writes NOTHING
    * local: the add-on rows change only when the webhook reconciles.

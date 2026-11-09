@@ -233,4 +233,40 @@ describe("DELETE /workspaces/{id} · workspace deletion request over HTTP", () =
     expect(again.statusCode).toBe(403);
     expect((await stateOf(owner.workspaceId)).deletion_execute_at).toEqual(first.deletion_execute_at);
   });
+
+  // ---- decision 83(a): the Stripe subscription is cancelled at period end by a job, after commit ---------------------------
+
+  it("DELETE-10 after commit exactly ONE billing.cancel_on_deletion job is enqueued, ids only, keyed by the workspace (KAD-06: no Stripe call in the request)", async () => {
+    const owner = await ownerWithWorkspace();
+    queue.jobs.length = 0;
+    expect((await del(owner, { confirm_slug: await slugOf(owner.workspaceId) })).statusCode).toBe(202);
+    expect(queue.jobs).toEqual([{ name: "billing.cancel_on_deletion", workspaceId: owner.workspaceId, payload: {}, idempotencyKey: `delcancel:${owner.workspaceId}` }]);
+  });
+
+  it("DELETE-11 a refused request (wrong slug, non-owner, no step-up, replay) enqueues nothing", async () => {
+    const owner = await ownerWithWorkspace();
+    const admin = await addMember(owner.workspaceId, "admin");
+    const noStepUp = await ownerWithWorkspace({ stepUp: false });
+    queue.jobs.length = 0;
+    expect((await del(owner, { confirm_slug: "not-the-slug" })).statusCode).toBe(400);
+    expect((await del(admin, { confirm_slug: await slugOf(owner.workspaceId) })).statusCode).toBe(403);
+    expect((await del(noStepUp, { confirm_slug: await slugOf(noStepUp.workspaceId) })).statusCode).toBe(401);
+    expect(queue.jobs).toEqual([]);
+    expect((await del(owner, { confirm_slug: await slugOf(owner.workspaceId) })).statusCode).toBe(202);
+    expect((await del(owner, { confirm_slug: await slugOf(owner.workspaceId) })).statusCode).toBe(403);
+    expect(queue.jobs, "the replay enqueued nothing more").toHaveLength(1);
+  });
+
+  it("DELETE-12 a failed enqueue never fails the committed request", async () => {
+    const owner = await ownerWithWorkspace();
+    queue.jobs.length = 0;
+    queue.failWith = new Error("valkey down");
+    try {
+      const res = await del(owner, { confirm_slug: await slugOf(owner.workspaceId) });
+      expect(res.statusCode, res.body).toBe(202);
+    } finally {
+      queue.failWith = undefined;
+    }
+    expect((await stateOf(owner.workspaceId)).status).toBe("pending_deletion");
+  });
 });

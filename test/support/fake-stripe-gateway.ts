@@ -223,6 +223,15 @@ export class FakeStripeGateway implements StripeGateway {
     return Promise.resolve();
   }
 
+  /** Decision 83(a) — every subscription set to cancel at period end, in call order. */
+  readonly cancelAtPeriodEnd: Array<{ subscriptionId: string }> = [];
+
+  setSubscriptionCancelAtPeriodEnd(input: { subscriptionId: string }): Promise<void> {
+    if (this.failFetchWith !== undefined) return Promise.reject(this.failFetchWith);
+    this.cancelAtPeriodEnd.push(input);
+    return Promise.resolve();
+  }
+
   /** STORY-076b — add-on quantity changes and scheduled removals sent to Stripe, in call order. */
   readonly addonChanges: AddonChangeInput[] = [];
   readonly addonRemovals: AddonRemovalInput[] = [];
