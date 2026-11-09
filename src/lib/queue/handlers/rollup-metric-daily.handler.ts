@@ -3,7 +3,6 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import { denormalizeProject } from "../../rollup/denormalize.js";
-import { refreshCategoryBenchmarks } from "../../rollup/category-benchmarks.js";
 import { refreshProjectGoals } from "../../rollup/refresh-project-goals.js";
 import { observeGeoFreshness, refreshProjectGeoWindows } from "../../rollup/refresh-project-geo.js";
 import { datesWithFacts } from "../../rollup/aggregate-day.js";
@@ -45,9 +44,6 @@ const payloadSchema = z
     fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(),
     toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(),
     reason: z.string().optional(),
-    /** STORY-176 AC4 — the category the project held before an override. The recompute removes it from that slug's contribution. */
-    // Not the slug pattern: a value that predates the taxonomy (migration 0189 keeps those) may be anything, and must still be removable.
-    previousCategorySlug: z.string().min(1).max(200).optional(),
   })
   .strict();
 
@@ -160,17 +156,6 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
         const { projectId, workspaceId } = payload;
         afterCommit(() => void observeGeoFreshness(workspaceId, projectId, enqueuedAt));
       }
-
-      // STORY-176 — the category aggregate (`platform_metrics`) for the project's category and the days just rolled up, and after an override for
-      // the previous slug too. The cross-tenant read is inside `app.refresh_platform_metrics` (named columns, >= 20 distinct workspaces); this reads only this
-      // database, makes no network call, and sits before the goals step so the goal's audit-chain lock is not held while it runs.
-      await refreshCategoryBenchmarks(tx, {
-        workspaceId: payload.workspaceId,
-        projectId: payload.projectId,
-        dates,
-        reason: payload.reason,
-        previousCategorySlug: payload.previousCategorySlug,
-      });
 
       // STORY-065 AC2 / AC6 / AC11 — goal progress is refreshed HERE, never on read, after the denormalised figures the goals read
       // were written. Same transaction and lock; an achievement and its system audit row commit together or not at all. It is the

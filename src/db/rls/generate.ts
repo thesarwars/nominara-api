@@ -253,7 +253,7 @@ export function resolveProjectPredicate(table: TableDescriptor): string | null {
 export interface ExpectedPolicy {
   readonly table: string;
   readonly policyName: string;
-  readonly cmd: "ALL" | "SELECT";
+  readonly cmd: "ALL" | "SELECT" | "UPDATE";
   readonly roles: readonly string[];
   readonly using: string;
   readonly withCheck: string | null;
@@ -432,6 +432,16 @@ export function computeDefinerOwnerPolicies(tables: readonly TableDescriptor[]):
     }
     return { table, policyName: `platform_aggregate_${table}`, cmd: "SELECT", roles: [PLATFORM_AGGREGATE_ROLE], using: "true", withCheck: null };
   });
+  // Decision 93 - the one write the aggregate role makes to a tenant table: the nightly membership step updates two columns of projects (the UPDATE grant is
+  // column-level). One FOR UPDATE policy, declared so rls-check expects it.
+  const membership: ExpectedPolicy = {
+    table: "projects",
+    policyName: "platform_aggregate_projects_membership",
+    cmd: "UPDATE",
+    roles: [PLATFORM_AGGREGATE_ROLE],
+    using: "true",
+    withCheck: "true",
+  };
   return [
     {
       table: "share_tokens",
@@ -443,6 +453,7 @@ export function computeDefinerOwnerPolicies(tables: readonly TableDescriptor[]):
     },
     ...maintenance,
     ...aggregate,
+    membership,
   ];
 }
 

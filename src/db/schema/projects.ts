@@ -116,4 +116,6 @@ export const projects = pgTable("projects", {
   demoSeededAt: timestamp("demo_seeded_at", { withTimezone: true }),
   pausedByDowngradeAt: timestamp("paused_by_downgrade_at", { withTimezone: true }),
   pausedByDowngradeFrom: text("paused_by_downgrade_from"),
+  benchmarkCategorySlug: text("benchmark_category_slug"),
+  benchmarkCategoryAppliedAt: timestamp("benchmark_category_applied_at", { withTimezone: true }),
 });

@@ -152,7 +152,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   projects: {
     columns:
-      "id workspace_id name slug kind parent_project_id root_url root_domain owned_domains brand_aliases negative_aliases category_slug verticals locale description cadence priority_prompt_limit next_run_at last_run_at discovery discovery_status fingerprint domain_verified_at visibility_blended visibility_by_engine visibility_delta_30d rendering_quality entity_authority aux_score_current source_coverage sparkline_30d open_task_count prompts_active prompts_cap status created_by created_at updated_at deleted_at rendering_delta_30d sentiment_score sentiment_delta_30d cells_30d open_tasks_by_severity demo_seeded_at paused_by_downgrade_at paused_by_downgrade_from",
+      "id workspace_id name slug kind parent_project_id root_url root_domain owned_domains brand_aliases negative_aliases category_slug verticals locale description cadence priority_prompt_limit next_run_at last_run_at discovery discovery_status fingerprint domain_verified_at visibility_blended visibility_by_engine visibility_delta_30d rendering_quality entity_authority aux_score_current source_coverage sparkline_30d open_task_count prompts_active prompts_cap status created_by created_at updated_at deleted_at rendering_delta_30d sentiment_score sentiment_delta_30d cells_30d open_tasks_by_severity demo_seeded_at paused_by_downgrade_at paused_by_downgrade_from benchmark_category_slug benchmark_category_applied_at",
     omit: "",
   },
   report_artifacts: {
