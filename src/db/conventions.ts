@@ -122,6 +122,11 @@ export const GLOBAL_TABLES = [
   "purge_runs",
   // STORY-111 (decision 68b) - erasures deferred by a legal hold; owner-only like legal_holds. Same migration.
   "subject_erasure_queue",
+  // STORY-189 (decisions 88 and 91) - the 180-category business taxonomy and its curated peer lists: versioned reference data, no workspace_id,
+  // no RLS. Read-only to every runtime role (see expectedTablePrivileges): rows change only by migration. security-and-tenancy R2 names both.
+  // Migrations 0187_business_categories and 0188_category_peers.
+  "business_categories",
+  "category_peers",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -485,6 +490,10 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
     if (role === "nominara_app") return APPEND_ONLY;
     if (role === "nominara_worker") return READ_ONLY;
     return NO_PRIVILEGES;
+  }
+  // STORY-189 (decision 91) - versioned reference data: every runtime role may read it, none may write it.
+  if (table === "business_categories" || table === "category_peers") {
+    return role === "nominara_app" || role === "nominara_worker" || role === "nominara_report" || role === "nominara_portal" ? READ_ONLY : NO_PRIVILEGES;
   }
   if (table === "audit_log") {
     if (role === "nominara_app" || role === "nominara_worker") return APPEND_ONLY;
