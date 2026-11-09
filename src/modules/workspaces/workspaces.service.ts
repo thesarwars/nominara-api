@@ -517,6 +517,16 @@ export class WorkspacesService {
     workspaceId: string,
     meta: AuditRequestMeta,
   ): Promise<{ accessToken: string; csrfToken: string }> {
+    // MEMBERSHIP FIRST (STORY-110, enumeration). The id is caller-supplied, so the order of the two checks is a disclosure: with
+    // the status check first, an id that does not exist and a suspended workspace the caller is not in answered
+    // `workspace_suspended` while an active foreign one answered `not_a_member` - three shapes that map out which ids exist
+    // and in what state. A non-member now gets one refusal for all three; a member still learns their own workspace is
+    // suspended.
+    const live = await this.membership.getLiveMembership(this.pool, userId, workspaceId);
+    if (!live || live.status !== "active") {
+      throw new NotAMemberException();
+    }
+
     const workspaceStatus = await this.membership.getWorkspaceStatus(this.pool, workspaceId);
     // Mirrors WorkspaceGuard.assertWorkspaceIsUsable exactly (STORY-018) — a
     // token minted for a suspended/pending-deletion/deleted workspace would
@@ -527,11 +537,6 @@ export class WorkspacesService {
     // check on the switch path — see isWorkspaceUsable's own comment.
     if (!isWorkspaceUsable(workspaceStatus)) {
       throw new WorkspaceSuspendedException();
-    }
-
-    const live = await this.membership.getLiveMembership(this.pool, userId, workspaceId);
-    if (!live || live.status !== "active") {
-      throw new NotAMemberException();
     }
 
     const client = await this.pool.connect();

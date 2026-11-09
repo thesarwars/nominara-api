@@ -168,6 +168,8 @@ export async function assertSafeUrl(
   // real: without the loop below, retrying until the private address comes
   // back first is enough to reach it.
   const addresses = await resolve(url.hostname);
+  // No answer is not "no objection": there is nothing to pin the connection to, so refuse rather than connect blind.
+  if (addresses.length === 0) throw new GuardedFetchRefusal("dns_resolution_failed", "ENODATA");
 
   // EVERY address, not the first. A round-robin that answers with one public
   // and one private address would otherwise be reachable by simply retrying
