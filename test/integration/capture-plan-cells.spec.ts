@@ -173,6 +173,43 @@ describe("STORY-032 · engine resolution, prompt selection and cell fan-out", ()
     expect((await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys))[0]?.sampleCount, "business at 21 prompts").toBe(1);
   }, 60_000);
 
+  // Round-2 review MAJOR: the planner's clamp must read the SAME effective entitlement as the write gate
+  // (EntitlementResolver: plan, then `workspaces.entitlement_overrides`, absolute and last). Each case fails without the override join.
+  async function setDriftOverride(value: unknown): Promise<void> {
+    await db.query("UPDATE workspaces SET entitlement_overrides = $2::jsonb WHERE id = $1", [workspaceId, JSON.stringify({ "drift_sampling.enabled": value })]);
+  }
+  const plannedSamples = async (): Promise<number | undefined> => (await resolveEnabledEngines(db, projectId, undefined, seededEngineKeys))[0]?.sampleCount;
+
+  it("a contract override granting drift sampling (true) on a plan without it is honoured at planning, as the write gate honours it", async () => {
+    await addEngine("perplexity");
+    await enableForProject("perplexity", { samples: 3 });
+    await setPlan("growth");
+    expect(await plannedSamples(), "growth, no override").toBe(1);
+    await setDriftOverride(true);
+    expect(await plannedSamples(), "growth with override true").toBe(3);
+  }, 60_000);
+
+  it("an override of true on Business is unbounded: the le_20_prompts ceiling does not apply past 20 prompts (the write gate skips it too)", async () => {
+    await addEngine("perplexity");
+    await enableForProject("perplexity", { samples: 5 });
+    await setPlan("business");
+    for (let i = 0; i < 21; i += 1) await addPrompt(`p ${i}`);
+    expect(await plannedSamples(), "business at 21 prompts, no override").toBe(1);
+    await setDriftOverride(true);
+    expect(await plannedSamples(), "business at 21 prompts, override true").toBe(5);
+  }, 60_000);
+
+  it("an override of false (or null) on a plan that grants drift sampling revokes it: a stored sample_count above 1 plans ONE sample", async () => {
+    await addEngine("perplexity");
+    await enableForProject("perplexity", { samples: 5 });
+    await setPlan("business");
+    expect(await plannedSamples(), "business, no override").toBe(5);
+    await setDriftOverride(false);
+    expect(await plannedSamples(), "override false").toBe(1);
+    await setDriftOverride(null);
+    expect(await plannedSamples(), "override null is a real value, not absence").toBe(1);
+  }, 60_000);
+
   // A caller-supplied list narrows. It must never widen, or it becomes a way
   // to probe which engines a workspace is entitled to.
   it("an explicit engine list narrows but cannot widen past the entitlement", async () => {

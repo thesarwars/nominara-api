@@ -117,7 +117,14 @@ export async function resolveEnabledEngines(
       FROM project_entitled_engines pes
       LEFT JOIN workspaces drift_w ON drift_w.id = pes.workspace_id
       LEFT JOIN plans drift_p ON drift_p.key = drift_w.plan_key
-      LEFT JOIN LATERAL (SELECT drift_p.entitlements -> 'drift_sampling.enabled' -> 'value' AS value) drift ON true
+      -- THE EFFECTIVE VALUE, as EntitlementResolver (the write gate's source) computes it: the plan's, then the workspace's contract
+      -- override, which is absolute and last. jsonb_exists, not IS NULL, so an override that is an explicit JSON null is honoured
+      -- (revokes) rather than read as "no override". Add-ons do not touch this key.
+      LEFT JOIN LATERAL (
+        SELECT CASE WHEN jsonb_exists(drift_w.entitlement_overrides, 'drift_sampling.enabled')
+                    THEN drift_w.entitlement_overrides -> 'drift_sampling.enabled'
+                    ELSE drift_p.entitlements -> 'drift_sampling.enabled' -> 'value' END AS value
+      ) drift ON true
      WHERE pes.project_id = $1
        AND pes.enabled
        -- CAPTURE-READY ONLY. An engine can be entitled and still have no
