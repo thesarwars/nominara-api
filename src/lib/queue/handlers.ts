@@ -1,8 +1,10 @@
 import type { Pool } from "pg";
 import type { Env } from "../../config/env.schema.js";
+import { createAttributionRollupHandler } from "./handlers/attribution-rollup.handler.js";
 import { createBillingAutoTopupHandler } from "./handlers/billing-auto-topup.handler.js";
 import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-email.handler.js";
 import { createBillingDowngradeNoticeHandler } from "./handlers/billing-downgrade-notice.handler.js";
+import { createGscSyncHandler } from "./handlers/gsc-sync.handler.js";
 import { createEmbedBatchHandler } from "./handlers/embed-batch.handler.js";
 import { createTopicClusterHandler } from "./handlers/topic-cluster.handler.js";
 import { createLookupExecuteHandler } from "./handlers/lookup-execute.handler.js";
@@ -112,6 +114,12 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * `topic.cluster` lands with STORY-047: it groups one project's embedded prompts into clusters and writes them with their membership in one
  * transaction. Its producer is the topic-cluster sweep (src/lib/topics/sweep.ts), not a cron: `schedule.ts` keeps it at the stated weekly cron.
  *
+ * `attribution.rollup` lands with STORY-114: one project's per-URL rollup (every window length) and the substitution alert. Tenant-scoped, so the
+ * registrar will not tick it as a bare cron; its producer (an hourly sweep) is not built.
+ *
+ * `gsc.sync` lands with STORY-115: one slice of one Search Console connection (backfill and incremental are one watermark loop). Tenant-scoped, so the
+ * registrar will not tick it as a bare cron; its producers are the manual sync route, the callback and the job itself (a continuation).
+ *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
@@ -145,6 +153,8 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "report.cleanup": (context) => createReportCleanupHandler(context),
   "embed.batch": (context) => createEmbedBatchHandler(context),
   "topic.cluster": (context) => createTopicClusterHandler(context),
+  "attribution.rollup": (context) => createAttributionRollupHandler(context),
+  "gsc.sync": (context) => createGscSyncHandler(context),
 };
 
 /** The factory for `name`, or undefined when the queue is not wired yet. */

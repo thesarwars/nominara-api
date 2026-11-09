@@ -18,6 +18,7 @@ import { NotificationsModule } from "../modules/notifications/notifications.modu
 import { GeoModule } from "../modules/geo/geo.module.js";
 import { DisplacementModule } from "../modules/displacement/displacement.module.js";
 import { IntegrationsModule } from "../modules/integrations/integrations.module.js";
+import { AttributionModule } from "../modules/attribution/attribution.module.js";
 import { AgencyModule } from "../modules/agency/agency.module.js";
 import { ApiKeysModule } from "../modules/api-keys/api-keys.module.js";
 import { TrustModule } from "../modules/trust/trust.module.js";
@@ -78,6 +79,7 @@ import { ResponseEnvelopeInterceptor } from "./interceptors/response-envelope.in
     GeoModule,
     DisplacementModule,
     IntegrationsModule,
+    AttributionModule,
     AgencyModule,
     ApiKeysModule,
     TrustModule,

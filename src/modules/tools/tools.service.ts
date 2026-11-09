@@ -2,7 +2,9 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import {
+  COMPARABLE_TOOL_KEYS,
   FREE_TOOL_KEYS,
+  type ComparableRunsResponse,
   type ConvertToolRunRequest,
   type ConvertToolRunResponse,
   type ToolKey,
@@ -522,6 +524,58 @@ export class ToolsService {
       competitor_slots: { carried: competitorCap === null ? competitorsFound : Math.min(competitorsFound, competitorCap), cap: competitorCap },
       credits: 0 as const,
     };
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------------
+  // STORY-084 - Compare Runs reads. SELECTs only: a comparison captures nothing, enqueues nothing and fetches nothing.
+  // ---------------------------------------------------------------------------------------------------------------------------------
+
+  /**
+   * AC2 / FR-TL-05c - the runs comparable with this one: same workspace, same tool, same normalised input hash, only `completed` or `partial`, and not past
+   * `expires_at` (the sweep may not have reached it yet, and the compare route refuses an expired side). Only the two comparable tools have any. Served by
+   * `ix_tr_diff_pairs`. A run that is not in this workspace is a 404 (RLS), never an empty list.
+   */
+  async comparableRuns(runId: string): Promise<ComparableRunsResponse> {
+    const { client } = this.store();
+    const own = await client.query<{ tool_key: string }>(`SELECT tool_key FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1`, [runId]);
+    if (own.rows[0] === undefined) throw new NotFoundError({ message: "no such tool run" });
+    if (!(COMPARABLE_TOOL_KEYS as readonly string[]).includes(own.rows[0].tool_key)) return { run_id: runId, comparable: [] };
+    const rows = await client.query<RunRow>(
+      `SELECT ${COLUMNS} FROM tool_runs
+        WHERE workspace_id = app.current_workspace()
+          AND (tool_key, input_hash) = (SELECT tool_key, input_hash FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = $1)
+          AND status IN ('completed', 'partial') AND expires_at > now() AND id <> $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50`,
+      [runId],
+    );
+    return { run_id: runId, comparable: rows.rows.map(toRun) };
+  }
+
+  /** Both runs of a comparison in one read, with whether their normalised input hashes agree. A run in another workspace is a 404 (RLS). */
+  async comparisonPair(baseId: string, compareId: string): Promise<{ base: ToolRunDetail; compare: ToolRunDetail; sameInput: boolean }> {
+    const { client } = this.store();
+    const found = await client.query<RunRow & { input_hash: Buffer }>(
+      `SELECT ${COLUMNS}, input_hash FROM tool_runs WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[])`,
+      [[baseId, compareId]],
+    );
+    const base = found.rows.find((r) => r.id === baseId);
+    const compare = found.rows.find((r) => r.id === compareId);
+    if (base === undefined) throw new NotFoundError({ message: "no such tool run (base_run_id)" });
+    if (compare === undefined) throw new NotFoundError({ message: "no such tool run (compare_run_id)" });
+    return { base: toDetail(base), compare: toDetail(compare), sameInput: base.input_hash.equals(compare.input_hash) };
+  }
+
+  /** AC11 - the stored comparison of exactly this ordered pair, if one exists: re-opening it is a read. */
+  async findComparison(baseId: string, compareId: string): Promise<string | null> {
+    const { client } = this.store();
+    const found = await client.query<{ id: string }>(
+      `SELECT id FROM tool_runs
+        WHERE workspace_id = app.current_workspace() AND tool_key = 'compare_runs' AND diff_base_run_id = $1 AND diff_compare_run_id = $2 AND status = 'completed'
+        ORDER BY created_at, id LIMIT 1`,
+      [baseId, compareId],
+    );
+    return found.rows[0]?.id ?? null;
   }
 
   private store(): { client: ClientBase; workspaceId: string; actorId: string } {

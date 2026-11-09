@@ -34,5 +34,15 @@ export const CREDIT_PRICE_KEY: Readonly<Record<CreditAction, string>> = Object.f
 
 export const CREDITS_KEY = "credits";
 
+/**
+ * STORY-085 (decision 79) - POST /command/execute prices whatever its single-use parse id names: a deep scan
+ * (priced) or a task (free). The route cannot declare one action statically, so it declares THIS marker and
+ * `CreditGuard` resolves the action from the parse record the caller presented, then runs the very same
+ * confirm-and-reserve path as `@Credits("deep_scan")`. It is the guard's own path, not a second pricing path.
+ */
+export const CREDITS_FROM_COMMAND_PARSE = "from_command_parse";
+
+export const CreditsFromCommandParse = (): MethodDecorator => SetMetadata(CREDITS_KEY, CREDITS_FROM_COMMAND_PARSE);
+
 export const Credits = (action: CreditAction): MethodDecorator & ClassDecorator =>
   SetMetadata(CREDITS_KEY, action);

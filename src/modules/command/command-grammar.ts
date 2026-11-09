@@ -2,6 +2,9 @@ import {
   COMMAND_INTENTS,
   type CommandIntent,
 } from "../../../contracts/command/command-intent.schema.js";
+import type { CommandScreen } from "../../../contracts/command/execute-response.schema.js";
+import type { z } from "zod";
+import type { commandActionHandlingSchema } from "../../../contracts/command/parse-response.schema.js";
 
 // STORY-085-A — the server grammar: deterministic, no model, no I/O.
 //
@@ -115,6 +118,27 @@ export function normalizeQuery(query: string): string {
     .replace(/^[\s?!.,;:]+|[\s?!.,;:]+$/g, "");
 }
 
+/** The slots that are the user's own words (a task title, a project name): stored and prefilled as typed, never lower-cased. */
+const FREE_TEXT_SLOTS: ReadonlySet<string> = new Set(["title", "name"]);
+
+/**
+ * The free-text slots of `intent` as the user TYPED them. The grammar matches the lower-cased text (and the cache keys on it), so the cased words
+ * are recovered per caller from the original query: the same rules, case-insensitively, over the same whitespace and edge-punctuation clean-up.
+ * Only `title` and `name` are returned; every other slot stays normalised.
+ */
+export function freeTextSlots(intent: CommandIntent, query: string): Record<string, string> {
+  const typed = query.replace(/\s+/g, " ").replace(/^[\s?!.,;:]+|[\s?!.,;:]+$/g, "");
+  const out: Record<string, string> = {};
+  for (const rule of RULES[intent]) {
+    const found = new RegExp(rule.pattern.source, "i").exec(typed);
+    if (found === null) continue;
+    const slots = bind(rule, found.slice(1));
+    for (const [name, value] of Object.entries(slots)) if (FREE_TEXT_SLOTS.has(name)) out[name] = value;
+    if (Object.keys(out).length > 0) break;
+  }
+  return out;
+}
+
 function bind(rule: Rule, groups: readonly (string | undefined)[]): Record<string, string> {
   const slots: Record<string, string> = {};
   rule.slots.forEach((name, index) => {
@@ -145,10 +169,21 @@ export function matchGrammar(normalized: string): Match[] {
   return matches.sort((a, b) => b.confidence - a.confidence);
 }
 
+export type ActionHandling = z.infer<typeof commandActionHandlingSchema>;
+
 export interface ActionSpec {
   readonly label: string;
   readonly isMutating: boolean;
   readonly requiredPermission: string | null;
+  /**
+   * STORY-085 (decision 78c): `execute` is the two actions the server runs from the bar; `open_screen` is what
+   * the client finishes on its own screen (the server writes and spends nothing); `client` is answered or
+   * navigated in the browser, and execute refuses it.
+   */
+  readonly handling: ActionHandling;
+  /** `open_screen` only: the screen, and which slot fills which prefill key. */
+  readonly screen?: CommandScreen;
+  readonly prefill?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -157,18 +192,22 @@ export interface ActionSpec {
  * until the price estimator (execute's slice) can say which are free.
  */
 export const ACTIONS: Readonly<Record<CommandIntent, ActionSpec>> = {
-  filter_find: { label: "Filter and find", isMutating: false, requiredPermission: "project:read" },
-  compare: { label: "Compare", isMutating: false, requiredPermission: "project:read" },
-  navigate: { label: "Go to", isMutating: false, requiredPermission: null },
-  run_visibility_scan: { label: "Run a visibility scan", isMutating: true, requiredPermission: "tracking:trigger" },
-  run_prompt_research: { label: "Run prompt research", isMutating: true, requiredPermission: "prompt:write" },
-  run_competitor_finder: { label: "Run the competitor finder", isMutating: true, requiredPermission: "project:update" },
-  run_aux_audit: { label: "Run an AUX audit", isMutating: true, requiredPermission: "aux:trigger" },
-  run_deep_scan: { label: "Run a deep scan", isMutating: true, requiredPermission: "tracking:trigger" },
-  create_project: { label: "Create a project", isMutating: true, requiredPermission: "project:create" },
-  create_task: { label: "Create a task", isMutating: true, requiredPermission: "task:create" },
-  show_tasks: { label: "Show tasks", isMutating: false, requiredPermission: "task:read" },
-  build_report: { label: "Build a report", isMutating: true, requiredPermission: "export:data" },
-  explain_metric: { label: "Explain a metric", isMutating: false, requiredPermission: null },
-  invite_member: { label: "Invite a member", isMutating: true, requiredPermission: "member:invite" },
+  filter_find: { label: "Filter and find", isMutating: false, requiredPermission: "project:read", handling: "client" },
+  compare: { label: "Compare", isMutating: false, requiredPermission: "project:read", handling: "client" },
+  navigate: { label: "Go to", isMutating: false, requiredPermission: null, handling: "client" },
+  // `requiredPermission` is ENFORCING (disabledReasonFor, assertMayExecute), so each open_screen action carries the permission of the route its
+  // screen reaches in tools.controller.ts, never a neighbour's: a role the tool screen admits must not be refused here.
+  run_visibility_scan: { label: "Run a visibility scan", isMutating: true, requiredPermission: "lookup:execute", handling: "open_screen", screen: "tools.visibility_scan", prefill: { project: "project_name" } },
+  // Prompt research has three routes: the screen's ENTRY action (discover / keep) is prompt:write; only its run step is lookup:execute.
+  // The bar opens the screen at its entry, so the entry's permission is the one pinned here.
+  run_prompt_research: { label: "Run prompt research", isMutating: true, requiredPermission: "prompt:write", handling: "open_screen", screen: "tools.prompt_research", prefill: { project: "project_name" } },
+  run_competitor_finder: { label: "Run the competitor finder", isMutating: true, requiredPermission: "lookup:execute", handling: "open_screen", screen: "tools.competitor_finder", prefill: { project: "project_name" } },
+  run_aux_audit: { label: "Run an AUX audit", isMutating: true, requiredPermission: "aux:trigger", handling: "open_screen", screen: "tools.aux_audit", prefill: { project: "project_name" } },
+  run_deep_scan: { label: "Run a deep scan", isMutating: true, requiredPermission: "tracking:trigger", handling: "execute" },
+  create_project: { label: "Create a project", isMutating: true, requiredPermission: "project:create", handling: "open_screen", screen: "projects.new", prefill: { name: "name" } },
+  create_task: { label: "Create a task", isMutating: true, requiredPermission: "task:create", handling: "execute" },
+  show_tasks: { label: "Show tasks", isMutating: false, requiredPermission: "task:read", handling: "client" },
+  build_report: { label: "Build a report", isMutating: true, requiredPermission: "export:data", handling: "open_screen", screen: "reports.new", prefill: { project: "project_name" } },
+  explain_metric: { label: "Explain a metric", isMutating: false, requiredPermission: null, handling: "client" },
+  invite_member: { label: "Invite a member", isMutating: true, requiredPermission: "member:invite", handling: "open_screen", screen: "members.invite", prefill: { email: "email", role: "role" } },
 };

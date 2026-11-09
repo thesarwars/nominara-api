@@ -61,5 +61,7 @@ import { TrackingService } from "./tracking.service.js";
       inject: [QUEUE_PRODUCER_CONNECTION],
     },
   ],
+  // STORY-085: the command bar's execute runs a deep scan through the same lifecycle service the route calls.
+  exports: [RunLifecycleService],
 })
 export class TrackingModule {}

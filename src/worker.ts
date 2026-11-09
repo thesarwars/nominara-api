@@ -19,6 +19,7 @@ import { NotifySweepRuntime } from "./lib/notifications/notify-sweep.js";
 import { poolTenantWrite, runSuppressionFanout } from "./lib/email/suppression-fanout.js";
 import { ReportSweepRuntime } from "./lib/reports/report-sweep.js";
 import { sweepStaleSendingDeliveries } from "./lib/reports/stale-delivery-sweep.js";
+import { runAttributionSweepIsolated } from "./lib/attribution/sweep.js";
 import { runTopicClusterSweepIsolated } from "./lib/topics/sweep.js";
 import { CanaryRuntime } from "./lib/engines/canary-runtime.js";
 import { captureEngineLeaseOptions } from "./lib/engines/engine-lease.js";
@@ -568,6 +569,9 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
           fanoutFailure = error;
         }
         await runTopicClusterSweepIsolated(client, (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options), new Date());
+        // STORY-114 / STORY-115 - the producers of `attribution.rollup` (hourly) and `gsc.sync` (daily, 04:00 UTC): both are tenant-scoped, so
+        // no bare cron can feed them. Reports its own failure and never throws, like the topic sweep above.
+        await runAttributionSweepIsolated(client, (queue, workspaceId, payload, options) => reportProducer.enqueueTenantJob(queue, workspaceId, payload, options), new Date());
         // STORY-183 - and the stale `sending` delivery sweep: a delivery whose sending process died is rewritten to `failed` (reads already show it so).
         // Independent of the other two: it runs even if the fan-out failed, and its own failure is raised only after both have run.
         let staleFailure: unknown;

@@ -7,6 +7,8 @@ import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { StructuralUsage } from "../../lib/entitlements/structural-usage.js";
 import { EntitlementsController } from "./entitlements.controller.js";
+import { PublicPlansController } from "./public-plans.controller.js";
+import { PublicPlansService } from "./public-plans.service.js";
 import { EntitlementsService } from "./entitlements.service.js";
 
 // STORY-022 scaffold, filled in by STORY-069.
@@ -28,9 +30,10 @@ import { EntitlementsService } from "./entitlements.service.js";
 // DbModule for the same reason.
 @Module({
   imports: [DbModule, CacheModule],
-  controllers: [EntitlementsController],
+  controllers: [EntitlementsController, PublicPlansController],
   providers: [
     EntitlementsService,
+    PublicPlansService,
     {
       provide: EntitlementResolver,
       useFactory: (cache: Cache, pool: Pool): EntitlementResolver => new EntitlementResolver(cache, pool),

@@ -201,7 +201,7 @@ describe("G12 · the schedule table matches the reference", () => {
   });
 
   it("⚠ records which dated queues are still inert, so the gap is visible", () => {
-    // `attribution.rollup` has a cron and NO handler (`capture.plan` was wired by NEW-A-10).
+    // `geo.analyze` has a schedule row and NO handler (`capture.plan` was wired by NEW-A-10, `attribution.rollup` by STORY-114, `gsc.sync` by STORY-115).
     // They are in the table on purpose — they light up the moment a handler
     // lands — but nothing schedules them today, and that must not be a
     // surprise discovered in production.
@@ -210,7 +210,7 @@ describe("G12 · the schedule table matches the reference", () => {
       .filter((queue) => handlerFor(queue) === undefined);
 
     // `topic.cluster` left this list with STORY-047: it has a handler now (and is tenant-scoped, so see the next test).
-    expect(datedAndInert.sort()).toEqual(["attribution.rollup", "geo.analyze", "gsc.sync"]);
+    expect(datedAndInert.sort()).toEqual(["geo.analyze"]);
     expect(inertQueueNames()).toEqual(expect.arrayContaining(datedAndInert));
   });
 
@@ -221,7 +221,7 @@ describe("G12 · the schedule table matches the reference", () => {
     // load-bearing:
     //
     //   a stated time      — six rows have a period and no hour
-    //   a wired handler    — `capture.plan`, `attribution.rollup`
+    //   a wired handler    — `geo.analyze` (`attribution.rollup` was wired by STORY-114 and `gsc.sync` by STORY-115; both are tenant-scoped)
     //   not tenant-scoped  — `rollup.metric_daily`
     //
     // The last was missing, and it is the one that bites: `rollup.metric_daily`
@@ -234,9 +234,11 @@ describe("G12 · the schedule table matches the reference", () => {
     const tenantScoped = dated.filter((queue) => handlerFor(queue) !== undefined && topologyFor(queue).tenantScoped);
     const schedulable = dated.filter((queue) => handlerFor(queue) !== undefined && !topologyFor(queue).tenantScoped);
 
-    expect(inert.sort()).toEqual(["attribution.rollup", "geo.analyze", "gsc.sync"]);
+    expect(inert.sort()).toEqual(["geo.analyze"]);
     // STORY-047: `topic.cluster` has a handler and is tenant-scoped, so a bare tick is refused for it; its producer is the sweep.
-    expect(tenantScoped.sort()).toEqual(["capture.plan", "rollup.metric_daily", "topic.cluster"]);
+    // STORY-114: `attribution.rollup` has a handler and is tenant-scoped; its producer is a per-project sweep, not a bare tick.
+    // STORY-115: `gsc.sync` has a handler and is tenant-scoped; its producers are the manual route, the callback and the job's own continuation.
+    expect(tenantScoped.sort()).toEqual(["attribution.rollup", "capture.plan", "gsc.sync", "rollup.metric_daily", "topic.cluster"]);
     expect(schedulable.sort()).toEqual([
       "audit.verify",
       "credit.housekeeping",

@@ -466,3 +466,25 @@ function assertNonNegativeInteger(value: number, what: string): void {
     throw new Error(`${what} must be a non-negative integer, received ${String(value)}`);
   }
 }
+
+export interface PublicCreditPackRow {
+  readonly key: string;
+  readonly display_name: string;
+  readonly credits: number;
+  readonly price_usd: string;
+  readonly currency: string;
+  readonly min_plan_key: string | null;
+  readonly sort_order: number;
+}
+
+/**
+ * STORY-103 - the PUBLIC credit-pack rows (`credit_packs` has no `workspace_id`: a global catalog), for the pricing page's add-on rows. Only the
+ * public ones, and only the columns the page shows: never the Stripe price id.
+ */
+export async function publicCreditPackRows(db: { query: ClientBase["query"] }): Promise<PublicCreditPackRow[]> {
+  const result = await db.query<PublicCreditPackRow>(
+    `SELECT key, display_name, credits, price_usd::text AS price_usd, currency, min_plan_key, sort_order
+       FROM credit_packs WHERE is_public ORDER BY sort_order, credits, key`,
+  );
+  return result.rows;
+}
