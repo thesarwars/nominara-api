@@ -91,6 +91,10 @@ export const geoAlignments = pgTable("geo_alignments", {
   createdBy: uuid("created_by"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  analysisState: text("analysis_state").notNull().default(sql`'pending'::text`),
+  analysisReason: text("analysis_reason"),
+  draftState: text("draft_state"),
+  draftRecomputeDueAt: timestamp("draft_recompute_due_at", { withTimezone: true }),
 });
 
 export const geoAnalyses = pgTable("geo_analyses", {
