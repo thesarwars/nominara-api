@@ -31,7 +31,7 @@ function buckets(config = RATE_LIMIT_DEFAULTS, clock = { ms: Date.UTC(2026, 7, 2
 // ---- the transcription --------------------------------------------------
 
 describe("STORY-025 · §12 transcribed exactly", () => {
-  it("defines every one of the sixteen route classes, once each", () => {
+  it("defines every one of the seventeen route classes, once each", () => {
     expect(RATE_LIMIT_DEFAULTS).toHaveLength(17);
     expect(RATE_LIMIT_DEFAULTS.map((entry) => entry.route_class).sort()).toEqual(
       [...rateLimitRouteClassSchema.options].sort(),
