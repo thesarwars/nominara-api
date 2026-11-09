@@ -62,18 +62,18 @@ export class AlignmentService {
         const workspaceId = store.context.workspaceId;
 
         const project = await tx.query<{ in_scope: boolean }>(
-          `SELECT ${SCOPE_OK.replace("%P%", "id")} AS in_scope FROM projects WHERE id = $1 AND deleted_at IS NULL`,
+          `SELECT ${SCOPE_OK.replace("%P%", "id")} AS in_scope FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL`,
           [body.project_id],
         );
         if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
         if (!project.rows[0].in_scope) throw new ProjectOutOfScopeException();
 
-        const cluster = await tx.query("SELECT 1 FROM topic_clusters WHERE id = $1 AND project_id = $2", [body.prompt_cluster_id, body.project_id]);
+        const cluster = await tx.query("SELECT 1 FROM topic_clusters WHERE id = $1 AND project_id = $2 AND workspace_id = app.current_workspace()", [body.prompt_cluster_id, body.project_id]);
         if (cluster.rows.length === 0) {
           throw new ValidationFailedError({ message: "no such topic cluster in this project", details: { issues: [{ path: ["prompt_cluster_id"], message: "no such topic cluster in this project" }] } });
         }
 
-        const engines = await tx.query<{ engine_key: string }>("SELECT engine_key FROM project_engines WHERE project_id = $1 AND enabled ORDER BY engine_key", [body.project_id]);
+        const engines = await tx.query<{ engine_key: string }>("SELECT engine_key FROM project_engines WHERE project_id = $1 AND workspace_id = app.current_workspace() AND enabled ORDER BY engine_key", [body.project_id]);
         const sessionId = uuidV7();
         await tx.query(
           `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, created_by)
@@ -158,7 +158,7 @@ export class AlignmentService {
   /** The 404 (RLS makes a foreign session absent) and the scope refusal, in one read. Returns what the callers need next. */
   private async assertVisible(tx: ClientBase, sessionId: string): Promise<{ project_id: string; analysis_state: string }> {
     const found = await tx.query<{ project_id: string; analysis_state: string; in_scope: boolean }>(
-      `SELECT project_id, analysis_state, ${SCOPE_OK.replace("%P%", "project_id")} AS in_scope FROM geo_alignments WHERE id = $1`,
+      `SELECT project_id, analysis_state, ${SCOPE_OK.replace("%P%", "project_id")} AS in_scope FROM geo_alignments WHERE id = $1 AND workspace_id = app.current_workspace()`,
       [sessionId],
     );
     const row = found.rows[0];
