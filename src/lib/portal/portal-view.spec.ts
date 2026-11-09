@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { ZodError } from "zod";
-import type { GrowthMapResponse } from "../../../contracts/analytics/index.js";
+import type { GrowthMapResponse, SourceIndexResponse } from "../../../contracts/analytics/index.js";
 import { portalGrowthMapResponseSchema } from "../../../contracts/portal/index.js";
 import type { MethodologyFooter } from "../../../contracts/reports/index.js";
 import { ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
-import { assertPortalTab, competitorLabel, findCostFields, parsePortalPayload, PORTAL_DEFAULT_TIMEFRAME, portalTimeframeDays, resolvePortalTimeframe, toPortalFooter, toPortalGrowthMap } from "./portal-view.js";
+import { assertPortalTab, competitorLabel, findCostFields, parsePortalPayload, PORTAL_DEFAULT_TIMEFRAME, portalTimeframeDays, resolvePortalTimeframe, toPortalFooter, toPortalGrowthMap, toPortalSources } from "./portal-view.js";
 
 // NEW-E-099a — the pure rules of the portal read model. Scenario IDs are STORY-098 / STORY-099's.
 const point = (d: string, v: number | null) => ({ d, visibility_score: v, sov: v === null ? null : 0.1, cells: v === null ? 0 : 12, live_ratio: v === null ? null : 1 });
@@ -195,5 +195,77 @@ describe("NEW-E-099a hide_costs footer · sample_size dropped, enforced by the a
   it("toPortalFooter drops exactly sample_size under hide_costs and returns the footer untouched otherwise", () => {
     expect(toPortalFooter(fullFooter, { hideCosts: true })).toEqual(hiddenFooter);
     expect(toPortalFooter(fullFooter, { hideCosts: false })).toEqual(fullFooter);
+  });
+});
+
+// Decision 83 (c) — the portal's Sources projection of the agency source index.
+describe("decision 83 (c) · toPortalSources", () => {
+  const domain = (over: Partial<SourceIndexResponse["domains"][number]> = {}): SourceIndexResponse["domains"][number] => ({
+    domain: "reddit.com",
+    influence: 0.5,
+    citations: 12,
+    prompts: 0,
+    source_class: "community_forum",
+    brand_present: null,
+    verified_at: null,
+    gap_severity: null,
+    seedable: true,
+    top_urls: [{ url: "https://reddit.com/r/x", citations: 3, last_seen: "2026-11-01" }],
+    competitors_present: [],
+    ...over,
+  });
+  const source = (domains: SourceIndexResponse["domains"], coverage: number | null = null): SourceIndexResponse => ({ window: { from: "2026-10-10", to: "2026-11-09" }, source_coverage: coverage, domains });
+  const open = { hideCosts: false, hideCompetitors: false };
+
+  it("drops the fields the portal never serves (seedable, last_seen) and keeps null and 0 distinct: unverified stays null, zero prompts stays 0", () => {
+    const out = toPortalSources(source([domain()], null), open);
+    expect(out.domains[0]).toEqual({
+      domain: "reddit.com",
+      influence: 0.5,
+      citations: 12,
+      prompts: 0,
+      source_class: "community_forum",
+      brand_present: null,
+      verified_at: null,
+      gap_severity: null,
+      top_urls: [{ url: "https://reddit.com/r/x", citations: 3 }],
+      competitors_present: [],
+    });
+    expect(out.source_coverage).toBeNull();
+    expect(toPortalSources(source([], 0), open).source_coverage).toBe(0);
+  });
+
+  it("hide_costs drops citations and prompts (and the per-url citation count) and nothing else", () => {
+    const out = toPortalSources(source([domain({ citations: 0, prompts: 0 })]), { ...open, hideCosts: true });
+    expect(out.domains[0]).toEqual({
+      domain: "reddit.com",
+      influence: 0.5,
+      source_class: "community_forum",
+      brand_present: null,
+      verified_at: null,
+      gap_severity: null,
+      top_urls: [{ url: "https://reddit.com/r/x" }],
+      competitors_present: [],
+    });
+  });
+
+  it("hide_competitors drops a competitor's OWN domain (its name is the domain) and passes every other row through with no competitor named", () => {
+    const rows = [domain({ domain: "globex.test", source_class: "vendor_owned", competitors_present: ["Globex Rival Industries"] }), domain({ domain: "reddit.com" })];
+    const hidden = toPortalSources(source(rows), { ...open, hideCompetitors: true });
+    expect(hidden.domains.map((d) => d.domain)).toEqual(["reddit.com"]);
+    expect(JSON.stringify(hidden)).not.toMatch(/Globex|globex/);
+    const visible = toPortalSources(source(rows), open);
+    expect(visible.domains.map((d) => [d.domain, d.competitors_present])).toEqual([["globex.test", ["Globex Rival Industries"]], ["reddit.com", []]]);
+  });
+
+  it("the allow-list: costs visible requires the counts, hide_costs refuses them, and an unknown key fails closed", () => {
+    const visible = toPortalSources(source([domain()]), open);
+    const hidden = toPortalSources(source([domain()]), { ...open, hideCosts: true });
+    expect(() => parsePortalPayload("sources", visible, { hideCosts: false })).not.toThrow();
+    expect(() => parsePortalPayload("sources", hidden, { hideCosts: true })).not.toThrow();
+    expect(() => parsePortalPayload("sources", visible, { hideCosts: true })).toThrow(ZodError);
+    expect(() => parsePortalPayload("sources", hidden, { hideCosts: false })).toThrow(ZodError);
+    expect(() => parsePortalPayload("sources", { ...visible, domains: [{ ...visible.domains[0], seedable: true }] }, { hideCosts: false })).toThrow(ZodError);
+    expect(findCostFields(hidden)).toEqual([]);
   });
 });

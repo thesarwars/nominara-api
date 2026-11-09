@@ -40,10 +40,15 @@ interface IndexRow {
 
 @Injectable()
 export class SourcesService {
-  async sourceIndex(projectId: string, query: SourceIndexQuery): Promise<SourceIndexResponse> {
+  /**
+   * `opts.portal.timezone` is the workspace timezone the portal interceptor read on the app pool: `nominara_portal` has no policy on
+   * `workspaces`, so the agency query's join to it would find no row. Everything else (the index rows, the competitors, the coverage)
+   * is the same code, read on the portal pool where RLS enforces the token's scope (including source_domains, decision 83 c).
+   */
+  async sourceIndex(projectId: string, query: SourceIndexQuery, opts: { readonly portal?: { readonly timezone: string } } = {}): Promise<SourceIndexResponse> {
     const { client: tx, workspaceId } = this.store();
     const days = DAYS[query.timeframe];
-    const project = await this.project(tx, projectId, days);
+    const project = await this.project(tx, projectId, days, opts.portal?.timezone);
     const rows = await this.rows(tx, projectId, days);
 
     const competitors = (
@@ -123,14 +128,23 @@ export class SourcesService {
     tx: ClientBase,
     projectId: string,
     days: number,
+    portalTimezone?: string,
   ): Promise<{ from: string; to: string; sourceCoverage: number | null }> {
-    const res = await tx.query<{ from: string; to: string; source_coverage: string | null }>(
-      `SELECT to_char(today - $2::int, 'YYYY-MM-DD') AS from, to_char(today, 'YYYY-MM-DD') AS to, p.source_coverage::text
-         FROM projects p JOIN workspaces w ON w.id = p.workspace_id,
-              LATERAL (SELECT (now() AT TIME ZONE w.timezone)::date AS today) t
-        WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [projectId, days],
-    );
+    const res =
+      portalTimezone === undefined
+        ? await tx.query<{ from: string; to: string; source_coverage: string | null }>(
+            `SELECT to_char(today - $2::int, 'YYYY-MM-DD') AS from, to_char(today, 'YYYY-MM-DD') AS to, p.source_coverage::text
+               FROM projects p JOIN workspaces w ON w.id = p.workspace_id,
+                    LATERAL (SELECT (now() AT TIME ZONE w.timezone)::date AS today) t
+              WHERE p.id = $1 AND p.deleted_at IS NULL`,
+            [projectId, days],
+          )
+        : await tx.query<{ from: string; to: string; source_coverage: string | null }>(
+            `SELECT to_char(today - $2::int, 'YYYY-MM-DD') AS from, to_char(today, 'YYYY-MM-DD') AS to, p.source_coverage::text
+               FROM projects p, LATERAL (SELECT (now() AT TIME ZONE $3::text)::date AS today) t
+              WHERE p.id = $1 AND p.deleted_at IS NULL`,
+            [projectId, days, portalTimezone],
+          );
     const row = res.rows[0];
     if (row === undefined) throw new NotFoundError({ message: "no such project" });
     return { from: row.from, to: row.to, sourceCoverage: row.source_coverage === null ? null : Number(row.source_coverage) };

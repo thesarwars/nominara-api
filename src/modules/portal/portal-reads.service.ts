@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { Injectable, Logger } from "@nestjs/common";
 import type { ScorecardEntry } from "../../../contracts/analytics/index.js";
 import type {
+  PortalSourcesQuery,
+  PortalSourcesResponse,
   PortalTasksQuery,
   PortalTasksResponse,
   PortalGrowthMapQuery,
@@ -11,12 +13,14 @@ import type {
   PortalOverviewResponse,
 } from "../../../contracts/portal/index.js";
 import type { ReportTimeframe } from "../../../contracts/reports/index.js";
+import { ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { selectPortalProject, type PortalSessionContext } from "../../api/decorators/portal-route.decorator.js";
 import { cacheKeyNamespace } from "../../lib/cache/key-namespace.js";
-import { assertPortalTab, findCostFields, parsePortalPayload, portalTimeframeDays, resolvePortalTimeframe, toPortalFooter, toPortalGrowthMap } from "../../lib/portal/portal-view.js";
+import { assertPortalTab, findCostFields, parsePortalPayload, portalTimeframeDays, resolvePortalTimeframe, toPortalFooter, toPortalGrowthMap, toPortalSources } from "../../lib/portal/portal-view.js";
 import { projectFacts } from "../../lib/portal/portal-facts.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { GrowthMapService, toMeasuredImpact } from "../analytics/growth-map.service.js";
+import { SourcesService } from "../analytics/sources.service.js";
 import { ScorecardsService } from "../analytics/scorecards.service.js";
 import { ProjectsService } from "../projects/projects.service.js";
 import { TasksService } from "../tasks/tasks.service.js";
@@ -42,7 +46,7 @@ const logger = new Logger("PortalReadsService");
 // value is never what sets the window — `days` is.
 const WINDOW_PLACEHOLDER = "30d" as const;
 
-type Tab = "overview" | "growth_map" | "matrix" | "tasks";
+type Tab = "overview" | "growth_map" | "matrix" | "tasks" | "sources";
 
 @Injectable()
 export class PortalReadsService {
@@ -54,6 +58,7 @@ export class PortalReadsService {
     private readonly methodology: MethodologyService,
     private readonly projects: ProjectsService,
     private readonly taskReads: TasksService,
+    private readonly sourceReads: SourcesService,
   ) {}
 
   async overview(session: PortalSessionContext, query: PortalOverviewQuery): Promise<PortalOverviewResponse> {
@@ -144,6 +149,26 @@ export class PortalReadsService {
         }),
         open: read.open.map((row) => ({ title: row.title, severity: row.severity, status: row.status })),
       };
+    });
+  }
+
+  // Decision 83 (c) — the Source Citation Index for one in-scope project. The same read as the agency's `GET /projects/{id}/sources`
+  // (SourcesService), projected for the portal: counts dropped under hide_costs, a competitor's own domain dropped under
+  // hide_competitors. The index is computed over 7, 30 and 90 days only, so a link locked to 24 hours has NO source window to serve:
+  // it is refused rather than served a wider one (a lock is a ceiling, never widened).
+  async sources(session: PortalSessionContext, query: PortalSourcesQuery): Promise<PortalSourcesResponse> {
+    assertPortalTab(session, "sources");
+    const project = selectPortalProject(session, query.project);
+    const timeframe = resolvePortalTimeframe(query.timeframe, session.policy.timeframeLock);
+    if (timeframe === "24h") {
+      throw new ValidationFailedError({
+        message: "sources are measured over 7, 30 or 90 days",
+        details: { issues: [{ path: ["timeframe"], message: "this link is locked to 24 hours, which has no source window" }] },
+      });
+    }
+    return this.cached(session, "sources", project, timeframe, async () => {
+      const source = await this.sourceReads.sourceIndex(project, { timeframe }, { portal: { timezone: session.facts.workspace.timezone } });
+      return toPortalSources(source, { hideCosts: session.policy.hideCosts, hideCompetitors: session.policy.hideCompetitors });
     });
   }
 

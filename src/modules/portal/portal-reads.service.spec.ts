@@ -43,6 +43,7 @@ function build(over: { footer?: Record<string, unknown>; growth?: Record<string,
     { footer } as never,
     { namesFor: vi.fn(async () => new Map([[P1, "Client One"]])) } as never,
     {} as never,
+    {} as never,
   );
   return { svc, footer };
 }
@@ -99,5 +100,48 @@ describe("owner decision 67 (o) · the portal cache follows a theme update", () 
     expect(policyFingerprint(same)).toBe(policyFingerprint(a));
     expect(policyFingerprint(edited)).not.toBe(policyFingerprint(a));
     expect(policyFingerprint(css)).not.toBe(policyFingerprint(a));
+  });
+});
+
+// Decision 83 (c) — PortalReadsService.sources
+describe("decision 83 (c) · PortalReadsService.sources", () => {
+  const indexRow = { domain: "reddit.com", influence: 0.5, citations: 2, prompts: 1, source_class: "community_forum", brand_present: null, verified_at: null, gap_severity: null, seedable: true, top_urls: [], competitors_present: [] };
+  const index = { window: { from: "2026-10-10", to: "2026-11-09" }, source_coverage: null, domains: [indexRow] };
+  function sourcesService(over: Partial<Record<string, unknown>> = {}) {
+    const sourceIndex = vi.fn(async () => ({ ...index, ...over }));
+    const svc = new PortalReadsService({} as never, {} as never, {} as never, {} as never, {} as never, { sourceIndex } as never);
+    return { svc, sourceIndex };
+  }
+  const withTabs = (tabs: string[], lock: string | null = null, hideCosts = false): PortalSessionContext => {
+    const base = session(hideCosts, "0198f6a0-0000-7000-8000-0000000000c1");
+    return { ...base, scopeTabs: tabs, policy: { ...base.policy, timeframeLock: lock } } as unknown as PortalSessionContext;
+  };
+
+  it("D83C-U1 reads the index for the in-scope project in the workspace timezone the interceptor supplied, on the window asked for", async () => {
+    const { svc, sourceIndex } = sourcesService();
+    const out = await svc.sources(withTabs(["sources"]), { project: P1, timeframe: "7d" });
+    expect(sourceIndex).toHaveBeenCalledWith(P1, { timeframe: "7d" }, { portal: { timezone: "UTC" } });
+    expect(out.domains[0]).not.toHaveProperty("seedable");
+  });
+
+  it("D83C-U2 a tab outside scope_tabs and a project outside scope read nothing", async () => {
+    const { svc, sourceIndex } = sourcesService();
+    await expect(svc.sources(withTabs(["overview"]), { project: P1 })).rejects.toThrow();
+    await expect(svc.sources(withTabs(["sources"]), { project: "0198f6a0-0000-7000-8000-0000000000ff" })).rejects.toThrow();
+    expect(sourceIndex).not.toHaveBeenCalled();
+  });
+
+  it("D83C-U3 a 24-hour lock has no source window: refused before any read, never served a wider window", async () => {
+    const { svc, sourceIndex } = sourcesService();
+    await expect(svc.sources(withTabs(["sources"], "24h"), { project: P1 })).rejects.toThrow(/7, 30 or 90 days/);
+    expect(sourceIndex).not.toHaveBeenCalled();
+  });
+
+  it("D83C-U4 a key no schema names is refused, not served (the allow-list is wired for sources)", async () => {
+    const { svc } = sourcesService({ domains: [{ ...indexRow, probe_tally: 7 }] });
+    // toPortalSources builds the row field by field, so a smuggled agency key never reaches the parse: prove the parse itself by a source that is malformed.
+    await expect(svc.sources(withTabs(["sources"]), { project: P1 })).resolves.toMatchObject({ domains: [{ domain: "reddit.com" }] });
+    const { svc: bad } = sourcesService({ source_coverage: 140 });
+    await expect(bad.sources(withTabs(["sources"], null, false), { project: P1 })).rejects.toBeInstanceOf(ZodError);
   });
 });
