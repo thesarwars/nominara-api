@@ -13,6 +13,9 @@ import { RATE_LIMIT_CLASS_KEY } from "../../api/rate-limit/route-class.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { InMemoryCacheAdapter } from "../../lib/cache/in-memory-cache.adapter.js";
 import { CommandController } from "./command.controller.js";
+import { ToolsController } from "../tools/tools.controller.js";
+import { TrackingController } from "../tracking/tracking.controller.js";
+import { evaluatePermission } from "../../tenancy/permission-matrix.js";
 import { RunLifecycleService } from "../tracking/run-lifecycle.service.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { CommandService } from "./command.service.js";
@@ -284,9 +287,9 @@ const EXPECTED: Readonly<Record<CommandIntent, { mutating: boolean; permission: 
   filter_find: { mutating: false, permission: "project:read" },
   compare: { mutating: false, permission: "project:read" },
   navigate: { mutating: false, permission: null },
-  run_visibility_scan: { mutating: true, permission: "tracking:trigger" },
+  run_visibility_scan: { mutating: true, permission: "lookup:execute" },
   run_prompt_research: { mutating: true, permission: "prompt:write" },
-  run_competitor_finder: { mutating: true, permission: "project:update" },
+  run_competitor_finder: { mutating: true, permission: "lookup:execute" },
   run_aux_audit: { mutating: true, permission: "aux:trigger" },
   run_deep_scan: { mutating: true, permission: "tracking:trigger" },
   create_project: { mutating: true, permission: "project:create" },
@@ -312,6 +315,35 @@ describe("STORY-085-A audit · every intent's action flags and permission are pi
       requires_confirmation: expected.mutating,
       required_permission: expected.permission,
     });
+  });
+});
+
+// B5 review finding: `required_permission` ENFORCES (disabled_reason, execute's re-check), so it must be the permission of the route the action
+// reaches. Derived from the controllers' own @RequirePermission metadata, not typed a second time.
+describe("B5 · each action's required_permission is its target route's @RequirePermission", () => {
+  const routePermission = (ctrl: object, method: string): string =>
+    Reflect.getMetadata(REQUIRE_PERMISSION_KEY, (ctrl as Record<string, object>)[method] as object) as string;
+  const TARGET: Partial<Record<CommandIntent, string>> = {
+    run_visibility_scan: routePermission(ToolsController.prototype, "scan"),
+    run_prompt_research: routePermission(ToolsController.prototype, "discoverPrompts"),
+    run_competitor_finder: routePermission(ToolsController.prototype, "findCompetitors"),
+    run_aux_audit: routePermission(ToolsController.prototype, "auxAuditStart"),
+    run_deep_scan: routePermission(TrackingController.prototype, "trigger"),
+  };
+
+  it.each(Object.keys(TARGET) as CommandIntent[])("%s matches its route", (intent) => {
+    expect(TARGET[intent]).toBeTruthy();
+    expect(EXPECTED[intent].permission).toBe(TARGET[intent]);
+  });
+
+  it("an analyst (lookup:execute allow, tracking:trigger deny) is offered the scan and competitor finder the tool screen allows", async () => {
+    const analyst = callerFor(WS_A, ACTOR_1, "analyst");
+    expect(evaluatePermission("analyst", "lookup:execute").access).not.toBe("deny");
+    expect(evaluatePermission("analyst", "tracking:trigger").access).toBe("deny");
+    for (const intent of ["run_visibility_scan", "run_competitor_finder"] as const) {
+      const parsed = await makeService().parse(analyst, PHRASES[intent]);
+      expect(parsed.actions[0]?.disabled_reason, intent).toBeNull();
+    }
   });
 });
 

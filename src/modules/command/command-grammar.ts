@@ -195,9 +195,13 @@ export const ACTIONS: Readonly<Record<CommandIntent, ActionSpec>> = {
   filter_find: { label: "Filter and find", isMutating: false, requiredPermission: "project:read", handling: "client" },
   compare: { label: "Compare", isMutating: false, requiredPermission: "project:read", handling: "client" },
   navigate: { label: "Go to", isMutating: false, requiredPermission: null, handling: "client" },
-  run_visibility_scan: { label: "Run a visibility scan", isMutating: true, requiredPermission: "tracking:trigger", handling: "open_screen", screen: "tools.visibility_scan", prefill: { project: "project_name" } },
+  // `requiredPermission` is ENFORCING (disabledReasonFor, assertMayExecute), so each open_screen action carries the permission of the route its
+  // screen reaches in tools.controller.ts, never a neighbour's: a role the tool screen admits must not be refused here.
+  run_visibility_scan: { label: "Run a visibility scan", isMutating: true, requiredPermission: "lookup:execute", handling: "open_screen", screen: "tools.visibility_scan", prefill: { project: "project_name" } },
+  // Prompt research has three routes: the screen's ENTRY action (discover / keep) is prompt:write; only its run step is lookup:execute.
+  // The bar opens the screen at its entry, so the entry's permission is the one pinned here.
   run_prompt_research: { label: "Run prompt research", isMutating: true, requiredPermission: "prompt:write", handling: "open_screen", screen: "tools.prompt_research", prefill: { project: "project_name" } },
-  run_competitor_finder: { label: "Run the competitor finder", isMutating: true, requiredPermission: "project:update", handling: "open_screen", screen: "tools.competitor_finder", prefill: { project: "project_name" } },
+  run_competitor_finder: { label: "Run the competitor finder", isMutating: true, requiredPermission: "lookup:execute", handling: "open_screen", screen: "tools.competitor_finder", prefill: { project: "project_name" } },
   run_aux_audit: { label: "Run an AUX audit", isMutating: true, requiredPermission: "aux:trigger", handling: "open_screen", screen: "tools.aux_audit", prefill: { project: "project_name" } },
   run_deep_scan: { label: "Run a deep scan", isMutating: true, requiredPermission: "tracking:trigger", handling: "execute" },
   create_project: { label: "Create a project", isMutating: true, requiredPermission: "project:create", handling: "open_screen", screen: "projects.new", prefill: { name: "name" } },
