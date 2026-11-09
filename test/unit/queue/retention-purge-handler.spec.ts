@@ -10,7 +10,7 @@ const state = vi.hoisted(() => ({
   clients: [] as { ended: boolean }[],
   locked: true,
   cycleCalls: 0,
-  cycleOptions: undefined as { deleteWorkspaceObjects?: (id: string) => Promise<void> } | undefined,
+  cycleOptions: undefined as { deleteWorkspaceObjects?: (id: string) => Promise<void>; deleteObjectPrefix?: (p: string) => Promise<void>; deleteProjectObjectKeys?: (workspaceId: string, keys: readonly string[]) => Promise<void>; objectKeyEnv?: string } | undefined,
   cycleThrows: false,
   result: { projectsPurged: ["p1", "p2"] as string[], workspacesPurged: [] as string[], skipped: [] as { scope: string; scopeId: string; reason: string }[], held: [] as unknown[], failed: 0 },
   unlocked: 0,
@@ -154,10 +154,22 @@ describe("retention.purge - STORY-180 r5: workspace erasure deletes the workspac
     expect(typeof state.cycleOptions?.deleteWorkspaceObjects).toBe("function");
   });
 
+  it("[STORY-182 AC3] leaves deleteObjectPrefix unwired: a project prefix would delete nothing (raw keys carry no project); project raw objects go by key instead", async () => {
+    await createRetentionPurgeHandler(withStorage(storageEnv))({} as never, tick);
+    expect(state.cycleOptions?.deleteObjectPrefix).toBeUndefined();
+  });
+
+  it("[STORY-182 decision 69(b)] hands the purge cycle a deleteProjectObjectKeys hook when object storage is configured", async () => {
+    await createRetentionPurgeHandler(withStorage(storageEnv))({} as never, tick);
+    expect(typeof state.cycleOptions?.deleteProjectObjectKeys).toBe("function");
+  });
+
   it("with object storage NOT configured the cycle runs without the hook, and says so", async () => {
     const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
     await createRetentionPurgeHandler(withStorage({}))({} as never, tick);
     expect(state.cycleOptions?.deleteWorkspaceObjects).toBeUndefined();
+    expect(state.cycleOptions?.deleteObjectPrefix).toBeUndefined();
+    expect(state.cycleOptions?.deleteProjectObjectKeys).toBeUndefined();
     expect(JSON.stringify(warn.mock.calls)).toContain("report_objects_not_deleted");
   });
 });

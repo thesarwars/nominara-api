@@ -1,4 +1,5 @@
 import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
@@ -8,7 +9,7 @@ import { PurgeJournal } from "../../compliance/purge-journal.js";
 import { S3JournalStore, writeComplianceExports } from "../../compliance/storage-adapters.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
-import { deleteWorkspaceReports } from "../../storage/workspace-purge.js";
+import { deleteProjectRawObjects, deleteWorkspaceObjectsEverywhere } from "../../storage/workspace-purge.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -51,6 +52,7 @@ import type { JobProcessor } from "../worker-factory.js";
 // discovery is filtered to zero rows under RLS, and a workspace hard delete issues `ALTER TABLE ... DISABLE TRIGGER`,
 // which needs table ownership. Direct (`DATABASE_URL`), never the pooler, because it holds a session advisory lock.
 export function createRetentionPurgeHandler(context: QueueHandlerContext): JobProcessor {
+  const tracer = trace.getTracer("nominara.retention");
   const logger = new Logger("retention.purge");
 
   return async (_client: ClientBase, _job: Job): Promise<void> => {
@@ -71,8 +73,11 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
         return;
       }
 
-      // STORY-180 r5: an erased workspace's stored report files are deleted (every version) AFTER its cascade commits. With object storage
-      // not configured the hook is absent, so the files would be left: say so, loudly, every run.
+      // STORY-180 r5 / STORY-182: an erased workspace's stored files (reports, raw captures, crawl snapshots; every version) are deleted AFTER
+      // its cascade commits. A PROJECT's raw objects are deleted BY KEY (decision 69(b)): raw keys are `{env}/{ws}/YYYY/MM/{id}.json.gz`, with no project
+      // segment, so `hardDeleteProject` collects each capture's `raw_object_key` before its cascade and `deleteProjectObjectKeys` removes them after
+      // the commit; `deleteObjectPrefix` stays unwired on purpose. With object storage not configured the hook
+      // is absent, so the files would be left: say so, loudly, every run.
       const storage = resolveStorageConfig(context.env);
       if (storage === null) logger.warn({ event: "report_objects_not_deleted", reason: "storage_unconfigured" });
       // STORY-111: with no object storage there is NO purge journal and NO compliance export. Said loudly every run; a workspace purge then
@@ -84,10 +89,39 @@ export function createRetentionPurgeHandler(context: QueueHandlerContext): JobPr
           ? {
               journal: new PurgeJournal(new S3JournalStore(adapter), storage.keyEnv),
               exporterFor: (workspaceId: string) => writeComplianceExports(adapter, storage.keyEnv, workspaceId),
+              deleteProjectObjectKeys: async (workspaceId: string, keys: readonly string[]): Promise<void> => {
+                await tracer.startActiveSpan("retention.project_objects_delete", async (span) => {
+                  try {
+                    const removed = await deleteProjectRawObjects(adapter, storage.keyEnv, workspaceId, keys);
+                    incrementCounter("nominara_retention_project_objects_deleted_total", { outcome: "deleted" });
+                    // Counts and the workspace ID only: never a key.
+                    logger.log({ event: "project_objects_deleted", workspace_id: workspaceId, keys: keys.length, versions_removed: removed });
+                  } catch (error) {
+                    span.setStatus({ code: SpanStatusCode.ERROR });
+                    incrementCounter("nominara_retention_project_objects_deleted_total", { outcome: "failed" });
+                    throw error;
+                  } finally {
+                    span.end();
+                  }
+                });
+              },
+              deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => {
+                await tracer.startActiveSpan("retention.workspace_objects_delete", async (span) => {
+                  try {
+                    const removed = await deleteWorkspaceObjectsEverywhere(adapter, storage.keyEnv, workspaceId);
+                    incrementCounter("nominara_retention_workspace_objects_deleted_total", { outcome: "deleted" });
+                    // The count and the workspace ID only: never a key.
+                    logger.log({ event: "workspace_objects_deleted", workspace_id: workspaceId, versions_removed: removed });
+                  } catch (error) {
+                    span.setStatus({ code: SpanStatusCode.ERROR });
+                    incrementCounter("nominara_retention_workspace_objects_deleted_total", { outcome: "failed" });
+                    throw error;
+                  } finally {
+                    span.end();
+                  }
+                });
+              },
             }
-          : {}),
-        ...(storage !== null && adapter !== undefined
-          ? { deleteWorkspaceObjects: async (workspaceId: string): Promise<void> => void (await deleteWorkspaceReports(adapter, storage.keyEnv, workspaceId)) }
           : {}),
       });
 

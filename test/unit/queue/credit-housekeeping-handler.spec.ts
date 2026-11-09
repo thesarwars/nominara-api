@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   expiryThrows: false,
   purged: 3,
   purgeThrows: false,
+  refreshThrows: false,
   purgeArgs: [] as unknown[],
   unlocked: 0,
 }));
@@ -40,6 +41,13 @@ vi.mock("../../../src/lib/credits/expire.js", () => ({
     state.order.push("expire");
     if (state.expiryThrows) throw new Error("expiry exploded");
     return state.expiry;
+  }),
+}));
+vi.mock("../../../src/lib/credits/monthly-refresh.js", () => ({
+  refreshMonthlyWallets: vi.fn(async () => {
+    state.order.push("refresh");
+    if (state.refreshThrows) throw new Error("refresh exploded");
+    return { workspacesChecked: 0, workspacesRolled: 0, failures: [] };
   }),
 }));
 vi.mock("../../../src/lib/usage/daily-cap.js", async () => {
@@ -76,6 +84,7 @@ beforeEach(() => {
   state.expiryThrows = false;
   state.purged = 3;
   state.purgeThrows = false;
+  state.refreshThrows = false;
   state.purgeArgs.length = 0;
   state.unlocked = 0;
 });
@@ -88,7 +97,7 @@ describe("credit.housekeeping", () => {
 
   it("runs the FIFO expiry sweep and then purges daily counters at their retention window, on ONE privileged connection", async () => {
     await run();
-    expect(state.order).toEqual(["expire", "purge"]);
+    expect(state.order).toEqual(["expire", "purge", "refresh"]);
     expect(state.purgeArgs).toEqual([DAILY_COUNTER_RETAIN_DAYS]);
     expect(state.clients).toHaveLength(1);
   });
@@ -116,7 +125,7 @@ describe("credit.housekeeping", () => {
     state.expiryThrows = true;
     vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
     await expect(run()).rejects.toThrow(/credit housekeeping/u);
-    expect(state.order).toEqual(["expire", "purge"]);
+    expect(state.order).toEqual(["expire", "purge", "refresh"]);
     expect(state.clients[0]!.ended).toBe(true);
   });
 
@@ -124,7 +133,14 @@ describe("credit.housekeeping", () => {
     state.purgeThrows = true;
     vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
     await expect(run()).rejects.toThrow(/credit housekeeping/u);
-    expect(state.order).toEqual(["expire", "purge"]);
+    expect(state.order).toEqual(["expire", "purge", "refresh"]);
+  });
+
+  it("[STORY-177] still expires and purges when the monthly refresh step throws, then fails the job", async () => {
+    state.refreshThrows = true;
+    vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+    await expect(run()).rejects.toThrow(/credit housekeeping/u);
+    expect(state.order).toEqual(["expire", "purge", "refresh"]);
   });
 
   it("fails the job when any workspace's expiry failed, naming the workspace by ID and never the reason's content in the thrown error", async () => {

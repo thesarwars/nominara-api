@@ -62,7 +62,7 @@ import { ExportService } from "./export.service.js";
 // i.e. Resend accepted it), `logged` (a sender that delivers to nobody: never `delivered`), or `failed` (with last_error and
 // the "N of M recipients" text). No row lock and no pooled connection is held while the provider is slow.
 // A process that dies between the commit and the second transaction leaves the row `sending`; reads show a `sending` row
-// older than STALE_SENDING_MS as `failed` (the row itself is not rewritten: a sweep is a follow-up).
+// older than STALE_SENDING_MS as `failed`, and the report group's stale-delivery sweep (lib/reports/stale-delivery-sweep.ts, STORY-183) rewrites the row itself.
 
 const logger = new Logger("ScheduledReportsService");
 /**

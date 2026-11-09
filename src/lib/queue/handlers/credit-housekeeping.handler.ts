@@ -3,6 +3,7 @@ import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
 import { expireDuePurchasedCredits, type ExpiryOutcome } from "../../credits/expire.js";
+import { refreshMonthlyWallets, type MonthlyRefreshOutcome } from "../../credits/monthly-refresh.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { DAILY_COUNTER_RETAIN_DAYS, purgeDailyCounters } from "../../usage/daily-cap.js";
 import { globalQueueLockKey, releaseAdvisorySessionLock, tryAdvisorySessionLock } from "../locks.js";
@@ -10,14 +11,17 @@ import type { QueueHandlerContext } from "../handlers.js";
 import type { JobProcessor } from "../worker-factory.js";
 
 // STORY-076 AC4 and STORY-071 AC10 — `credit.housekeeping`, the daily tick for the two credit jobs that were built,
-// tested, and called by nothing:
+// tested, and called by nothing (and, from STORY-177, a third step: the monthly included-credit refresh for annual and
+// free wallets, `monthly-refresh.ts`. The trigger is this daily tick, not a request-path check, so a quiet workspace
+// still refreshes):
 //
 //   1. `expireDuePurchasedCredits` — FIFO expiry of purchased credits, writing an `expire` ledger entry
 //      (`plans-and-entitlements.md` §5: "12 months from purchase, FIFO by expiry. Expiry writes an `expire` ledger
 //      entry"). Before this, a purchased credit never expired.
 //   2. `purgeDailyCounters` — `schemas/billing-and-credits.md`: "Rows older than 35 days are purged nightly."
+//   3. `refreshMonthlyWallets` — STORY-177: the monthly included-credit refresh for annual and free wallets.
 //
-// ⚠ ONE QUEUE FOR BOTH, AND THE REASON IS THE CONNECTION, NOT TIDINESS. Both need the same privileged, direct,
+// ⚠ ONE QUEUE FOR ALL THREE, AND THE REASON IS THE CONNECTION, NOT TIDINESS. All need the same privileged, direct,
 // non-pooled connection (`credit_purchases`, `credit_wallets` and `credit_daily_counters` carry FORCE ROW LEVEL
 // SECURITY, so a cross-tenant scan on the runtime role sees nothing and reports a clean run). Two queues would be two
 // of those per night for jobs that are each a few statements. They stay INDEPENDENT STEPS: one throwing never skips
@@ -35,7 +39,7 @@ import type { JobProcessor } from "../worker-factory.js";
 //
 // ⚠ A FAILURE DOES FAIL THE JOB here, unlike the reconciler. The reconciler runs every ten minutes, so a failed
 // reservation is retried without ceremony; this runs once a day, so the retry ladder is the only prompt second try,
-// and both steps are idempotent, so re-running the one that already succeeded costs nothing.
+// and all three steps are idempotent, so re-running the one that already succeeded costs nothing.
 export function createCreditHousekeepingHandler(context: QueueHandlerContext): JobProcessor {
   const logger = new Logger("credit.housekeeping");
 
@@ -80,12 +84,28 @@ export function createCreditHousekeepingHandler(context: QueueHandlerContext): J
         logger.error(`daily counter purge step failed: ${error instanceof Error ? error.message : String(error)}`);
       }
 
+      // STORY-177: annual and free wallets' monthly refresh. An independent step, like the other two.
+      let refresh: MonthlyRefreshOutcome | undefined;
+      try {
+        refresh = await refreshMonthlyWallets({ discovery, work: context.pool });
+      } catch (error) {
+        failedSteps += 1;
+        incrementCounter("nominara_credit_housekeeping_step_failed_total", { step: "monthly_refresh" });
+        logger.error(`monthly refresh step failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      for (const failure of refresh?.failures ?? []) {
+        failedSteps += 1;
+        incrementCounter("nominara_credit_housekeeping_step_failed_total", { step: "monthly_refresh_workspace" });
+        logger.error(`could not refresh monthly credits: workspaceId=${failure.workspaceId} reason="${failure.reason}"`);
+      }
+
       incrementCounter("nominara_credit_housekeeping_runs_total");
       // Counts only — never an address, a name or a balance.
       logger.log(
         `credit housekeeping: expiry checked ${String(expiry?.workspacesChecked ?? 0)} workspace(s), ` +
           `expired ${String(expiry?.creditsExpired ?? 0)} credit(s) in ${String(expiry?.workspacesExpired ?? 0)}; ` +
-          `purged ${String(purged)} daily counter row(s); ${String(failedSteps)} failure(s)`,
+          `purged ${String(purged)} daily counter row(s); monthly refresh rolled ${String(refresh?.workspacesRolled ?? 0)} ` +
+          `of ${String(refresh?.workspacesChecked ?? 0)} wallet(s); ${String(failedSteps)} failure(s)`,
       );
     } finally {
       // `end()` is the guarantee that the lock is released; the explicit unlock is the documentation (see
