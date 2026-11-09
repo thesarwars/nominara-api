@@ -224,6 +224,8 @@ export class ProjectsService {
         nextRunAfter(startingCadence, new Date()),
       ],
     ).catch((error: unknown) => {
+      // STORY-189 AC2 — a category outside the taxonomy is the caller's mistake, said as a 422 naming the field.
+      if (isCategoryViolation(error)) throw unknownCategoryError(["category_slug"]);
       // `nextFreeSlug` picked a free one a moment ago, so reaching here means
       // a CONCURRENT create took it in between. The unique index is the real
       // guarantee and this is the honest report of it — a 409 the caller can
@@ -454,6 +456,7 @@ export class ProjectsService {
     const assignments: string[] = [];
     const params: unknown[] = [projectId];
     let categoryChanged = false;
+    let newCategory: string | undefined;
 
     for (const [name, decision] of Object.entries(input.fields ?? {})) {
       const field = name as ConfirmableField;
@@ -475,7 +478,10 @@ export class ProjectsService {
       assignments.push(`${COLUMN_FOR_FIELD[field]} = $${String(params.length + 1)}`);
       params.push(value);
 
-      if (field === "category" && value !== existing.rows[0]!.category_slug) categoryChanged = true;
+      if (field === "category" && value !== existing.rows[0]!.category_slug) {
+        categoryChanged = true;
+        newCategory = typeof value === "string" ? value : undefined;
+      }
 
       // AC3/AC4 — accepting records that it was applied; overriding also
       // records that a HUMAN decided, which is what re-discovery reads.
@@ -505,11 +511,15 @@ export class ProjectsService {
     await client.query(
       `UPDATE projects SET ${assignments.join(", ")}, updated_at = now() WHERE id = $1`,
       params,
-    );
+    ).catch((error: unknown) => {
+      // STORY-189 AC2 — the whole confirmation is refused, so competitors confirmed in the same request are not left half-applied.
+      if (isCategoryViolation(error)) throw unknownCategoryError(["fields", "category", "value"]);
+      throw error;
+    });
 
     // AC9 — overriding the category must not leave everything derived from it
     // stale. `rollup.metric_daily` is the job that recomputes it.
-    if (categoryChanged) this.requestRecompute(workspaceId, projectId);
+    if (categoryChanged) this.requestRecompute(workspaceId, projectId, existing.rows[0]!.category_slug, newCategory);
 
     // STORY-043 AC12 — the top-up. A URL-only project's first discovery pass had no brand, category or verticals to fill the prompt
     // templates from; the confirmed values are what it was waiting for. AFTER the columns above are written (the generator reads the
@@ -595,7 +605,7 @@ export class ProjectsService {
    * in the log, that the recomputation was skipped rather than silently
    * dropping the requirement.
    */
-  private requestRecompute(workspaceId: string, projectId: string): void {
+  private requestRecompute(workspaceId: string, projectId: string, previousCategory: string | null, newCategory: string | undefined): void {
     if (handlerFor("rollup.metric_daily") === undefined) {
       this.logger.warn(
         `project ${projectId}: category changed but rollup.metric_daily has no handler yet — ` +
@@ -605,8 +615,11 @@ export class ProjectsService {
     }
     afterCommit(() => {
       void this.queues
-        .enqueueTenantJob("rollup.metric_daily", workspaceId, { projectId, reason: "category_override" }, {
-          idempotencyKey: `rollup:${projectId}:category-override`,
+        // STORY-176 AC4 — names the slug the project left, so the recompute removes it from that slug's contribution. The key carries both slugs
+        // and the time: each override is its own recompute (a repeat of an earlier A-to-B must not be swallowed by that job's key), and a
+        // redelivery of one job is idempotent in the handler.
+        .enqueueTenantJob("rollup.metric_daily", workspaceId, { projectId, reason: "category_override", ...(previousCategory === null ? {} : { previousCategorySlug: previousCategory }) }, {
+          idempotencyKey: `rollup:${projectId}:category-override:${previousCategory ?? "none"}>${newCategory ?? "none"}:${String(Date.now())}`,
         })
         .catch((error: unknown) => {
           this.logger.error(`failed to enqueue recompute for project ${projectId}: ${String(error)}`);
@@ -940,6 +953,20 @@ async function nextFreeSlug(
 }
 
 /** A Postgres 23505 on one named constraint. */
+/** STORY-189 — `fk_projects_category` (migration 0189) refused a `category_slug` outside `business_categories`. */
+function isCategoryViolation(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const pgError = error as { code?: unknown; constraint?: unknown };
+  return pgError.code === "23503" && pgError.constraint === "fk_projects_category";
+}
+
+function unknownCategoryError(path: string[]): InstanceType<typeof ValidationFailedError> {
+  return new ValidationFailedError({
+    message: "category is not one of the business categories",
+    details: { issues: [{ path, message: "unknown business category" }] },
+  });
+}
+
 function isUniqueViolation(error: unknown, constraint: string): boolean {
   if (typeof error !== "object" || error === null) return false;
   const pgError = error as { code?: unknown; constraint?: unknown };
