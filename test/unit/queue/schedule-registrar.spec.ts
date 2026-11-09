@@ -1,5 +1,6 @@
 import type { Queue } from "bullmq";
 import { describe, expect, it, vi } from "vitest";
+import { QUEUE_HANDLERS } from "../../../src/lib/queue/handlers.js";
 import { reconcileSchedules, schedulerIdFor } from "../../../src/lib/queue/schedule-registrar.js";
 
 // G12 — the registrar decides what actually ticks. Driven against a Queue
@@ -87,19 +88,34 @@ describe("G12 · reconcileSchedules", () => {
   });
 
   it("⚠ REFUSES a queue whose handler is not wired, however clear its cron", async () => {
-    // `attribution.rollup` has `0 * * * *` and no handler (`capture.plan` had
-    // the same until NEW-A-10 wired it). A repeatable
+    // No dated queue is left without a handler (`attribution.rollup` was the last, wired by STORY-114), so the refusal is exercised by
+    // taking that one handler out of the registry for the duration of the call. `attribution.rollup` has `0 * * * *`. A repeatable
     // here would fail every job down the retry ladder into the DLQ on a
     // timer — turning "not built yet" into "tried and failed" in the record
     // an operator reads during an incident. `src/worker.ts` makes the same
     // argument for the workers: inert is a better lie than broken.
     const queue = fakeQueue();
+    const wired = QUEUE_HANDLERS["attribution.rollup"];
+    delete QUEUE_HANDLERS["attribution.rollup"];
+    try {
+      const result = await reconcileSchedules(new Map([["attribution.rollup", asQueue(queue)]]));
+
+      expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
+      expect(result.scheduled).toEqual([]);
+      expect(result.skippedInert).toEqual(["attribution.rollup"]);
+    } finally {
+      QUEUE_HANDLERS["attribution.rollup"] = wired;
+    }
+  });
+
+  it("STORY-114 · attribution.rollup now has a handler but is tenant-scoped, so a bare cron is refused as tenant-scoped, not inert", async () => {
+    const queue = fakeQueue();
 
     const result = await reconcileSchedules(new Map([["attribution.rollup", asQueue(queue)]]));
 
     expect(queue.upsertJobScheduler).not.toHaveBeenCalled();
-    expect(result.scheduled).toEqual([]);
-    expect(result.skippedInert).toEqual(["attribution.rollup"]);
+    expect(result.skippedTenantScoped).toEqual(["attribution.rollup"]);
+    expect(result.skippedInert).toEqual([]);
   });
 
   it("NEW-A-10 · capture.plan now has a handler but is tenant-scoped, so a bare cron is still refused", async () => {

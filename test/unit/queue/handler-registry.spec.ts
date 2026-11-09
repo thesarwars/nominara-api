@@ -60,6 +60,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
   // ran on partitions nobody was extending.
   it("ships exactly the handlers the stories that landed them declared", () => {
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
+      // STORY-114 - the per-URL attribution rollup and the substitution alert.
+      "attribution.rollup",
       "audit.verify",
       "billing.auto_topup",
       "billing.customer_email",
@@ -108,6 +110,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "topic.cluster",
       // STORY-063 — declared after topic.cluster in topology.ts, i.e. between the rollup and credit entries.
       "task.generate",
+      // STORY-114 - declared after task.generate and before credit.reconcile in topology.ts.
+      "attribution.rollup",
       "credit.reconcile",
       // STORY-100 — report.build (the cadence path of a scheduled report), declared before notify.dispatch in topology.ts.
       "report.build",

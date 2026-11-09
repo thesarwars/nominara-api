@@ -60,6 +60,8 @@ export function alertDeepLink(code: string, facts: DeepLinkFacts): NotificationD
       return project("geo", { analysis: "divergence" });
     case "topic_gap_high":
       return project("geo", { analysis: "topics" });
+    case "ai_substitution":
+      return project("attribution", { tf });
     case "quota_threshold":
       return { path: "/settings/plan", query: {} };
     default:
