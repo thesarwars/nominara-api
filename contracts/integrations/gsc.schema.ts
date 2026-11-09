@@ -38,7 +38,7 @@ export const GSC_SESSIONS_LIMIT_COPY =
 export const GSC_INDEPENDENCE_COPY =
   "Citations, link impressions and sessions are three independent measurements. None of them answers the outcome question on its own.";
 export const GSC_CORRELATION_ONLY_COPY =
-  "These figures are shown side by side so movements can be compared. They show correlation only; no claim is made that one caused another.";
+  "These figures are shown side by side so movements can be compared. They show correlation only, never a cause.";
 export const GSC_SEARCH_QUERY_LABEL = "Search query (a real Google query, not an AI prompt)";
 
 export const gscOauthStartRequestSchema = z
