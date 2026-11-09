@@ -5,8 +5,12 @@ import {
   portalOverviewQuerySchema,
   portalOverviewResponseSchema,
   portalProjectQuerySchema,
+  portalSourcesQuerySchema,
+  portalSourcesResponseSchema,
   portalTasksQuerySchema,
   portalTasksResponseSchema,
+  type PortalSourcesQuery,
+  type PortalSourcesResponse,
   type PortalTasksQuery,
   type PortalTasksResponse,
   type PortalGrowthMapQuery,
@@ -66,5 +70,16 @@ export class PortalReadsController {
     @Query(new ZodValidationPipe(portalTasksQuerySchema)) query: PortalTasksQuery,
   ): Promise<PortalTasksResponse> {
     return this.reads.tasks(session, query);
+  }
+
+  // Decision 83 (c) — the Sources tab. Read-only like every route here; the database narrows scope (portal_scope_source_domains).
+  @Get("sources")
+  @PortalRoute()
+  @ApiContract({ operationId: "getPortalSources", querySchema: portalSourcesQuerySchema, responseSchema: portalSourcesResponseSchema })
+  sources(
+    @PortalSession() session: PortalSessionContext,
+    @Query(new ZodValidationPipe(portalSourcesQuerySchema)) query: PortalSourcesQuery,
+  ): Promise<PortalSourcesResponse> {
+    return this.reads.sources(session, query);
   }
 }

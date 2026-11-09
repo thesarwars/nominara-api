@@ -587,6 +587,11 @@ export class TasksService {
     return { updated, tasks };
   }
 
+  /** One task's read model, in the ambient tenant transaction. For a module that found a task id through its own link (the AUX finding promotion). */
+  async readTaskById(taskId: string): Promise<Task> {
+    return this.readTask(currentTenantStore()!.client, taskId);
+  }
+
   private async readTask(client: ClientBase, taskId: string): Promise<Task> {
     const row = await client.query<TaskRow>(
       `SELECT t.id, t.short_ref, t.project_id, t.goal_id, t.title, t.description, t.kind, t.origin, t.status,

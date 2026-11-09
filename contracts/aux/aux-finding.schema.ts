@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 import { PAGINATION_LIMIT_DEFAULT, PAGINATION_LIMIT_MAX } from "../common/pagination.schema.js";
 import { auxCategorySchema } from "./aux-audit.schema.js";
 import { auxGuidanceSchema, auxPatchSchema } from "./patch.schema.js";
@@ -126,3 +127,8 @@ export const updateAuxFindingRequestSchema = z
   });
 
 export type UpdateAuxFindingRequest = z.infer<typeof updateAuxFindingRequestSchema>;
+
+// The :id of every /aux-findings/{id}/... route. Validated at the boundary so a non-UUID is a 400, not a uuid-cast 500 deeper in.
+export const auxFindingParamsSchema = z.object({ id: lowercaseUuidSchema }).strict();
+
+export type AuxFindingParams = z.infer<typeof auxFindingParamsSchema>;

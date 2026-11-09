@@ -126,6 +126,19 @@ CREATE POLICY portal_scope_answer_captures ON answer_captures
          AND project_id = ANY (app.current_scope_projects()));
 ```
 
+**`portal_scope_source_domains` (owner decision 83c, migration 0178).** The one portal policy that enforces scope through a join. `source_domains` has no `project_id` column, and a workspace-only policy would let a project-scoped token enumerate every domain in the workspace, so the policy admits a domain only where a `project_source_index` row exists for a project in the token's scope:
+
+```sql
+CREATE POLICY portal_scope_source_domains ON source_domains
+  FOR SELECT TO nominara_portal
+  USING (workspace_id = app.current_workspace()
+         AND EXISTS (SELECT 1 FROM project_source_index psi
+                     WHERE psi.source_domain_id = source_domains.id
+                       AND psi.project_id = ANY (app.current_scope_projects())));
+```
+
+`project_source_index` is itself portal-scoped by its own `project_id`, so the subquery runs under the portal role's RLS too, and a domain seen only in an out-of-scope project stays invisible (ISO-09). This backs `GET /portal/sources`. It overrides the earlier note, from STORY-011, that removed `source_domains` from the portal-readable set.
+
 **Why `WITH CHECK` is mandatory.** `USING` filters reads. Without `WITH CHECK`, a defect or a crafted payload could `INSERT` — or `UPDATE … SET workspace_id = <other tenant>` — writing into a tenant it could never read. Every `FOR ALL` policy specifies both, and CI asserts that `pg_policies` contains a non-null `with_check` for every one of them.
 
 **Maintenance count policies (migration 0160, ADR-0004).** `nominara_maintenance` (§2) is admitted to exactly seven tables by one role-targeted policy each, and to nothing else. Each is `FOR SELECT TO nominara_maintenance USING (true)`; permissive policies combine per role, so none contributes anything to any other role. The grant behind them is column-level `SELECT` on key columns only (no table grant, no write, no content column). The functions read the partitioned parents, so no per-partition policy is needed as months are added.
@@ -357,7 +370,7 @@ Access tokens are short-lived but not instantly revocable, which is unacceptable
 | `ISO-06` | Every table in `information_schema.tables` either has `workspace_id` with RLS enabled, appears in `TENANT_SCOPE_COLUMN`, or appears in `GLOBAL_TABLES`. **The census counts are asserted too** — 59 tenant, 10 global — so a table added without a decision fails here rather than silently shrinking `ISO-01`'s loop. **As built (2026-11-06, batch 4): 91 base tables, 68 tenant, 23 global** — STORY-111 adds three global tables (`legal_holds`, `purge_runs`, `subject_erasure_queue`, migration 0165) and STORY-098 one tenant table (`share_token_email_codes`, migration 0169). The subject inventory (`src/lib/compliance/subject-inventory.ts`) is keyed on the same tenant-table list, so a tenant table with no inventory entry fails the build |
 | `ISO-07` | No runtime role has `rolbypassrls`; only `nominara_breakglass` does |
 | `ISO-08` | Fuzz: 500 randomised authenticated requests replaying tenant A's resource IDs under tenant B's session yield only 403/404 — never 200 with A's data |
-| `ISO-09` | A share-token session cannot read a project outside `scope_project_ids`, even within the same workspace |
+| `ISO-09` | A share-token session cannot read a project outside `scope_project_ids`, even within the same workspace; this covers `source_domains` through `portal_scope_source_domains` (owner decision 83c) |
 | `ISO-10` | A share-token session receives `42501` on any `INSERT`/`UPDATE`/`DELETE` — the role has no grants |
 | `ISO-11` | A worker job whose payload signature is tampered is rejected **before** any `set_config` executes |
 | `ISO-12` | Ciphertext from tenant A fails to decrypt when copied into tenant B's row (AAD binding). Runs against **every** table holding an envelope-encrypted column, **discovered from the schema rather than named**, so a table added later is picked up automatically |

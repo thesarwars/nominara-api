@@ -278,6 +278,16 @@ export class StripeHttpGateway implements StripeGateway {
     }
   }
 
+  async setSubscriptionCancelAtPeriodEnd(input: { readonly subscriptionId: string }): Promise<void> {
+    const client = this.requireClient();
+    try {
+      // The flag and nothing else: not `subscriptions.cancel` (immediate), no proration, no refund, no idempotency key.
+      await client.subscriptions.update(input.subscriptionId, { cancel_at_period_end: true });
+    } catch (error) {
+      throw this.asUpstream(error);
+    }
+  }
+
   async changeAddonQuantity(input: AddonChangeInput): Promise<void> {
     const client = this.requireClient();
     try {

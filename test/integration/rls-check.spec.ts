@@ -71,6 +71,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       // 0081 supplies the (workspace_id, id) key on share_tokens that 0169's composite foreign key references.
       "0081_share_token_tenant_fk",
       "0169_share_token_email_codes",
+      // Owner decision 83 (c) — checkRls() expects portal_scope_source_domains, the join-scoped policy migration 0178 creates.
+      "0178_portal_source_domains_policy",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

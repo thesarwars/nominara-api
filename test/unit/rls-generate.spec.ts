@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ACTOR_SELF_SCOPED_TABLES,
   GLOBAL_TABLES,
+  PORTAL_JOIN_SCOPED_TABLES,
   PORTAL_READABLE_TABLES,
   RLS_POLICY_ROLES,
   RUNTIME_ROLES,
@@ -10,7 +11,9 @@ import {
 import {
   computeActorSelfScopedPolicies,
   computeDefinerOwnerPolicies,
+  computeExpectedPolicies,
   generateActorSelfScopedRlsSql,
+  generatePortalJoinScopedRlsSql,
   generateRlsSql,
   resolveProjectPredicate,
   type TableDescriptor,
@@ -84,7 +87,7 @@ const PROJECTS_PROMPTS_FIXTURES: TableDescriptor[] = [
 
 // ---- 0004_rollups_aux_tasks_geo_tools.up.sql (31, excl. the 4 global ones)
 const ROLLUPS_AUX_TASKS_GEO_FIXTURES: TableDescriptor[] = [
-  t("source_domains", ["id", "workspace_id"]), // no project_id — not portal-readable, STORY-011-E-2
+  t("source_domains", ["id", "workspace_id"]), // no project_id — portal-readable through project_source_index only (decision 83 c)
   t("project_source_index", ["workspace_id", "project_id"]),
   t("metric_daily", ["workspace_id", "project_id"]),
   t("milestones", ["id", "workspace_id", "project_id"]),
@@ -185,12 +188,15 @@ describe("STORY-011 · src/db/rls/generate.ts — RLS policy generator", () => {
 
   // ---- portal_scope_* only for portal-readable tables ------------------------
 
-  it("emits portal_scope_* ONLY for the 18 portal-readable tables, never for a non-portal tenant table", () => {
-    expect(PORTAL_READABLE_TABLES.length).toBe(18);
+  it("0006 emits portal_scope_* for the 18 project-keyed portal-readable tables, never a non-portal tenant table, and NOT source_domains (that policy has its own migration)", () => {
+    expect(PORTAL_READABLE_TABLES.length).toBe(19);
+    expect([...PORTAL_JOIN_SCOPED_TABLES]).toEqual(["source_domains"]);
     const sql = generateRlsSql(REAL_SCHEMA_TABLES);
-    for (const table of PORTAL_READABLE_TABLES) {
+    for (const table of PORTAL_READABLE_TABLES.filter((name) => !(PORTAL_JOIN_SCOPED_TABLES as readonly string[]).includes(name))) {
       expect(sql, `expected portal_scope_${table}`).toContain(`CREATE POLICY portal_scope_${table} ON ${table}`);
     }
+    // ⚠ 0006 is an APPLIED migration: a policy added to it would never reach a database that already ran it.
+    expect(sql).not.toContain("portal_scope_source_domains");
     const nonPortalTenantTables = REAL_SCHEMA_TABLES.filter(
       (table) =>
         !(GLOBAL_TABLES as readonly string[]).includes(table.name) &&
@@ -223,15 +229,27 @@ describe("STORY-011 · src/db/rls/generate.ts — RLS policy generator", () => {
     expect(resolveProjectPredicate(t("hypothetical_workspace_only_table", ["id", "workspace_id"]))).toBeNull();
   });
 
-  it("source_domains and brand_themes no longer receive ANY portal_scope_* policy at all — removed from PORTAL_READABLE_TABLES", () => {
-    const sql = generateRlsSql([
-      t("source_domains", ["id", "workspace_id"]),
-      t("brand_themes", ["id", "workspace_id"]),
-    ]);
-    expect(sql).not.toContain("portal_scope_source_domains");
-    expect(sql).not.toContain("portal_scope_brand_themes");
-    expect((PORTAL_READABLE_TABLES as readonly string[])).not.toContain("source_domains");
+  it("decision 83 (c) — source_domains is portal-readable ONLY through a project_source_index row for a project in the token's scope; brand_themes still receives no portal policy", () => {
+    const portalPolicy = computeExpectedPolicies(REAL_SCHEMA_TABLES).find((policy) => policy.policyName === "portal_scope_source_domains");
+    expect(portalPolicy).toMatchObject({ table: "source_domains", cmd: "SELECT", roles: ["nominara_portal"], withCheck: null });
+    expect(portalPolicy!.using).toBe(
+      "workspace_id = app.current_workspace() AND EXISTS (SELECT 1 FROM project_source_index psi WHERE psi.source_domain_id = source_domains.id AND psi.project_id = ANY (app.current_scope_projects()))",
+    );
+    expect(computeExpectedPolicies(REAL_SCHEMA_TABLES).some((policy) => policy.policyName === "portal_scope_brand_themes")).toBe(false);
     expect((PORTAL_READABLE_TABLES as readonly string[])).not.toContain("brand_themes");
+  });
+
+  it("decision 83 (c) — the join-scoped portal policy is generated into its OWN migration: one guarded SELECT policy for nominara_portal, no ENABLE/FORCE, no ws_isolation, and it names the override of the STORY-011-E-2 note", () => {
+    const sql = generatePortalJoinScopedRlsSql(REAL_SCHEMA_TABLES);
+    expect(sql).toContain("CREATE POLICY portal_scope_source_domains ON source_domains");
+    expect(sql).toContain("FOR SELECT TO nominara_portal");
+    expect(sql).toContain("EXISTS (SELECT 1 FROM project_source_index psi");
+    expect(sql).toContain("psi.project_id = ANY (app.current_scope_projects())");
+    expect(sql).toContain("STORY-011-E-2");
+    expect(sql).toMatch(/owner decision 83/i);
+    expect(sql).not.toMatch(/ENABLE ROW LEVEL SECURITY|FORCE\s+ROW LEVEL SECURITY|ws_isolation_/);
+    expect([...sql.matchAll(/CREATE POLICY /g)]).toHaveLength(1);
+    expect(sql).toContain("pg_policies");
   });
 
   it("invariant — every real PORTAL_READABLE_TABLES entry resolves a non-null project predicate (the workspace-scope-only fallback is unreached in production)", () => {
@@ -272,7 +290,7 @@ describe("STORY-011 · src/db/rls/generate.ts — RLS policy generator", () => {
     expect(enableCount).toBe(59);
     expect(forceCount).toBe(59);
     expect(wsIsolationCount).toBe(59);
-    expect(portalScopeCount).toBe(18);
+    expect(portalScopeCount).toBe(18); // the 19th, source_domains, is in its own migration (decision 83 c)
 
     for (const table of GLOBAL_TABLES) {
       expect([...sql.matchAll(new RegExp(`CREATE POLICY \\w+ ON ${table}\\b`, "g"))]).toEqual([]);

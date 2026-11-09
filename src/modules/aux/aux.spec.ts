@@ -12,14 +12,24 @@ import { IDEMPOTENT_KEY } from "../../api/decorators/idempotent.decorator.js";
 import { RATE_LIMIT_CLASS_KEY } from "../../api/rate-limit/route-class.js";
 import { PROJECT_PARAM_KEY } from "../../api/decorators/project-param.decorator.js";
 import { CREDITS_KEY } from "../../api/decorators/credits.decorator.js";
-import { updateAuxFindingRequestSchema } from "../../../contracts/aux/index.js";
+import { applyFakeApiEnv } from "../../../test/support/fake-env.js";
+import { API_CONTRACT_KEY } from "../../api/decorators/api-contract.decorator.js";
+import { auxFindingParamsSchema, updateAuxFindingRequestSchema } from "../../../contracts/aux/index.js";
 
 // STORY-022 — one compiles-test per scaffolded module.
 describe("STORY-022 · AuxModule compiles", () => {
   it("resolves in a Nest testing module", async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [AuxModule] }).compile();
-    expect(moduleRef.get(AuxController)).toBeInstanceOf(AuxController);
-    await moduleRef.close();
+    // AuxModule imports TasksModule (the finding promotion inserts through TasksService), which builds the realtime
+    // publisher and validates the env eagerly.
+    const originalEnv = { ...process.env };
+    applyFakeApiEnv();
+    try {
+      const moduleRef = await Test.createTestingModule({ imports: [AuxModule] }).compile();
+      expect(moduleRef.get(AuxController)).toBeInstanceOf(AuxController);
+      await moduleRef.close();
+    } finally {
+      process.env = originalEnv;
+    }
   });
 });
 
@@ -172,10 +182,23 @@ describe("NEW-C-10 · controller", () => {
     expect(meta(AUDIT_METADATA_KEY, "updateFinding")).toMatchObject({ action: "aux_finding.updated", resourceType: "aux_finding" });
   });
 
+  it("[STORY-194 AC5] POST /aux-findings/{id}/create-task requires task:create, is idempotent and audited as task.created", () => {
+    expect(meta(REQUIRE_PERMISSION_KEY, "createTaskFromFinding")).toBe("task:create");
+    expect(meta(IDEMPOTENT_KEY, "createTaskFromFinding")).toBeTruthy();
+    expect(meta(AUDIT_METADATA_KEY, "createTaskFromFinding")).toMatchObject({ action: "task.created", resourceType: "task" });
+  });
+
+  it("[STORY-194] both /aux-findings/{id} routes validate :id, so a malformed id is a 400 and not a uuid-cast 500", () => {
+    for (const handler of ["createTaskFromFinding", "updateFinding"]) {
+      expect(meta(API_CONTRACT_KEY, handler)).toMatchObject({ paramsSchema: auxFindingParamsSchema });
+    }
+  });
+
   it("[NEW-C-10 AC1] no route can set resolved: the controller has exactly the reads and the one finding action (a patch is read, never written, by a client)", () => {
     const routes = Object.getOwnPropertyNames(AuxController.prototype).filter((n) => n !== "constructor").sort();
     // + triggerAudit and previewAudit (AUXLIVE-3): one creates an audit, the other quotes it; neither can touch a finding.
-    expect(routes).toEqual(["getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "previewAudit", "triggerAudit", "updateFinding"]);
+    // + createTaskFromFinding (STORY-194 AC5): it creates a task and never writes the finding.
+    expect(routes).toEqual(["createTaskFromFinding", "getAudit", "getPatch", "listProjectAudits", "listProjectFindings", "previewAudit", "triggerAudit", "updateFinding"]);
   });
 
   it("AUXLIVE-3 · POST /projects/{id}/aux-audits requires aux:trigger, is project-scoped, audited, idempotent and in the project_aux_audits rate class (10/hour per user, burst 3)", () => {

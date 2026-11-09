@@ -3,6 +3,7 @@ import {
   auxAuditListQuerySchema,
   auxAuditSchema,
   auxFindingListQuerySchema,
+  auxFindingParamsSchema,
   auxFindingSchema,
   auxPatchSchema,
   triggerAuxAuditPreviewResponseSchema,
@@ -12,6 +13,7 @@ import {
   type AuxAudit,
   type AuxAuditListQuery,
   type AuxFinding,
+  type AuxFindingParams,
   type AuxFindingListQuery,
   type AuxPatch,
   type TriggerAuxAuditPreviewResponse,
@@ -19,6 +21,7 @@ import {
   type TriggerAuxAuditResponse,
   type UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
+import { createTaskFromFindingRequestSchema, taskSchema, type CreateTaskFromFindingRequest, type Task } from "../../../contracts/tasks/index.js";
 import type { Page } from "../../api/pagination/page.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
@@ -123,15 +126,31 @@ export class AuxController {
     return this.service.getPatch(id);
   }
 
+  // `POST /aux-findings/{id}/create-task`, `task:create` (STORY-194 AC5). Idempotent: a replayed key returns the first response, and
+  // the service never makes a second open task for one finding. The URL names a finding: scope is enforced by the service.
+  @Post("aux-findings/:id/create-task")
+  @HttpCode(201)
+  @Idempotent()
+  @RequirePermission("task:create")
+  @ScopedByQuery()
+  @Audit({ action: "task.created", resourceType: "task", resourceIdFrom: "response" })
+  @ApiContract({ operationId: "createTaskFromAuxFinding", paramsSchema: auxFindingParamsSchema, requestSchema: createTaskFromFindingRequestSchema, responseSchema: taskSchema })
+  createTaskFromFinding(
+    @Param(new ZodValidationPipe(auxFindingParamsSchema)) { id }: AuxFindingParams,
+    @Body(new ZodValidationPipe(createTaskFromFindingRequestSchema.default({}))) _body: CreateTaskFromFindingRequest,
+  ): Promise<Task> {
+    return this.service.createTaskFromFinding(id);
+  }
+
   // The URL names a finding, not a project: scope is enforced by the service
   // against the finding's project (403 out-of-scope), as PATCH /tasks/{id} does.
   @Patch("aux-findings/:id")
   @RequirePermission("task:create")
   @ScopedByQuery()
   @Audit({ action: "aux_finding.updated", resourceType: "aux_finding" })
-  @ApiContract({ operationId: "updateAuxFinding", requestSchema: updateAuxFindingRequestSchema, responseSchema: auxFindingSchema })
+  @ApiContract({ operationId: "updateAuxFinding", paramsSchema: auxFindingParamsSchema, requestSchema: updateAuxFindingRequestSchema, responseSchema: auxFindingSchema })
   updateFinding(
-    @Param("id") id: string,
+    @Param(new ZodValidationPipe(auxFindingParamsSchema)) { id }: AuxFindingParams,
     @Body(new ZodValidationPipe(updateAuxFindingRequestSchema)) body: UpdateAuxFindingRequest,
   ): Promise<AuxFinding> {
     return this.service.updateFinding(id, body);

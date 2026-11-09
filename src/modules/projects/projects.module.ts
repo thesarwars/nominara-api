@@ -1,7 +1,9 @@
 import { Module } from "@nestjs/common";
 import { ProjectsController } from "./projects.controller.js";
 import { ProjectsService } from "./projects.service.js";
+import { ProjectEnginesController } from "./project-engines.controller.js";
 import { CompetitorsController } from "./competitors.controller.js";
+import { ProjectEnginesService } from "./project-engines.service.js";
 import { CompetitorTrackingService } from "./competitor-tracking.service.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { EntitlementsModule } from "../entitlements/entitlements.module.js";
@@ -20,10 +22,11 @@ import { defaultCheckDeps } from "../../lib/verification/checkers.js";
 // it rather than constructing a second instance with its own cache.
 @Module({
   imports: [QueueProducerModule, EntitlementsModule],
-  controllers: [ProjectsController, CompetitorsController],
+  controllers: [ProjectsController, CompetitorsController, ProjectEnginesController],
   providers: [
     ProjectsService,
     CompetitorTrackingService,
+    ProjectEnginesService,
     UrlGuard,
     DomainVerificationService,
     // A factory, so a test supplies its own resolver and fetcher and the

@@ -35,7 +35,12 @@ describe("STORY-110 · scenario 13 — the portal is read-only in the applicatio
   const isPortalRoute = (route: DiscoveredRoute): boolean => Reflect.getMetadata(PORTAL_ROUTE_KEY, route.handler) === true;
 
   it("the sweep sees the portal routes at all (a vacuous pass is the failure mode of every sweep)", () => {
-    expect(routes.filter(isPortalRoute).length).toBeGreaterThanOrEqual(4);
+    expect(routes.filter(isPortalRoute).length).toBeGreaterThanOrEqual(6);
+    // Decision 83 (c): GET /portal/sources is a portal route, a GET, and in the table.
+    const sources = routes.filter((r) => r.fullPath === "portal/sources");
+    expect(sources).toHaveLength(1);
+    expect(isPortalRoute(sources[0]!)).toBe(true);
+    expect(verbOf(sources[0]!)).toBe(GET);
     expect(routes.some((r) => r.fullPath === SESSION_MINT)).toBe(true);
   });
 

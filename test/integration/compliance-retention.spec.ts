@@ -191,6 +191,27 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
     });
   });
 
+  // Decision 83(b): a legal hold does NOT refuse the deletion request; the PURGE is what skips a held workspace, so nothing is destroyed.
+  it("D83B a workspace-scope hold on a pending_deletion workspace past its grace: the purge skips and reports it, every row survives, and it purges once the hold is released", async () => {
+    const ws = await workspace();
+    const [a, b] = [await user(), await user()];
+    const proj = await project(ws);
+    await db.query("UPDATE workspaces SET status = 'pending_deletion', deletion_requested_at = now() - interval '31 days', deletion_execute_at = now() - interval '1 day' WHERE id = $1", [ws]);
+    const hold = await placeLegalHold(db, { scope: "workspace", scopeId: ws, reason: "Hold on the whole workspace", requestedBy: a, approvedBy: b, expiresAt: new Date(Date.now() + 5 * DAY) });
+    const held = await runDailyPurgeCycle(db, { exportComplianceRecords: noop, deleteObjectPrefix: noop });
+    expect(held.held).toContainEqual({ scope: "workspace", scopeId: ws, reason: "legal-hold" });
+    expect(held.workspacesPurged).not.toContain(ws);
+    expect(await exists("workspaces", ws), "the held workspace row is not destroyed").toBe(true);
+    expect(await exists("projects", proj), "nor its project").toBe(true);
+    // Run it again: a held workspace stays held, however many nights pass.
+    await runDailyPurgeCycle(db, { exportComplianceRecords: noop, deleteObjectPrefix: noop });
+    expect(await exists("workspaces", ws)).toBe(true);
+    await releaseLegalHold(db, hold.id, b);
+    const released = await runDailyPurgeCycle(db, { exportComplianceRecords: noop, deleteObjectPrefix: noop });
+    expect(released.workspacesPurged).toContain(ws);
+    expect(await exists("workspaces", ws)).toBe(false);
+  });
+
   // ------------------------------------------------------------------ journal, idempotence, no archive
   describe("purge journal, idempotence and no content archive (scenarios 16, 17, 18, 19, 20, 21)", () => {
     it("S20 each purge appends an entry to the journal outside the database: identifiers, a timestamp, a reason, no content", async () => {

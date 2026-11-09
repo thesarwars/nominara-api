@@ -14,3 +14,4 @@ export * from "./task-generation.schema.js";
 export * from "./task-generate-job.schema.js";
 export * from "./task-verification-payload.schema.js";
 export * from "./task-verification.schema.js";
+export * from "./create-task-from-finding.schema.js";

@@ -20,6 +20,10 @@ import {
   acceptInvitationRequestSchema,
   createInvitationRequestSchema,
   createWorkspaceRequestSchema,
+  deleteWorkspaceParamsSchema,
+  deleteWorkspaceRequestSchema,
+  type DeleteWorkspaceParams,
+  type DeleteWorkspaceRequest,
   invitationResponseSchema,
   invitationRevokeParamsSchema,
   workspaceDetailResponseSchema,
@@ -147,6 +151,27 @@ export class WorkspacesController {
     const { detail, entityTag } = await this.service.getDetail(id);
     reply.header("ETag", formatEntityTag(entityTagFor(entityTag)));
     return detail;
+  }
+
+  // api-specification.md section 3: `DELETE /workspaces/{id}` - `workspace:delete` (owner, step-up), 30-day grace. The permission matrix
+  // puts the step-up on the permission, so the guard answers 401 `step_up_required` before this runs.
+  @Delete("workspaces/:id")
+  @HttpCode(202)
+  @RequirePermission("workspace:delete")
+  @Audit({ action: "workspace.deletion_scheduled", resourceType: "workspace", severity: "critical" })
+  @ApiContract({
+    operationId: "deleteWorkspace",
+    paramsSchema: deleteWorkspaceParamsSchema,
+    requestSchema: deleteWorkspaceRequestSchema,
+    responseSchema: workspaceDetailResponseSchema,
+  })
+  requestDeletion(
+    @Req() req: RbacScopedRequest,
+    @Param(new ZodValidationPipe(deleteWorkspaceParamsSchema)) { id }: DeleteWorkspaceParams,
+    @Body(new ZodValidationPipe(deleteWorkspaceRequestSchema)) body: DeleteWorkspaceRequest,
+  ): Promise<WorkspaceDetailResponse> {
+    assertPathIsTokenWorkspace(id, req.tenant!.workspaceId);
+    return this.service.requestDeletion(id, body.confirm_slug);
   }
 
   @Post("workspaces/:id/switch")

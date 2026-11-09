@@ -1,11 +1,14 @@
-import type { GrowthMapResponse } from "../../../contracts/analytics/index.js";
+import type { GrowthMapResponse, SourceIndexResponse } from "../../../contracts/analytics/index.js";
 import {
   portalGrowthMapResponseSchema,
   portalMatrixResponseSchema,
   portalOverviewCostsHiddenSchema,
   portalOverviewCostsVisibleSchema,
+  portalSourcesCostsHiddenSchema,
+  portalSourcesCostsVisibleSchema,
   portalTasksResponseSchema,
   type PortalGrowthMapResponse,
+  type PortalSourcesResponse,
 } from "../../../contracts/portal/index.js";
 import type { MethodologyFooter, ReportTimeframe } from "../../../contracts/reports/index.js";
 import { ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
@@ -69,6 +72,30 @@ export function toPortalGrowthMap(source: GrowthMapResponse, opts: { readonly hi
   return { ...source, series };
 }
 
+/**
+ * Decision 83 (c) — the agency source index as the portal serves it. `seedable` and the per-url `last_seen` are never served. Under
+ * hide_costs the citations and prompts counts (and the per-url citation count) are ABSENT, not zero. Under hide_competitors a
+ * competitor's OWN domain is dropped: the domain string is the competitor's name, so relabelling the name would still leave it on the
+ * row. Every other row carries no competitor, so `competitors_present` is empty. Null (unverified presence, no severity, no coverage)
+ * passes through as null, never 0 or false.
+ */
+export function toPortalSources(source: SourceIndexResponse, opts: { readonly hideCosts: boolean; readonly hideCompetitors: boolean }): PortalSourcesResponse {
+  const domains = source.domains
+    .filter((row) => !opts.hideCompetitors || row.competitors_present.length === 0)
+    .map((row) => ({
+      domain: row.domain,
+      influence: row.influence,
+      ...(opts.hideCosts ? {} : { citations: row.citations, prompts: row.prompts }),
+      source_class: row.source_class,
+      brand_present: row.brand_present,
+      verified_at: row.verified_at,
+      gap_severity: row.gap_severity,
+      top_urls: row.top_urls.map((entry) => (opts.hideCosts ? { url: entry.url } : { url: entry.url, citations: entry.citations })),
+      competitors_present: opts.hideCompetitors ? [] : row.competitors_present,
+    }));
+  return { window: source.window, source_coverage: source.source_coverage, domains };
+}
+
 // A cost-side field: a quota, a credit balance, a cost or price, a usage meter, or a capture/cell count. The
 // methodology footer's `live_capture_ratio` is NOT here (a ratio, and the footer is mandatory and unremovable,
 // NFR-AGY-05). `sample_size` IS: owner decision 2026-10-08, it is derived from the capture count, so under hide_costs it
@@ -100,6 +127,7 @@ const PORTAL_PAYLOAD_SCHEMAS = {
   growth_map: portalGrowthMapResponseSchema,
   matrix: portalMatrixResponseSchema,
   tasks: portalTasksResponseSchema,
+  sources: portalSourcesCostsVisibleSchema,
 } as const;
 
 /**
@@ -109,6 +137,7 @@ const PORTAL_PAYLOAD_SCHEMAS = {
  */
 export function parsePortalPayload<T extends keyof typeof PORTAL_PAYLOAD_SCHEMAS>(tab: T, value: unknown, opts: { readonly hideCosts: boolean }): ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]> {
   // `hideCosts` is required, not defaulted: a caller that forgets it does not compile rather than serving the wrong footer.
-  const schema = tab === "overview" && opts.hideCosts ? portalOverviewCostsHiddenSchema : PORTAL_PAYLOAD_SCHEMAS[tab];
+  const schema =
+    opts.hideCosts && tab === "overview" ? portalOverviewCostsHiddenSchema : opts.hideCosts && tab === "sources" ? portalSourcesCostsHiddenSchema : PORTAL_PAYLOAD_SCHEMAS[tab];
   return schema.parse(value) as ReturnType<(typeof PORTAL_PAYLOAD_SCHEMAS)[T]["parse"]>;
 }

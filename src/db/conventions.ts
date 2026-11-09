@@ -282,6 +282,10 @@ export const MIGRATION_LEDGER_READERS: readonly RuntimeRole[] = ["nominara_app"]
 // would need to be revised to permit). src/db/rls/generate.ts imports this
 // rather than redeclaring it, so the generator and this list can never
 // silently diverge.
+//
+// OWNER DECISION 83 (c) (2026-11-09) OVERRIDES THAT NOTE for `source_domains`, and it is back on this list as the 19th entry: its portal policy
+// is the one deliberate join, limited to domains with a `project_source_index` row for a project in `app.current_scope_projects()`, so a
+// project-scoped token still cannot enumerate a domain that only ever appeared in a project outside its scope. `brand_themes` stays off.
 export const PORTAL_READABLE_TABLES = [
   "projects",
   "competitors",
@@ -301,7 +305,15 @@ export const PORTAL_READABLE_TABLES = [
   "geo_analyses",
   "entity_nodes",
   "attribution_url_rollup",
+  "source_domains",
 ] as const;
+
+/**
+ * Decision 83 (c) — portal-readable tables whose scope is a JOIN, not a `project_id` column. Their `portal_scope_*` policy is NOT in
+ * 0006 (an applied migration, which a regeneration must reproduce byte for byte): the generator emits it into its own migration
+ * (`PORTAL_JOIN_SCOPED_MIGRATION_NAME` in src/db/rls/generate.ts), exactly as ACTOR_SELF_SCOPED_TABLES' policies are.
+ */
+export const PORTAL_JOIN_SCOPED_TABLES = ["source_domains"] as const;
 
 // security-and-tenancy.md §3's own `portal_scope_projects` example policy
 // scopes by the table's own `id`, not a `project_id` column — `projects` is

@@ -68,3 +68,11 @@ export {
   transferOwnershipResponseSchema,
   type TransferOwnershipResponse,
 } from "../../../../contracts/workspaces/transfer-ownership-response.schema.js";
+export {
+  deleteWorkspaceRequestSchema,
+  type DeleteWorkspaceRequest,
+} from "../../../../contracts/workspaces/delete-workspace-request.schema.js";
+export {
+  deleteWorkspaceParamsSchema,
+  type DeleteWorkspaceParams,
+} from "../../../../contracts/workspaces/delete-workspace-params.schema.js";

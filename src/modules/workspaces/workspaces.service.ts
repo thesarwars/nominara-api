@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { ConflictException, Inject, Injectable, Logger, NotFoundException, Optional } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
-import { DegradedError } from "../../api/errors/domain-errors.js";
+import { DegradedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { entityTagFor } from "../../api/etag/entity-tag.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -10,7 +11,10 @@ import { AuditChainService } from "../audit/audit-chain.service.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { REALTIME_PUBLISHER, type RealtimePublisher } from "../../lib/cache/realtime-publisher.js";
 import { lockWorkspaceBounded } from "../../lib/billing/workspace-lock.js";
+import { buildIdempotencyKey } from "../../lib/queue/idempotency.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { scheduleWorkspaceDeletion } from "../../workers/rollup/retention.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import {
@@ -133,6 +137,8 @@ export function toMemberResponse(row: MemberRow): MemberResponse {
 }
 
 const lockLogger = new Logger("workspaces-lock");
+const deletionLogger = new Logger("workspaces-deletion");
+const tracer = trace.getTracer("nominara.workspaces");
 
 /** The retryable 503 for a writer that could not take the workspace row within the bound. The log line carries the workspace ID only. */
 function workspaceBusy(path: string, workspaceId: string): Error {
@@ -150,6 +156,9 @@ export class WorkspacesService {
     private readonly membership: MembershipService,
     private readonly sessions: SessionService,
     @Inject(REALTIME_PUBLISHER) private readonly realtime: RealtimePublisher,
+    // Decision 83(a): only `requestDeletion` enqueues. Optional so the many specs that build this service for other methods need not
+    // supply a producer; the API process always provides one, and an absent one is counted and logged as a failed enqueue, never silent.
+    @Optional() private readonly queues?: QueueProducer,
   ) {}
 
   /** Test scenario 8 (STORY-018): a suspended workspace refuses access immediately (WorkspaceGuard reads status live, never cached). */
@@ -181,6 +190,60 @@ export class WorkspacesService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * DELETE /workspaces/{id} (owner decision 80) — the 30-day-grace deletion REQUEST: status `pending_deletion`, share tokens revoked and custom
+   * domains disabled by the same writes the system path uses (`scheduleWorkspaceDeletion`); the hard delete is the retention job's, at
+   * `deletion_execute_at`. Ambient transaction, row lock first (bounded), and the slug is compared under that lock so a rename cannot slip
+   * between the check and the write. No network or storage I/O here (ADR-0003).
+   */
+  async requestDeletion(workspaceId: string, confirmSlug: string): Promise<WorkspaceDetailResponse> {
+    return tracer.startActiveSpan("workspaces.request_deletion", async (span) => {
+      try {
+        const client = currentTenantStore()!.client;
+        await lockWorkspaceBounded(client, workspaceId, () => workspaceBusy("request_deletion", workspaceId));
+        const current = await client.query<{ slug: string }>("SELECT slug FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+        const row = current.rows[0];
+        if (row === undefined) throw new NotFoundException();
+        if (row.slug !== confirmSlug) {
+          throw new ValidationFailedError({
+            message: "confirm_slug must be the workspace's slug",
+            details: { issues: [{ path: ["confirm_slug"], message: "does not match the workspace slug" }] },
+          });
+        }
+        await scheduleWorkspaceDeletion(client, workspaceId, new Date());
+        incrementCounter("nominara_workspace_deletion_requested_total", {});
+        this.enqueueSubscriptionCancel(workspaceId);
+        deletionLogger.log({ message: "workspace deletion requested", workspace_id: workspaceId });
+        return (await this.getDetail(workspaceId)).detail;
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  /**
+   * Decision 83(a) / KAD-06: no Stripe call on a request path. AFTER the deletion request COMMITS (`afterCommit`: a rolled-back
+   * request queues nothing), one signed tenant job sets the workspace's Stripe subscription to cancel at period end. Ids only; the
+   * worker reads the subscription live and is a no-op for a workspace with none. A failure to enqueue is logged and counted, never
+   * raised: the deletion is committed, and the request must not fail for the cancel.
+   */
+  private enqueueSubscriptionCancel(workspaceId: string): void {
+    afterCommit(() => {
+      const failed = (reason: string): void => {
+        incrementCounter("nominara_workspace_deletion_cancel_enqueue_failed_total", {});
+        deletionLogger.error({ event: "workspace.deletion_cancel_enqueue_failed", workspace_id: workspaceId, error: reason });
+      };
+      if (this.queues === undefined) return failed("no_producer");
+      this.queues
+        .enqueueTenantJob("billing.cancel_on_deletion", workspaceId, {}, { idempotencyKey: buildIdempotencyKey("billing.cancel_on_deletion", { workspace: workspaceId }) })
+        .then(() => incrementCounter("nominara_workspace_deletion_cancel_enqueued_total", {}))
+        .catch((error: unknown) => failed(error instanceof Error ? error.name : "unknown"));
+    });
   }
 
   /**
