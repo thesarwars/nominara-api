@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { auxPatchSchema } from "../aux/patch.schema.js";
+import { lowercaseUuidSchema } from "../common/uuid.schema.js";
 
 // STORY-192 - the HTTP surface of the alignment session (api-specification.md "GEO", `optimizer:use`): open one, read its payload
 // (`alignmentSessionPayloadSchema`), edit its draft, and cut a patch from it.
@@ -21,14 +22,14 @@ export const ALIGNMENT_DRAFT_P95_OBJECTIVE_MS = 200;
 
 export const openAlignmentRequestSchema = z
   .object({
-    project_id: z.string().uuid(),
+    project_id: lowercaseUuidSchema,
     /** An http(s) page only: the worker fetches it through the SSRF-guarded fetcher, and no other scheme is a page. */
     target_url: z
       .string()
       .url()
       .max(2048)
       .refine((value) => /^https?:\/\//i.test(value), { message: "target_url must be an http(s) URL" }),
-    prompt_cluster_id: z.string().uuid(),
+    prompt_cluster_id: lowercaseUuidSchema,
   })
   .strict();
 export type OpenAlignmentRequest = z.infer<typeof openAlignmentRequestSchema>;
@@ -44,7 +45,7 @@ export const openAlignmentResponseSchema = z
   .strict();
 export type OpenAlignmentResponse = z.infer<typeof openAlignmentResponseSchema>;
 
-export const alignmentIdParamSchema = z.string().uuid();
+export const alignmentIdParamSchema = lowercaseUuidSchema;
 
 export const updateAlignmentDraftRequestSchema = z
   .object({ draft_content_md: z.string().min(1).max(ALIGNMENT_DRAFT_MAX_CHARS) })

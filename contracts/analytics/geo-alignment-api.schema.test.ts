@@ -57,6 +57,11 @@ describe("STORY-192 - the alignment HTTP contracts", () => {
     expect(openAlignmentRequestSchema.safeParse({ ...ok, target_url: "HTTP://brand.test/p" }).success).toBe(true);
   });
 
+  it("AC open - an uppercase id is lowercased at the boundary (STORY-150 AC7)", () => {
+    const upper = uuid.toUpperCase();
+    expect(openAlignmentRequestSchema.parse({ project_id: upper, target_url: "https://brand.test/p", prompt_cluster_id: upper })).toMatchObject({ project_id: uuid, prompt_cluster_id: uuid });
+  });
+
   it("AC open - charges nothing: the 202 says pending, carries a poll pointer and 0 credits", () => {
     expect(openAlignmentResponseSchema.safeParse({ session_id: uuid, status: "pending", poll_url: `/v1/geo/alignment/${uuid}`, credits_charged: 0 }).success).toBe(true);
     expect(openAlignmentResponseSchema.safeParse({ session_id: uuid, status: "pending", poll_url: "/x", credits_charged: 1 }).success).toBe(false);
