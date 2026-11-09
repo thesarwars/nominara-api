@@ -50,6 +50,7 @@ export const projectBenchmarkResponseSchema = z
 
 export const projectBenchmarkParamsSchema = z.object({ id: lowercaseUuidSchema }).strict();
 
+export type ProjectBenchmarkParams = z.infer<typeof projectBenchmarkParamsSchema>;
 export type ProjectBenchmarkResponse = z.infer<typeof projectBenchmarkResponseSchema>;
 export type CategoryBenchmarkEngine = z.infer<typeof categoryBenchmarkEngineSchema>;
 export type TopSourceDomains = z.infer<typeof topSourceDomainsSchema>;
