@@ -214,9 +214,18 @@ export const alignmentSessionPayloadSchema = z
     status_reason: z.string().min(1).nullable(),
     /** The state of the customer's draft recompute; null when no draft was ever saved. While `pending`, the figures predate the draft. */
     draft_status: z.enum(["pending", "ready", "failed"]).nullable(),
+    /**
+     * Owner decision 92 - the draft prefill: the text of the live page the worker fetched (`geo_alignments.live_content_md`), so the editor opens on it instead of
+     * an empty box. NULL until a session has fetched the page, and null for every session that is not `ready` (a pending page is not final); always the LIVE
+     * page, never the customer's draft (`draft_content_md` is theirs and is not echoed). Served on the same route and permission as the rest of the payload.
+     */
+    live_content_md: z.string().nullable(),
   })
   .strict()
   .superRefine((p, ctx) => {
+    if (p.status !== "ready" && p.live_content_md !== null) {
+      ctx.addIssue({ code: "custom", message: "an analysis that is not ready serves no page text", path: ["live_content_md"] });
+    }
     if (p.status !== "ready" && (p.coverage.coverage_ratio !== null || p.coverage.required_nodes !== null || p.coverage.present_nodes !== null || p.recommendations.length > 0 || p.projection !== null || p.content.chunks.length > 0)) {
       ctx.addIssue({ code: "custom", message: "an analysis that is not ready shows no coverage, chunk, recommendation or projection", path: ["status"] });
     }
