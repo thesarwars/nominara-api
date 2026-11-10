@@ -67,7 +67,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   capture_runs: {
     columns:
-      "id workspace_id project_id trigger triggered_by engine_keys prompt_scope scope_ref planned_cells skipped_cells captured_cells failed_cells scoring_version status error_summary started_at finished_at created_at",
+      "id workspace_id project_id trigger triggered_by engine_keys prompt_scope scope_ref planned_cells skipped_cells captured_cells failed_cells scoring_version status error_summary started_at finished_at created_at retry_of",
     omit: "",
   },
   competitors: {

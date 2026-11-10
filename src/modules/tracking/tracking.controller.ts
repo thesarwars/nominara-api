@@ -112,4 +112,26 @@ export class TrackingController {
     return progress;
   }
 
+  // STORY-195 AC4 — the free retry of an all-degraded first run. `✚` (an idempotency key) and NOT `¢`: no `@Credits`, so no price is
+  // confirmed, reserved or debited. 202 as the trigger: the run is planned and its cells are queued jobs. Same rate class as the
+  // trigger, since it starts a capture run.
+  @Post("retry")
+  @HttpCode(202)
+  @Idempotent()
+  @RateLimitClass("project_runs")
+  @RequirePermission("tracking:trigger")
+  @ProjectParam("id")
+  @Audit({ action: "run.free_retry", resourceType: "project" })
+  @ApiContract({
+    operationId: "retryRun",
+    requestSchema: triggerRunRequestSchema,
+    responseSchema: runProgressResponseSchema,
+  })
+  retry(
+    @Req() req: RbacScopedRequest,
+    @Param("id") projectId: string,
+    @Body(new ZodValidationPipe(triggerRunRequestSchema)) _body: TriggerRunRequest,
+  ): Promise<RunProgressResponse> {
+    return this.lifecycle.retryFree(projectId, req.auth?.sub ?? null);
+  }
 }

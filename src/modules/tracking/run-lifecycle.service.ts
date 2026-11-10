@@ -6,7 +6,9 @@ import type { CreditUsage } from "../../api/interceptors/credit.interceptor.js";
 import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
 import { commitDeepScanCharge } from "../../lib/capture/fair-use.js";
 import { deepScanPrice } from "../../lib/capture/deep-scan-price.js";
+import { planFreeRetry } from "../../lib/capture/free-retry.js";
 import { loadManualRunProject, planManualRun } from "../../lib/capture/manual-run.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { readRunProgress, type RunProgress } from "../../lib/capture/run-progress.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
@@ -128,6 +130,43 @@ export class RunLifecycleService {
         },
       },
     };
+  }
+
+  /**
+   * STORY-195 AC4 — the free retry of an all-degraded first run. Planned inside the request's transaction, dispatched after it commits
+   * (KAD-06, ADR-0003: no queue call inside the transaction), exactly as `trigger`. Charges nothing: it has no `@Credits`, and
+   * `planFreeRetry` reserves and debits no credit. Whether the retry is allowed, and the once-only limit, are `planFreeRetry`'s.
+   */
+  async retryFree(projectId: string, actorId: string | null): Promise<RunProgressResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("RunLifecycleService requires an active tenant context");
+
+    const now = new Date();
+    const project = await loadManualRunProject(store.client, projectId);
+    await assertProjectInScope(store.client, projectId);
+    const runId = uuidV7();
+    let plan;
+    try {
+      ({ plan } = await planFreeRetry(store.client, this.cache, project, { runId, triggeredBy: actorId, now }));
+    } catch (error) {
+      const reason = (error as { details?: { reason?: string } }).details?.reason;
+      incrementCounter("nominara_capture_free_retry_total", { outcome: reason ?? "error" });
+      throw error;
+    }
+    incrementCounter("nominara_capture_free_retry_total", { outcome: "started" });
+    this.logger.log({ event: "run.free_retry_started", workspace_id: project.workspaceId, project_id: projectId, run_id: runId, planned: plan.planned });
+
+    afterCommit(() => {
+      // A person is waiting on this retry, so it takes the interactive lane even though its trigger is not `manual`.
+      void this.queues.dispatchPlannedCells(CAPTURE_EXECUTE.name, plan, { priorityVariant: "interactive", cadence: "manual" }).catch((error: unknown) => {
+        // The run row exists and its cells are planned; a failed dispatch must not tell the customer the retry did not start (a second
+        // request is refused as retry_already_used). A replan recovers it.
+        this.logger.error(`failed to dispatch free retry run ${runId}: ${String(error)}`);
+      });
+    });
+
+    const progress = await readRunProgress(store.client, runId, now);
+    return this.present(progress, null, null);
   }
 
   /** AC3 and AC4 — the projection, and on a manual run the charge beside it. */
