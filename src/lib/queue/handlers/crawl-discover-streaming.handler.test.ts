@@ -100,3 +100,23 @@ describe("STORY-195 · crawl.discover checkpoints the fields it has found", () =
     expect(running.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe("STORY-043 AC15 · crawl.discover feeds the latency judge from submission", () => {
+  it("STORY-043-AC15 the commit observes the time since the project was created, in milliseconds, queue wait included", async () => {
+    const { defaultDiscoveryLatencyMonitor } = await import("../../discovery/latency-alert.js");
+    const observe = vi.spyOn(defaultDiscoveryLatencyMonitor, "observe").mockImplementation(() => undefined);
+    const submitted = new Date(1_000_000);
+    const handler = createCrawlDiscoverHandler(CONTEXT, { ...deps(), now: () => 1_000_000 + 12_345 });
+    await handler(tx([], { root_domain: "hubspot.com", discovery: {}, created_at: submitted }), job());
+    expect(observe).toHaveBeenCalledWith(12_345);
+    observe.mockRestore();
+  });
+
+  it("STORY-043-AC15 a project with no submission time is no observation (0 would read as an instant pass)", async () => {
+    const { defaultDiscoveryLatencyMonitor } = await import("../../discovery/latency-alert.js");
+    const observe = vi.spyOn(defaultDiscoveryLatencyMonitor, "observe").mockImplementation(() => undefined);
+    await createCrawlDiscoverHandler(CONTEXT, deps())(tx([], { root_domain: "hubspot.com", discovery: {} }), job());
+    expect(observe).not.toHaveBeenCalled();
+    observe.mockRestore();
+  });
+});

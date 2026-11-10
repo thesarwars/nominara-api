@@ -9,6 +9,7 @@ import { mergeCategoryPeers } from "../../categories/peers.js";
 import { loadCategoryPeers, loadTaxonomy } from "../../categories/taxonomy.js";
 import { DEFAULT_DISCOVER_DEPS, discover, FREE_PROMPT_ALLOWANCE, type DiscoverDeps } from "../../discovery/discover.js";
 import { generateFreeAllowance } from "../../discovery/free-prompts.js";
+import { defaultDiscoveryLatencyMonitor } from "../../discovery/latency-alert.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { textEmbedderFor } from "./embed-batch.handler.js";
@@ -218,7 +219,10 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
       // sub-measure, so a slow site can be told apart from a backlog.
       const now = (deps?.now ?? Date.now)();
       if (prepared.submittedAt !== null) {
-        observeValue("nominara_discovery_duration_seconds", Math.max(0, now - prepared.submittedAt.getTime()) / 1000, { status: merged.discovery_status });
+        const sinceSubmissionMs = Math.max(0, now - prepared.submittedAt.getTime());
+        observeValue("nominara_discovery_duration_seconds", sinceSubmissionMs / 1000, { status: merged.discovery_status });
+        // AC15 - the judge of the objective. Every status counts, as it does in the duration metric: a pass that timed out is the slow case it exists to catch.
+        defaultDiscoveryLatencyMonitor.observe(sinceSubmissionMs);
       }
       if (merged.duration_ms !== null && merged.duration_ms !== undefined) {
         observeValue("nominara_discovery_run_seconds", merged.duration_ms / 1000, { status: merged.discovery_status });
