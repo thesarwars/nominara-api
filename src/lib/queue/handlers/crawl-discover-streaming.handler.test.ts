@@ -42,7 +42,7 @@ describe("STORY-195 · crawl.discover checkpoints the fields it has found", () =
     await (phases.run as (p: unknown, j: Job, s: unknown) => Promise<unknown>)(prepared, job(), step);
 
     expect(step).toHaveBeenCalled();
-    const write = writes[0]!;
+    const write = writes.find((c) => c.sql.includes("UPDATE projects"))!;
     expect(write.params[0]).toBe(PROJECT);
     const payload = JSON.parse(write.params[1] as string) as { discovery_status: string; fields: Record<string, { confidence: number; source: string }> };
     expect(payload.discovery_status).toBe("running");
@@ -55,8 +55,8 @@ describe("STORY-195 · crawl.discover checkpoints the fields it has found", () =
     const prepared = await phases.prepare(tx([]), job());
     const writes: Call[] = [];
     await (phases.run as (p: unknown, j: Job, s: unknown) => Promise<unknown>)(prepared, job(), async (fn: (t: ClientBase) => Promise<void>) => fn(tx(writes)));
-    expect(writes[0]!.sql).toMatch(/discovery_status IN \('pending', 'running'\)/);
-    expect(writes[0]!.sql).toMatch(/deleted_at IS NULL/);
+    expect(writes.find((c) => c.sql.includes("UPDATE projects"))!.sql).toMatch(/discovery_status IN \('pending', 'running'\)/);
+    expect(writes.find((c) => c.sql.includes("UPDATE projects"))!.sql).toMatch(/deleted_at IS NULL/);
   });
 
   it("STORY-195-AC6 a checkpoint keeps the human-decided fields and the earlier payload's other parts", async () => {
@@ -69,7 +69,7 @@ describe("STORY-195 · crawl.discover checkpoints the fields it has found", () =
     const prepared = await phases.prepare(tx([], { root_domain: "hubspot.com", discovery: stored }), job());
     const writes: Call[] = [];
     await (phases.run as (p: unknown, j: Job, s: unknown) => Promise<unknown>)(prepared, job(), async (fn: (t: ClientBase) => Promise<void>) => fn(tx(writes)));
-    const payload = JSON.parse(writes[0]!.params[1] as string) as typeof stored & { fields: Record<string, { value: unknown }> };
+    const payload = JSON.parse(writes.find((c) => c.sql.includes("UPDATE projects"))!.params[1] as string) as typeof stored & { fields: Record<string, { value: unknown }> };
     expect(payload.fields.description?.value).toBe("Mine");
     expect(payload.competitors_proposed).toHaveLength(1);
     expect(payload.discovery_status).toBe("running");
@@ -118,5 +118,69 @@ describe("STORY-043 AC15 · crawl.discover feeds the latency judge from submissi
     await createCrawlDiscoverHandler(CONTEXT, deps())(tx([], { root_domain: "hubspot.com", discovery: {} }), job());
     expect(observe).not.toHaveBeenCalled();
     observe.mockRestore();
+  });
+});
+
+// A fake projects row: the discovery payload is mutable state, so a confirm can land between two writes of the pass.
+function liveRow(initial: unknown = {}) {
+  const state = { discovery: initial as Record<string, unknown>, status: "pending" };
+  const client = {
+    query: vi.fn(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("SELECT root_domain")) return { rows: [{ root_domain: "hubspot.com", discovery: state.discovery }], rowCount: 1 };
+      if (/SELECT discovery/.test(sql) && sql.includes("FOR UPDATE")) return { rows: [{ discovery: state.discovery, category_slug: null }], rowCount: 1 };
+      if (sql.includes("discovery = $2")) {
+        state.discovery = JSON.parse(params[1] as string) as Record<string, unknown>;
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes("jsonb_set")) {
+        state.discovery = { ...state.discovery, discovery_status: "partial" };
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    }),
+  } as unknown as ClientBase;
+  return { state, client };
+}
+const MINE = { value: "Mine", confidence: 1, source: "user", user_edited: true };
+type Fields = Record<string, { value: unknown; user_edited?: boolean }>;
+
+describe("STORY-044 AC4 / STORY-195 · a confirm made mid-pass survives the pass", () => {
+  it("STORY-044-AC4 an override landing between two checkpoints is neither overwritten by the next checkpoint nor by the commit", async () => {
+    const textual = Buffer.from(`<html lang="en-US"><head><title>HubSpot CRM software for sales teams</title><script type="application/ld+json">{"@type":"Organization","name":"HubSpot"}</script></head></html>`);
+    const withCategory = { fetch: vi.fn(async () => ({ status: 200, headers: {}, body: textual, finalUrl: "https://hubspot.com/" })), now: () => Date.now(), classify: async () => ({ slug: "crm", confidence: 0.9, source: "embedding", tokens: 1 }) } as unknown as DiscoverDeps;
+    const phases = phasesOf(createCrawlDiscoverHandler(CONTEXT, withCategory))!;
+    const row = liveRow({});
+    const prepared = await phases.prepare(row.client, job());
+    let steps = 0;
+    const step = async (fn: (t: ClientBase) => Promise<void>) => {
+      await fn(row.client);
+      steps += 1;
+      if (steps === 1) row.state.discovery = { ...row.state.discovery, fields: { ...(row.state.discovery.fields as Fields), brand_name: MINE } };
+    };
+    const result = await (phases.run as (p: unknown, j: Job, s: unknown) => Promise<unknown>)(prepared, job(), step);
+    expect(steps).toBeGreaterThanOrEqual(2);
+    expect((row.state.discovery.fields as Fields).brand_name).toEqual(MINE);
+    await phases.commit(row.client, prepared, result as never, job());
+    expect((row.state.discovery.fields as Fields).brand_name).toEqual(MINE);
+  });
+
+  it("STORY-044-AC4 the checkpoint re-reads the row under FOR UPDATE", async () => {
+    const phases = phasesOf(createCrawlDiscoverHandler(CONTEXT, deps()))!;
+    const row = liveRow({});
+    const prepared = await phases.prepare(row.client, job());
+    await (phases.run as (p: unknown, j: Job, s: unknown) => Promise<unknown>)(prepared, job(), async (fn: (t: ClientBase) => Promise<void>) => fn(row.client));
+    const reads = (row.client.query as unknown as { mock: { calls: [string][] } }).mock.calls.filter(([s]) => /SELECT discovery/.test(s) && s.includes("FOR UPDATE"));
+    expect(reads.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("STORY-195 AC13 · recover settles the stored payload's status", () => {
+  it("STORY-195-AC13 a run-phase failure after a checkpoint on the final attempt leaves no 'running' in the stored payload", async () => {
+    const phases = phasesOf(createCrawlDiscoverHandler(CONTEXT, deps()))!;
+    const row = liveRow({ discovery_status: "running", fields: { brand_name: { value: "HubSpot", confidence: 0.9, source: "x", user_edited: false } } });
+    const finalJob = { ...job(), attemptsMade: 3, opts: { attempts: 4 } } as unknown as Job;
+    await expect(phases.recover!(row.client, finalJob, { error: new Error("boom"), phase: "run" } as never)).resolves.toBe(true);
+    expect(row.state.discovery.discovery_status).toBe("partial");
+    expect((row.state.discovery.fields as Fields).brand_name).toBeDefined();
   });
 });

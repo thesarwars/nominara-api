@@ -101,7 +101,7 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
         submittedAt: toDate(row.created_at),
         knownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? [])],
         humanDecided,
-        preserved: preservedFields(row.discovery),
+        preserved: userEditedEntries(row.discovery),
         stored: row.discovery,
         categories,
         currentCategory: row.category_slug ?? null,
@@ -186,12 +186,17 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
 
       // The overridden entries are carried forward verbatim: `discover` skipped them, so without this they would vanish from the
       // payload and the NEXT pass would re-derive them.
-      const fields = { ...result.fields, ...(prepared.preserved as DiscoveryResponse["fields"]) };
+      // Merged against the row AS IT IS NOW, not the prepare-time snapshot: a person may have confirmed or overridden a field while the pass
+      // ran (confirm is allowed mid-pass), and that decision must survive this write (STORY-044 AC4).
+      const current = await readCurrent(tx, payload.projectId);
+      const decided = current === undefined ? prepared.preserved : userEditedEntries(current.discovery);
+      const fields = { ...result.fields, ...(decided as DiscoveryResponse["fields"]) };
+      const peerBase = current === undefined ? prepared.currentCategory : current.categorySlug;
 
       // STORY-189 AC5 — curated category peers, after the site's own comparison links. The category is the one the project already holds
       // (supplied at creation or confirmed), else the one just discovered when it is confident; a low-confidence guess brings no peers.
       // Not proposed when the caller supplied competitors. A global read: peers are never derived from other customers' projects.
-      const peerCategory = prepared.currentCategory ?? confidentCategory(fields.category);
+      const peerCategory = peerBase ?? confidentCategory(fields.category);
       const competitors =
         peerCategory === null || payload.fieldsSupplied.includes("competitors")
           ? result.competitors_proposed
@@ -200,6 +205,8 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
       const merged: DiscoveryResponse = {
         ...result,
         fields,
+        // A field a person decided is no longer awaiting confirmation, however uncertain the machine was about it.
+        low_confidence_fields: result.low_confidence_fields.filter((name) => !(name in decided)),
         competitors_proposed: competitors,
         prompts_generated: generated,
         prompts_free_remaining: allowance.remaining,
@@ -248,18 +255,25 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
       const payload = payloadSchema.safeParse((job.data as { payload: unknown }).payload);
       if (!payload.success) return false;
 
+      // The same carry-forward `commit` does, against the row as it is now: `discover` skipped the human-decided fields, so without this a
+      // failed commit would drop them from the stored payload and the next pass would re-derive them (STORY-044 AC4).
+      const current = failure.fetched === undefined ? undefined : await readCurrent(tx, payload.data.projectId);
+      const decided = current === undefined ? (failure.prepared?.preserved ?? {}) : userEditedEntries(current.discovery);
       const kept: DiscoveryResponse | undefined =
         failure.fetched === undefined
           ? undefined
           : {
               ...failure.fetched,
-              // The same carry-forward `commit` does: `discover` skipped the human-decided fields, so without this a failed commit
-              // would drop them from the stored payload and the next pass would re-derive them (STORY-044 AC4).
-              fields: { ...failure.fetched.fields, ...((failure.prepared?.preserved ?? {}) as DiscoveryResponse["fields"]) },
+              fields: { ...failure.fetched.fields, ...(decided as DiscoveryResponse["fields"]) },
               discovery_status: "partial",
             };
+      // Nothing kept: the stored payload may still say 'running' from a checkpoint, and GET /projects/{id}/discovery reads that, so it is
+      // settled to the same value as the column (AC13).
       await tx.query(
-        `UPDATE projects SET discovery_status = 'partial', discovery = COALESCE($2::jsonb, discovery), updated_at = now()
+        `UPDATE projects SET discovery_status = 'partial',
+                discovery = COALESCE($2::jsonb, CASE WHEN jsonb_typeof(discovery) = 'object' AND discovery ? 'discovery_status'
+                                                     THEN jsonb_set(discovery, '{discovery_status}', '"partial"') ELSE discovery END),
+                updated_at = now()
           WHERE id = $1 AND deleted_at IS NULL AND discovery_status IN ('pending', 'running')`,
         [payload.data.projectId, kept === undefined ? null : JSON.stringify(kept)],
       );
@@ -276,8 +290,12 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
  * (a finished payload another delivery wrote, a deleted project) writes nothing. No `workspace_id` predicate: RLS scopes the transaction.
  */
 async function writeCheckpoint(tx: ClientBase, prepared: Prepared, found: Readonly<Record<string, DiscoveredField>>): Promise<void> {
-  const stored = typeof prepared.stored === "object" && prepared.stored !== null && "fields" in prepared.stored ? (prepared.stored as DiscoveryResponse) : undefined;
-  const fields = { ...(stored?.fields ?? {}), ...found, ...(prepared.preserved as DiscoveryResponse["fields"]) };
+  // Re-read under FOR UPDATE: a confirm made since the last write is part of the row now, and must not be overwritten by a snapshot.
+  const current = await readCurrent(tx, prepared.payload.projectId);
+  const base = current === undefined ? prepared.stored : current.discovery;
+  const stored = typeof base === "object" && base !== null && "fields" in base ? (base as DiscoveryResponse) : undefined;
+  const decided = current === undefined ? prepared.preserved : userEditedEntries(base);
+  const fields = { ...(stored?.fields ?? {}), ...found, ...(decided as DiscoveryResponse["fields"]) };
   const payload: DiscoveryResponse = {
     discovery_status: "running",
     duration_ms: stored?.duration_ms ?? null,
@@ -295,6 +313,16 @@ async function writeCheckpoint(tx: ClientBase, prepared: Prepared, found: Readon
       WHERE id = $1 AND deleted_at IS NULL AND discovery_status IN ('pending', 'running')`,
     [prepared.payload.projectId, JSON.stringify(payload)],
   );
+}
+
+/** The project's discovery payload and category as they are now, locked for the rest of the transaction. Undefined when the row is not visible. */
+async function readCurrent(tx: ClientBase, projectId: string): Promise<{ discovery: unknown; categorySlug: string | null } | undefined> {
+  const read = await tx.query<{ discovery: unknown; category_slug: string | null }>(
+    "SELECT discovery, category_slug FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    [projectId],
+  );
+  const row = read.rows[0];
+  return row === undefined ? undefined : { discovery: row.discovery, categorySlug: row.category_slug ?? null };
 }
 
 /** The category is already decided: the caller supplied it at creation, or a person overrode it. Discovery neither derives nor re-proposes it. */
@@ -337,7 +365,7 @@ function userEditedFields(stored: unknown): string[] {
 }
 
 /** Those same entries, to merge back over a fresh pass's result. */
-function preservedFields(stored: unknown): Record<string, unknown> {
+function userEditedEntries(stored: unknown): Record<string, unknown> {
   const fields = storedDiscovery(stored)?.fields ?? {};
   return Object.fromEntries(Object.entries(fields).filter(([, field]) => field?.user_edited === true));
 }
