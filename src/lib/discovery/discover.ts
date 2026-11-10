@@ -56,6 +56,12 @@ export interface DiscoverDeps {
    * discovery then proposes no category. It may throw (the provider is down); `discover` treats that as no category, not a failed pass.
    */
   readonly classify?: (siteText: string) => Promise<CategoryClassification | null>;
+  /**
+   * STORY-195 AC6 - called with a SNAPSHOT of the fields obtained so far, as each stage finishes (the document's fields, then the category),
+   * so the project's discovery reads can show them before the pass ends. The caller owns where they go; it must not throw, and if it does
+   * the pass carries on regardless: the final payload is what the handler commits, and this is progress only.
+   */
+  readonly onFields?: (fields: Readonly<Record<string, DiscoveredField>>) => Promise<void>;
 }
 
 /**
@@ -144,6 +150,15 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
   let competitors: ProposedCompetitor[] = [];
   let reachedSite = true;
 
+  const report = async (): Promise<void> => {
+    if (deps.onFields === undefined || Object.keys(fields).length === 0) return;
+    try {
+      await deps.onFields({ ...fields });
+    } catch {
+      // Progress reporting only: a failure to show a field early must not fail, or change, the pass.
+    }
+  };
+
   try {
     const response = await withinBudget(deps.fetch(input.rootUrl), DISCOVERY_BUDGET_MS);
     if (response.status >= 400) {
@@ -172,6 +187,8 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
 
       if (!skip.has("products") && products) put(fields, "products", products);
       if (!skip.has("locale") && extracted.locale) put(fields, "locale", extracted.locale);
+      // AC6 - the document's fields are known now; the category classification below is a provider call and can take seconds.
+      await report();
 
       // STORY-189 AC3/AC4 — the category, from the text just read. Not derived at all when the caller supplied it or a person decided it
       // (supplied wins). A failed or empty classification proposes NOTHING: a missing category is honest, a guessed one corrupts the benchmark.
@@ -181,7 +198,10 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
           try {
             const remaining = Math.max(1, DISCOVERY_BUDGET_MS - (deps.now() - startedAt));
             const category = await withinBudget(deps.classify(siteText), remaining);
-            if (category !== null) put(fields, "category", { value: category.slug, confidence: category.confidence, source: category.source });
+            if (category !== null) {
+              put(fields, "category", { value: category.slug, confidence: category.confidence, source: category.source });
+              await report();
+            }
           } catch {
             // The provider is down, slow or returned nonsense. Nothing proposed; the project is still usable and the customer can pick one.
           }

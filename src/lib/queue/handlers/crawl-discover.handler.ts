@@ -3,7 +3,7 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
 import { z } from "zod";
-import { LOW_CONFIDENCE_THRESHOLD, type DiscoveryResponse } from "../../../../contracts/projects/index.js";
+import { LOW_CONFIDENCE_THRESHOLD, type DiscoveredField, type DiscoveryResponse } from "../../../../contracts/projects/index.js";
 import { classifyCategory, type CategoryDescriptor, type TextEmbedder } from "../../categories/classify.js";
 import { mergeCategoryPeers } from "../../categories/peers.js";
 import { loadCategoryPeers, loadTaxonomy } from "../../categories/taxonomy.js";
@@ -12,7 +12,7 @@ import { generateFreeAllowance } from "../../discovery/free-prompts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { textEmbedderFor } from "./embed-batch.handler.js";
-import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure } from "../worker-factory.js";
+import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure, type TenantStep } from "../worker-factory.js";
 
 // STORY-043 — the first real entry in STORY-124's registry, and the one its
 // own comment named: "crawl.discover with STORY-043".
@@ -46,6 +46,8 @@ interface Prepared {
   /** Field names a person decided: skipped by `discover`, then carried forward verbatim. */
   readonly humanDecided: readonly string[];
   readonly preserved: Record<string, unknown>;
+  /** What `projects.discovery` held when the pass began: a checkpoint keeps its other parts (competitors, prompts) until the commit replaces them. */
+  readonly stored: unknown;
   /** STORY-189 — the taxonomy to classify against, read in `prepare`. Empty when the category is supplied or decided, or nothing is seeded. */
   readonly categories: readonly CategoryDescriptor[];
   /** The category the project already holds (supplied at creation, or confirmed): where its curated peers come from. */
@@ -99,6 +101,7 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
         knownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? [])],
         humanDecided,
         preserved: preservedFields(row.discovery),
+        stored: row.discovery,
         categories,
         currentCategory: row.category_slug ?? null,
       };
@@ -108,7 +111,7 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
     // throw here would be OUR bug, and should reach the retry ladder.
     // The category classification (an embedding call) lives HERE, in `run`: no transaction and no pooled connection is held across it
     // (ADR-0003 / KAD-06). A provider failure proposes no category; it never fails the pass.
-    async run(prepared) {
+    async run(prepared, _job, step?: TenantStep) {
       const classification = { attempted: false, failed: false, tokens: 0 };
       const classify =
         prepared.categories.length === 0
@@ -129,6 +132,20 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
                   span.end();
                 }
               });
+      // STORY-195 AC6 - each field is written as it is found, in its own short tenant transaction (`step`), so `GET /projects/{id}/discovery`
+      // shows it with its confidence before the pass ends. Progress only: the commit below is authoritative, and a failed checkpoint is
+      // counted and skipped, never allowed to fail the pass.
+      const onFields =
+        step === undefined
+          ? undefined
+          : async (found: Readonly<Record<string, DiscoveredField>>): Promise<void> => {
+              try {
+                await step((tx) => writeCheckpoint(tx, prepared, found));
+              } catch (error) {
+                incrementCounter("nominara_discovery_checkpoint_failed_total", {});
+                logger.warn(`workspace ${prepared.payload.workspaceId} project ${prepared.payload.projectId}: discovery checkpoint not written (${error instanceof Error ? error.name : "unknown"})`);
+              }
+            };
       const result = await discover(
         {
           rootUrl: prepared.payload.rootUrl,
@@ -136,7 +153,7 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
           fieldsSupplied: [...prepared.payload.fieldsSupplied, ...prepared.humanDecided],
           knownBrandNames: prepared.knownBrandNames,
         },
-        { ...(deps ?? DEFAULT_DISCOVER_DEPS), ...(classify === undefined ? {} : { classify }) },
+        { ...(deps ?? DEFAULT_DISCOVER_DEPS), ...(classify === undefined ? {} : { classify }), ...(onFields === undefined ? {} : { onFields }) },
       );
       const category = result.fields.category;
       const outcome = categoryIsDecided(prepared.payload.fieldsSupplied, prepared.humanDecided)
@@ -247,6 +264,33 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
       return true;
     },
   });
+}
+
+/**
+ * STORY-195 AC6 - the review payload as it stands mid-pass: what the project held, with the fields found so far laid over it and the human-decided
+ * ones laid over those. The status stays `running`; the commit phase writes the final payload and status. Guarded so a pass that lost a race
+ * (a finished payload another delivery wrote, a deleted project) writes nothing. No `workspace_id` predicate: RLS scopes the transaction.
+ */
+async function writeCheckpoint(tx: ClientBase, prepared: Prepared, found: Readonly<Record<string, DiscoveredField>>): Promise<void> {
+  const stored = typeof prepared.stored === "object" && prepared.stored !== null && "fields" in prepared.stored ? (prepared.stored as DiscoveryResponse) : undefined;
+  const fields = { ...(stored?.fields ?? {}), ...found, ...(prepared.preserved as DiscoveryResponse["fields"]) };
+  const payload: DiscoveryResponse = {
+    discovery_status: "running",
+    duration_ms: stored?.duration_ms ?? null,
+    fields,
+    competitors_proposed: stored?.competitors_proposed ?? [],
+    prompts_generated: stored?.prompts_generated ?? [],
+    prompts_free_remaining: stored?.prompts_free_remaining ?? FREE_PROMPT_ALLOWANCE,
+    credits_charged: 0,
+    low_confidence_fields: Object.entries(fields)
+      .filter(([, field]) => field.confidence < LOW_CONFIDENCE_THRESHOLD)
+      .map(([name]) => name),
+  };
+  await tx.query(
+    `UPDATE projects SET updated_at = now(), discovery = $2
+      WHERE id = $1 AND deleted_at IS NULL AND discovery_status IN ('pending', 'running')`,
+    [prepared.payload.projectId, JSON.stringify(payload)],
+  );
 }
 
 /** The category is already decided: the caller supplied it at creation, or a person overrode it. Discovery neither derives nor re-proposes it. */
