@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
-import { NotFoundException } from "@nestjs/common";
+import { ConflictException, NotFoundException } from "@nestjs/common";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -194,6 +194,33 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
 
     expect(second.slug).not.toBe(first.slug);
     expect(await countRows("workspaces", second.id, "id")).toBe(1);
+  });
+
+  it("STORY-195-AC2 a supplied slug is stored as given, and a taken one is refused with slug_taken and creates nothing", async () => {
+    const service = makeService();
+    const ownerA = await createUser();
+    const ownerB = await createUser();
+
+    const first = await service.create(ownerA, { name: "Anything", slug: "my-chosen-slug" }, meta);
+    expect(first.slug).toBe("my-chosen-slug");
+
+    const refusal = await service.create(ownerB, { name: "Other", slug: "my-chosen-slug" }, meta).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(ConflictException);
+    expect((refusal as ConflictException).getResponse()).toMatchObject({ details: { field: "slug", reason: "slug_taken" } });
+
+    const owned = await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [ownerB]);
+    expect(owned.rowCount).toBe(0);
+    // The refusal did not trip the one-owned invariant: ownerB can still create.
+    const retry = await service.create(ownerB, { name: "Other", slug: "other-slug" }, meta);
+    expect(retry.slug).toBe("other-slug");
+  });
+
+  it("STORY-195-AC2 a taken slug is refused for a second caller too (the unique index, not a pre-check, decides)", async () => {
+    const service = makeService();
+    const ownerA = await createUser();
+    const ownerB = await createUser();
+    await service.create(ownerA, { name: "A", slug: "acme" }, meta);
+    await expect(service.create(ownerB, { name: "B", slug: "acme" }, meta)).rejects.toBeInstanceOf(ConflictException);
   });
 
   // ---- scenario 3 ---------------------------------------------------------

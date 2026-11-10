@@ -259,7 +259,8 @@ export class WorkspacesService {
    */
   async create(userId: string, input: CreateWorkspaceRequest, meta: AuditRequestMeta): Promise<WorkspaceResponse> {
     const workspaceId = uuidV7();
-    const baseSlug = kebabCase(input.name);
+    const supplied = input.slug !== undefined;
+    const baseSlug = input.slug ?? kebabCase(input.name);
     const orgType = input.org_type ?? "in_house";
     const region = input.region ?? "us-east-1";
     const timezone = input.timezone ?? "UTC";
@@ -274,6 +275,14 @@ export class WorkspacesService {
       } catch (error) {
         const pg = error as { code?: string; constraint?: string };
         if (pg?.code === "23505" && pg.constraint === "ux_workspaces_slug") {
+          // A slug the caller chose is never silently altered (STORY-195 AC2): refuse it, naming why.
+          if (supplied) {
+            throw new ConflictException({
+              code: "conflict",
+              message: "this workspace address is already taken",
+              details: { field: "slug", reason: "slug_taken" },
+            });
+          }
           continue;
         }
         if (pg?.code === "23505" && pg.constraint === "ux_one_owned_workspace_per_user") {
