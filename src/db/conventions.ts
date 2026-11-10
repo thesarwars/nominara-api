@@ -122,6 +122,11 @@ export const GLOBAL_TABLES = [
   "purge_runs",
   // STORY-111 (decision 68b) - erasures deferred by a legal hold; owner-only like legal_holds. Same migration.
   "subject_erasure_queue",
+  // STORY-189 (decisions 88 and 91) - the 180-category business taxonomy and its curated peer lists: versioned reference data, no workspace_id,
+  // no RLS. Read-only to every runtime role (see expectedTablePrivileges): rows change only by migration. security-and-tenancy R2 names both.
+  // Migrations 0187_business_categories and 0188_category_peers.
+  "business_categories",
+  "category_peers",
 ] as const;
 
 // workspaces is scoped by its own `id`, not a `workspace_id` column — declared
@@ -186,6 +191,14 @@ export const MAINTENANCE_COUNT_TABLES = [
   "corpus_passages",
 ] as const;
 
+// STORY-176 (migration 0190, ADR-0005, owner decision 91 / NFR-SEC-05 option A) - the dedicated, NOLOGIN owner of app.refresh_platform_metrics, the one
+// cross-tenant read behind `platform_metrics`. Same shape as the two roles above: NOBYPASSRLS, no members, admitted by one SELECT policy per table it reads,
+// reach bounded by COLUMN-level SELECT grants (the named columns of option A, none of them content).
+export const PLATFORM_AGGREGATE_ROLE = "nominara_platform_agg";
+
+/** The tables the aggregate function reads. One role-targeted policy each (`platform_aggregate_<table>`), declared to rls-check. */
+export const PLATFORM_AGGREGATE_TABLES = ["metric_daily", "projects", "project_source_index", "source_domains"] as const;
+
 // Ordered src/api, src/gateway, src/workers/*, replica-only reporting,
 // share-token portal — matches the comments in security-and-tenancy.md §2.
 export const RUNTIME_ROLES = ["nominara_app", "nominara_worker", "nominara_report", "nominara_portal"] as const;
@@ -228,6 +241,7 @@ export const DATABASE_ROLES: Record<string, DatabaseRoleSpec> = {
 export const DEFINER_OWNER_ROLES: Record<string, DatabaseRoleSpec> = {
   nominara_share_lookup: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
   nominara_maintenance: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
+  [PLATFORM_AGGREGATE_ROLE]: { login: false, bypassrls: false, connectionLimit: -1, inherit: false },
 };
 
 // STORY-120 — the migration ledger (src/db/migrate-runner.ts's BOOTSTRAP_SQL)
@@ -485,6 +499,10 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
     if (role === "nominara_app") return APPEND_ONLY;
     if (role === "nominara_worker") return READ_ONLY;
     return NO_PRIVILEGES;
+  }
+  // STORY-189 (decision 91) - versioned reference data: every runtime role may read it, none may write it.
+  if (table === "business_categories" || table === "category_peers") {
+    return role === "nominara_app" || role === "nominara_worker" || role === "nominara_report" || role === "nominara_portal" ? READ_ONLY : NO_PRIVILEGES;
   }
   if (table === "audit_log") {
     if (role === "nominara_app" || role === "nominara_worker") return APPEND_ONLY;

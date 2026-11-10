@@ -362,6 +362,14 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "`pnpm credits:verify`. §4's table allocates it no queue. A queue of its own (not a housekeeping step) so a mismatch is ONE dead-letter entry that names the verifier, " +
       "and is never retried alongside the idempotent expiry. Cross-tenant on the owner connection, advisory-locked, concurrency 1.",
   },
+  "rollup.category_benchmark": {
+    workerGroup: "rollup",
+    because:
+      "STORY-176 / owner decision 93: the cross-workspace benchmark (platform_metrics) was recomputed inside every tenant's rollup transaction, holding a category-wide advisory lock until " +
+      "that tenant committed, and a category override recomputed it at once, which two workspaces of one attacker could difference. It is a nightly batch of its own: category membership " +
+      "moves there and only there (once per 7 days per project), then each category is recomputed in its own short transaction with lock and statement timeouts. Not tenant-scoped; the " +
+      "cross-tenant read is inside two SECURITY DEFINER functions (ADR-0005). A queue of its own so a failure never rolls a tenant's rollup back and a DLQ entry names the job.",
+  },
   "retention.purge": {
     workerGroup: "rollup",
     because:
@@ -451,7 +459,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     }
   });
 
-  it("marks tenantScoped=false only for the nine cross-tenant system jobs; true for every other queue", () => {
+  it("marks tenantScoped=false only for the cross-tenant system jobs; true for every other queue", () => {
     // ⚠ THE SHORT LIST IS THE ASSERTION. A tenant-scoped queue cannot be
     // driven by a bare cron tick — `createJobProcessor` verifies a signature
     // before the handler is reached — so this set is exactly the set of
@@ -470,6 +478,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
       "maintenance.partition",
       "report.cleanup",
       "retention.purge",
+      "rollup.category_benchmark",
       "task.resurface",
     ]);
   });

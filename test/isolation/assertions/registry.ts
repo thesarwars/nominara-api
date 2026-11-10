@@ -33,6 +33,8 @@ import { assertIso30MaintenanceExecuteAdminOnly, iso30Breaker } from "./iso-30-m
 import { assertIso28DefinerOwnerHoldsNoRoles, iso28Breaker } from "./iso-28-definer-owner-holds-no-roles.js";
 import { assertIso27MaintenanceDefinerShape, iso27Breaker } from "./iso-27-maintenance-definer-shape.js";
 import { assertIso31ReportLinkTokenIsolation, iso31Breaker } from "./iso-31-report-link-token-isolation.js";
+import { assertIso32PlatformAggregateDefinerShape, iso32Breaker } from "./iso-32-platform-aggregate-definer-shape.js";
+import { assertIso33PlatformAggregateKRule, iso33Breaker } from "./iso-33-platform-aggregate-k-rule.js";
 
 // STORY-012 — the single place every registered assertion AND its paired
 // breaker are aggregated. test/isolation/meta/breaker-matrix.spec.ts (T27)
@@ -220,6 +222,12 @@ export const ASSERTIONS: readonly AssertionEntry[] = [
   // STORY-180 r5 (owner decision 60) - a report-link token never serves another workspace's object; a foreign, expired or revoked token is
   // refused. readOnly: false - it inserts probe rows (removed in finally) with the superuser, so it is outside the staging read-only subset.
   { id: "ISO-31", needsDatabase: true, readOnly: false, needsFixture: true, assert: assertIso31ReportLinkTokenIsolation, assertUnderBreaker: assertIso31ReportLinkTokenIsolation, breaker: iso31Breaker },
+  // STORY-176 r2 / ADR-0005 - the platform-aggregate definers (app.refresh_platform_metrics, app.apply_benchmark_membership): owner, EXECUTE ACL, pinned
+  // search_path, counts-only output, no caller-supplied cooldown. Catalog only, so read-only and fixture-free.
+  { id: "ISO-32", needsDatabase: true, readOnly: true, needsFixture: false, assert: assertIso32PlatformAggregateDefinerShape, assertUnderBreaker: assertIso32PlatformAggregateDefinerShape, breaker: iso32Breaker },
+  // STORY-176 r2 (decisions 88(d), 91, 93) - the k >= 20 rule on the function itself: 19 workspaces publish nothing, 20 publish one row of whole numbers, a
+  // domain cited by 19 is not listed. Inserts probe rows inside a transaction it rolls back (outside the staging read-only subset).
+  { id: "ISO-33", needsDatabase: true, readOnly: false, needsFixture: false, assert: assertIso33PlatformAggregateKRule, assertUnderBreaker: assertIso33PlatformAggregateKRule, breaker: iso33Breaker },
 ];
 
 // STORY-012 T24 · D-6 — ISOLATION_TARGET=staging runs ONLY the read-only,

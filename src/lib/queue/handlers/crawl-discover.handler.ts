@@ -1,12 +1,17 @@
 import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { Job } from "bullmq";
 import { z } from "zod";
-import type { DiscoveryResponse } from "../../../../contracts/projects/index.js";
-import { discover, FREE_PROMPT_ALLOWANCE, type DiscoverDeps } from "../../discovery/discover.js";
+import { LOW_CONFIDENCE_THRESHOLD, type DiscoveryResponse } from "../../../../contracts/projects/index.js";
+import { classifyCategory, type CategoryDescriptor, type TextEmbedder } from "../../categories/classify.js";
+import { mergeCategoryPeers } from "../../categories/peers.js";
+import { loadCategoryPeers, loadTaxonomy } from "../../categories/taxonomy.js";
+import { DEFAULT_DISCOVER_DEPS, discover, FREE_PROMPT_ALLOWANCE, type DiscoverDeps } from "../../discovery/discover.js";
 import { generateFreeAllowance } from "../../discovery/free-prompts.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
+import { textEmbedderFor } from "./embed-batch.handler.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure } from "../worker-factory.js";
 
 // STORY-043 — the first real entry in STORY-124's registry, and the one its
@@ -41,6 +46,10 @@ interface Prepared {
   /** Field names a person decided: skipped by `discover`, then carried forward verbatim. */
   readonly humanDecided: readonly string[];
   readonly preserved: Record<string, unknown>;
+  /** STORY-189 — the taxonomy to classify against, read in `prepare`. Empty when the category is supplied or decided, or nothing is seeded. */
+  readonly categories: readonly CategoryDescriptor[];
+  /** The category the project already holds (supplied at creation, or confirmed): where its curated peers come from. */
+  readonly currentCategory: string | null;
 }
 
 // ADR-0003 / NFR-ARCH-04 — a PHASED job. The middle of this handler is a fetch of a site we do not control, so it must not hold a
@@ -48,8 +57,11 @@ interface Prepared {
 //   prepare  short tenant transaction: confirm the project, mark it running (committed BEFORE the fetch, so a poll mid-flight says so).
 //   run      NO transaction: the guarded fetch and the pure parsing.
 //   commit   short tenant transaction: the free allowance and the review payload, written together.
-export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?: DiscoverDeps): JobProcessor {
+export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: DiscoverDeps, categoryEmbedder?: TextEmbedder): JobProcessor {
   const logger = new Logger("crawl.discover");
+  // Built on first use: a process that never classifies (nothing seeded, or every category supplied) never selects a provider.
+  let embedder: TextEmbedder | undefined = categoryEmbedder;
+  const embedderFor = (): TextEmbedder => (embedder ??= textEmbedderFor(context.env));
 
   return phasedProcessor<Prepared, DiscoveryResponse>({
     async prepare(tx: ClientBase, job: Job) {
@@ -59,8 +71,8 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       // A job payload is a snapshot from enqueue time; the row is the truth, and
       // reading it also confirms the project still exists — it may have been
       // deleted between creation and this job being picked up.
-      const project = await tx.query<{ root_domain: string; discovery: unknown; name?: string | null; brand_aliases?: string[] | null; created_at?: Date | string | null }>(
-        "SELECT root_domain, discovery, name, brand_aliases, created_at FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      const project = await tx.query<{ root_domain: string; discovery: unknown; name?: string | null; brand_aliases?: string[] | null; created_at?: Date | string | null; category_slug?: string | null }>(
+        "SELECT root_domain, discovery, name, brand_aliases, created_at, category_slug FROM projects WHERE id = $1 AND deleted_at IS NULL",
         [payload.projectId],
       );
       const row = project.rows[0];
@@ -77,28 +89,71 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
 
       // STORY-044 AC4/scenario 5 — a field a human overrode is NEVER overwritten by a later pass. Folded into the same
       // `fieldsSupplied` skip list that makes "supplied wins" work: both mean "a person decided this, do not derive it".
+      const humanDecided = userEditedFields(row.discovery);
+      // STORY-189 — a global, read-only table: nothing to filter by tenant. Not read at all when the category is already decided.
+      const categories = categoryIsDecided(payload.fieldsSupplied, humanDecided) ? [] : await loadTaxonomy(tx);
       return {
         payload,
         rootDomain: row.root_domain,
         submittedAt: toDate(row.created_at),
         knownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? [])],
-        humanDecided: userEditedFields(row.discovery),
+        humanDecided,
         preserved: preservedFields(row.discovery),
+        categories,
+        currentCategory: row.category_slug ?? null,
       };
     },
 
     // `discover` does not throw for a site-side problem — it returns `partial` or `failed` with whatever it obtained (AC13). A
     // throw here would be OUR bug, and should reach the retry ladder.
-    run: (prepared) =>
-      discover(
+    // The category classification (an embedding call) lives HERE, in `run`: no transaction and no pooled connection is held across it
+    // (ADR-0003 / KAD-06). A provider failure proposes no category; it never fails the pass.
+    async run(prepared) {
+      const classification = { attempted: false, failed: false, tokens: 0 };
+      const classify =
+        prepared.categories.length === 0
+          ? undefined
+          : (siteText: string) =>
+              trace.getTracer("nominara.discovery").startActiveSpan("discovery.classify_category", async (span) => {
+                classification.attempted = true;
+                try {
+                  const result = await classifyCategory(siteText, prepared.categories, embedderFor());
+                  span.setAttribute("nominara.discovery.category_found", result !== null);
+                  classification.tokens += result?.tokens ?? 0;
+                  return result;
+                } catch (error) {
+                  classification.failed = true;
+                  span.setStatus({ code: SpanStatusCode.ERROR });
+                  throw error;
+                } finally {
+                  span.end();
+                }
+              });
+      const result = await discover(
         {
           rootUrl: prepared.payload.rootUrl,
           rootDomain: prepared.rootDomain,
           fieldsSupplied: [...prepared.payload.fieldsSupplied, ...prepared.humanDecided],
           knownBrandNames: prepared.knownBrandNames,
         },
-        deps,
-      ),
+        { ...(deps ?? DEFAULT_DISCOVER_DEPS), ...(classify === undefined ? {} : { classify }) },
+      );
+      const category = result.fields.category;
+      const outcome = categoryIsDecided(prepared.payload.fieldsSupplied, prepared.humanDecided)
+        ? "supplied"
+        : classification.failed
+          ? "failed"
+          : category === undefined
+            ? "none"
+            : category.confidence < LOW_CONFIDENCE_THRESHOLD
+              ? "low_confidence"
+              : "proposed";
+      incrementCounter("nominara_discovery_category_total", { outcome });
+      // What the provider reported for this pass. The budget is stated, not metered to the workspace: one site text of at most
+      // MAX_CLASSIFICATION_TEXT_CHARS, plus the category vectors once per process and model.
+      if (classification.attempted && classification.tokens > 0) observeValue("nominara_discovery_category_embed_tokens", classification.tokens);
+      return result;
+    },
 
     async commit(tx: ClientBase, prepared: Prepared, result: DiscoveryResponse) {
       const { payload } = prepared;
@@ -113,9 +168,21 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
 
       // The overridden entries are carried forward verbatim: `discover` skipped them, so without this they would vanish from the
       // payload and the NEXT pass would re-derive them.
+      const fields = { ...result.fields, ...(prepared.preserved as DiscoveryResponse["fields"]) };
+
+      // STORY-189 AC5 — curated category peers, after the site's own comparison links. The category is the one the project already holds
+      // (supplied at creation or confirmed), else the one just discovered when it is confident; a low-confidence guess brings no peers.
+      // Not proposed when the caller supplied competitors. A global read: peers are never derived from other customers' projects.
+      const peerCategory = prepared.currentCategory ?? confidentCategory(fields.category);
+      const competitors =
+        peerCategory === null || payload.fieldsSupplied.includes("competitors")
+          ? result.competitors_proposed
+          : mergeCategoryPeers({ own: result.competitors_proposed, peers: await loadCategoryPeers(tx, peerCategory), ownDomain: prepared.rootDomain });
+
       const merged: DiscoveryResponse = {
         ...result,
-        fields: { ...result.fields, ...(prepared.preserved as DiscoveryResponse["fields"]) },
+        fields,
+        competitors_proposed: competitors,
         prompts_generated: generated,
         prompts_free_remaining: allowance.remaining,
       };
@@ -145,7 +212,8 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       logger.log(
         `workspace ${payload.workspaceId} project ${payload.projectId}: ${merged.discovery_status} in ${String(merged.duration_ms ?? 0)}ms, ` +
           `${String(Object.keys(merged.fields).length)} field(s), ${String(merged.low_confidence_fields.length)} low-confidence, ` +
-          `${String(merged.competitors_proposed.length)} competitor(s), ${String(generated.length)} prompt(s) generated, ` +
+          `${String(merged.competitors_proposed.length)} competitor(s) (${String(merged.competitors_proposed.filter((c) => c.basis === "category peer").length)} category peer), ` +
+          `category ${merged.fields.category === undefined ? "none" : merged.low_confidence_fields.includes("category") ? "low-confidence" : "proposed"}, ${String(generated.length)} prompt(s) generated, ` +
           `${String(prepared.humanDecided.length)} preserved from a human decision`,
       );
     },
@@ -179,6 +247,16 @@ export function createCrawlDiscoverHandler(_context: QueueHandlerContext, deps?:
       return true;
     },
   });
+}
+
+/** The category is already decided: the caller supplied it at creation, or a person overrode it. Discovery neither derives nor re-proposes it. */
+function categoryIsDecided(fieldsSupplied: readonly string[], humanDecided: readonly string[]): boolean {
+  return fieldsSupplied.includes("category_slug") || fieldsSupplied.includes("category") || humanDecided.includes("category");
+}
+
+/** The discovered category's slug, only when it clears the confidence line. */
+function confidentCategory(field: { value: unknown; confidence: number } | undefined): string | null {
+  return field !== undefined && typeof field.value === "string" && field.confidence >= LOW_CONFIDENCE_THRESHOLD ? field.value : null;
 }
 
 /** BullMQ increments `attemptsMade` when an attempt fails, so during attempt N it is N-1. An unknown attempt count is "not known to be final". */

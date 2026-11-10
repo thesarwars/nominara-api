@@ -90,6 +90,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "report.build",
       "report.cleanup",
       "retention.purge",
+      "rollup.category_benchmark",
       "rollup.metric_daily",
       "source.verify_presence",
       "task.generate",
@@ -154,6 +155,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "report.cleanup",
       // STORY-073 AC4 — declared after task.resurface in topology.ts.
       "credit.verify",
+      // STORY-176 / decision 93 — declared after credit.verify in topology.ts.
+      "rollup.category_benchmark",
     ]);
   });
 

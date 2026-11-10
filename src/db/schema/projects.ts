@@ -11,6 +11,23 @@ import { sql } from "drizzle-orm";
 import { boolean, integer, jsonb, numeric, pgTable, primaryKey, real, smallint, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { citext } from "./columns.js";
 
+export const businessCategories = pgTable("business_categories", {
+  slug: text("slug").primaryKey(),
+  name: text("name").notNull(),
+  parentSlug: text("parent_slug"),
+  parentName: text("parent_name"),
+  description: text("description").notNull(),
+  taxonomyVersion: integer("taxonomy_version").notNull().default(sql`1`),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
+export const categoryPeers = pgTable("category_peers", {
+  categorySlug: text("category_slug").notNull(),
+  rootDomain: text("root_domain").notNull(),
+  name: text("name").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+}, (table) => [primaryKey({ columns: [table.categorySlug, table.rootDomain] })]);
+
 export const competitors = pgTable("competitors", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),
@@ -99,4 +116,6 @@ export const projects = pgTable("projects", {
   demoSeededAt: timestamp("demo_seeded_at", { withTimezone: true }),
   pausedByDowngradeAt: timestamp("paused_by_downgrade_at", { withTimezone: true }),
   pausedByDowngradeFrom: text("paused_by_downgrade_from"),
+  benchmarkCategorySlug: text("benchmark_category_slug"),
+  benchmarkCategoryAppliedAt: timestamp("benchmark_category_applied_at", { withTimezone: true }),
 });

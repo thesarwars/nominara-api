@@ -104,6 +104,12 @@ const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; sou
     source:
       "STORY-180 r5 (owner decision 60 (b)) - delete expired and half-uploaded report files daily; the references state no time of day, 03:30 UTC is a chosen quiet window",
   },
+  "rollup.category_benchmark": {
+    cron: "50 3 * * *",
+    section: "STORY-176 / decision 93",
+    source:
+      "STORY-176 / owner decision 93 - the category-benchmark membership batch and per-category recompute run nightly; the references state no time of day, 03:50 UTC is a chosen quiet window after the retention purge (03:40)",
+  },
   "task.resurface": {
     cron: "10 2 * * *",
     section: "STORY-064 AC5",
@@ -185,9 +191,9 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(undatedSchedules().map((s) => s.queue).sort()).toEqual([...ON_DEMAND_ONLY].sort());
   });
 
-  it("STORY-140 AC11 · seventeen of nineteen cron queues are dated, two are on demand", () => {
-    // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5) + maintenance.integrity (STORY-013) + report.cleanup (STORY-180 r5) + credit.verify (STORY-073 AC4).
-    expect(datedSchedules()).toHaveLength(17);
+  it("STORY-140 AC11 · eighteen of twenty cron queues are dated, two are on demand", () => {
+    // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5) + maintenance.integrity (STORY-013) + report.cleanup (STORY-180 r5) + credit.verify (STORY-073 AC4) + rollup.category_benchmark (STORY-176).
+    expect(datedSchedules()).toHaveLength(18);
     expect(undatedSchedules()).toHaveLength(2);
   });
 
@@ -252,6 +258,7 @@ describe("G12 · the schedule table matches the reference", () => {
       "maintenance.partition",
       "report.cleanup",
       "retention.purge",
+      "rollup.category_benchmark",
       "task.resurface",
     ]);
     // The three reasons partition the dated rows — no queue is refused twice
@@ -293,6 +300,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("17 of 19 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("18 of 20 cron queues state a time");
   });
 });

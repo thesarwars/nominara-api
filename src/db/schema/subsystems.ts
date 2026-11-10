@@ -48,7 +48,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "stripe_subscription_syncs",
     "downgrade_notices",
   ],
-  projects: ["projects", "project_engines", "competitors", "domain_verifications"],
+  projects: ["projects", "project_engines", "competitors", "domain_verifications", "business_categories", "category_peers"],
   prompts: ["tracked_prompts", "prompt_stability", "topic_clusters"],
   captures: [
     "engines",

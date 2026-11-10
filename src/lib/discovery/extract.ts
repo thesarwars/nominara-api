@@ -1,9 +1,9 @@
 // STORY-043 — pulling brand facts out of a fetched page.
 //
-// SCOPE. Business category is NOT derived and not faked: "classification against a 180-category taxonomy" names a taxonomy that
-// exists nowhere (no table, seed or owning story), and `category_slug` is the benchmark join key, so a guessed category would make
-// every category-relative comparison silently wrong. Competitors are proposed in competitors.ts and the free prompt allowance is
-// generated in free-prompts.ts (both now unblocked by STORY-049/045).
+// SCOPE. Business category is not derived here: the taxonomy and the classifier are STORY-189 (src/lib/categories/classify.ts), fed the
+// text this file and html-signals.ts read. `category_slug` is the benchmark join key, so a guessed category would make every
+// category-relative comparison silently wrong. Competitors are proposed in competitors.ts and the free prompt allowance is
+// generated in free-prompts.ts.
 //
 // What IS here is everything derivable from one fetch of the root document:
 // JSON-LD, Open Graph, <title>, meta description, and the lang attribute.
@@ -186,6 +186,15 @@ export function extractFromHtml(html: string): Extracted {
   if (lang) out.locale = { value: normalizeLocale(lang), confidence: CONFIDENCE.htmlLang, source: "html[lang]" };
 
   return out as Extracted;
+}
+
+/** The page's own title, undecorated and untruncated: `og:title`, else `<title>`. Context for classification, not a brand name (STORY-189). */
+export function extractPageTitle(html: string): string | undefined {
+  const og = metaContent(html, "og:title");
+  if (og) return og;
+  const raw = TITLE_RE.exec(html)?.[1];
+  const title = raw ? decodeEntities(raw).trim() : "";
+  return title === "" ? undefined : title;
 }
 
 /**

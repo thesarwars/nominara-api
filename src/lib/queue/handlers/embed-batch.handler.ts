@@ -4,6 +4,7 @@ import { UnrecoverableError, type Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { EmbeddingProviderError, type EmbeddingProvider } from "../../../modules/prompts/ports/embedding-provider.js";
 import { selectEmbeddingProvider } from "../../../modules/prompts/embedding-provider.selector.js";
+import type { TextEmbedder } from "../../categories/classify.js";
 import { lockNodeScope } from "../../geo/alignment/scope-lock.js";
 import { CircuitBreaker, CircuitOpenError } from "../../resilience/circuit-breaker.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
@@ -119,6 +120,22 @@ function isRetryable(cause: unknown): boolean {
  */
 export function selectedEmbeddingModel(env: Parameters<typeof selectEmbeddingProvider>[0]): string {
   return selectEmbeddingProvider(env).model;
+}
+
+/**
+ * STORY-189 / decision 88(b) - the same provider, as a plain text embedder, for category classification in `crawl.discover`'s no-transaction
+ * `run` phase. Exported from THIS file for the reason `selectedEmbeddingModel` is: the provider, its adapters and its selector are importable
+ * here only (NFR-ARCH-01), so a second caller gets a function that returns vectors, never the provider. Reachable from queue handlers only.
+ */
+export function textEmbedderFor(env: Parameters<typeof selectEmbeddingProvider>[0]): TextEmbedder {
+  const provider = selectEmbeddingProvider(env);
+  return {
+    model: provider.model,
+    async embed(texts) {
+      const result = await provider.embed(texts);
+      return { vectors: result.vectors, totalTokens: result.totalTokens };
+    },
+  };
 }
 
 export interface EmbedBatchDeps {

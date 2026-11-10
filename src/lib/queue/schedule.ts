@@ -101,6 +101,11 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // `audit.verify` (02:40) so the two estate-wide walks do not contend for connections. The owner can move it.
   { queue: "credit.verify", cron: "45 2 * * *", statedAs: "STORY-073 AC4 / NFR-CRD-03: replay every wallet against its ledger nightly and page on mismatch" },
 
+  // ⚠ NOT FROM §4 - STORY-176 / owner decision 93: the nightly category-benchmark batch (membership, then one short transaction per category). THE HOUR IS A
+  // CHOICE, NOT A TRANSCRIPTION: 03:50 UTC, after the retention purge (03:40) and the rest of the estate-wide ticks, so it reads the previous day's closed
+  // rollups once they have settled; :50 and not :00 for the reason §6.1 gives `capture.plan` :05. Idempotent and cheap when nothing changed. The owner can move it.
+  { queue: "rollup.category_benchmark", cron: "50 3 * * *", statedAs: "STORY-176 / decision 93: category benchmark membership batch and per-category recompute, nightly" },
+
   // ⚠ NOT FROM §4 — STORY-077 R4 / STORY-013, `data-model.md` §7 ("nightly"). 03:40 UTC: after the partition tick
   // (03:20) so the two do not contend for the same locks, and a chosen hour for the reason above. SCHEDULED IS NOT
   // ENABLED: the handler is a no-op unless `RETENTION_PURGE_ENABLED=true`. See `handlers/retention-purge.handler.ts`.

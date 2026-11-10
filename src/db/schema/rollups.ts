@@ -129,6 +129,7 @@ export const platformMetrics = pgTable("platform_metrics", {
   medianAuxScore: numeric("median_aux_score", { precision: 6, scale: 3 }).notNull(),
   topSourceDomains: jsonb("top_source_domains").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  scoringVersion: text("scoring_version"),
 }, (table) => [primaryKey({ columns: [table.metricDate, table.categorySlug, table.engineKey] })]);
 
 export const refCounters = pgTable("ref_counters", {
