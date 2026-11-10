@@ -13,8 +13,8 @@ import type { ClientBase } from "pg";
 //   VectorDedupePort    the seam generatePass takes: one `embed` call for the batch and one `compare` round trip.
 //
 // WHERE THE VECTORS COME FROM IS NOT DECIDED HERE. `embed` is whatever the caller injects. NFR-ARCH-01 forbids an embedding-provider call
-// from a request handler and eslint refuses the port's import outside the embed.batch handler, so nothing in src/modules binds an
-// embedder today - see PROMPT_CANDIDATE_EMBEDDER (modules/prompts/ports/candidate-embedder.ts).
+// from a request handler and eslint refuses the port's import outside the embed.batch handler, so the only caller is the `prompt.generate` job
+// (decision 95(a)), which reaches the provider through `textEmbedderFor` in that handler's module (promptgen/generation-job.ts buildVectorDedupe).
 
 /** tracking-engine.md section 4 step 5; schemas/projects-and-prompts.md `embedding` row: "generation dedupe (>= 0.92)". */
 export const VECTOR_DEDUPE_THRESHOLD = 0.92;
@@ -92,7 +92,7 @@ const NEAREST_SQL = `
     LEFT JOIN LATERAL (
       SELECT p.id, 1 - (p.embedding <=> c.v::halfvec(1536)) AS cosine
         FROM tracked_prompts p
-       WHERE p.project_id = $3 AND p.deleted_at IS NULL
+       WHERE p.project_id = $3 AND p.workspace_id = app.current_workspace() AND p.deleted_at IS NULL
          AND p.embedding IS NOT NULL AND p.embedding_model = $4
        ORDER BY p.embedding <=> c.v::halfvec(1536)
        LIMIT 1
