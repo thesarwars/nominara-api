@@ -4,7 +4,7 @@ import { guidanceFor, NON_FIXABLE_RULES } from "../patches/guidance.js";
 import { loadAuxCatalog, type AuxCatalog } from "../catalog.js";
 import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateDocuments } from "./engine.js";
 import { ALL_AUX_RULES, AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL, HELD_RULES } from "./index.js";
-import { CATALOG, CATALOG_ROWS, PROJECT_ID, evaluatorFindings, findings, runAll } from "../../../../test/support/aux-rules.js";
+import { CATALOG, CATALOG_ROWS, PROJECT_ID, findings, runAll } from "../../../../test/support/aux-rules.js";
 import { CLEAN_TEXT, block, makeDoc, variant } from "../../../../test/support/aux-document.js";
 import type { AuxRule } from "./types.js";
 

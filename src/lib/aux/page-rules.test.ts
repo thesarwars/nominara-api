@@ -159,7 +159,7 @@ describe("STORY-051 AC13 · runPageRules over stored pages", () => {
 
   it("AUXLIVE-2 · no pages is an empty result, not an error", async () => {
     const out = await run([]);
-    expect(out).toEqual({ findings: [], evaluated: new Map(), unmodelled: [] });
+    expect(out).toEqual({ findings: [], evaluated: new Map(), patches: new Map(), unmodelled: [] });
   });
 });
 
@@ -218,5 +218,35 @@ describe("AUXLIVE-2 review round 1 · a rule that crashes on one page does not f
     const f = fixture([{ url: "https://acme.com/", raw: GOOD }]);
     const noCatalogRow: AuxRule = { ...AUX_RULES.find((r) => r.code === "AUX-R-008")!, code: "AUX-R-999" };
     await expect(runPageRules(f.pages, f.read, CATALOG, { projectId: PROJECT_ID }, [...AUX_RULES, noCatalogRow])).rejects.toBeInstanceOf(AuxRuleConfigError);
+  });
+});
+
+describe("STORY-053 AC1 · the page-level patches come out of the same pass, keyed by the finding's fingerprint", () => {
+  const LD = (extra: string): string =>
+    `<html><head><title>Acme</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Acme"${extra}}</script></head>` +
+    `<body><main><h1>Acme</h1><h2>Pipeline analytics</h2><p>See every deal.</p><h2>Workflow automation</h2><p>Automate follow-ups.</p></main></body></html>`;
+
+  it("STORY-053 AC1 · a page whose AUX-R-014 fires yields a jsonld draft under that finding's fingerprint", async () => {
+    const out = await run([{ url: "https://acme.com/", raw: LD("") }]);
+    const f = out.findings.find((x) => x.rule_code === "AUX-R-014");
+    expect(f).toBeDefined();
+    const entry = out.patches.get(pageFindingFingerprint(f!));
+    expect(entry).toMatchObject({ draft: { kind: "jsonld", ruleCode: "AUX-R-014", targetUrl: "https://acme.com/" } });
+  });
+
+  it("STORY-053 AC1 · a finding whose rule has no page generator has no entry (no empty patch)", async () => {
+    const out = await run([{ url: "https://acme.com/", raw: BROKEN_JSONLD }]);
+    expect(out.findings.some((x) => x.rule_code === "AUX-R-008")).toBe(true);
+    for (const f of out.findings.filter((x) => x.rule_code === "AUX-R-008")) expect(out.patches.has(pageFindingFingerprint(f))).toBe(false);
+  });
+
+  it("STORY-053 AC5 · a generator that rejects its own output is recorded under the fingerprint as a reason code, not thrown", async () => {
+    // A long unstructured paragraph with no heading at all: AUX-R-023 fires, and the structure template has nothing to anchor to.
+    const sentences = Array.from({ length: 12 }, (_, i) => `Sentence number ${String(i)} is about widgets.`).join(" ");
+    const noHeading = `<html><head><title>Acme</title></head><body><main><p>${sentences}</p></main></body></html>`;
+    const out = await run([{ url: "https://acme.com/", raw: noHeading }]);
+    const f = out.findings.find((x) => x.rule_code === "AUX-R-023");
+    expect(f).toBeDefined();
+    expect(out.patches.get(pageFindingFingerprint(f!))).toEqual({ rejected: "no_heading" });
   });
 });

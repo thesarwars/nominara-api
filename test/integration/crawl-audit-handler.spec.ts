@@ -1208,6 +1208,44 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       }
     });
 
+    // STORY-053 AC1 end to end: a page-level finding (AUX-R-014) produces a stored, immutable, copy-ready patch.
+    const NO_FEATURES_PAGE = HEALTHY_PAGE.replace('"featureList":["Pipeline analytics","Workflow automation"],', "");
+    it("STORY-053 AC1 · a crawled page whose AUX-R-014 fires gets a jsonld patch written in the tenant transaction, linked to its finding, free and with a page_hash precondition", async () => {
+      expect(NO_FEATURES_PAGE).not.toContain("featureList");
+      await runAsTenant({ ...healthy(OPEN), "/": { status: 200, body: NO_FEATURES_PAGE } });
+      const finding = (await findings()).find((f) => f.rule_code === "AUX-R-014");
+      expect(finding).toBeDefined();
+      const rows = (await patchRows()).filter((p) => p.rule_code === "AUX-R-014");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ kind: "jsonld", finding_id: finding.id, target_url: "https://acme.com/", requires_human_review: false });
+      expect(rows[0].content_before_hash.equals(sha(NO_FEATURES_PAGE))).toBe(true);
+      expect(rows[0].preconditions).toEqual([{ kind: "page_hash", value: `sha256:${sha(NO_FEATURES_PAGE).toString("hex")}` }]);
+      expect(rows[0].jsonld_blocks[0].featureList).toEqual(["Pipeline analytics", "Workflow automation"]);
+      expect(counters).toContainEqual({ name: "nominara_aux_patches_generated_total", labels: { kind: "jsonld", rule_code: "AUX-R-014" } });
+      expect((await db.query("SELECT count(*)::int AS n FROM credit_ledger")).rows[0].n).toBe(0);
+    });
+
+    it("STORY-053 AC8 · re-detecting the same finding on the same page writes no second patch; a changed page writes a new one and keeps the first", async () => {
+      const served = { ...healthy(OPEN), "/": { status: 200, body: NO_FEATURES_PAGE } };
+      await runAsTenant(served);
+      await runAsTenant(served);
+      expect((await patchRows()).filter((p) => p.rule_code === "AUX-R-014")).toHaveLength(1);
+      await runAsTenant({ ...served, "/": { status: 200, body: NO_FEATURES_PAGE.replace("See every deal.", "See every deal today.") } });
+      const rows = (await patchRows()).filter((p) => p.rule_code === "AUX-R-014");
+      expect(rows).toHaveLength(2);
+      expect(rows[0].id).not.toBe(rows[1].id);
+    });
+
+    it("STORY-053 AC5 · a page generator that refuses its own output is counted and offers no patch, and the finding and the audit stand", async () => {
+      const sentences = Array.from({ length: 12 }, (_, i) => `Sentence number ${String(i)} is about widgets.`).join(" ");
+      const bare = HEALTHY_PAGE.replace(/<h1>[\s\S]*<\/main>/, `<p>${sentences}</p></main>`);
+      await runAsTenant({ ...healthy(OPEN), "/": { status: 200, body: bare } });
+      expect((await findings()).some((f) => f.rule_code === "AUX-R-023")).toBe(true);
+      expect((await patchRows()).filter((p) => p.rule_code === "AUX-R-023")).toHaveLength(0);
+      expect(counters).toContainEqual({ name: "nominara_aux_patch_rejected_total", labels: { reason: "no_heading" } });
+      expect((await audits())[0]).toMatchObject({ status: "completed" });
+    });
+
     it("STORY-053 · generation makes no network call and holds no I/O: the patch modules import nothing that can fetch", () => {
       const dir = new URL("../../src/lib/aux/patches/", import.meta.url);
       for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))) {

@@ -30,7 +30,7 @@ import {
   type LifecycleAction,
 } from "../../aux/lifecycle.js";
 import { crawlPages, NOMINARA_USER_AGENT, type PageRecord } from "../../aux/page-crawl.js";
-import { pageFindingFingerprint, runPageRules } from "../../aux/page-rules.js";
+import { pageFindingFingerprint, runPageRules, type PageRulesResult } from "../../aux/page-rules.js";
 import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "../../aux/rules/index.js";
 import { pageCapForPlan, selectPages, type SelectionScope } from "../../aux/page-selection.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../../aux/politeness.js";
@@ -328,6 +328,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     readonly covered: ReadonlySet<string>;
     /** Per page the page rules looked at: the rules that could be decided on it. */
     readonly pageEvaluated: ReadonlyMap<string, ReadonlySet<string>>;
+    /** STORY-053: the page-level patches (or rejection reasons) built in the fetch phase, keyed by finding fingerprint. */
+    readonly pagePatches: PageRulesResult["patches"];
     /** Pages whose stored copy could not be read back or modelled. */
     readonly unmodelledPages: number;
     readonly pagesToCrawl: readonly string[];
@@ -767,6 +769,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       detected,
       covered,
       pageEvaluated: pageRules.evaluated,
+      pagePatches: pageRules.patches,
       unmodelledPages: pageRules.unmodelled.length,
       pagesToCrawl,
       pagesCrawled,
@@ -929,7 +932,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     };
     const patchStats = await tracer.startActiveSpan("crawl.audit.patches", async (span) => {
       try {
-        const stats = await writePatches(tx, { payload, detected: detected.filter((d) => (RAN_RULES as readonly string[]).includes(d.ruleCode)), site, logger });
+        const stats = await writePatches(tx, { payload, detected: detected.filter((d) => (RAN_RULES as readonly string[]).includes(d.ruleCode) || outcome.pagePatches.has(d.fingerprint)), pagePatches: outcome.pagePatches, site, logger });
         span.setAttribute("nominara.aux.patches_written", stats.written);
         span.setAttribute("nominara.aux.patches_rejected", stats.rejected);
         return stats;
@@ -1309,9 +1312,9 @@ async function applyAction(
  */
 async function writePatches(
   tx: ClientBase,
-  args: { payload: { projectId: string; workspaceId: string }; detected: readonly DetectedFinding[]; site: SiteInputs; logger: Logger },
+  args: { payload: { projectId: string; workspaceId: string }; detected: readonly DetectedFinding[]; pagePatches: PageRulesResult["patches"]; site: SiteInputs; logger: Logger },
 ): Promise<{ written: number; rejected: number }> {
-  const { payload, detected, site, logger } = args;
+  const { payload, detected, pagePatches, site, logger } = args;
   if (detected.length === 0) return { written: 0, rejected: 0 };
   const live = await tx.query<{ id: string; fp: string; rule_code: string; url: string | null }>(
     `SELECT id, encode(fingerprint, 'hex') AS fp, rule_code, url FROM aux_findings
@@ -1322,16 +1325,29 @@ async function writePatches(
   let rejected = 0;
   for (const row of live.rows) {
     let draft: PatchDraft | null = null;
-    try {
-      const generated = generateSiteFilePatch({ ruleCode: row.rule_code, targetUrl: row.url ?? site.origin, url: row.url, site });
-      if (generated.outcome === "patch") draft = generated.draft;
-    } catch (error) {
-      if (!(error instanceof PatchRejectedError)) throw error;
+    const reject = (reason: string): void => {
       rejected += 1;
-      incrementCounter("nominara_aux_patch_rejected_total", { reason: error.reason });
+      incrementCounter("nominara_aux_patch_rejected_total", { reason });
       // IDs and the reason code only: never the file's text.
-      logger.warn({ event: "aux.patch.rejected", workspace_id: payload.workspaceId, project_id: payload.projectId, finding_id: row.id, rule_code: row.rule_code, reason: error.reason });
-      continue;
+      logger.warn({ event: "aux.patch.rejected", workspace_id: payload.workspaceId, project_id: payload.projectId, finding_id: row.id, rule_code: row.rule_code, reason });
+    };
+    const pagePatch = pagePatches.get(row.fp);
+    if (pagePatch !== undefined) {
+      // A page-level patch was built in the fetch phase (pure CPU, outside any transaction); here it is only compared and written.
+      if ("rejected" in pagePatch) {
+        reject(pagePatch.rejected);
+        continue;
+      }
+      draft = pagePatch.draft;
+    } else {
+      try {
+        const generated = generateSiteFilePatch({ ruleCode: row.rule_code, targetUrl: row.url ?? site.origin, url: row.url, site });
+        if (generated.outcome === "patch") draft = generated.draft;
+      } catch (error) {
+        if (!(error instanceof PatchRejectedError)) throw error;
+        reject(error.reason);
+        continue;
+      }
     }
     if (draft === null) continue;
 

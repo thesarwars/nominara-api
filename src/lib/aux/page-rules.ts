@@ -8,6 +8,8 @@ import { byCodePoint } from "./rules/helpers.js";
 import { AuxRuleEvaluationError, evaluateDocument } from "./rules/engine.js";
 import { AUX_RULES } from "./rules/index.js";
 import type { AuxRule } from "./rules/types.js";
+import { generatePagePatch } from "./patches/page-patch.js";
+import { PatchRejectedError, type PatchDraft, type PatchRejectionReason } from "./patches/types.js";
 import { cl100kTokenizer } from "./tokenizer-cl100k.js";
 
 // STORY-051 AC13 - the page rule engine over a crawl's stored pages (aux-and-geo-analysis.md section 1, step 6, EVALUATE).
@@ -53,6 +55,11 @@ export interface PageRulesResult {
   /** Per page that was modelled: the rules that could be decided on it. A page absent here was NOT looked at by the page rules. */
   readonly evaluated: Map<string, ReadonlySet<string>>;
   /** A stored page that could not be read back or modelled. Reason codes only; never the content or the error text. */
+  /**
+   * STORY-053: the copy-ready patch for each finding that has a page generator, keyed by `pageFindingFingerprint`. A generator that refused its
+   * own output is `{ rejected: reason }` (the reason code only); a finding with no generator, or nothing to offer, has no entry.
+   */
+  readonly patches: Map<string, { readonly draft: PatchDraft } | { readonly rejected: PatchRejectionReason }>;
   readonly unmodelled: { readonly url: string; readonly reason: "snapshot_unreadable" | `rule_error:${string}` }[];
 }
 
@@ -88,9 +95,20 @@ export async function runPageRules(
   // reported as unmodelled with the rule code (never the error text, never the content) and the audit ends partial.
   const evaluated = new Map<string, ReadonlySet<string>>();
   const findings: AuxRuleFinding[] = [];
+  const patches: PageRulesResult["patches"] = new Map();
   for (const document of documents) {
     try {
-      findings.push(...(await evaluateDocument(document, catalog, rules, ctx)));
+      const pageFindings = await evaluateDocument(document, catalog, rules, ctx);
+      findings.push(...pageFindings);
+      for (const finding of pageFindings) {
+        try {
+          const draft = generatePagePatch({ finding, document, thresholds: catalog.byCode.get(finding.rule_code)?.thresholds ?? {} });
+          if (draft !== null) patches.set(pageFindingFingerprint(finding), { draft });
+        } catch (error) {
+          if (!(error instanceof PatchRejectedError)) throw error;
+          patches.set(pageFindingFingerprint(finding), { rejected: error.reason });
+        }
+      }
       evaluated.set(document.url, evaluablePageRules(document));
     } catch (error) {
       if (!(error instanceof AuxRuleEvaluationError)) throw error;
@@ -99,5 +117,5 @@ export async function runPageRules(
     }
   }
   findings.sort((a, b) => byCodePoint(a.url, b.url) || byCodePoint(a.rule_code, b.rule_code) || byCodePoint(a.evidence.locator, b.evidence.locator));
-  return { findings, evaluated, unmodelled };
+  return { findings, evaluated, patches, unmodelled };
 }
