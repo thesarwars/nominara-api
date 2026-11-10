@@ -759,7 +759,7 @@ describe("STORY-187 AUX-R-013 · the rewrite (review rounds 5-7 corpus)", () => 
   });
   const product99 = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: offer("99") };
   const faqPage = { "@context": ctx, "@type": "FAQPage", mainEntity: [{ "@type": "Question", name: "Q?", acceptedAnswer: { "@type": "Answer", text: "A" } }] };
-  const wrongPrice = { mainText: "Wool coat\nPrice: $49" };
+  const wrongPrice = { mainText: "Wool coat\nPrice: $52" };
   it("STORY-187 AC1 · a top-level Product with a wrong price fires on its own (control)", async () => {
     expect(await findings(withLd([org, product99], wrongPrice), "AUX-R-013")).toHaveLength(1);
   });
@@ -776,7 +776,7 @@ describe("STORY-187 AUX-R-013 · the rewrite (review rounds 5-7 corpus)", () => 
     expect(hits[0]!.evidence.reason).toBe("name");
   });
   it("STORY-187 AC1 · an entity reached from a node that is not the page (Organization.about) is not the page's subject", async () => {
-    const orgAbout = { ...org, about: { "@type": "Product", name: "Zebra gizmo", offers: offer("49") } };
+    const orgAbout = { ...org, about: { "@type": "Product", name: "Zebra gizmo", offers: offer("52") } };
     const hits = await findings(withLd([orgAbout, product99], wrongPrice), "AUX-R-013");
     expect(hits).toHaveLength(1);
     expect(hits[0]).toMatchObject({ measured_value: 1 });
