@@ -3,6 +3,7 @@ import { ConflictError } from "../../api/errors/domain-errors.js";
 import type { Cache } from "../cache/cache.port.js";
 import { cacheKeyNamespace } from "../cache/key-namespace.js";
 import { resolveEntitlements } from "../entitlements/resolution.js";
+import { measurementStatusSql, nonMeasurementStatusSql } from "../rollup/aggregate-day.js";
 import { NORMALIZER_VERSION } from "../parser/normalize.js";
 import { resolveBillingPeriod } from "../usage/billing-period.js";
 import { MANUAL_CAPTURE_MODE, noCapturableScopeError, scopeIsCapturable, sharedCacheEnabled, type ManualRunProject } from "./manual-run.js";
@@ -13,6 +14,13 @@ import { planRun, type PlannedRun } from "./plan-run.js";
 //   WHICH RUN. The project's FIRST run, and only while it ended `failed` (resolveRunOutcome: zero cells delivered, i.e. every engine
 //   degraded or blocked). A `partial` run delivered something and is charged in full as the deep-scan rule says; a `completed` one has
 //   nothing to retry. A run that has since been followed by another run is not "the first run's outcome" any more, so it is refused too.
+//
+//   FAILED COMPLETELY BY DEGRADATION (owner decision 96b). `failed` alone is not that: the stale-run reaper (`error_summary.reason =
+//   'stale_queued'`) and a failed dispatch (`'dispatch_failed'`) write it too, for runs no engine ever answered or refused. What the code
+//   records of "every engine degraded" is the CELL OUTCOMES: finalizeRun writes `failed` only at zero delivered cells, each of which is an
+//   `answer_captures` row `failed` (the engine erred) or `blocked` (engine_degraded / quota_exhausted skip), or is counted in
+//   `capture_runs.failed_cells` (a cell that died without a row), and it leaves `error_summary` NULL. So: no `error_summary.reason`, at
+//   least one failed/blocked/uncounted cell, and no cell of any other status. Anything else is `failure_not_degradation`.
 //
 //   ONCE. `capture_runs.retry_of` carries a partial unique index (migration 0195), so a run is retried at most once and two concurrent
 //   requests cannot both start one. The first run's row is locked FOR UPDATE for the check, and the index is the backstop.
@@ -26,6 +34,8 @@ import { planRun, type PlannedRun } from "./plan-run.js";
 interface RunRow {
   id: string;
   status: string;
+  failed_cells: number;
+  error_reason: string | null;
 }
 
 export async function planFreeRetry(
@@ -42,7 +52,7 @@ export async function planFreeRetry(
 ): Promise<{ readonly plan: PlannedRun; readonly retryOf: string }> {
   const first = (
     await tx.query<RunRow>(
-      `SELECT id, status FROM capture_runs
+      `SELECT id, status, failed_cells, error_summary->>'reason' AS error_reason FROM capture_runs
         WHERE project_id = $1 AND workspace_id = app.current_workspace()
         ORDER BY created_at, id LIMIT 1 FOR UPDATE`,
       [project.projectId],
@@ -54,6 +64,17 @@ export async function planFreeRetry(
   if ((used.rowCount ?? 0) > 0) throw refusal("retry_already_used", "the free retry of this project's first run has already been used");
   if (first.status === "queued" || first.status === "running") throw refusal("run_in_progress", "this project's first run has not finished");
   if (first.status !== "failed") throw refusal("not_all_degraded", "this project's first run did not end with every engine degraded");
+
+  if (first.error_reason !== null) throw refusal("failure_not_degradation", "this project's first run failed, but not because every engine degraded");
+  const cells = (
+    await tx.query<{ degraded: string; other: string }>(
+      `SELECT count(*) FILTER (WHERE ${nonMeasurementStatusSql("status")})::text AS degraded,
+              count(*) FILTER (WHERE ${measurementStatusSql("status")})::text AS other
+         FROM answer_captures WHERE run_id = $1 AND workspace_id = app.current_workspace()`,
+      [first.id],
+    )
+  ).rows[0]!;
+  if (Number(cells.degraded) + first.failed_cells === 0 || Number(cells.other) > 0) throw refusal("failure_not_degradation", "this project's first run failed, but not because every engine degraded");
 
   const later = await tx.query("SELECT 1 FROM capture_runs WHERE project_id = $1 AND workspace_id = app.current_workspace() AND id <> $2 LIMIT 1", [project.projectId, first.id]);
   if ((later.rowCount ?? 0) > 0) throw refusal("run_since_first_run", "this project has run since its first run");
@@ -92,6 +113,6 @@ export async function planFreeRetry(
   return { plan, retryOf: first.id };
 }
 
-function refusal(reason: "not_all_degraded" | "run_in_progress" | "retry_already_used" | "no_first_run" | "run_since_first_run", message: string): InstanceType<typeof ConflictError> {
+function refusal(reason: "not_all_degraded" | "run_in_progress" | "retry_already_used" | "no_first_run" | "run_since_first_run" | "failure_not_degradation", message: string): InstanceType<typeof ConflictError> {
   return new ConflictError({ message, details: { reason } });
 }

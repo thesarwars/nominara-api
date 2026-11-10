@@ -132,6 +132,50 @@ describe("STORY-195 · the free retry of an all-degraded first run", () => {
     expect(first).toBeTruthy();
   });
 
+  // Owner decision 96(b): the free retry covers a first run that "failed completely" - every engine degraded. `status = 'failed'` alone is
+  // not that: the stale-run reaper and a failed dispatch also write it. The evidence is `error_summary.reason` (those two write one; the
+  // cell path leaves it NULL) and the cell outcomes: failed or blocked `answer_captures` rows, or `failed_cells` (cells that died without a row).
+  async function seedCell(runId: string, status: string, errorCode: string | null, sampleIndex: number): Promise<void> {
+    const promptId = (await db.query<{ id: string }>("SELECT id FROM tracked_prompts WHERE project_id = $1 LIMIT 1", [projectId])).rows[0]!.id;
+    await db.query(
+      `INSERT INTO answer_captures
+         (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version, normalizer_version, content_hash, flags, cache_layer, status, sample_index, error_code)
+       VALUES ($1,$2,$3,$4,$5,$6,now(),'api','1.0.0','n1',sha256($7::bytea),'{}','live',$8,$9,$10)`,
+      [randomUUID(), workspaceId, projectId, runId, promptId, SEEDED_ENGINE_KEY, Buffer.from(randomUUID()), status, sampleIndex, errorCode],
+    );
+  }
+  const noRetryRuns = async (): Promise<number> => count("SELECT count(*)::text AS n FROM capture_runs WHERE retry_of IS NOT NULL");
+
+  it.each(["stale_queued", "dispatch_failed"])("STORY-195-AC4 a first run failed by %s (not by engines degrading) is refused failure_not_degradation and adds no run", async (why) => {
+    const first = await seedRun("failed", 30, projectId, "scheduled");
+    await db.query("UPDATE capture_runs SET failed_cells = 0, error_summary = $2::jsonb WHERE id = $1", [first, JSON.stringify({ reason: why })]);
+    expect(await reasonOf(retry())).toBe("failure_not_degradation");
+    expect(await noRetryRuns()).toBe(0);
+  });
+
+  it("STORY-195-AC4 a failed first run with no cell outcome at all is not shown to be all-degraded: failure_not_degradation", async () => {
+    const first = await seedRun("failed", 30);
+    await db.query("UPDATE capture_runs SET failed_cells = 0 WHERE id = $1", [first]);
+    expect(await reasonOf(retry())).toBe("failure_not_degradation");
+    expect(await noRetryRuns()).toBe(0);
+  });
+
+  it("STORY-195-AC4 a first run whose every cell was blocked engine_degraded or failed is retried", async () => {
+    const first = await seedRun("failed", 30);
+    await db.query("UPDATE capture_runs SET failed_cells = 0 WHERE id = $1", [first]);
+    await seedCell(first, "blocked", "engine_degraded", 0);
+    await seedCell(first, "failed", "upstream_5xx", 1);
+    expect((await retry()).retryOf).toBe(first);
+  });
+
+  it("STORY-195-AC4 a failed run that nonetheless holds a delivered cell is not all-degraded: failure_not_degradation", async () => {
+    const first = await seedRun("failed", 30);
+    await seedCell(first, "failed", "timeout", 0);
+    await seedCell(first, "captured", null, 1);
+    expect(await reasonOf(retry())).toBe("failure_not_degradation");
+    expect(await noRetryRuns()).toBe(0);
+  });
+
   it("STORY-195-AC4 two concurrent retries start exactly one run", async () => {
     await seedRun("failed", 30);
     const settled = await Promise.allSettled([retry(), retry(), retry(), retry()]);
