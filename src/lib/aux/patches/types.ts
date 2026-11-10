@@ -46,7 +46,9 @@ export type PatchRejectionReason =
   | "invalid_jsonld"
   | "underived_value"
   | "no_change"
-  | "no_heading";
+  | "no_heading"
+  /** The generator itself crashed (not a gate rejecting its output): the finding is kept, the patch is not offered. */
+  | "generator_error";
 
 /** A generator's own output failed a gate. A hard error, never a stripped or quietly adjusted result. */
 export class PatchRejectedError extends Error {

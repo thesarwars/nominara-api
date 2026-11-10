@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { CrawlManifest } from "../../../contracts/aux/index.js";
 import { CATALOG } from "../../../test/support/aux-rules.js";
 import { makeDoc } from "../../../test/support/aux-document.js";
@@ -8,6 +8,13 @@ import { evaluablePageRules, pageFindingFingerprint, runPageRules } from "./page
 import { AuxRuleConfigError } from "./rules/engine.js";
 import { AUX_RULES } from "./rules/index.js";
 import type { AuxRule } from "./rules/types.js";
+import { generatePagePatch } from "./patches/page-patch.js";
+
+// Wraps the real generator so one test can make it crash; every other test runs the real one.
+vi.mock("./patches/page-patch.js", async (original) => {
+  const real = await original<typeof import("./patches/page-patch.js")>();
+  return { ...real, generatePagePatch: vi.fn(real.generatePagePatch) };
+});
 
 // STORY-051 AC13 / STORY-052 AC1, AC9 - the page rule engine over a crawl's stored pages: which rules could be decided on which
 // page, which findings came out, and which pages could not be modelled.
@@ -248,5 +255,17 @@ describe("STORY-053 AC1 · the page-level patches come out of the same pass, key
     const f = out.findings.find((x) => x.rule_code === "AUX-R-023");
     expect(f).toBeDefined();
     expect(out.patches.get(pageFindingFingerprint(f!))).toEqual({ rejected: "no_heading" });
+  });
+
+  it("STORY-053 AC5 · a generator that crashes (not a rejection) does not fail the audit: the finding stays, the patch is recorded as generator_error", async () => {
+    vi.mocked(generatePagePatch).mockImplementationOnce(() => {
+      throw new TypeError("boom with page text");
+    });
+    const out = await run([{ url: "https://acme.com/", raw: LD("") }]);
+    const f = out.findings.find((x) => x.rule_code === "AUX-R-014");
+    expect(f).toBeDefined();
+    expect(out.patches.get(pageFindingFingerprint(f!))).toEqual({ rejected: "generator_error" });
+    expect(out.unmodelled).toEqual([]);
+    expect(out.evaluated.has("https://acme.com/")).toBe(true);
   });
 });

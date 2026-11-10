@@ -105,7 +105,13 @@ export async function runPageRules(
           const draft = generatePagePatch({ finding, document, thresholds: catalog.byCode.get(finding.rule_code)?.thresholds ?? {} });
           if (draft !== null) patches.set(pageFindingFingerprint(finding), { draft });
         } catch (error) {
-          if (!(error instanceof PatchRejectedError)) throw error;
+          // A generator that crashes costs that finding its patch, not the audit its result: the error text can carry page content, so
+          // only its class is logged, and the reason code is recorded like any other rejection.
+          if (!(error instanceof PatchRejectedError)) {
+            logger.warn({ event: "aux.page_rules.patch_error", project_id: ctx.projectId, rule_code: finding.rule_code, error: error instanceof Error ? error.name : "unknown" });
+            patches.set(pageFindingFingerprint(finding), { rejected: "generator_error" });
+            continue;
+          }
           patches.set(pageFindingFingerprint(finding), { rejected: error.reason });
         }
       }
