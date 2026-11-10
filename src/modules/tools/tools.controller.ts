@@ -12,6 +12,10 @@ import {
   type CompareRunsRequest,
   type CompareRunsResponse,
   schemaBuilderRequestSchema,
+  schemaBuilderUrlAcceptedSchema,
+  schemaBuilderUrlRequestSchema,
+  type SchemaBuilderUrlAccepted,
+  type SchemaBuilderUrlRequest,
   schemaBuilderResponseSchema,
   type SchemaBuilderRequest,
   type SchemaBuilderResponse,
@@ -79,6 +83,7 @@ import { AuxAuditToolService } from "./aux-audit.service.js";
 import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { CompareRunsService } from "./compare-runs.service.js";
 import { SchemaBuilderService } from "./schema-builder.service.js";
+import { SchemaBuilderUrlService } from "./schema-builder-url.service.js";
 import { ToolsService } from "./tools.service.js";
 import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
@@ -100,6 +105,7 @@ export class ToolsController {
     private readonly auxAudit: AuxAuditToolService,
     private readonly compare: CompareRunsService,
     private readonly schemaBuilder: SchemaBuilderService,
+    private readonly schemaBuilderUrl: SchemaBuilderUrlService,
   ) {}
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
@@ -353,5 +359,21 @@ export class ToolsController {
   @ApiContract({ operationId: "saveSchemaBuilderRun", requestSchema: schemaBuilderRequestSchema, responseSchema: schemaBuilderResponseSchema, requiresIdempotencyKey: true })
   saveSchemaBuilder(@Body(new ZodValidationPipe(schemaBuilderRequestSchema)) body: SchemaBuilderRequest): Promise<SchemaBuilderResponse> {
     return this.schemaBuilder.save(body);
+  }
+
+  // STORY-083 AC5 (decision 82) - the URL path of Check. 202: the run is `running` and the worker fetches the page; the request never does (KAD-06). Free, so no credit
+  // header and no ledger row. `tool_site_files` is the rate class of the other free "fetch one site" tool (60/hour per user), not the generic `writes` budget.
+  @Post("schema-builder/url")
+  @HttpCode(202)
+  @Idempotent()
+  @RequirePermission("lookup:execute")
+  @ScopedByQuery()
+  @RateLimitClass("tool_site_files")
+  @Audit({ action: "tool_run.schema_builder_url_started", resourceType: "tool_run", resourceIdFrom: "response", responseIdPath: "tool_run_id" })
+  @ApiContract({ operationId: "startSchemaBuilderUrlCheck", requestSchema: schemaBuilderUrlRequestSchema, responseSchema: schemaBuilderUrlAcceptedSchema, requiresIdempotencyKey: true })
+  schemaBuilderUrlStart(@Body(new ZodValidationPipe(schemaBuilderUrlRequestSchema)) body: SchemaBuilderUrlRequest, @Req() request: AuditableRequest): Promise<SchemaBuilderUrlAccepted> {
+    const tenant = request.tenant;
+    if (tenant === undefined) throw new Error("the schema-builder URL route has no tenant context: WorkspaceGuard did not run");
+    return this.schemaBuilderUrl.start(tenant, body);
   }
 }

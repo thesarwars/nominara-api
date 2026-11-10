@@ -294,10 +294,41 @@ describe("STORY-192 · /geo/alignment over HTTP", () => {
     expect(body).toMatchObject({
       alignment_id: sessionId, status: "pending", alignment: { baseline: null, current: null, percentile_vs_cited_docs: null, target_band: null }, coverage: { coverage_ratio: null },
       content: { chunks: [] }, recommendations: [], projection: null, anti_filler_policy: { generation: "disabled" }, draft_status: null,
+      // decision 92: the page text was stored by the worker, but a session that is not ready serves none.
+      live_content_md: null,
     });
     expect((await get(b, sessionId)).statusCode).toBe(404);
     expect((await get(a, randomUUID())).statusCode).toBe(404);
     expect((await get(a, "not-a-uuid")).statusCode).toBe(400);
+  }, 120_000);
+
+  it("AC prefill H9c · decision 92 - a READY session serves the live page text for the editor to open on; null before a page was fetched; never the draft; the same permission as the rest of the payload", async () => {
+    const a = await owner();
+    const projectId = await project(a);
+    const clusterId = await cluster(a, projectId);
+    const ready = await readySession(a, projectId, clusterId);
+    const res = await get(a, ready);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(alignmentSessionPayloadSchema.safeParse(dataOf(res)).success).toBe(true);
+    expect(dataOf<{ live_content_md: string | null }>(res).live_content_md).toBe("# CRM\n\nReporting for teams.");
+
+    // The customer's draft never replaces it: the prefill is the LIVE page.
+    await harness.db().query("UPDATE geo_alignments SET draft_content_md = 'MY SECRET DRAFT', draft_state = 'ready' WHERE id = $1", [ready]);
+    const withDraft = dataOf<{ live_content_md: string | null }>(await get(a, ready));
+    expect(withDraft.live_content_md).toBe("# CRM\n\nReporting for teams.");
+    expect(JSON.stringify(withDraft)).not.toContain("MY SECRET DRAFT");
+
+    // Ready but no text stored (null, not an empty string); and a failed or stale session serves none even if a text was left behind.
+    await harness.db().query("UPDATE geo_alignments SET live_content_md = NULL WHERE id = $1", [ready]);
+    expect(dataOf<{ live_content_md: string | null }>(await get(a, ready)).live_content_md).toBeNull();
+    for (const [state, reason] of [["failed", "fetch_failed"], ["stale", "embedding_model_changed"]] as const) {
+      const other = await readySession(a, projectId, clusterId);
+      await harness.db().query("UPDATE geo_alignments SET analysis_state = $2, analysis_reason = $3 WHERE id = $1", [other, state, reason]);
+      expect(dataOf<{ live_content_md: string | null }>(await get(a, other)).live_content_md, state).toBeNull();
+    }
+    // The PATCH response is the same payload and carries the same field.
+    const edited = await patch(a, await readySession(a, projectId, clusterId), { draft_content_md: "# CRM\n\nmore" });
+    expect(dataOf<{ live_content_md: string | null }>(edited).live_content_md).toBe("# CRM\n\nReporting for teams.");
   }, 120_000);
 
   // ---- draft ----------------------------------------------------------------------------------------------------------------

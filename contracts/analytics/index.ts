@@ -12,3 +12,4 @@ export * from "./recovery-plan-response.schema.js";
 export * from "./geo-alignment.schema.js";
 export * from "./geo-alignment-api.schema.js";
 export * from "./geo-analyze-job.schema.js";
+export * from "./geo-alignment-targets.schema.js";

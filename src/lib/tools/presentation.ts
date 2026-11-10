@@ -16,6 +16,12 @@ export const DID_NOT_CHECK: Readonly<Record<ToolKey, string>> = {
   compare_runs: "Only the two stored results you chose: nothing was re-run, and nothing outside them was checked.",
 };
 
+/** Schema Builder URL mode (STORY-083 AC5): the run DID fetch a page, so the paste path's "no live page fetch" would be false for it. */
+const DID_NOT_CHECK_SCHEMA_URL_CHECK = "Only the structured data of the one page fetched: no other page was checked, and nothing was checked of how any engine currently renders it.";
+
+/** A tool run that reads differently from its tool's usual shape: today only a Schema Builder run made by fetching a URL. */
+export type ToolPresentationVariant = "url_check";
+
 /**
  * Which headline figures are ESTIMATES, by tool. A capture-backed tool draws ONE sample per engine, so every figure it derives from
  * those answers is an estimate (ui-ux-guidelines.md: "every figure from a single-sample tool run renders with ≈"). The AUX audit,
@@ -30,11 +36,11 @@ const SAMPLED_FIELDS: Readonly<Record<ToolKey, readonly ToolHeadlineField[]>> = 
   compare_runs: [],
 };
 
-export function toolPresentation(toolKey: ToolKey, headline: ToolRunHeadline): ToolRunPresentation {
+export function toolPresentation(toolKey: ToolKey, headline: ToolRunHeadline, variant?: ToolPresentationVariant): ToolRunPresentation {
   return {
     not_tracked: true,
     not_tracked_note: NOT_TRACKED_NOTE,
-    did_not_check: DID_NOT_CHECK[toolKey],
+    did_not_check: variant === "url_check" && toolKey === "schema_builder" ? DID_NOT_CHECK_SCHEMA_URL_CHECK : DID_NOT_CHECK[toolKey],
     // `!== null`, not truthiness: a measured 0 (or `false`) is a present estimate; only an absent figure is not flagged.
     estimated_fields: SAMPLED_FIELDS[toolKey].filter((field) => headline[field] !== null),
   };

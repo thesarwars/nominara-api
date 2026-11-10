@@ -27,14 +27,14 @@ const ready = {
   recommendations: [recommendation],
   projection: { naive_sum: 0.02, diminished_sum: 0.02, diminishing_returns_factor: 0.85, method: "additive_blend_estimate", confidence: "modeled", caveat: ALIGNMENT_CAVEAT },
   anti_filler_policy: { generation: "disabled", explanation: "Nominara returns phrases, structures, and schema - never generated prose." },
-  status: "ready", status_reason: null, draft_status: null,
+  status: "ready", status_reason: null, draft_status: null, live_content_md: "# CRM\n\nReporting for teams.",
 } as const;
 
 /** What a session that is not ready may carry: nothing measured. */
 const UNMEASURED = {
   alignment: { baseline: null, current: null, target_band: null, percentile_vs_cited_docs: null },
   coverage: { required_nodes: null, present_nodes: null, coverage_ratio: null },
-  content: { chunks: [] }, recommendations: [], projection: null,
+  content: { chunks: [] }, recommendations: [], projection: null, live_content_md: null,
 } as const;
 
 describe("STORY-192 - the alignment HTTP contracts", () => {

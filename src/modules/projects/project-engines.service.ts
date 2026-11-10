@@ -1,6 +1,8 @@
 import { Injectable, Logger } from "@nestjs/common";
+import type { ClientBase } from "pg";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type {
+  GetProjectEnginesResponse,
   ProjectEngineState,
   UpdateProjectEnginesRequest,
   UpdateProjectEnginesResponse,
@@ -63,6 +65,55 @@ export class ProjectEnginesService {
         span.end();
       }
     });
+  }
+
+  /**
+   * `GET /projects/{id}/engines`: the saved overrides AND the effective set, in one read-only pass. The overrides are the stored rows
+   * (including one for an engine the plan no longer entitles: it is stored, so it is shown); the effective set is the same
+   * `project_entitled_engines` answer the PUT returns. Rows only: no network, no write, no entitlement lookup.
+   */
+  async read(workspaceId: string, projectId: string): Promise<GetProjectEnginesResponse> {
+    return tracer.startActiveSpan("projects.read_engines", async (span) => {
+      try {
+        const store = currentTenantStore();
+        if (store === undefined) throw new Error("ProjectEnginesService requires an active tenant context");
+        const tx = store.client;
+        const project = await tx.query("SELECT 1 FROM projects WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL", [projectId, workspaceId]);
+        if (project.rowCount === 0) throw new NotFoundError({ message: "no such project" });
+        const saved = await tx.query<{ engine_key: string; enabled: boolean; weight: string; sample_count: number }>(
+          "SELECT engine_key, enabled, weight::numeric::text AS weight, sample_count FROM project_engines WHERE project_id = $1 AND workspace_id = $2 ORDER BY engine_key",
+          [projectId, workspaceId],
+        );
+        const engines = await this.effective(tx, workspaceId, projectId);
+        incrementCounter("nominara_project_engines_reads_total", {});
+        this.logger.log({ event: "project.engines_read", workspace_id: workspaceId, project_id: projectId, overrides: saved.rows.length });
+        return {
+          project_id: projectId,
+          overrides: saved.rows.map((row) => ({ engine_key: row.engine_key, enabled: row.enabled, weight: Number(row.weight), sample_count: row.sample_count })),
+          engines,
+        };
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  private async effective(tx: ClientBase, workspaceId: string, projectId: string): Promise<ProjectEngineState[]> {
+    const effective = await tx.query<{ engine_key: string; display_name: string; enabled: boolean; weight: string; sample_count: number }>(
+      `SELECT engine_key, display_name, enabled, weight::numeric::text AS weight, sample_count
+         FROM project_entitled_engines WHERE project_id = $1 AND workspace_id = $2 ORDER BY engine_key`,
+      [projectId, workspaceId],
+    );
+    return effective.rows.map((row) => ({
+      engine_key: row.engine_key,
+      display_name: row.display_name,
+      enabled: row.enabled,
+      weight: Number(row.weight),
+      sample_count: row.sample_count,
+    }));
   }
 
   private async apply(workspaceId: string, projectId: string, input: UpdateProjectEnginesRequest): Promise<UpdateProjectEnginesResponse> {
@@ -134,18 +185,7 @@ export class ProjectEnginesService {
       );
     }
 
-    const effective = await tx.query<{ engine_key: string; display_name: string; enabled: boolean; weight: string; sample_count: number }>(
-      `SELECT engine_key, display_name, enabled, weight::numeric::text AS weight, sample_count
-         FROM project_entitled_engines WHERE project_id = $1 AND workspace_id = $2 ORDER BY engine_key`,
-      [projectId, workspaceId],
-    );
-    const engines: ProjectEngineState[] = effective.rows.map((row) => ({
-      engine_key: row.engine_key,
-      display_name: row.display_name,
-      enabled: row.enabled,
-      weight: Number(row.weight),
-      sample_count: row.sample_count,
-    }));
+    const engines = await this.effective(tx, workspaceId, projectId);
     return { project_id: projectId, engines };
   }
 }

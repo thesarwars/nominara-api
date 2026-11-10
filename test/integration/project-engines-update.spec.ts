@@ -6,7 +6,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { updateProjectEnginesResponseSchema } from "../../contracts/projects/index.js";
+import { getProjectEnginesResponseSchema, updateProjectEnginesResponseSchema } from "../../contracts/projects/index.js";
 import { ProjectEnginesService } from "../../src/modules/projects/project-engines.service.js";
 import { EntitlementExceededError, FeatureNotInPlanError, NotFoundError, UnsupportedEngineError } from "../../src/api/errors/domain-errors.js";
 import type { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
@@ -217,5 +217,55 @@ describe("PUT /projects/{id}/engines", () => {
     await db.query("UPDATE tracked_prompts SET status = 'archived' WHERE project_id = $1 AND id IN (SELECT id FROM tracked_prompts WHERE project_id = $1 LIMIT 1)", [projectId]);
     await put([{ engine_key: "chatgpt", sample_count: 2 }]);
     expect((await rows())[0]).toMatchObject({ sample_count: 2 });
+  });
+  const get = (project = projectId, ws = workspaceId) => withTenantContext(db, { workspaceId: ws, actorId }, () => service.read(ws, project));
+
+  it("GE-1 GET with nothing saved: no overrides, and the effective set is the plan's defaults", async () => {
+    const res = await get();
+    expect(getProjectEnginesResponseSchema.safeParse(res).success).toBe(true);
+    expect(res.overrides).toEqual([]);
+    expect(res.engines.map((e) => e.engine_key)).toEqual(["chatgpt", "claude", "gemini", "google_ai_mode", "google_aio", "perplexity"]);
+    expect(res.engines.every((e) => e.enabled && e.weight === 1 && e.sample_count === 1)).toBe(true);
+  });
+
+  it("GE-2 GET returns exactly what PUT saved, and the effective set equals the PUT's answer", async () => {
+    const written = await put([{ engine_key: "chatgpt", enabled: false }, { engine_key: "perplexity", weight: 2.5, sample_count: 2 }]);
+    const res = await get();
+    expect(res.overrides).toEqual([
+      { engine_key: "chatgpt", enabled: false, weight: 1, sample_count: 1 },
+      { engine_key: "perplexity", enabled: true, weight: 2.5, sample_count: 2 },
+    ]);
+    expect(res.engines).toEqual(written.engines);
+  });
+
+  it("GE-3 an override of an engine the plan no longer entitles is still listed as saved, but is not in the effective set", async () => {
+    await put([{ engine_key: "gemini", weight: 3 }]);
+    await setPlan("growth");
+    const res = await get();
+    expect(res.overrides.map((o) => o.engine_key)).toEqual(["gemini"]);
+    expect(res.engines.map((e) => e.engine_key)).not.toContain("gemini");
+  });
+
+  it("GE-4 another workspace's project, a missing project and a deleted project are 404, and a sibling's overrides never leak", async () => {
+    await put([{ engine_key: "chatgpt", weight: 4 }], otherProjectId, otherWorkspaceId);
+    await expect(get(otherProjectId, workspaceId)).rejects.toBeInstanceOf(NotFoundError);
+    await expect(get(randomUUID())).rejects.toBeInstanceOf(NotFoundError);
+    expect((await get()).overrides).toEqual([]);
+    await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projectId]);
+    await expect(get()).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("GE-5 emits a span, a metric and a log line carrying the workspace id and no engine text", async () => {
+    const logs: unknown[] = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((message: unknown) => void logs.push(message));
+    try {
+      await get();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(exporter.getFinishedSpans().map((s) => s.name)).toContain("projects.read_engines");
+    expect(logs).toContainEqual(expect.objectContaining({ metric: "nominara_project_engines_reads_total" }));
+    const line = logs.find((l) => (l as { event?: string }).event === "project.engines_read") as Record<string, unknown>;
+    expect(line).toMatchObject({ workspace_id: workspaceId, project_id: projectId });
   });
 });

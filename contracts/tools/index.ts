@@ -7,3 +7,4 @@ export * from "./competitor-finder.schema.js";
 export * from "./aux-audit.schema.js";
 export * from "./compare-runs.schema.js";
 export * from "./schema-builder.schema.js";
+export * from "./schema-builder-url.schema.js";

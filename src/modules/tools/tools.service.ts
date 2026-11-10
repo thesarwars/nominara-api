@@ -206,7 +206,7 @@ function toRun(row: RunRow): ToolRun {
     diff_compare_run_id: row.diff_compare_run_id,
     converted_project_id: row.converted_project_id,
     converted_at: row.converted_at === null ? null : iso(row.converted_at),
-    presentation: toolPresentation(row.tool_key, headline),
+    presentation: toolPresentation(row.tool_key, headline, row.tool_key === "schema_builder" && row.result_json?.["source"] === "url" ? "url_check" : undefined),
     expired: expiredNotice(row),
   };
 }

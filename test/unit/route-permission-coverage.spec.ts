@@ -53,6 +53,7 @@ const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "WorkspacesController.create": "creates the workspace whose roles a permission would be read from",
   "WorkspacesController.list": "lists the caller's OWN memberships; runs before a workspace is chosen",
   "WorkspacesController.switchWorkspace": "chooses the workspace the rest of the session is scoped to",
+  "ProjectFingerprintController.fingerprint": "POST /projects/fingerprint (STORY-195, owner decision 87b) — a PRE-creation suggestion for a URL the caller types: it reads no workspace data, touches no table and is tenant-less by design so no transaction can span its fetch (ADR-0003). Session-authenticated (not @Public), free, rate-limited per user, and the URL passes the SSRF guard before any socket opens",
   "WorkspacesController.acceptInvitation": "the caller is not yet a member, so they hold no role to require",
 });
 

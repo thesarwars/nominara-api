@@ -7,6 +7,7 @@ import { AuxAuditToolService } from "./aux-audit.service.js";
 import { CompareRunsService } from "./compare-runs.service.js";
 import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { SchemaBuilderService } from "./schema-builder.service.js";
+import { SchemaBuilderUrlService } from "./schema-builder-url.service.js";
 import { ToolsController } from "./tools.controller.js";
 import { QueueProducerModule } from "../../lib/queue/queue-producer.module.js";
 import { ToolsService } from "./tools.service.js";
@@ -19,7 +20,7 @@ import { VisibilityScanService } from "./visibility-scan.service.js";
 @Module({
   imports: [AuditModule, EntitlementsModule, ProjectsModule, QueueProducerModule],
   controllers: [ToolsController],
-  providers: [ToolsService, CompareRunsService, SchemaBuilderService, VisibilityScanService, PromptResearchService, CompetitorFinderService, AuxAuditToolService, UrlGuard],
+  providers: [ToolsService, CompareRunsService, SchemaBuilderService, SchemaBuilderUrlService, VisibilityScanService, PromptResearchService, CompetitorFinderService, AuxAuditToolService, UrlGuard],
   exports: [ToolsService],
 })
 export class ToolsModule {}
