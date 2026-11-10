@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { ConflictException, Inject, Injectable, Logger, NotFoundException, Optional } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
-import { DegradedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, DegradedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { entityTagFor } from "../../api/etag/entity-tag.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -277,11 +277,7 @@ export class WorkspacesService {
         if (pg?.code === "23505" && pg.constraint === "ux_workspaces_slug") {
           // A slug the caller chose is never silently altered (STORY-195 AC2): refuse it, naming why.
           if (supplied) {
-            throw new ConflictException({
-              code: "conflict",
-              message: "this workspace address is already taken",
-              details: { field: "slug", reason: "slug_taken" },
-            });
+            throw new ConflictError({ message: "this workspace address is already taken", details: { reason: "slug_taken" } });
           }
           continue;
         }

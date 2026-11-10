@@ -229,6 +229,11 @@ export const featureNotInPlanDetailsSchema = z
 //   plan_change_not_pending             cancelling when nothing is pending
 // STORY-055 (review r3) - completing a seeding task with a contribution URL:
 //   no_source_domain                    the task has a playbook but no source domain to hold the URL to, so it cannot be verified
+// STORY-195 - onboarding surfaces:
+//   slug_taken                          POST /workspaces: the chosen workspace address is already in use; nothing was created
+//   not_all_degraded                    POST /projects/{id}/runs/retry: the project's first run did not end with every engine degraded
+//   run_in_progress                     the same: that first run has not finished
+//   retry_already_used                  the same: the one free retry of the first run was already taken
 export const CONFLICT_REASONS = [
   "member_suspended",
   "already_member",
@@ -250,6 +255,10 @@ export const CONFLICT_REASONS = [
   "plan_change_pending",
   "plan_change_not_pending",
   "no_source_domain",
+  "slug_taken",
+  "not_all_degraded",
+  "run_in_progress",
+  "retry_already_used",
 ] as const;
 
 export const conflictDetailsSchema = z

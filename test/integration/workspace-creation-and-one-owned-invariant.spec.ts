@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
-import { ConflictException, NotFoundException } from "@nestjs/common";
+import { NotFoundException } from "@nestjs/common";
+import { ConflictError } from "../../src/api/errors/domain-errors.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -205,8 +206,8 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
     expect(first.slug).toBe("my-chosen-slug");
 
     const refusal = await service.create(ownerB, { name: "Other", slug: "my-chosen-slug" }, meta).catch((error: unknown) => error);
-    expect(refusal).toBeInstanceOf(ConflictException);
-    expect((refusal as ConflictException).getResponse()).toMatchObject({ details: { field: "slug", reason: "slug_taken" } });
+    expect(refusal).toBeInstanceOf(ConflictError);
+    expect((refusal as ConflictError).details).toEqual({ reason: "slug_taken" });
 
     const owned = await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [ownerB]);
     expect(owned.rowCount).toBe(0);
@@ -220,7 +221,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
     const ownerA = await createUser();
     const ownerB = await createUser();
     await service.create(ownerA, { name: "A", slug: "acme" }, meta);
-    await expect(service.create(ownerB, { name: "B", slug: "acme" }, meta)).rejects.toBeInstanceOf(ConflictException);
+    await expect(service.create(ownerB, { name: "B", slug: "acme" }, meta)).rejects.toBeInstanceOf(ConflictError);
   });
 
   // ---- scenario 3 ---------------------------------------------------------
