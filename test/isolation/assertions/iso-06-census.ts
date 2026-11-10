@@ -27,6 +27,7 @@ import { NOOP_REVERT, type Breaker } from "../support/breakers.js";
 // for why 0006 must not carry it.
 //
 // 83/64/19 as of STORY-077 (owner decision 2026-10-23): `downgrade_notices` (migration 0134) is a tenant table (workspace_id, own-migration policy, not portal-readable).
+// 94/69/25 as of STORY-045 (owner decision 95a): `prompt_generations` (migration 0193) is a tenant table (workspace_id, own-migration policy, not portal-readable).
 // 93/68/25 as of STORY-189 (owner decisions 88 and 91): `business_categories` and `category_peers` (migrations 0187-0188) are global - versioned reference data, no workspace_id, no RLS, read-only to every runtime role; tenant count unchanged.
 // 90/67/23 as of STORY-111: `legal_holds`, `purge_runs` and `subject_erasure_queue` (migration 0165) are global - owner-only platform state, no RLS, no runtime grant; tenant count unchanged.
 // 91/68/23 as of STORY-098 (owner decision 71 b): `share_token_email_codes` (migration 0169) is a tenant table (workspace_id, own-migration policy, not portal-readable).
@@ -49,11 +50,11 @@ export async function assertIso06Census(ctx: AssertionContext): Promise<void> {
   try {
     const census = await computeCensus(client);
 
-    if (census.totalTables !== 93) {
-      throw new Error(`ISO-06: expected 93 total base tables, discovered ${census.totalTables}`);
+    if (census.totalTables !== 94) {
+      throw new Error(`ISO-06: expected 94 total base tables, discovered ${census.totalTables}`);
     }
-    if (census.tenantTables.length !== 68) {
-      throw new Error(`ISO-06: expected 68 tenant tables, discovered ${census.tenantTables.length}`);
+    if (census.tenantTables.length !== 69) {
+      throw new Error(`ISO-06: expected 69 tenant tables, discovered ${census.tenantTables.length}`);
     }
     if (census.globalTables.length !== 25) {
       throw new Error(`ISO-06: expected 25 global tables, discovered ${census.globalTables.length}`);

@@ -49,7 +49,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "downgrade_notices",
   ],
   projects: ["projects", "project_engines", "competitors", "domain_verifications", "business_categories", "category_peers"],
-  prompts: ["tracked_prompts", "prompt_stability", "topic_clusters"],
+  prompts: ["tracked_prompts", "prompt_stability", "topic_clusters", "prompt_generations"],
   captures: [
     "engines",
     "engine_health",

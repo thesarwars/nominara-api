@@ -488,6 +488,13 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
       [workspaceId, projectIds[i], `https://example.com/${label}/${i}`],
     );
   }
+  // STORY-045 (migration 0193, decision 95a) - a settled background prompt-generation pass per project. Tenant-scoped, not portal-readable.
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      "INSERT INTO prompt_generations (id, workspace_id, project_id, status, request, failure_code, completed_at) VALUES (gen_random_uuid(), $1, $2, 'failed', '{}'::jsonb, 'generation_failed', now())",
+      [workspaceId, projectIds[i]],
+    );
+  }
   for (let i = 0; i < R; i++) {
     await client.query(
       `INSERT INTO content_chunks (workspace_id, project_id, url, chunk_index, text, token_count, content_hash)

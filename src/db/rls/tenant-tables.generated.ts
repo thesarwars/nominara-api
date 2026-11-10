@@ -59,6 +59,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "project_engines",
   "project_source_index",
   "projects",
+  "prompt_generations",
   "prompt_stability",
   "ref_counters",
   "report_artifacts",
