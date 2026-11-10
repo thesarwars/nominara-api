@@ -37,7 +37,16 @@ describe("STORY-021 · createWorkspaceRequestSchema (scenario 1 — create a wor
   });
 
   it("rejects an unrecognized key (.strict())", () => {
-    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: "acme" }).success).toBe(false);
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", owner: "x" }).success).toBe(false);
+  });
+
+  it("STORY-195-AC2 accepts an optional kebab-case slug and rejects a malformed one", () => {
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: "acme-2" }).success).toBe(true);
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme" }).success).toBe(true);
+    for (const bad of ["", "Acme", "-acme", "acme-", "a--b", "a b", "a_b", "a".repeat(61)]) {
+      expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: bad }).success, bad).toBe(false);
+    }
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: "a".repeat(60) }).success).toBe(true);
   });
 
   it("rejects a region outside the two CHECK-legal values", () => {
