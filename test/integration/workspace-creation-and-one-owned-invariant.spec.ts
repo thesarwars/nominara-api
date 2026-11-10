@@ -207,7 +207,7 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
 
     const refusal = await service.create(ownerB, { name: "Other", slug: "my-chosen-slug" }, meta).catch((error: unknown) => error);
     expect(refusal).toBeInstanceOf(ConflictError);
-    expect((refusal as ConflictError).details).toEqual({ reason: "slug_taken" });
+    expect((refusal as { details: unknown }).details).toEqual({ reason: "slug_taken" });
 
     const owned = await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [ownerB]);
     expect(owned.rowCount).toBe(0);
