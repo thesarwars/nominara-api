@@ -753,6 +753,39 @@ describe("STORY-187 AUX-R-013 · the rewrite (review rounds 5-7 corpus)", () => 
     expect(hits).toHaveLength(1);
     expect(hits[0]).toMatchObject({ severity: "critical", measured_value: 2 });
   });
+  it("STORY-187 AC1 · a related-entity fixture: a product's relatedLink product (offer 5, rating 1.0) is not judged beside its own mainEntity", async () => {
+    const page = { "@context": ctx, "@type": "WebPage", mainEntity: { "@type": "Product", name: "Wool coat", offers: offer("39.99"), isRelatedTo: { "@type": "Product", name: "Scarf", offers: offer("5"), aggregateRating: { "@type": "AggregateRating", ratingValue: "1.0", reviewCount: "3" } } } };
+    expect(await findings(withLd([org, page], { mainText: "Wool coat\nPrice: $39.99" }), "AUX-R-013")).toEqual([]);
+  });
+  const product99 = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: offer("99") };
+  const faqPage = { "@context": ctx, "@type": "FAQPage", mainEntity: [{ "@type": "Question", name: "Q?", acceptedAnswer: { "@type": "Answer", text: "A" } }] };
+  const wrongPrice = { mainText: "Wool coat\nPrice: $49" };
+  it("STORY-187 AC1 · a top-level Product with a wrong price fires on its own (control)", async () => {
+    expect(await findings(withLd([org, product99], wrongPrice), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · a FAQPage whose mainEntity is Questions does not hide the top-level Product's wrong price", async () => {
+    expect(await findings(withLd([org, product99, faqPage], wrongPrice), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · a WebPage.about Thing does not hide the top-level Product's wrong price", async () => {
+    const wp = { "@context": ctx, "@type": "WebPage", about: { "@type": "Thing", name: "coats" } };
+    expect(await findings(withLd([org, product99, wp], wrongPrice), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · a reached Question does not displace the top-level Product in the name check", async () => {
+    const hits = await findings(withLd([org, { ...product99, name: "Zebra gizmo" }, faqPage], { mainText: "Wool coat\nPrice: $99" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.evidence.reason).toBe("name");
+  });
+  it("STORY-187 AC1 · an entity reached from a node that is not the page (Organization.about) is not the page's subject", async () => {
+    const orgAbout = { ...org, about: { "@type": "Product", name: "Zebra gizmo", offers: offer("49") } };
+    const hits = await findings(withLd([orgAbout, product99], wrongPrice), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ measured_value: 1 });
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  it("STORY-187 AC3c · site-wide product blocks (two top-level products) on a page with no Article schema that discusses a rival price: neither is the subject, so no price is judged", async () => {
+    const other = { ...siteWide, name: "Acme Mail" };
+    expect(await findings(withLd([org, siteWide, other], { mainText: "Compare\nA rival costs a price of $20 per month." }), "AUX-R-013")).toEqual([]);
+  });
   it("STORY-187 AC4 · an offer set of which no member is shown is one disagreement, not one per offer", async () => {
     const product = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: [offer("39.99"), offer("44.99")] };
     const hits = await findings(withLd([org, product], { mainText: "Wool coat\nPrice: $59.99" }), "AUX-R-013");

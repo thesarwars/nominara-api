@@ -240,8 +240,21 @@ export const schemaTextContradiction = defineRule({
     // about is that; otherwise, on a page that is not an article, the top-level entities are; on an article (a site-wide product block
     // on a blog post) nothing is, because that block is not what the post is about. A listing's items are never the subject.
     const pageIsArticle = jsonLdEntities(doc.structured.jsonLd).some((e) => typesOf(e.node).some((x) => t.article_types.includes(x)));
-    const reachedAny = all.filter((e) => /\.(?:mainEntity|mainEntityOfPage|about)(?![\p{L}\p{N}])/u.test(e.locator));
-    const subjects = (reachedAny.length > 0 ? reachedAny : pageIsArticle ? [] : all).filter((e) => !e.locator.includes(".itemListElement"));
+    // "Reached" means reached from the page's own WebPage / Article node (a root whose type is an article type or ends in "Page"):
+    // a FAQPage's Questions or a WebPage.about Thing are not the page's product, so only a reached entity that carries offers, variants
+    // or a rating displaces the top-level rule. Otherwise price and rating are judged on the one top-level subject-typed entity.
+    const rootNodes = new Map(jsonLdEntities(doc.structured.jsonLd).map((r) => [r.locator, r.node]));
+    const reachedFromPage = (e: Entity): boolean => {
+      const m = /^([^.]+)\.(?:mainEntity|mainEntityOfPage|about)(?![\p{L}\p{N}])/u.exec(e.locator);
+      const root = m === null ? undefined : rootNodes.get(m[1]!);
+      return root !== undefined && typesOf(root).some((x) => t.article_types.includes(x) || /Page$/u.test(x));
+    };
+    const carriesCommerce = (e: Entity): boolean => present(e.node["offers"]) || present(e.node["hasVariant"]) || present(e.node["aggregateRating"]);
+    const notListed = all.filter((e) => !e.locator.includes(".itemListElement"));
+    const qualifying = notListed.filter((e) => reachedFromPage(e) && carriesCommerce(e));
+    // A ProductGroup is the subject of its variants' prices though it is not a name-checked type.
+    const topSubjects = notListed.filter((e) => !e.locator.includes(".") && (entitiesOfType([e], t.name_entity_types).length > 0 || present(e.node["hasVariant"])));
+    const subjects = qualifying.length > 0 ? qualifying : pageIsArticle || topSubjects.length !== 1 ? [] : topSubjects;
     for (const e of subjects) {
       // An offer set (tiers, per-variant offers) agrees with the page when ANY member is shown; only a set of which none is shown is
       // one disagreement. A free tier is usually written as a word ("Free forever"), not as an amount: a declared 0 agrees with that.
@@ -268,7 +281,7 @@ export const schemaTextContradiction = defineRule({
     // page's one top-level product is, unless the page is an article (a site-wide SoftwareApplication block on a blog post is not its
     // subject). Anything else, and a listing's items, is a name the page need not show: absence is not disagreement.
     const named = entitiesOfType(all, t.name_entity_types).filter((e) => !e.locator.includes(".itemListElement"));
-    const reached = named.filter((e) => /\.(?:mainEntity|mainEntityOfPage|about)(?![\p{L}\p{N}])/u.test(e.locator));
+    const reached = named.filter(reachedFromPage);
     const topLevel = named.filter((e) => !e.locator.includes("."));
     const aboutPage = reached.length > 0 ? reached : topLevel.length === 1 && !pageIsArticle ? topLevel : [];
     for (const e of aboutPage) {
