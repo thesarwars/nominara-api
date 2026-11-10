@@ -4,7 +4,7 @@ import { guidanceFor, NON_FIXABLE_RULES } from "../patches/guidance.js";
 import { loadAuxCatalog, type AuxCatalog } from "../catalog.js";
 import { AuxRuleConfigError, AuxRuleEvaluationError, evaluateDocument, evaluateDocuments } from "./engine.js";
 import { ALL_AUX_RULES, AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL, HELD_RULES } from "./index.js";
-import { CATALOG, CATALOG_ROWS, PROJECT_ID, evaluatorFindings, findings, runAll } from "../../../../test/support/aux-rules.js";
+import { CATALOG, CATALOG_ROWS, PROJECT_ID, findings, runAll } from "../../../../test/support/aux-rules.js";
 import { CLEAN_TEXT, block, makeDoc, variant } from "../../../../test/support/aux-document.js";
 import type { AuxRule } from "./types.js";
 
@@ -21,24 +21,22 @@ describe("STORY-051 · the rule engine", () => {
   });
 
   it("STORY-051 AC1 · the rules not evaluated each carry a reason that names what is missing", () => {
-    expect(Object.keys(AUX_RULES_NOT_EVALUATED).sort()).toEqual(["AUX-R-005", "AUX-R-013", "AUX-R-028", "AUX-R-031", "AUX-R-032", "AUX-R-033", "AUX-R-034"]);
+    expect(Object.keys(AUX_RULES_NOT_EVALUATED).sort()).toEqual(["AUX-R-005", "AUX-R-028", "AUX-R-031", "AUX-R-032", "AUX-R-033", "AUX-R-034"]);
     for (const reason of Object.values(AUX_RULES_NOT_EVALUATED)) expect(reason.length).toBeGreaterThan(30);
   });
 
-  it("STORY-051 AUX-R-013 · held (owner decision 8): reported as not evaluated, with a reason, and not run by the engine", () => {
-    expect(Object.keys(HELD_RULES)).toEqual(["AUX-R-013"]);
-    expect(AUX_RULES_NOT_EVALUATED["AUX-R-013"]).toBe(HELD_RULES["AUX-R-013"]);
-    expect(HELD_RULES["AUX-R-013"]!.length).toBeGreaterThan(30);
-    expect(AUX_RULES.map((r) => r.code)).not.toContain("AUX-R-013");
-    expect(Object.keys(AUX_RULES_PARTIAL)).not.toContain("AUX-R-013");
-    expect(ALL_AUX_RULES.map((r) => r.code)).toContain("AUX-R-013");
+  it("STORY-187 AC6 · the hold on AUX-R-013 is released: the switch is empty, the engine runs the rule, and it is listed as a partial reading (raw copy until a renderer exists)", () => {
+    expect(Object.keys(HELD_RULES)).toEqual([]);
+    expect(Object.keys(AUX_RULES_NOT_EVALUATED)).not.toContain("AUX-R-013");
+    expect(AUX_RULES.map((r) => r.code)).toContain("AUX-R-013");
+    expect(Object.keys(AUX_RULES_PARTIAL)).toContain("AUX-R-013");
+    expect(ALL_AUX_RULES.map((r) => r.code)).toEqual(AUX_RULES.map((r) => r.code));
   });
 
-  it("STORY-051 AUX-R-013 · a page that contradicts its schema price raises no AUX-R-013 finding from the engine, but the evaluator still sees it", async () => {
+  it("STORY-187 AC6 · a page that contradicts the price of its own subject now raises AUX-R-013 from the engine", async () => {
     const doc = makeDoc({ raw: variant({ mainText: CLEAN_TEXT.replace("$47", "$57") }) });
-    expect(await findings(doc, "AUX-R-013")).toEqual([]);
-    expect(await runAll(doc)).toEqual([]);
-    expect((await evaluatorFindings(doc, "AUX-R-013"))[0]).toMatchObject({ severity: "critical" });
+    expect((await findings(doc, "AUX-R-013"))[0]).toMatchObject({ severity: "critical" });
+    expect((await runAll(doc)).map((f) => f.rule_code)).toContain("AUX-R-013");
   });
 
   it("STORY-051 AC2 · a clean page raises no finding from any rule", async () => {
@@ -102,7 +100,7 @@ describe("STORY-051 · the rule engine", () => {
   });
 
   it("STORY-051 AC1, AC10 · rules built on an interim reading are recorded as PARTIAL with the document-model field they need", () => {
-    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027", "AUX-R-029"]);
+    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027", "AUX-R-029"]);
     const built = new Set(AUX_RULES.map((r) => r.code));
     for (const [code, why] of Object.entries(AUX_RULES_PARTIAL)) {
       expect(built.has(code), code).toBe(true);

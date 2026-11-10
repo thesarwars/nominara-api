@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { ContentBlock, Heading } from "../document-model.js";
+import type { Heading } from "../document-model.js";
 import { PRESENCE_THRESHOLD, clip, flattenHeadings, variantOf } from "./helpers.js";
 import { defineRule, type RuleHit } from "./types.js";
 
@@ -36,9 +36,7 @@ export const mainContentRatioLow = defineRule({
   },
 });
 
-const hasStructure = (b: ContentBlock): boolean => b.tables > 0 || b.lists.ordered + b.lists.unordered + b.lists.definition > 0;
-
-// Interim reading (STORY-050 model gap: contiguous unstructured-run tokens per block): a list or table anywhere in a section counts as a break.
+// STORY-051 AC10: the measure is the longest run of text with no intervening subheading (the section's own end), list or table.
 export const contextBlockTruncation = defineRule({
   code: "AUX-R-021",
   category: "context_fitness",
@@ -48,9 +46,9 @@ export const contextBlockTruncation = defineRule({
     // One finding per page: the largest unstructured section (a page's penalty is its rule's weight once, not once per long section).
     let largest: { tokens: number; index: number } | null = null;
     doc.blocks.forEach((b, i) => {
-      // A heading section already ends at its next heading; a table or list inside it is the other kind of break.
-      if (!(b.tokens > t.warn_tokens) || hasStructure(b)) return;
-      if (largest === null || b.tokens > largest.tokens) largest = { tokens: b.tokens, index: i };
+      // A heading section already ends at its next heading; a table or list inside it is the other kind of break, and the model has measured the run.
+      if (!(b.longestUnstructuredTokens > t.warn_tokens)) return;
+      if (largest === null || b.longestUnstructuredTokens > largest.tokens) largest = { tokens: b.longestUnstructuredTokens, index: i };
     });
     if (largest === null) return [];
     const { tokens, index } = largest as { tokens: number; index: number };

@@ -57,10 +57,20 @@ describe("STORY-051 AUX-R-021 · context block truncation risk", () => {
     expect((await findings(section(3000), "AUX-R-021"))[0]!.severity).toBe("high");
     expect((await findings(section(3001), "AUX-R-021"))[0]).toMatchObject({ severity: "critical", threshold_value: 3000 });
   });
-  it("STORY-051 AUX-R-021 · a table or any list in the section is intervening structure", async () => {
-    for (const over of [{ tables: 1 }, { lists: { ordered: 1, unordered: 0, definition: 0 } }, { lists: { ordered: 0, unordered: 1, definition: 0 } }, { lists: { ordered: 0, unordered: 0, definition: 1 } }]) {
-      expect(await findings(section(5000, over), "AUX-R-021")).toEqual([]);
+  it("STORY-051 AC10 · the run between breaks is measured, not the section: 5,000 tokens split by a list into runs of 1,800 and 3,200 fires high-or-critical at the LONGEST run, and into 1,800 + 1,800 does not fire", async () => {
+    const split = (run: number) => section(5000, { lists: { ordered: 0, unordered: 1, definition: 0 }, longestUnstructuredTokens: run });
+    expect(await findings(split(1800), "AUX-R-021")).toEqual([]);
+    const [f] = await findings(split(1801), "AUX-R-021");
+    expect(f).toMatchObject({ severity: "high", measured_value: 1801, threshold_value: 1800 });
+    expect((await findings(split(3001), "AUX-R-021"))[0]).toMatchObject({ severity: "critical", measured_value: 3001, threshold_value: 3000 });
+  });
+  it("STORY-051 AC10 · a table or any list no longer excuses a section whose own run is long (the interim reading is gone)", async () => {
+    for (const over of [{ tables: 1 }, { lists: { ordered: 1, unordered: 0, definition: 0 } }]) {
+      expect(await findings(section(5000, over), "AUX-R-021")).toHaveLength(1);
     }
+  });
+  it("STORY-051 AC10 · a long section whose runs are all short (a list or table every few paragraphs) does not fire", async () => {
+    expect(await findings(section(5000, { tables: 3, longestUnstructuredTokens: 900 }), "AUX-R-021")).toEqual([]);
   });
   it("STORY-051 AUX-R-021 · the largest unstructured section is the one measured: one finding per page, critical, located at it", async () => {
     const doc = makeDoc({ blocks: [block({ tokens: 2000 }), block({ tokens: 2500 }), block({ tokens: 100 }), block({ tokens: 3500 })] });

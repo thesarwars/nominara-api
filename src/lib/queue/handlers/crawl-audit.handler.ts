@@ -28,9 +28,10 @@ import {
   type ExistingFinding,
   type FindingStatus,
   type LifecycleAction,
+  LIVE_FINDING_STATUSES,
 } from "../../aux/lifecycle.js";
 import { crawlPages, NOMINARA_USER_AGENT, type PageRecord } from "../../aux/page-crawl.js";
-import { pageFindingFingerprint, runPageRules } from "../../aux/page-rules.js";
+import { pageFindingFingerprint, runPageRules, type PageRulesResult } from "../../aux/page-rules.js";
 import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "../../aux/rules/index.js";
 import { pageCapForPlan, selectPages, type SelectionScope } from "../../aux/page-selection.js";
 import { PolitenessBudget, PolitenessCapReached, PolitenessDeadlineReached } from "../../aux/politeness.js";
@@ -75,7 +76,7 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // purpose), models each (loadDocumentSnapshot -> buildAuxDocument with cl100k) and evaluates the 22 document-model rules over every page
 // (evaluateDocuments), all in the fetch phase, so no transaction is open while it works. `commit` reconciles those findings in the same
 // lifecycle as the site-file ones (STORY-052). A rule is named in `excluded_rules` only when it did not run on ANY page: the codes in
-// AUX_RULES_NOT_EVALUATED always (incl. the held AUX-R-013), AUX-R-026/027 when no page had a rendered copy, AUX-R-029 when no page had a
+// AUX_RULES_NOT_EVALUATED always (AUX-R-013 ran again from STORY-187), AUX-R-026/027 when no page had a rendered copy, AUX-R-029 when no page had a
 // measured timing. The partly-checked rules that did run (AUX_RULES_PARTIAL) are listed in `error_summary.rules_partial`.
 //
 // WHAT IS STILL NOT EVALUATED. AUX-R-005 (bot-hostile
@@ -127,7 +128,7 @@ const TOKENIZER = AUX_AUDIT_TOKENIZER;
 const AUDIT_TRACKED_PATHS: readonly string[] = ["/"];
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
 const TERMINAL_STATUSES = ["completed", "partial", "failed"];
-const OPEN_STATUSES = ["open", "acknowledged", "in_progress", "regressed"];
+const OPEN_STATUSES: readonly string[] = LIVE_FINDING_STATUSES;
 /**
  * The statuses the published crawler_access subscore and the critical cap read. A STALE finding is one we could not re-observe, not one
  * that was fixed: it must score exactly as it did while open, or an unreachable file reads as a fix (STORY-052 "stale versus resolved").
@@ -328,6 +329,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     readonly covered: ReadonlySet<string>;
     /** Per page the page rules looked at: the rules that could be decided on it. */
     readonly pageEvaluated: ReadonlyMap<string, ReadonlySet<string>>;
+    /** STORY-053: the page-level patches (or rejection reasons) built in the fetch phase, keyed by finding fingerprint. */
+    readonly pagePatches: PageRulesResult["patches"];
     /** Pages whose stored copy could not be read back or modelled. */
     readonly unmodelledPages: number;
     readonly pagesToCrawl: readonly string[];
@@ -767,6 +770,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       detected,
       covered,
       pageEvaluated: pageRules.evaluated,
+      pagePatches: pageRules.patches,
       unmodelledPages: pageRules.unmodelled.length,
       pagesToCrawl,
       pagesCrawled,
@@ -929,7 +933,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     };
     const patchStats = await tracer.startActiveSpan("crawl.audit.patches", async (span) => {
       try {
-        const stats = await writePatches(tx, { payload, detected: detected.filter((d) => (RAN_RULES as readonly string[]).includes(d.ruleCode)), site, logger });
+        const stats = await writePatches(tx, { payload, detected: detected.filter((d) => (RAN_RULES as readonly string[]).includes(d.ruleCode) || outcome.pagePatches.has(d.fingerprint)), pagePatches: outcome.pagePatches, site, logger });
         span.setAttribute("nominara.aux.patches_written", stats.written);
         span.setAttribute("nominara.aux.patches_rejected", stats.rejected);
         return stats;
@@ -998,7 +1002,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     );
     // OWNER DECISIONS 52 and 55. The rules that were DECIDED in this audit: the site-file rules whose file answered, and the page rules that ran on at least one page.
     // This one set is BOTH the score basis and the penalty set. A category is scored ONLY on those rules: max_penalty(cat) is the sum of the decided rules' weights, so a
-    // rule nobody could judge (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, the held AUX-R-013, ...) is out of the denominator instead of counting as passed.
+    // rule nobody could judge (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, ...) is out of the denominator instead of counting as passed.
     // A category with no decided rule is dropped. An open or stale finding whose rule was NOT decided in this audit (not re-checked) contributes NOTHING - not to the
     // penalty, not to the denominator; it stays in the findings list as stale / not re-checked (the lifecycle, STORY-052, is untouched). Its rule is named in
     // `excluded_rules`, so the headline is partial.
@@ -1309,9 +1313,9 @@ async function applyAction(
  */
 async function writePatches(
   tx: ClientBase,
-  args: { payload: { projectId: string; workspaceId: string }; detected: readonly DetectedFinding[]; site: SiteInputs; logger: Logger },
+  args: { payload: { projectId: string; workspaceId: string }; detected: readonly DetectedFinding[]; pagePatches: PageRulesResult["patches"]; site: SiteInputs; logger: Logger },
 ): Promise<{ written: number; rejected: number }> {
-  const { payload, detected, site, logger } = args;
+  const { payload, detected, pagePatches, site, logger } = args;
   if (detected.length === 0) return { written: 0, rejected: 0 };
   const live = await tx.query<{ id: string; fp: string; rule_code: string; url: string | null }>(
     `SELECT id, encode(fingerprint, 'hex') AS fp, rule_code, url FROM aux_findings
@@ -1322,16 +1326,29 @@ async function writePatches(
   let rejected = 0;
   for (const row of live.rows) {
     let draft: PatchDraft | null = null;
-    try {
-      const generated = generateSiteFilePatch({ ruleCode: row.rule_code, targetUrl: row.url ?? site.origin, url: row.url, site });
-      if (generated.outcome === "patch") draft = generated.draft;
-    } catch (error) {
-      if (!(error instanceof PatchRejectedError)) throw error;
+    const reject = (reason: string): void => {
       rejected += 1;
-      incrementCounter("nominara_aux_patch_rejected_total", { reason: error.reason });
+      incrementCounter("nominara_aux_patch_rejected_total", { reason });
       // IDs and the reason code only: never the file's text.
-      logger.warn({ event: "aux.patch.rejected", workspace_id: payload.workspaceId, project_id: payload.projectId, finding_id: row.id, rule_code: row.rule_code, reason: error.reason });
-      continue;
+      logger.warn({ event: "aux.patch.rejected", workspace_id: payload.workspaceId, project_id: payload.projectId, finding_id: row.id, rule_code: row.rule_code, reason });
+    };
+    const pagePatch = pagePatches.get(row.fp);
+    if (pagePatch !== undefined) {
+      // A page-level patch was built in the fetch phase (pure CPU, outside any transaction); here it is only compared and written.
+      if ("rejected" in pagePatch) {
+        reject(pagePatch.rejected);
+        continue;
+      }
+      draft = pagePatch.draft;
+    } else {
+      try {
+        const generated = generateSiteFilePatch({ ruleCode: row.rule_code, targetUrl: row.url ?? site.origin, url: row.url, site });
+        if (generated.outcome === "patch") draft = generated.draft;
+      } catch (error) {
+        if (!(error instanceof PatchRejectedError)) throw error;
+        reject(error.reason);
+        continue;
+      }
     }
     if (draft === null) continue;
 

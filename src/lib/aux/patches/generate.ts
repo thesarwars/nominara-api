@@ -4,8 +4,8 @@ import { guidanceFor, GUIDANCE_ONLY_RULES, NON_FIXABLE_RULES, type Guidance } fr
 import type { PatchDraft } from "./types.js";
 
 // STORY-053 — the dispatcher for the findings the crawl produces today: the site-file rules (AUX-R-001, 002, 003, 004, 007).
-// The page-level generators (jsonld.ts, html-fragment.ts, markdown.ts#buildStructurePatch) are built and tested as pure functions and
-// are wired here when STORY-051 produces the page-level findings and the extracted page content that drives them.
+// The page-level findings are dispatched by page-patch.ts (AUX-R-014, AUX-R-023); html-fragment.ts has no bound rule yet. They are built and tested as pure functions and
+// run in the fetch phase beside the page rules.
 //
 // PURE. It either returns a draft, returns guidance, returns `none` (nothing to offer: an honest empty, never an empty patch), or
 // throws PatchRejectedError when its own output fails a gate. The caller records a rejection; it does not abort the audit.

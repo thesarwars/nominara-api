@@ -6,7 +6,7 @@ import {
   RENDERING_ATTRIBUTES,
   RENDERING_CAUSE_RULES,
   type EngineCounts,
-  type OpenFinding,
+  type LiveFinding,
 } from "./rendering-quality.js";
 
 // NEW-C-11 (scoring-models.md §8; STORY-039 read side). Pure: the score is the
@@ -14,7 +14,7 @@ import {
 // the per-engine/blended split and the cause link. Scoring is a dangerous area.
 
 const ID = "0195e5b7-0000-7000-8000-0000000000b1";
-const finding = (over: Partial<OpenFinding> = {}): OpenFinding => ({
+const finding = (over: Partial<LiveFinding> = {}): LiveFinding => ({
   id: ID, ruleCode: "AUX-R-012", severity: "high", title: "Offer data absent", ...over,
 });
 const counts = (engineKey: string, mentions: number, withAttr: EngineCounts["withAttr"] = {}): EngineCounts => ({ engineKey, mentions, withAttr });

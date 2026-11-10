@@ -34,6 +34,8 @@ export function block(over: Partial<ContentBlock> = {}): ContentBlock {
     heading: "Section",
     level: 2,
     tokens: 100,
+    // No structure by default: the whole section is one run. A test that wants a break sets both.
+    longestUnstructuredTokens: over.longestUnstructuredTokens ?? over.tokens ?? 100,
     sentences: { count: 4, meanWords: 12, maxWords: 20 },
     longestParagraphChars: 200,
     tables: 0,

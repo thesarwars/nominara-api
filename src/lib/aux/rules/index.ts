@@ -27,16 +27,12 @@ const IMPLEMENTED_RULES: readonly AuxRule[] = [
 
 /**
  * THE HOLD SWITCH. A rule listed here keeps its catalog row, its evaluator and its evaluator tests, but the engine does not run it:
- * it is reported as not evaluated (AUX_RULES_NOT_EVALUATED), raises no finding and so adds no penalty, and the catalog weights are
- * untouched (a rule that is not run contributes no penalty, as for every other rule in AUX_RULES_NOT_EVALUATED).
+ * it is reported as not evaluated (AUX_RULES_NOT_EVALUATED), raises no finding and so adds no penalty.
  *
- * AUX-R-013: owner decision 8 (plans-7day/decisions-2026-10-28.md). After 7 review rounds the rule still raised false criticals on
- * pricing tiers, per-variant offers and site-wide product blocks on blog pages. The follow-up story rewrites it to judge name, price
- * and rating only against the page's own subject. That story removes the entry below; nothing else needs to change.
+ * EMPTY since STORY-187 released AUX-R-013 (held by owner decision 8, plans-7day/decisions-2026-10-28.md): the rewritten rule judges name,
+ * price and rating only against the page's own subject, and an offer or variant set agrees when any member is shown.
  */
-export const HELD_RULES: Readonly<Record<string, string>> = {
-  "AUX-R-013": "Held by owner decision 8: the schema-versus-text contradiction rule raised false criticals on pricing tiers, per-variant offers and site-wide product blocks on blog pages, so it is not run and adds no penalty. A follow-up story rewrites it to judge name, price and rating only against the page's own subject.",
-};
+export const HELD_RULES: Readonly<Record<string, string>> = {};
 
 /** Every implemented evaluator, held ones included: for the evaluators' own unit tests and the follow-up story. The engine runs AUX_RULES. */
 export const ALL_AUX_RULES: readonly AuxRule[] = IMPLEMENTED_RULES;
@@ -72,7 +68,6 @@ const PARTIAL_READINGS: Readonly<Record<string, string>> = {
   "AUX-R-018": "Compares only the catalog singleton_types (Organization, WebSite and similar), so two Product blocks with different names are not reported: a listing page legitimately describes many products, and a page with exactly one Product block that two plugins both emit is missed. The reference says any @type; narrowing it needs a rule for telling a listing from a duplicate.",
   "AUX-R-019": "Measures the raw copy's token count while no renderer is installed; the reference defines it on rendered.tokenCount.",
   "AUX-R-020": "Measures the raw copy's main-content ratio while no renderer is installed; the reference defines it on rendered tokens.",
-  "AUX-R-021": "A list or table anywhere in a section counts as a break, so a long wall of text with one list at its end passes. Needs the longest unstructured token run per content block (a STORY-050 ContentBlock field).",
   "AUX-R-023": "A whole short section stands in for the summary paragraph. Needs sentence counts per paragraph (a STORY-050 ContentBlock field).",
   "AUX-R-025": "Sees images in the plain HTML only, so script-injected images are missed. Needs per-image records (source, alt, adjacent text) in the document model.",
   "AUX-R-026": "Undecidable without a rendered copy: with rendered null (STORY-049 has no renderer) it returns no finding, so it can never fire today. A page with no rendered copy keeps AUX-R-026 in excluded_rules for that audit; it is not a pass.",

@@ -95,11 +95,13 @@ describe("NEW-C-11 · RenderingQualityService", () => {
     }
   });
 
-  it("[NEW-C-11 AC3] the cause query reads OPEN findings of the mapped rules only, bound, no workspace predicate", async () => {
+  it("[STORY-039 AC7] the cause query reads LIVE findings (open, acknowledged, in progress, regressed) of the mapped rules, bound, no workspace predicate; resolved, stale and will-not-fix findings are not a cause", async () => {
     const service = serviceWith(scorecardsFake([entry("google_ai_mode", 1, "demo")], 1));
     await service.renderingQuality(PROJECT_ID, { timeframe: "30d" });
     const finding = calls.find((c) => isFindings(c.sql))!;
-    expect(finding.sql).toContain("status = 'open'");
+    expect(finding.sql).not.toContain("status = 'open'");
+    expect(finding.sql).toMatch(/f\.status = ANY\(\$3::text\[\]\)/);
+    expect(finding.params[2]).toEqual(["open", "acknowledged", "in_progress", "regressed"]);
     expect(finding.sql).not.toContain("workspace_id");
     expect(finding.params.flat()).toEqual(expect.arrayContaining([PROJECT_ID, "AUX-R-012", "AUX-R-013", "AUX-R-015"]));
   });

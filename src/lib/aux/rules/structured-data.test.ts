@@ -10,6 +10,8 @@ const app = CLEAN_JSON_LD[1] as Record<string, unknown>;
 const withLd = (jsonLd: unknown[], over: Partial<ReturnType<typeof variant>> = {}) => makeDoc({ raw: variant({ structured: { jsonLd, microdata: [], rdfa: [], parseErrors: [] }, ...over }) });
 const withApp = (patch: Record<string, unknown>, over: Partial<ReturnType<typeof variant>> = {}) => withLd([org, { ...app, ...patch }], over);
 const withoutKey = (o: Record<string, unknown>, ...keys: string[]) => Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+/** The page's own subject: a WebPage whose mainEntity is the app. */
+const reachedApp = (patch: Record<string, unknown>) => ({ "@context": "https://schema.org", "@type": "WebPage", mainEntity: { ...withoutKey(app, "@context"), ...patch } });
 const textWith = (extra: string) => ({ mainText: `${CLEAN_TEXT}\n${extra}` });
 
 describe("STORY-051 AUX-R-006 · noai / noimageai / noarchive", () => {
@@ -204,9 +206,13 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
   it("STORY-051 AUX-R-013 · any of several visible prices that matches is agreement", async () => {
     expect(await findings(withApp({}, textWith("Team plan $99 per month")), "AUX-R-013")).toEqual([]);
   });
-  it("STORY-051 AUX-R-013 · a product name absent from the visible text fires", async () => {
-    const [f] = await findings(withApp({ name: "Zed Gadget" }), "AUX-R-013");
-    expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].name" });
+  // Owner decision 97: only the page's own (reached) subject can contradict by name; a top-level product the page never names is unchecked.
+  it("STORY-051 AUX-R-013 · a product name absent from the visible text fires (on the page's own mainEntity)", async () => {
+    const [f] = await findings(withLd([org, reachedApp({ name: "Zed Gadget" })]), "AUX-R-013");
+    expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].mainEntity.name" });
+  });
+  it("STORY-187 decision 97 · a lone top-level product the page never names is unchecked, not a name contradiction", async () => {
+    expect(await findings(withApp({ name: "Zed Gadget" }), "AUX-R-013")).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · a name that differs only in a trademark sign, a curly apostrophe, & versus and, or a pack suffix is not a contradiction", async () => {
     const cases: [string, string][] = [
@@ -248,7 +254,7 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
     expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("$47", "$57") }), "AUX-R-013", withThresholds("AUX-R-013", { price_context_words: ["zzz"] }))).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · several disagreements measure their count", async () => {
-    const doc = withApp({ name: "Zed Gadget" }, { mainText: CLEAN_TEXT.replace("$47", "$57") });
+    const doc = withLd([org, reachedApp({ name: "Zed Gadget" })], { mainText: CLEAN_TEXT.replace("$47", "$57") });
     expect((await findings(doc, "AUX-R-013"))[0]!.measured_value).toBe(2);
   });
 });
@@ -460,7 +466,7 @@ describe("STORY-051 AUX-R-010 / 011 / 012 / 013 / 014 · schema.org subtypes (ro
     expect(await findings(withLd([typed("WebApplication")]), "AUX-R-014")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-013 · a WebApplication whose name is not on the page fires", async () => {
-    const [f] = await findings(withLd([typed("WebApplication", { name: "Zed Gadget" })]), "AUX-R-013");
+    const [f] = await findings(withLd([org, reachedApp({ "@type": "WebApplication", name: "Zed Gadget" })]), "AUX-R-013");
     expect(f!.evidence.reason).toBe("name");
   });
 });
@@ -491,8 +497,9 @@ describe("STORY-051 AUX-R-013 · a free tier written as a word agrees with a dec
   it("STORY-051 AUX-R-013 · 'Free' as a tier name agrees too", async () => {
     expect(await findings(tiers("Acme Widgets\nFree\nPro starts at $47 per month."), "AUX-R-013")).toEqual([]);
   });
+  // STORY-187: a set agrees when any member is shown, so [0, 47] beside "$47" agrees; the free-word cases below use a lone 0.
   it("STORY-051 AUX-R-013 · Offer 0 with NO free word on a page that prices everything does fire", async () => {
-    const [f] = await findings(tiers("Acme Widgets\nEvery plan starts at $47 per month."), "AUX-R-013");
+    const [f] = await findings(tiers("Acme Widgets\nEvery plan starts at $47 per month.", ["0"]), "AUX-R-013");
     expect(f).toMatchObject({ severity: "critical" });
     expect(f!.evidence).toMatchObject({ reason: "price" });
     expect(f!.evidence.snippet).toContain("schema price 0");
@@ -504,13 +511,13 @@ describe("STORY-051 AUX-R-013 · a free tier written as a word agrees with a dec
     expect(await findings(tiers("Acme Widgets\nFree trial. Pro starts at $57 per month.", ["47"]), "AUX-R-013")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-013 · 'free' inside another word (carefree) is not a free word", async () => {
-    expect(await findings(tiers("Acme Widgets\nA carefree plan. Every plan starts at $47 per month."), "AUX-R-013")).toHaveLength(1);
+    expect(await findings(tiers("Acme Widgets\nA carefree plan. Every plan starts at $47 per month.", ["0"]), "AUX-R-013")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-013 · the free words come from the catalog row", async () => {
     const { withThresholds } = await import("../../../../test/support/aux-rules.js");
     const cat = withThresholds("AUX-R-013", { free_words: ["gratis"] });
-    expect(await findings(tiers("Acme Widgets\nFree forever. Pro starts at $47 per month."), "AUX-R-013", cat)).toHaveLength(1);
-    expect(await findings(tiers("Acme Widgets\nGratis. Pro starts at $47 per month."), "AUX-R-013", cat)).toEqual([]);
+    expect(await findings(tiers("Acme Widgets\nFree forever. Pro starts at $47 per month.", ["0"]), "AUX-R-013", cat)).toHaveLength(1);
+    expect(await findings(tiers("Acme Widgets\nGratis. Pro starts at $47 per month.", ["0"]), "AUX-R-013", cat)).toEqual([]);
   });
 });
 
@@ -724,5 +731,91 @@ describe("STORY-051 AUX-R-012 · a price carried by priceSpecification, round 6"
   it("STORY-051 AUX-R-012 · a priceSpecification with no currency is not priced", async () => {
     const offers = { "@type": "Offer", priceSpecification: { "@type": "UnitPriceSpecification", price: "47.00" } };
     expect((await findings(withApp({ offers }), "AUX-R-012"))[0]!.evidence.reason).toBe("offers_incomplete");
+  });
+});
+
+// STORY-187 — AUX-R-013 judges name, price and rating only against the page's own subject; an offer set agrees when any member is shown.
+describe("STORY-187 AUX-R-013 · the rewrite (review rounds 5-7 corpus)", () => {
+  const ctx = "https://schema.org";
+  const offer = (price: string) => ({ "@type": "Offer", price, priceCurrency: "USD" });
+  const blog = { "@context": ctx, "@type": "BlogPosting", headline: "Five ways to clean a sales pipeline" };
+  const siteWide = { "@context": ctx, "@type": "SoftwareApplication", name: "Acme CRM", offers: offer("99"), aggregateRating: { "@type": "AggregateRating", ratingValue: "4.9", reviewCount: "400" } };
+
+  it("STORY-187 AC3a · a SaaS tier offers set [9, 29] against 'Plans start at $9/mo' does not fire", async () => {
+    const tiers = { "@context": ctx, "@type": "SoftwareApplication", name: "Acme CRM", offers: [offer("9"), offer("29")] };
+    expect(await findings(withLd([org, tiers], { mainText: "Acme CRM\nPricing: plans start at $9/mo" }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC3b · Product.offers with per-variant prices [39.99, 44.99] against 'Price: $39.99' does not fire", async () => {
+    const product = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: [offer("39.99"), offer("44.99")] };
+    expect(await findings(withLd([org, product], { mainText: "Wool coat\nPrice: $39.99" }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC3c · a site-wide product price and rating block on a BlogPosting that discusses other prices and ratings does not fire", async () => {
+    const text = { mainText: "Five ways to clean a sales pipeline\nOne rival has a price of $20 per month and is rated 3.1/5 by customers." };
+    expect(await findings(withLd([org, siteWide, blog], text), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC1 · a price and rating on a related entity are not judged, but the page's own subject (mainEntity) still is", async () => {
+    const page = { "@context": ctx, "@type": "WebPage", mainEntity: { "@type": "Product", name: "Wool coat", offers: offer("39.99"), aggregateRating: { "@type": "AggregateRating", ratingValue: "4.9", reviewCount: "10" } } };
+    const hits = await findings(withLd([org, page], { mainText: "Wool coat\nPrice: $59.99\nRated 3.1/5 by customers" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ severity: "critical", measured_value: 2 });
+  });
+  it("STORY-187 AC1 · a related-entity fixture: a product's relatedLink product (offer 5, rating 1.0) is not judged beside its own mainEntity", async () => {
+    const page = { "@context": ctx, "@type": "WebPage", mainEntity: { "@type": "Product", name: "Wool coat", offers: offer("39.99"), isRelatedTo: { "@type": "Product", name: "Scarf", offers: offer("5"), aggregateRating: { "@type": "AggregateRating", ratingValue: "1.0", reviewCount: "3" } } } };
+    expect(await findings(withLd([org, page], { mainText: "Wool coat\nPrice: $39.99" }), "AUX-R-013")).toEqual([]);
+  });
+  const product99 = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: offer("99") };
+  const faqPage = { "@context": ctx, "@type": "FAQPage", mainEntity: [{ "@type": "Question", name: "Q?", acceptedAnswer: { "@type": "Answer", text: "A" } }] };
+  const wrongPrice = { mainText: "Wool coat\nPrice: $52" };
+  it("STORY-187 AC1 · a top-level Product with a wrong price fires on its own (control)", async () => {
+    expect(await findings(withLd([org, product99], wrongPrice), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · a FAQPage whose mainEntity is Questions does not hide the top-level Product's wrong price", async () => {
+    expect(await findings(withLd([org, product99, faqPage], wrongPrice), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · a WebPage.about Thing does not hide the top-level Product's wrong price", async () => {
+    const wp = { "@context": ctx, "@type": "WebPage", about: { "@type": "Thing", name: "coats" } };
+    expect(await findings(withLd([org, product99, wp], wrongPrice), "AUX-R-013")).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · a FAQPage's Question is not a name check, and does not hide the top-level Product's price when the page names it", async () => {
+    const hits = await findings(withLd([org, faqPage, product99], wrongPrice), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  // Decision 97: scenario D exactly as the auditor's probe writes it.
+  const siteApp = { "@context": ctx, "@type": "SoftwareApplication", name: "Acme CRM", offers: offer("99") };
+  it("STORY-187 decision 97 · a single site-wide SoftwareApplication (offer 99), no Article schema, page about a rival's $20 and not naming the product: no finding", async () => {
+    expect(await findings(withLd([org, siteApp], { mainText: "Guide\nOne rival has a price of $20 per month." }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 decision 97 · the same page naming the product with a wrong price fires once", async () => {
+    const hits = await findings(withLd([org, siteApp], { mainText: "Acme CRM review\nOne rival has a price of $20 per month." }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  it("STORY-187 decision 97 · the name is matched ignoring case, spacing and typography (acme   CRM\u2122)", async () => {
+    const hits = await findings(withLd([org, siteApp], { mainText: "the  ACME\u00a0crm\u2122 review\nOne rival has a price of $20 per month." }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+  });
+  it("STORY-187 AC1 · an entity reached from a node that is not the page (Organization.about) is not the page's subject", async () => {
+    const orgAbout = { ...org, about: { "@type": "Product", name: "Zebra gizmo", offers: offer("52") } };
+    const hits = await findings(withLd([orgAbout, product99], wrongPrice), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ measured_value: 1 });
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  it("STORY-187 AC3c · site-wide product blocks (two top-level products) on a page with no Article schema that discusses a rival price: neither is the subject, so no price is judged", async () => {
+    const other = { ...siteWide, name: "Acme Mail" };
+    expect(await findings(withLd([org, siteWide, other], { mainText: "Compare\nA rival costs a price of $20 per month." }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC4 · an offer set of which no member is shown is one disagreement, not one per offer", async () => {
+    const product = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: [offer("39.99"), offer("44.99")] };
+    const hits = await findings(withLd([org, product], { mainText: "Wool coat\nPrice: $59.99" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ severity: "critical", measured_value: 1 });
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  it("STORY-187 AC4 · a blog post whose own mainEntity is the product with a wrong price still fires", async () => {
+    const post = { ...blog, mainEntity: { "@type": "Product", name: "Wool coat", offers: offer("39.99") } };
+    const hits = await findings(withLd([org, post], { mainText: "Wool coat review\nPrice: $59.99" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
   });
 });

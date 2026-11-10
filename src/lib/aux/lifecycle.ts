@@ -44,6 +44,9 @@ export function findingFingerprint(ruleCode: string, url: string | null, evidenc
 
 export type FindingStatus = "open" | "acknowledged" | "in_progress" | "resolved" | "regressed" | "wont_fix" | "stale";
 
+/** The statuses of a finding that is live: the problem is present and someone has not given up on it. Not resolved, not stale, not will-not-fix. */
+export const LIVE_FINDING_STATUSES: readonly FindingStatus[] = ["open", "acknowledged", "in_progress", "regressed"];
+
 export interface ExistingFinding {
   readonly id: string;
   readonly fingerprint: string;
