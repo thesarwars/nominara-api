@@ -222,7 +222,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   workspace_members: {
     columns:
-      "id workspace_id user_id role project_scope status invited_by joined_at last_active_at created_at updated_at digest_cadence",
+      "id workspace_id user_id role project_scope status invited_by joined_at last_active_at created_at updated_at digest_cadence sentiment_alerts_enabled",
     omit: "",
   },
   workspaces: {

@@ -433,12 +433,47 @@ describe("STORY-068 · notifications, read state, digests and dispatch", () => {
 
   it("[owner 2026-10-23] a member reads and sets THEIR OWN digest cadence; null restores the role default; another member is untouched", async () => {
     const prefs = (name: string, role: string) => inTenant(workspaceId, users[name]!, () => service.preferences(viewer(name, role)));
-    expect(await prefs("owner", "owner")).toEqual({ digest_cadence: "weekly", is_default: true });
-    expect(await prefs("analyst", "analyst")).toEqual({ digest_cadence: "off", is_default: true });
-    expect(await inTenant(workspaceId, users.owner!, () => service.updatePreferences(viewer("owner", "owner"), { digest_cadence: "daily" }))).toEqual({ digest_cadence: "daily", is_default: false });
-    expect(await prefs("owner", "owner")).toEqual({ digest_cadence: "daily", is_default: false });
-    expect(await prefs("admin", "admin"), "another member's preference is not touched").toEqual({ digest_cadence: "weekly", is_default: true });
-    expect(await inTenant(workspaceId, users.owner!, () => service.updatePreferences(viewer("owner", "owner"), { digest_cadence: null }))).toEqual({ digest_cadence: "weekly", is_default: true });
+    expect(await prefs("owner", "owner")).toEqual({ digest_cadence: "weekly", is_default: true, sentiment_alerts: true });
+    expect(await prefs("analyst", "analyst")).toEqual({ digest_cadence: "off", is_default: true, sentiment_alerts: true });
+    expect(await inTenant(workspaceId, users.owner!, () => service.updatePreferences(viewer("owner", "owner"), { digest_cadence: "daily" }))).toEqual({ digest_cadence: "daily", is_default: false, sentiment_alerts: true });
+    expect(await prefs("owner", "owner")).toEqual({ digest_cadence: "daily", is_default: false, sentiment_alerts: true });
+    expect(await prefs("admin", "admin"), "another member's preference is not touched").toEqual({ digest_cadence: "weekly", is_default: true, sentiment_alerts: true });
+    expect(await inTenant(workspaceId, users.owner!, () => service.updatePreferences(viewer("owner", "owner"), { digest_cadence: null }))).toEqual({ digest_cadence: "weekly", is_default: true, sentiment_alerts: true });
+  });
+
+  // ---- owner decision 96(a): a per-member sentiment-alerts setting ----------------------------------------------------
+
+  it("[decision 96a] a member who turned sentiment alerts off is not emailed a negative_spike, and every other member and kind is unaffected", async () => {
+    await owner.query("UPDATE workspace_members SET sentiment_alerts_enabled = false WHERE user_id = $1", [users.admin]);
+    await write({ eventKey: "spike", severity: "critical", kind: "alert.negative_spike", title: "Spike" });
+    await write({ eventKey: "other", severity: "critical", kind: "alert.sov_drop_engine", title: "Drop" });
+    const rows = (await owner.query("SELECT user_id, subject FROM notification_emails WHERE kind = 'immediate'")).rows;
+    const to = (subject: string) => rows.filter((r) => String(r.subject).includes(subject)).map((r) => r.user_id).sort();
+    // owner, admin and the scoped manager are emailable by default (a project-less alert reaches the scoped manager); the analyst defaults to off.
+    expect(to("Spike")).toEqual([users.owner, users.scoped].sort());
+    expect(to("Drop")).toEqual([users.owner, users.admin, users.scoped].sort());
+  });
+
+  it("[decision 96a] the inbox and the unread count omit negative_spike for that member only", async () => {
+    await owner.query("UPDATE workspace_members SET sentiment_alerts_enabled = false WHERE user_id = $1", [users.admin]);
+    await write({ eventKey: "spike2", severity: "warning", kind: "alert.negative_spike", title: "Spike" });
+    await write({ eventKey: "other2", severity: "warning", kind: "alert.sov_drop_engine", title: "Drop" });
+    const titles = async (name: string, role: string) => (await list(name, role)).items.map((n) => n.title).sort();
+    expect(await titles("owner", "owner")).toEqual(["Drop", "Spike"]);
+    expect(await titles("admin", "admin")).toEqual(["Drop"]);
+    expect((await list("owner", "owner")).data.unread_count).toBe(2);
+    expect((await list("admin", "admin")).data.unread_count).toBe(1);
+  });
+
+  it("[decision 96a] a member reads and sets THEIR OWN sentiment_alerts; null returns to on; the digest cadence is not disturbed either way", async () => {
+    const as = (name: string, role: string) => ({ run: <T,>(fn: () => Promise<T>) => inTenant(workspaceId, users[name]!, fn), v: viewer(name, role) });
+    const owned = as("owner", "owner");
+    expect(await owned.run(() => service.updatePreferences(owned.v, { sentiment_alerts: false }))).toEqual({ digest_cadence: "weekly", is_default: true, sentiment_alerts: false });
+    expect(await owned.run(() => service.updatePreferences(owned.v, { digest_cadence: "daily" }))).toEqual({ digest_cadence: "daily", is_default: false, sentiment_alerts: false });
+    const admin = as("admin", "admin");
+    expect(await admin.run(() => service.preferences(admin.v)), "another member is untouched").toMatchObject({ sentiment_alerts: true });
+    expect(await owned.run(() => service.updatePreferences(owned.v, { sentiment_alerts: null }))).toMatchObject({ sentiment_alerts: true });
+    expect((await owner.query("SELECT sentiment_alerts_enabled FROM workspace_members WHERE user_id = $1", [users.owner])).rows[0].sentiment_alerts_enabled).toBeNull();
   });
 
   it("[hazard] marking a non-id read is a 404, not a server error", async () => {

@@ -87688,11 +87688,15 @@
                         },
                         "is_default": {
                           "type": "boolean"
+                        },
+                        "sentiment_alerts": {
+                          "type": "boolean"
                         }
                       },
                       "required": [
                         "digest_cadence",
-                        "is_default"
+                        "is_default",
+                        "sentiment_alerts"
                       ],
                       "additionalProperties": false
                     },
@@ -87973,11 +87977,15 @@
                         },
                         "is_default": {
                           "type": "boolean"
+                        },
+                        "sentiment_alerts": {
+                          "type": "boolean"
                         }
                       },
                       "required": [
                         "digest_cadence",
-                        "is_default"
+                        "is_default",
+                        "sentiment_alerts"
                       ],
                       "additionalProperties": false
                     },
@@ -88254,11 +88262,18 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "sentiment_alerts": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   }
                 },
-                "required": [
-                  "digest_cadence"
-                ],
                 "additionalProperties": false
               }
             }

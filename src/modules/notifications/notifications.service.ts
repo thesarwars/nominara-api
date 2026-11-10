@@ -135,22 +135,25 @@ export class NotificationsService {
 
   async preferences(viewer: Viewer): Promise<NotificationPreferences> {
     const { client, workspaceId } = this.store();
-    const row = await client.query<{ digest_cadence: string | null }>(
-      "SELECT digest_cadence FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND status = 'active'",
+    const row = await client.query<{ digest_cadence: string | null; sentiment_alerts_enabled: boolean | null }>(
+      "SELECT digest_cadence, sentiment_alerts_enabled FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND status = 'active'",
       [workspaceId, viewer.userId],
     );
     const stored = row.rows[0]?.digest_cadence ?? null;
-    return { digest_cadence: effectiveCadence(viewer.role, stored), is_default: stored === null };
+    return { digest_cadence: effectiveCadence(viewer.role, stored), is_default: stored === null, sentiment_alerts: row.rows[0]?.sentiment_alerts_enabled !== false };
   }
 
-  /** The caller's OWN membership row, never another member's. */
+  /** The caller's OWN membership row, never another member's. A key left out of the body is left as it is; `null` returns it to its default. */
   async updatePreferences(viewer: Viewer, body: UpdateNotificationPreferencesRequest): Promise<NotificationPreferences> {
     const { client, workspaceId } = this.store();
-    await client.query("UPDATE workspace_members SET digest_cadence = $3, updated_at = now() WHERE workspace_id = $1 AND user_id = $2 AND status = 'active'", [
-      workspaceId,
-      viewer.userId,
-      body.digest_cadence,
-    ]);
+    await client.query(
+      `UPDATE workspace_members
+          SET digest_cadence = CASE WHEN $3::boolean THEN $4 ELSE digest_cadence END,
+              sentiment_alerts_enabled = CASE WHEN $5::boolean THEN $6::boolean ELSE sentiment_alerts_enabled END,
+              updated_at = now()
+        WHERE workspace_id = $1 AND user_id = $2 AND status = 'active'`,
+      [workspaceId, viewer.userId, body.digest_cadence !== undefined, body.digest_cadence ?? null, body.sentiment_alerts !== undefined, body.sentiment_alerts ?? null],
+    );
     return this.preferences(viewer);
   }
 

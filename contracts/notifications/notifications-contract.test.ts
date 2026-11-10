@@ -5,6 +5,7 @@ import {
   notificationListQuerySchema,
   notificationListResponseSchema,
   notificationSchema,
+  notificationPreferencesSchema,
   updateNotificationPreferencesRequestSchema,
 } from "./index.js";
 
@@ -46,6 +47,14 @@ describe("STORY-068 · notification contracts", () => {
     for (const cadence of ["off", "daily", "weekly", null]) expect(updateNotificationPreferencesRequestSchema.safeParse({ digest_cadence: cadence }).success, String(cadence)).toBe(true);
     expect(updateNotificationPreferencesRequestSchema.safeParse({ digest_cadence: "monthly" }).success).toBe(false);
     expect(updateNotificationPreferencesRequestSchema.safeParse({}).success).toBe(false);
+  });
+
+  it("[owner decision 96a] sentiment_alerts is a boolean the caller sets alone, or null to return to the default (on)", () => {
+    for (const value of [true, false, null]) expect(updateNotificationPreferencesRequestSchema.safeParse({ sentiment_alerts: value }).success, String(value)).toBe(true);
+    expect(updateNotificationPreferencesRequestSchema.safeParse({ sentiment_alerts: false, digest_cadence: "daily" }).success).toBe(true);
+    expect(updateNotificationPreferencesRequestSchema.safeParse({ sentiment_alerts: "off" }).success).toBe(false);
+    expect(notificationPreferencesSchema.safeParse({ digest_cadence: "weekly", is_default: true, sentiment_alerts: true }).success).toBe(true);
+    expect(notificationPreferencesSchema.safeParse({ digest_cadence: "weekly", is_default: true }).success).toBe(false);
   });
 
   it("every schema is representable in JSON Schema (the client is generated from it)", () => {

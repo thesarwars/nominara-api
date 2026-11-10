@@ -100,6 +100,7 @@ export const workspaceMembers = pgTable("workspace_members", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
   digestCadence: text("digest_cadence"),
+  sentimentAlertsEnabled: boolean("sentiment_alerts_enabled"),
 });
 
 export const workspaces = pgTable("workspaces", {
