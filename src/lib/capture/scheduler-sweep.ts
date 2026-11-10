@@ -7,6 +7,7 @@ import { claimDueProjectRefs } from "./scheduler.js";
 import type { EnqueueRollup } from "../queue/handlers/run-rollup-request.js";
 import { reapStaleManualAudits } from "../aux/stale-audit-reaper.js";
 import { reapStaleQueuedRuns } from "./stale-run-reaper.js";
+import { reapStaleGenerations } from "../promptgen/stale-generation-reaper.js";
 import { reapStuckRuns } from "./stuck-run-reaper.js";
 import { sweepEngineSkipRefunds } from "./engine-skip-refund-sweep.js";
 import { runVerificationSweep, type EnqueueVerification } from "../impact/verification-sweep.js";
@@ -361,6 +362,11 @@ export class SchedulerSweepRuntime {
       // claim, the same discipline: it must never hold up, or fail, the sweep.
       await reapStaleManualAudits(client, this.clock()).catch((error: unknown) => {
         logger.error({ event: "capture.scheduler.reap_stale_audits_failed", error: error instanceof Error ? error.name : "unknown" });
+      });
+      // STORY-045 (decision 95a) - a prompt generation whose job was dropped as stalled (so its recover hook never ran) is failed after 30
+      // minutes, so the client's poll ends. Best-effort and after the claim, the same discipline.
+      await reapStaleGenerations(client, this.clock()).catch((error: unknown) => {
+        logger.error({ event: "capture.scheduler.reap_stale_generations_failed", error: error instanceof Error ? error.name : "unknown" });
       });
       // SCANFIX D4 - the same discipline for runs that STARTED and never finished: finalise them, settle
       // the money, request the rollup. Skipped without an enqueuer, because finishing a run without
