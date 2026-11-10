@@ -25,7 +25,7 @@ const NEEDS_TIMING = "AUX-R-029";
 /**
  * The engine's rules that could actually be DECIDED on this page. AUX-R-026 and 027 compare the rendered copy with the plain one, so a page with
  * no rendered copy (no renderer is installed; STORY-049 AC6) cannot decide them. AUX-R-029 is about the response, so a page the fetcher recorded no
- * timing for cannot decide it: null is "not measured", and a measured 0 ms is a measurement. A rule the engine does not run (AUX-R-013, held)
+ * timing for cannot decide it: null is "not measured", and a measured 0 ms is a measurement. A rule the engine does not run (the AUX_RULES_NOT_EVALUATED codes)
  * is never in this set.
  */
 export function evaluablePageRules(doc: AuxDocument): ReadonlySet<string> {

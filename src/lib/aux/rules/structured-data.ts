@@ -236,23 +236,28 @@ export const schemaTextContradiction = defineRule({
     const prices = amountMatches(body, t.currency_symbols, t.currency_codes)
       .filter((f) => nearWord(body, f, t.price_context_words, t.context_window_chars))
       .map((f) => f.readings);
-    for (const e of all) {
-      // A listing's items (ItemList.itemListElement) are many things, each with its own price; the amounts the text shows near a pricing
-      // word there (a price filter, "$0 - $500") are not theirs, so the page has no price for them to disagree with.
-      if (e.locator.includes(".itemListElement")) continue;
-      asArray(e.node["offers"]).forEach((o, i) => {
-        if (!isRecord(o) || !present(o["price"])) return;
-        const declared = toNumber(String(o["price"]));
-        // A free tier is usually written as a word ("Free forever"), not as an amount: a declared 0 agrees with that.
-        if (declared === 0 && t.free_words.some((w) => containsFreeWord(flat, w))) return;
-        if (Number.isFinite(declared) && prices.length > 0 && !prices.some((rs) => rs.some((p) => Math.abs(p - declared) < t.price_tolerance))) {
-          hits.push({ reason: "price", snippet: `schema price ${String(o["price"])}; page prices ${[...new Set(prices.map((rs) => rs[0]!))].slice(0, 5).join(", ")}`, locator: `${e.locator}.offers${Array.isArray(e.node["offers"]) ? `[${String(i)}]` : ""}.price` });
-        }
-      });
+    // STORY-187: price and rating are judged only for the page's own subject. A product reached through mainEntity / mainEntityOfPage /
+    // about is that; otherwise, on a page that is not an article, the top-level entities are; on an article (a site-wide product block
+    // on a blog post) nothing is, because that block is not what the post is about. A listing's items are never the subject.
+    const pageIsArticle = jsonLdEntities(doc.structured.jsonLd).some((e) => typesOf(e.node).some((x) => t.article_types.includes(x)));
+    const reachedAny = all.filter((e) => /\.(?:mainEntity|mainEntityOfPage|about)(?![\p{L}\p{N}])/u.test(e.locator));
+    const subjects = (reachedAny.length > 0 ? reachedAny : pageIsArticle ? [] : all).filter((e) => !e.locator.includes(".itemListElement"));
+    for (const e of subjects) {
+      // An offer set (tiers, per-variant offers) agrees with the page when ANY member is shown; only a set of which none is shown is
+      // one disagreement. A free tier is usually written as a word ("Free forever"), not as an amount: a declared 0 agrees with that.
+      const members = asArray(e.node["offers"])
+        .flatMap((o, i) => (isRecord(o) && present(o["price"]) ? [{ declared: toNumber(String(o["price"])), raw: String(o["price"]), i }] : []))
+        .filter((m) => Number.isFinite(m.declared));
+      if (members.length === 0 || prices.length === 0) continue;
+      const agrees = members.some((m) => (m.declared === 0 && t.free_words.some((w) => containsFreeWord(flat, w))) || prices.some((rs) => rs.some((p) => Math.abs(p - m.declared) < t.price_tolerance)));
+      if (!agrees) {
+        const first = members[0]!;
+        hits.push({ reason: "price", snippet: `schema price ${members.map((m) => m.raw).slice(0, 5).join(", ")}; page prices ${[...new Set(prices.map((rs) => rs[0]!))].slice(0, 5).join(", ")}`, locator: `${e.locator}.offers${Array.isArray(e.node["offers"]) ? `[${String(first.i)}]` : ""}.price` });
+      }
     }
     // A ProductGroup carries no offers of its own: its variants do. The variant set agrees with the page when any variant's price is shown;
     // only a set of which none is shown is one disagreement (variant names are not compared).
-    for (const e of all) {
+    for (const e of subjects) {
       const variantPrices = asArray(e.node["hasVariant"]).flatMap((v) => (isRecord(v) ? asArray(v["offers"]) : [])).flatMap((o) => (isRecord(o) && present(o["price"]) ? [toNumber(String(o["price"]))] : [])).filter((n) => Number.isFinite(n));
       if (variantPrices.length === 0 || prices.length === 0 || e.locator.includes(".itemListElement")) continue;
       if (!variantPrices.some((v) => prices.some((rs) => rs.some((p) => Math.abs(p - v) < t.price_tolerance)))) {
@@ -265,13 +270,12 @@ export const schemaTextContradiction = defineRule({
     const named = entitiesOfType(all, t.name_entity_types).filter((e) => !e.locator.includes(".itemListElement"));
     const reached = named.filter((e) => /\.(?:mainEntity|mainEntityOfPage|about)(?![\p{L}\p{N}])/u.test(e.locator));
     const topLevel = named.filter((e) => !e.locator.includes("."));
-    const pageIsArticle = jsonLdEntities(doc.structured.jsonLd).some((e) => typesOf(e.node).some((x) => t.article_types.includes(x)));
     const aboutPage = reached.length > 0 ? reached : topLevel.length === 1 && !pageIsArticle ? topLevel : [];
     for (const e of aboutPage) {
       const name = text(e.node["name"]);
       if (name !== undefined && !nameShown(flat, name)) hits.push({ reason: "name", snippet: `schema name ${name}`, locator: `${e.locator}.name` });
     }
-    for (const e of all) {
+    for (const e of subjects) {
       const rating = e.node["aggregateRating"];
       if (!isRecord(rating) || e.locator.includes(".itemListElement")) continue;
       // A field the data leaves out has not contradicted the page: Number("") is 0, so an absent or blank one is skipped, not compared.

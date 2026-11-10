@@ -75,9 +75,9 @@ describe("STORY-051 AC13 · evaluablePageRules: which rules a page could actuall
     expect(evaluablePageRules(makeDoc({ rendered: null, timing: { ttfbMs: null, loadMs: 0, bytes: 10 } })).has("AUX-R-029")).toBe(true);
   });
 
-  it("AUXLIVE-2 · only rules the engine runs are ever reported: the held AUX-R-013 never is", () => {
+  it("AUXLIVE-2 · only rules the engine runs are ever reported: AUX-R-013 is among them since the hold was released (STORY-187)", () => {
     const set = evaluablePageRules(makeDoc());
-    expect(set.has("AUX-R-013")).toBe(false);
+    expect(set.has("AUX-R-013")).toBe(true);
     expect([...set].sort()).toEqual(AUX_RULES.map((r) => r.code).sort());
   });
 });

@@ -150,12 +150,12 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   // OWNER DECISIONS 52 and 55: a category's max_penalty is the sum of the DECIDED rules' weights. These are worked by hand from the catalog (0070 and 0148), NOT read
   // back from the audit's own `excluded_rules`, so a wrongly excluded rule cannot make the expectation agree with the bug.
   //   crawler_access: 001 .30 + 002 .08 + 003 .12 + 004 .06 + 005 .24 + 006 .12 + 007 .08 = 1.00; 005 is never decided; 006 is a page rule
-  //   structured_data: 008 .14 + 009 .10 + 010 .12 + 011 .07 + 012 .09 + 013 .11 + 014 .09 + 015 .06 + 016 .06 + 017 .08 + 018 .08 = 1.00; 013 is held
+  //   structured_data: 008 .14 + 009 .10 + 010 .12 + 011 .07 + 012 .09 + 013 .11 + 014 .09 + 015 .06 + 016 .06 + 017 .08 + 018 .08 = 1.00; 013 runs again since STORY-187 (the hold is released), so structured_data is fully decided
   //   render_mode: 026 .34 + 027 .28 + 028 .22 + 029 .16 = 1.00
   const DECIDED = {
     crawlerAccessWithPages: 0.76, // 001 .30 + 002 .08 + 003 .12 + 004 .06 + 006 .12 + 007 .08
     crawlerAccessSiteFilesOnly: 0.64, // the same without the page rule 006
-    structuredData: 0.89, // 1.00 - 013 (.11, held)
+    structuredData: 1.0, // every rule decided: 013 is evaluated again (STORY-187)
     renderMode029Only: 0.16, // 026, 027 and 028 undecided with no renderer
   } as const;
   const audits = async (): Promise<any[]> => (await db.query("SELECT * FROM aux_audits ORDER BY created_at")).rows;
@@ -214,15 +214,15 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(a.finished_at).not.toBeNull();
   });
 
-  it("NEW-C-9 AC2.2 · excluded_rules names every rule that did not run: AUX-R-005, 013, 028, 031-034 and, with no measured timing, AUX-R-029 (the page rules that ran are no longer named: STORY-051 AC13)", async () => {
+  it("NEW-C-9 AC2.2 · excluded_rules names every rule that did not run: AUX-R-005, 028, 031-034 and, with no measured timing, AUX-R-029 (the page rules that ran are no longer named: STORY-051 AC13)", async () => {
     await run(job(), depsServing(healthy(OPEN)));
     const [a] = await audits();
     const excluded: string[] = a.excluded_rules;
     const codes = excluded.filter((e) => e.startsWith("AUX-R-"));
-    expect(codes).toHaveLength(8);
+    expect(codes).toHaveLength(7);
     for (const ran of ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007", "AUX-R-006", "AUX-R-008"]) expect(excluded).not.toContain(ran);
     expect(excluded).toContain("AUX-R-005");
-    expect(excluded).toContain("AUX-R-013");
+    expect(excluded).not.toContain("AUX-R-013"); // STORY-187: evaluated again
     expect(excluded).toContain("AUX-R-029");
     expect(excluded).toContain("AUX-R-034");
     expect(excluded).not.toContain("page_crawl"); // a page WAS crawled: naming it as not run would be false
@@ -1221,7 +1221,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
   // STORY-051 AC13 / STORY-052 AC1, AC9 (owner decision 34, item 2) - the page rules run inside crawl.audit
   // ------------------------------------------------------------------------------------------------------------------
   describe("AUXLIVE-2 · the page rule engine is wired into crawl.audit", () => {
-    const NOT_EVALUATED = ["AUX-R-005", "AUX-R-013", "AUX-R-028", "AUX-R-031", "AUX-R-032", "AUX-R-033", "AUX-R-034"];
+    const NOT_EVALUATED = ["AUX-R-005", "AUX-R-028", "AUX-R-031", "AUX-R-032", "AUX-R-033", "AUX-R-034"];
     const SITE_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"];
     const weightOf = async (code: string): Promise<number> => Number((await db.query("SELECT weight FROM aux_rule_catalog WHERE code = $1", [code])).rows[0].weight);
     const withPages = (pages: Record<string, string>): Served => ({
@@ -1250,7 +1250,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect((await audits())[0]).toMatchObject({ status: "completed", pages_crawled: 1 });
     });
 
-    it("STORY-051 AC13 · excluded_rules drops the page rules that ran, and keeps AUX-R-029 (no measured timing) and every not-evaluated code, AUX-R-013 included", async () => {
+    it("STORY-051 AC13 · excluded_rules drops the page rules that ran, and keeps AUX-R-029 (no measured timing) and every not-evaluated code", async () => {
       await run(job(), depsServing(healthy(OPEN)));
       const excluded: string[] = (await audits())[0].excluded_rules;
       expect([...excluded].sort()).toEqual([...NOT_EVALUATED, "AUX-R-029"].sort());
@@ -1273,13 +1273,12 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect([...excluded].sort()).toEqual([...NOT_EVALUATED].sort());
     });
 
-    it("STORY-051 AC13 · AUX_RULES_PARTIAL is surfaced as its own annotation: error_summary.rules_partial names the partly-checked rules that ran, not the ones that were excluded or held", async () => {
+    it("STORY-051 AC13 · AUX_RULES_PARTIAL is surfaced as its own annotation: error_summary.rules_partial names the partly-checked rules that ran, not the ones that were excluded", async () => {
       await run(job(), depsServing(healthy(OPEN)));
       const partial: string[] = (await audits())[0].error_summary.rules_partial;
-      expect(partial).toEqual(expect.arrayContaining(["AUX-R-006", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027"]));
+      expect(partial).toEqual(expect.arrayContaining(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027"]));
       expect(partial).not.toContain("AUX-R-029"); // no timing: it did not run, so it is excluded, not partial
-      expect(partial).not.toContain("AUX-R-013"); // held: not evaluated at all
-      expect(partial).toEqual([...partial].sort());
+            expect(partial).toEqual([...partial].sort());
       expect(new Set(partial).size).toBe(partial.length);
     });
 
@@ -1312,7 +1311,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
       const [a] = await audits();
       const w = await weightOf("AUX-R-008");
-      // decision 52: over structured_data's DECIDED rules (AUX-R-013 is held, so out of the denominator)
+      // decision 52: over structured_data's DECIDED rules (every structured_data rule is decided since STORY-187)
       const decided = DECIDED.structuredData;
       expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - w / decided, 5);
       for (const c of ["crawler_access", "context_fitness", "freshness", "render_mode"]) expect(Number(a.score_breakdown[c]), c).toBe(1);
@@ -1654,7 +1653,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       // render_mode has AUX-R-028 held and (no timing) AUX-R-029 undecided: its 1.0 is NOT a full measurement, and the payload says so
       expect(cats.render_mode).toEqual(expect.arrayContaining(["AUX-R-028", "AUX-R-029"]));
       expect(cats.freshness).toEqual(["AUX-R-031"]);
-      expect(cats.structured_data).toEqual(["AUX-R-013"]);
+      expect(cats.structured_data).toEqual([]); // AUX-R-013 is evaluated again (STORY-187)
     });
 
     it("AUXLIVE-5 · an audit with no score (nothing measured: a failed one) is not partial and lists every category as unmeasured", async () => {
@@ -1710,14 +1709,12 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect(cats.render_mode).toEqual(expect.arrayContaining(["AUX-R-026", "AUX-R-027", "AUX-R-028"]));
     });
 
-    it("D52 · AUX-R-013 (held, decision 8) is left out of the structured_data denominator: one critical AUX-R-008 weighs w008 / (Σ structured_data weights - w013)", async () => {
+    it("D52 / STORY-187 · AUX-R-013 is decided again, so it is in the structured_data denominator: one critical AUX-R-008 weighs w008 / Σ structured_data weights (1.00)", async () => {
       await run(job(), depsServing({ ...healthy(OPEN), "/": { status: 200, body: BROKEN_PAGE } }));
       const [a] = await audits();
-      expect(a.excluded_rules).toContain("AUX-R-013");
-      const decided = DECIDED.structuredData;
-      expect(decided).toBeCloseTo(1 - (await weightOf("AUX-R-013")), 12);
-      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (await weightOf("AUX-R-008")) / decided, 5);
-      expect(Number(a.score_breakdown.structured_data)).toBeLessThan(1 - (await weightOf("AUX-R-008")) - 0.01);
+      expect(a.excluded_rules).not.toContain("AUX-R-013");
+      expect(DECIDED.structuredData).toBe(1);
+      expect(Number(a.score_breakdown.structured_data)).toBeCloseTo(1 - (await weightOf("AUX-R-008")), 5);
     });
 
     it("D52 · a fully measured category scores as before: context_fitness lists no unmeasured rule, its decided weights sum to 1, and a clean page is 1", async () => {

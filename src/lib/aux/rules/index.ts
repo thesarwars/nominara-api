@@ -27,16 +27,12 @@ const IMPLEMENTED_RULES: readonly AuxRule[] = [
 
 /**
  * THE HOLD SWITCH. A rule listed here keeps its catalog row, its evaluator and its evaluator tests, but the engine does not run it:
- * it is reported as not evaluated (AUX_RULES_NOT_EVALUATED), raises no finding and so adds no penalty, and the catalog weights are
- * untouched (a rule that is not run contributes no penalty, as for every other rule in AUX_RULES_NOT_EVALUATED).
+ * it is reported as not evaluated (AUX_RULES_NOT_EVALUATED), raises no finding and so adds no penalty.
  *
- * AUX-R-013: owner decision 8 (plans-7day/decisions-2026-10-28.md). After 7 review rounds the rule still raised false criticals on
- * pricing tiers, per-variant offers and site-wide product blocks on blog pages. The follow-up story rewrites it to judge name, price
- * and rating only against the page's own subject. That story removes the entry below; nothing else needs to change.
+ * EMPTY since STORY-187 released AUX-R-013 (held by owner decision 8, plans-7day/decisions-2026-10-28.md): the rewritten rule judges name,
+ * price and rating only against the page's own subject, and an offer or variant set agrees when any member is shown.
  */
-export const HELD_RULES: Readonly<Record<string, string>> = {
-  "AUX-R-013": "Held by owner decision 8: the schema-versus-text contradiction rule raised false criticals on pricing tiers, per-variant offers and site-wide product blocks on blog pages, so it is not run and adds no penalty. A follow-up story rewrites it to judge name, price and rating only against the page's own subject.",
-};
+export const HELD_RULES: Readonly<Record<string, string>> = {};
 
 /** Every implemented evaluator, held ones included: for the evaluators' own unit tests and the follow-up story. The engine runs AUX_RULES. */
 export const ALL_AUX_RULES: readonly AuxRule[] = IMPLEMENTED_RULES;

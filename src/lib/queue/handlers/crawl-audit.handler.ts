@@ -75,7 +75,7 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // purpose), models each (loadDocumentSnapshot -> buildAuxDocument with cl100k) and evaluates the 22 document-model rules over every page
 // (evaluateDocuments), all in the fetch phase, so no transaction is open while it works. `commit` reconciles those findings in the same
 // lifecycle as the site-file ones (STORY-052). A rule is named in `excluded_rules` only when it did not run on ANY page: the codes in
-// AUX_RULES_NOT_EVALUATED always (incl. the held AUX-R-013), AUX-R-026/027 when no page had a rendered copy, AUX-R-029 when no page had a
+// AUX_RULES_NOT_EVALUATED always (AUX-R-013 ran again from STORY-187), AUX-R-026/027 when no page had a rendered copy, AUX-R-029 when no page had a
 // measured timing. The partly-checked rules that did run (AUX_RULES_PARTIAL) are listed in `error_summary.rules_partial`.
 //
 // WHAT IS STILL NOT EVALUATED. AUX-R-005 (bot-hostile
@@ -998,7 +998,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
     );
     // OWNER DECISIONS 52 and 55. The rules that were DECIDED in this audit: the site-file rules whose file answered, and the page rules that ran on at least one page.
     // This one set is BOTH the score basis and the penalty set. A category is scored ONLY on those rules: max_penalty(cat) is the sum of the decided rules' weights, so a
-    // rule nobody could judge (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, the held AUX-R-013, ...) is out of the denominator instead of counting as passed.
+    // rule nobody could judge (AUX-R-026/027 with no renderer, AUX-R-029 with no timing, ...) is out of the denominator instead of counting as passed.
     // A category with no decided rule is dropped. An open or stale finding whose rule was NOT decided in this audit (not re-checked) contributes NOTHING - not to the
     // penalty, not to the denominator; it stays in the findings list as stale / not re-checked (the lifecycle, STORY-052, is untouched). Its rule is named in
     // `excluded_rules`, so the headline is partial.

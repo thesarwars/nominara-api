@@ -491,8 +491,9 @@ describe("STORY-051 AUX-R-013 · a free tier written as a word agrees with a dec
   it("STORY-051 AUX-R-013 · 'Free' as a tier name agrees too", async () => {
     expect(await findings(tiers("Acme Widgets\nFree\nPro starts at $47 per month."), "AUX-R-013")).toEqual([]);
   });
+  // STORY-187: a set agrees when any member is shown, so [0, 47] beside "$47" agrees; the free-word cases below use a lone 0.
   it("STORY-051 AUX-R-013 · Offer 0 with NO free word on a page that prices everything does fire", async () => {
-    const [f] = await findings(tiers("Acme Widgets\nEvery plan starts at $47 per month."), "AUX-R-013");
+    const [f] = await findings(tiers("Acme Widgets\nEvery plan starts at $47 per month.", ["0"]), "AUX-R-013");
     expect(f).toMatchObject({ severity: "critical" });
     expect(f!.evidence).toMatchObject({ reason: "price" });
     expect(f!.evidence.snippet).toContain("schema price 0");
@@ -504,13 +505,13 @@ describe("STORY-051 AUX-R-013 · a free tier written as a word agrees with a dec
     expect(await findings(tiers("Acme Widgets\nFree trial. Pro starts at $57 per month.", ["47"]), "AUX-R-013")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-013 · 'free' inside another word (carefree) is not a free word", async () => {
-    expect(await findings(tiers("Acme Widgets\nA carefree plan. Every plan starts at $47 per month."), "AUX-R-013")).toHaveLength(1);
+    expect(await findings(tiers("Acme Widgets\nA carefree plan. Every plan starts at $47 per month.", ["0"]), "AUX-R-013")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-013 · the free words come from the catalog row", async () => {
     const { withThresholds } = await import("../../../../test/support/aux-rules.js");
     const cat = withThresholds("AUX-R-013", { free_words: ["gratis"] });
-    expect(await findings(tiers("Acme Widgets\nFree forever. Pro starts at $47 per month."), "AUX-R-013", cat)).toHaveLength(1);
-    expect(await findings(tiers("Acme Widgets\nGratis. Pro starts at $47 per month."), "AUX-R-013", cat)).toEqual([]);
+    expect(await findings(tiers("Acme Widgets\nFree forever. Pro starts at $47 per month.", ["0"]), "AUX-R-013", cat)).toHaveLength(1);
+    expect(await findings(tiers("Acme Widgets\nGratis. Pro starts at $47 per month.", ["0"]), "AUX-R-013", cat)).toEqual([]);
   });
 });
 
@@ -724,5 +725,44 @@ describe("STORY-051 AUX-R-012 · a price carried by priceSpecification, round 6"
   it("STORY-051 AUX-R-012 · a priceSpecification with no currency is not priced", async () => {
     const offers = { "@type": "Offer", priceSpecification: { "@type": "UnitPriceSpecification", price: "47.00" } };
     expect((await findings(withApp({ offers }), "AUX-R-012"))[0]!.evidence.reason).toBe("offers_incomplete");
+  });
+});
+
+// STORY-187 — AUX-R-013 judges name, price and rating only against the page's own subject; an offer set agrees when any member is shown.
+describe("STORY-187 AUX-R-013 · the rewrite (review rounds 5-7 corpus)", () => {
+  const ctx = "https://schema.org";
+  const offer = (price: string) => ({ "@type": "Offer", price, priceCurrency: "USD" });
+  const blog = { "@context": ctx, "@type": "BlogPosting", headline: "Five ways to clean a sales pipeline" };
+  const siteWide = { "@context": ctx, "@type": "SoftwareApplication", name: "Acme CRM", offers: offer("99"), aggregateRating: { "@type": "AggregateRating", ratingValue: "4.9", reviewCount: "400" } };
+
+  it("STORY-187 AC3a · a SaaS tier offers set [9, 29] against 'Plans start at $9/mo' does not fire", async () => {
+    const tiers = { "@context": ctx, "@type": "SoftwareApplication", name: "Acme CRM", offers: [offer("9"), offer("29")] };
+    expect(await findings(withLd([org, tiers], { mainText: "Acme CRM\nPricing: plans start at $9/mo" }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC3b · Product.offers with per-variant prices [39.99, 44.99] against 'Price: $39.99' does not fire", async () => {
+    const product = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: [offer("39.99"), offer("44.99")] };
+    expect(await findings(withLd([org, product], { mainText: "Wool coat\nPrice: $39.99" }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC3c · a site-wide product price and rating block on a BlogPosting that discusses other prices and ratings does not fire", async () => {
+    const text = { mainText: "Five ways to clean a sales pipeline\nOne rival has a price of $20 per month and is rated 3.1/5 by customers." };
+    expect(await findings(withLd([org, siteWide, blog], text), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 AC1 · a price and rating on a related entity are not judged, but the page's own subject (mainEntity) still is", async () => {
+    const page = { "@context": ctx, "@type": "WebPage", mainEntity: { "@type": "Product", name: "Wool coat", offers: offer("39.99"), aggregateRating: { "@type": "AggregateRating", ratingValue: "4.9", reviewCount: "10" } } };
+    const hits = await findings(withLd([org, page], { mainText: "Wool coat\nPrice: $59.99\nRated 3.1/5 by customers" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ severity: "critical", measured_value: 2 });
+  });
+  it("STORY-187 AC4 · an offer set of which no member is shown is one disagreement, not one per offer", async () => {
+    const product = { "@context": ctx, "@type": "Product", name: "Wool coat", offers: [offer("39.99"), offer("44.99")] };
+    const hits = await findings(withLd([org, product], { mainText: "Wool coat\nPrice: $59.99" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({ severity: "critical", measured_value: 1 });
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  it("STORY-187 AC4 · a blog post whose own mainEntity is the product with a wrong price still fires", async () => {
+    const post = { ...blog, mainEntity: { "@type": "Product", name: "Wool coat", offers: offer("39.99") } };
+    const hits = await findings(withLd([org, post], { mainText: "Wool coat review\nPrice: $59.99" }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
   });
 });
