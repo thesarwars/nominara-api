@@ -253,7 +253,13 @@ export const schemaTextContradiction = defineRule({
     const notListed = all.filter((e) => !e.locator.includes(".itemListElement"));
     const qualifying = notListed.filter((e) => reachedFromPage(e) && carriesCommerce(e));
     // A ProductGroup is the subject of its variants' prices though it is not a name-checked type.
-    const topSubjects = notListed.filter((e) => !e.locator.includes(".") && (entitiesOfType([e], t.name_entity_types).length > 0 || present(e.node["hasVariant"])));
+    // Owner decision 97: that one is the page's subject only if the page names it (case, spacing and typography folded, as the name check
+    // does); a page that never names the product goes unchecked rather than risk a false critical.
+    const topSubjects = notListed.filter((e) => {
+      if (e.locator.includes(".") || !(entitiesOfType([e], t.name_entity_types).length > 0 || present(e.node["hasVariant"]))) return false;
+      const name = text(e.node["name"]);
+      return name !== undefined && nameShown(flat, name);
+    });
     const subjects = qualifying.length > 0 ? qualifying : pageIsArticle || topSubjects.length !== 1 ? [] : topSubjects;
     for (const e of subjects) {
       // An offer set (tiers, per-variant offers) agrees with the page when ANY member is shown; only a set of which none is shown is
@@ -282,8 +288,8 @@ export const schemaTextContradiction = defineRule({
     // subject). Anything else, and a listing's items, is a name the page need not show: absence is not disagreement.
     const named = entitiesOfType(all, t.name_entity_types).filter((e) => !e.locator.includes(".itemListElement"));
     const reached = named.filter(reachedFromPage);
-    const topLevel = named.filter((e) => !e.locator.includes("."));
-    const aboutPage = reached.length > 0 ? reached : topLevel.length === 1 && !pageIsArticle ? topLevel : [];
+    // Only a reached entity can have a name the page does not show: a top-level fallback subject is one the page names (decision 97).
+    const aboutPage = reached;
     for (const e of aboutPage) {
       const name = text(e.node["name"]);
       if (name !== undefined && !nameShown(flat, name)) hits.push({ reason: "name", snippet: `schema name ${name}`, locator: `${e.locator}.name` });

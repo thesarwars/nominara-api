@@ -10,6 +10,8 @@ const app = CLEAN_JSON_LD[1] as Record<string, unknown>;
 const withLd = (jsonLd: unknown[], over: Partial<ReturnType<typeof variant>> = {}) => makeDoc({ raw: variant({ structured: { jsonLd, microdata: [], rdfa: [], parseErrors: [] }, ...over }) });
 const withApp = (patch: Record<string, unknown>, over: Partial<ReturnType<typeof variant>> = {}) => withLd([org, { ...app, ...patch }], over);
 const withoutKey = (o: Record<string, unknown>, ...keys: string[]) => Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+/** The page's own subject: a WebPage whose mainEntity is the app. */
+const reachedApp = (patch: Record<string, unknown>) => ({ "@context": "https://schema.org", "@type": "WebPage", mainEntity: { ...withoutKey(app, "@context"), ...patch } });
 const textWith = (extra: string) => ({ mainText: `${CLEAN_TEXT}\n${extra}` });
 
 describe("STORY-051 AUX-R-006 · noai / noimageai / noarchive", () => {
@@ -204,9 +206,13 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
   it("STORY-051 AUX-R-013 · any of several visible prices that matches is agreement", async () => {
     expect(await findings(withApp({}, textWith("Team plan $99 per month")), "AUX-R-013")).toEqual([]);
   });
-  it("STORY-051 AUX-R-013 · a product name absent from the visible text fires", async () => {
-    const [f] = await findings(withApp({ name: "Zed Gadget" }), "AUX-R-013");
-    expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].name" });
+  // Owner decision 97: only the page's own (reached) subject can contradict by name; a top-level product the page never names is unchecked.
+  it("STORY-051 AUX-R-013 · a product name absent from the visible text fires (on the page's own mainEntity)", async () => {
+    const [f] = await findings(withLd([org, reachedApp({ name: "Zed Gadget" })]), "AUX-R-013");
+    expect(f!.evidence).toMatchObject({ reason: "name", locator: "jsonld[1].mainEntity.name" });
+  });
+  it("STORY-187 decision 97 · a lone top-level product the page never names is unchecked, not a name contradiction", async () => {
+    expect(await findings(withApp({ name: "Zed Gadget" }), "AUX-R-013")).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · a name that differs only in a trademark sign, a curly apostrophe, & versus and, or a pack suffix is not a contradiction", async () => {
     const cases: [string, string][] = [
@@ -248,7 +254,7 @@ describe("STORY-051 AUX-R-013 · schema versus visible text contradiction", () =
     expect(await findings(withApp({}, { mainText: CLEAN_TEXT.replace("$47", "$57") }), "AUX-R-013", withThresholds("AUX-R-013", { price_context_words: ["zzz"] }))).toEqual([]);
   });
   it("STORY-051 AUX-R-013 · several disagreements measure their count", async () => {
-    const doc = withApp({ name: "Zed Gadget" }, { mainText: CLEAN_TEXT.replace("$47", "$57") });
+    const doc = withLd([org, reachedApp({ name: "Zed Gadget" })], { mainText: CLEAN_TEXT.replace("$47", "$57") });
     expect((await findings(doc, "AUX-R-013"))[0]!.measured_value).toBe(2);
   });
 });
@@ -460,7 +466,7 @@ describe("STORY-051 AUX-R-010 / 011 / 012 / 013 / 014 · schema.org subtypes (ro
     expect(await findings(withLd([typed("WebApplication")]), "AUX-R-014")).toHaveLength(1);
   });
   it("STORY-051 AUX-R-013 · a WebApplication whose name is not on the page fires", async () => {
-    const [f] = await findings(withLd([typed("WebApplication", { name: "Zed Gadget" })]), "AUX-R-013");
+    const [f] = await findings(withLd([org, reachedApp({ "@type": "WebApplication", name: "Zed Gadget" })]), "AUX-R-013");
     expect(f!.evidence.reason).toBe("name");
   });
 });
@@ -770,10 +776,24 @@ describe("STORY-187 AUX-R-013 · the rewrite (review rounds 5-7 corpus)", () => 
     const wp = { "@context": ctx, "@type": "WebPage", about: { "@type": "Thing", name: "coats" } };
     expect(await findings(withLd([org, product99, wp], wrongPrice), "AUX-R-013")).toHaveLength(1);
   });
-  it("STORY-187 AC1 · a reached Question does not displace the top-level Product in the name check", async () => {
-    const hits = await findings(withLd([org, { ...product99, name: "Zebra gizmo" }, faqPage], { mainText: "Wool coat\nPrice: $99" }), "AUX-R-013");
+  it("STORY-187 AC1 · a FAQPage's Question is not a name check, and does not hide the top-level Product's price when the page names it", async () => {
+    const hits = await findings(withLd([org, faqPage, product99], wrongPrice), "AUX-R-013");
     expect(hits).toHaveLength(1);
-    expect(hits[0]!.evidence.reason).toBe("name");
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  // Decision 97: scenario D exactly as the auditor's probe writes it.
+  const siteApp = { "@context": ctx, "@type": "SoftwareApplication", name: "Acme CRM", offers: offer("99") };
+  it("STORY-187 decision 97 · a single site-wide SoftwareApplication (offer 99), no Article schema, page about a rival's $20 and not naming the product: no finding", async () => {
+    expect(await findings(withLd([org, siteApp], { mainText: "Guide\nOne rival has a price of $20 per month." }), "AUX-R-013")).toEqual([]);
+  });
+  it("STORY-187 decision 97 · the same page naming the product with a wrong price fires once", async () => {
+    const hits = await findings(withLd([org, siteApp], { mainText: "Acme CRM review\nOne rival has a price of $20 per month." }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.evidence.reason).toBe("price");
+  });
+  it("STORY-187 decision 97 · the name is matched ignoring case, spacing and typography (acme   CRM\u2122)", async () => {
+    const hits = await findings(withLd([org, siteApp], { mainText: "the  ACME\u00a0crm\u2122 review\nOne rival has a price of $20 per month." }), "AUX-R-013");
+    expect(hits).toHaveLength(1);
   });
   it("STORY-187 AC1 · an entity reached from a node that is not the page (Organization.about) is not the page's subject", async () => {
     const orgAbout = { ...org, about: { "@type": "Product", name: "Zebra gizmo", offers: offer("52") } };
