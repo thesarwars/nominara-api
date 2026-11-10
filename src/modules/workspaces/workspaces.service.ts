@@ -30,6 +30,7 @@ import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { isWorkspaceUsable, MembershipService } from "./membership.service.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import { isReservedWorkspaceSlug } from "../../../contracts/workspaces/reserved-slugs.js";
 import type {
   CreateWorkspaceRequest,
   MemberResponse,
@@ -261,12 +262,17 @@ export class WorkspacesService {
     const workspaceId = uuidV7();
     const supplied = input.slug !== undefined;
     const baseSlug = input.slug ?? kebabCase(input.name);
+    // Decision 96(c): a reserved address the caller chose is refused, naming why; one derived from the name takes a suffix from the start.
+    if (supplied && isReservedWorkspaceSlug(baseSlug)) {
+      throw new ConflictError({ message: "this workspace address is reserved", details: { reason: "slug_reserved" } });
+    }
+    const derivedReserved = !supplied && isReservedWorkspaceSlug(baseSlug);
     const orgType = input.org_type ?? "in_house";
     const region = input.region ?? "us-east-1";
     const timezone = input.timezone ?? "UTC";
 
     for (let attempt = 0; attempt < MAX_SLUG_ATTEMPTS; attempt++) {
-      const slug = attempt === 0 ? baseSlug : `${baseSlug}-${randomBytes(3).toString("hex")}`;
+      const slug = attempt === 0 && !derivedReserved ? baseSlug : `${baseSlug}-${randomBytes(3).toString("hex")}`;
       const client = await this.pool.connect();
       try {
         return await withTenantContext(client, { workspaceId, actorId: userId }, (tx) =>

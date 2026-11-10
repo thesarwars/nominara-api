@@ -224,6 +224,29 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
     await expect(service.create(ownerB, { name: "B", slug: "acme" }, meta)).rejects.toBeInstanceOf(ConflictError);
   });
 
+  it.each(["admin", "api", "www", "app", "support", "help", "billing", "status", "auth", "onboarding"])(
+    "[decision 96c] a supplied reserved slug %s is refused 409 slug_reserved and creates nothing",
+    async (reserved) => {
+      const service = makeService();
+      const owner = await createUser();
+      const refusal = await service.create(owner, { name: "Acme", slug: reserved }, meta).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(ConflictError);
+      expect((refusal as { details: unknown }).details).toEqual({ reason: "slug_reserved" });
+      expect((await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [owner])).rowCount).toBe(0);
+    },
+  );
+
+  it("[decision 96c] a server-derived slug that would be reserved takes a suffix instead", async () => {
+    const service = makeService();
+    const created = await service.create(await createUser(), { name: "Admin" }, meta);
+    expect(created.slug).toMatch(/^admin-[0-9a-f]{6}$/);
+  });
+
+  it("[decision 96c] a slug that merely contains a reserved word is not reserved", async () => {
+    const created = await makeService().create(await createUser(), { name: "Admin Co", slug: "admin-co" }, meta);
+    expect(created.slug).toBe("admin-co");
+  });
+
   // ---- scenario 3 ---------------------------------------------------------
 
   it(
