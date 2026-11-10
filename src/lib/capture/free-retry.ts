@@ -48,7 +48,7 @@ export async function planFreeRetry(
       [project.projectId],
     )
   ).rows[0];
-  if (first === undefined) throw refusal("not_all_degraded", "this project has no first run to retry");
+  if (first === undefined) throw refusal("no_first_run", "this project has no first run to retry");
 
   const used = await tx.query("SELECT 1 FROM capture_runs WHERE retry_of = $1 AND workspace_id = app.current_workspace()", [first.id]);
   if ((used.rowCount ?? 0) > 0) throw refusal("retry_already_used", "the free retry of this project's first run has already been used");
@@ -56,7 +56,7 @@ export async function planFreeRetry(
   if (first.status !== "failed") throw refusal("not_all_degraded", "this project's first run did not end with every engine degraded");
 
   const later = await tx.query("SELECT 1 FROM capture_runs WHERE project_id = $1 AND workspace_id = app.current_workspace() AND id <> $2 LIMIT 1", [project.projectId, first.id]);
-  if ((later.rowCount ?? 0) > 0) throw refusal("not_all_degraded", "this project has run since its first run");
+  if ((later.rowCount ?? 0) > 0) throw refusal("run_since_first_run", "this project has run since its first run");
 
   const resolved = await resolveEntitlements(tx, project.workspaceId);
   try {
@@ -92,6 +92,6 @@ export async function planFreeRetry(
   return { plan, retryOf: first.id };
 }
 
-function refusal(reason: "not_all_degraded" | "run_in_progress" | "retry_already_used", message: string): InstanceType<typeof ConflictError> {
+function refusal(reason: "not_all_degraded" | "run_in_progress" | "retry_already_used" | "no_first_run" | "run_since_first_run", message: string): InstanceType<typeof ConflictError> {
   return new ConflictError({ message, details: { reason } });
 }

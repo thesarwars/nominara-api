@@ -2,7 +2,9 @@ import { Body, Controller, HttpCode, Param, Post, Req } from "@nestjs/common";
 import {
   runEstimateResponseSchema,
   runProgressResponseSchema,
+  retryRunRequestSchema,
   triggerRunRequestSchema,
+  type RetryRunRequest,
   type RunEstimateResponse,
   type RunProgressResponse,
   type TriggerRunRequest,
@@ -124,13 +126,13 @@ export class TrackingController {
   @Audit({ action: "run.free_retry", resourceType: "project" })
   @ApiContract({
     operationId: "retryRun",
-    requestSchema: triggerRunRequestSchema,
+    requestSchema: retryRunRequestSchema,
     responseSchema: runProgressResponseSchema,
   })
   retry(
     @Req() req: RbacScopedRequest,
     @Param("id") projectId: string,
-    @Body(new ZodValidationPipe(triggerRunRequestSchema)) _body: TriggerRunRequest,
+    @Body(new ZodValidationPipe(retryRunRequestSchema)) _body: RetryRunRequest,
   ): Promise<RunProgressResponse> {
     return this.lifecycle.retryFree(projectId, req.auth?.sub ?? null);
   }

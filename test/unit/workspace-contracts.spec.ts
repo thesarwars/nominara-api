@@ -276,7 +276,7 @@ describe("STORY-021 · acceptInvitationRequestSchema (scenario 11 — accepting 
 describe("STORY-195 · the conflict reasons onboarding adds are in the closed enum", () => {
   it("STORY-195-AC2/AC4 slug_taken and the three free-retry refusals are accepted conflict reasons", async () => {
     const { conflictDetailsSchema } = await import("../../contracts/common/error-details.schema.js");
-    for (const reason of ["slug_taken", "not_all_degraded", "run_in_progress", "retry_already_used"]) {
+    for (const reason of ["slug_taken", "not_all_degraded", "run_in_progress", "retry_already_used", "no_first_run", "run_since_first_run"]) {
       expect(conflictDetailsSchema.safeParse({ reason }).success, reason).toBe(true);
     }
   });

@@ -234,6 +234,8 @@ export const featureNotInPlanDetailsSchema = z
 //   not_all_degraded                    POST /projects/{id}/runs/retry: the project's first run did not end with every engine degraded
 //   run_in_progress                     the same: that first run has not finished
 //   retry_already_used                  the same: the one free retry of the first run was already taken
+//   no_first_run                        the same: the project has no run yet, so there is no first run to retry
+//   run_since_first_run                 the same: the project has run again since its first run, which is therefore not its latest outcome
 export const CONFLICT_REASONS = [
   "member_suspended",
   "already_member",
@@ -259,6 +261,8 @@ export const CONFLICT_REASONS = [
   "not_all_degraded",
   "run_in_progress",
   "retry_already_used",
+  "no_first_run",
+  "run_since_first_run",
 ] as const;
 
 export const conflictDetailsSchema = z

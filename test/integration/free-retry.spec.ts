@@ -150,14 +150,14 @@ describe("STORY-195 · the free retry of an all-degraded first run", () => {
     expect(await reasonOf(retry())).toBe("run_in_progress");
   });
 
-  it("STORY-195-AC4 a project with no run has nothing to retry: not_all_degraded", async () => {
-    expect(await reasonOf(retry())).toBe("not_all_degraded");
+  it("STORY-195-AC4 a project with no run has nothing to retry: no_first_run", async () => {
+    expect(await reasonOf(retry())).toBe("no_first_run");
   });
 
-  it("STORY-195-AC4 only the FIRST run is retried: a later run supersedes it", async () => {
+  it("STORY-195-AC4 only the FIRST run is retried: a later run supersedes it: run_since_first_run", async () => {
     await seedRun("failed", 60);
     await seedRun("completed", 10);
-    expect(await reasonOf(retry())).toBe("not_all_degraded");
+    expect(await reasonOf(retry())).toBe("run_since_first_run");
   });
 
   it("STORY-195-AC4 a failed later run after a completed first run is not retryable", async () => {
@@ -170,7 +170,7 @@ describe("STORY-195 · the free retry of an all-degraded first run", () => {
     const other = randomUUID();
     await seedProject(other);
     await seedRun("failed", 30, other);
-    expect(await reasonOf(retry(pool, projectId))).toBe("not_all_degraded");
+    expect(await reasonOf(retry(pool, projectId))).toBe("no_first_run");
     expect(await count("SELECT count(*)::text AS n FROM capture_runs WHERE retry_of IS NOT NULL")).toBe(0);
   });
 
