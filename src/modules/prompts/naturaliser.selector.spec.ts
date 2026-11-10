@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { GeminiNaturaliser } from "./adapters/gemini-naturaliser.js";
-import { selectRequestPathNaturaliser, selectNaturaliser } from "./naturaliser.selector.js";
+import { selectNaturaliser } from "./naturaliser.selector.js";
 
 // STORY-045 AC3 - the naturaliser is swappable by configuration, and a missing key degrades to the template-only path.
 
@@ -16,11 +16,5 @@ describe("STORY-045 AC3 - selectNaturaliser", () => {
 
   it.each([undefined, ""])("falls back to null (template-only) rather than failing when the key is %j", (key) => {
     expect(selectNaturaliser({ PROMPT_NATURALISER: "gemini", GEMINI_API_KEY: key, PROMPT_NATURALISER_MODEL: "m", PROMPT_NATURALISER_TIMEOUT_MS: 8000 })).toBeNull();
-  });
-
-  it("STORY-045 NFR-ARCH-04 - the request-path selection is null for gemini, so no adapter can await a provider under the handler's transaction", () => {
-    const env = { PROMPT_NATURALISER: "gemini" as const, GEMINI_API_KEY: "k", PROMPT_NATURALISER_MODEL: "m", PROMPT_NATURALISER_TIMEOUT_MS: 8000 };
-    expect(selectRequestPathNaturaliser(env)).toBeNull();
-    expect(selectNaturaliser(env)).toBeInstanceOf(GeminiNaturaliser);
   });
 });

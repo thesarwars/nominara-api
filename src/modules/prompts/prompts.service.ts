@@ -1,175 +1,125 @@
-import { Inject, Injectable, Optional } from "@nestjs/common";
-import type { ClientBase } from "pg";
-import type {
-  GeneratePromptsRequest,
-  GeneratePromptsResponse,
-  GeneratedVariant,
-  RejectedCandidate,
+import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import type { ClientBase, Pool } from "pg";
+import {
+  generatePromptsResponseSchema,
+  type GeneratePromptsAcceptedResponse,
+  type GeneratePromptsRequest,
+  type PromptGeneration,
 } from "../../../contracts/prompts/index.js";
 import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
-import { CACHE, type Cache } from "../../lib/cache/cache.port.js";
-import { l5TemplateCacheKey } from "../../lib/promptgen/cache-key.js";
-import type { Candidate } from "../../lib/promptgen/emit.js";
-import { DEFAULT_GENERATION_TEMPERATURE, DEFAULT_PRIORITY_SUBSET_SIZE, generatePass, type TemplateCache } from "../../lib/promptgen/generate.js";
-import { insertPromptStatement, type PromptRow } from "../../lib/promptgen/persist.js";
-import type { SlotContext } from "../../lib/promptgen/slots.js";
-import { promptTextHash } from "../../lib/promptgen/text-hash.js";
+import { PG_POOL } from "../../db/pg-pool.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
-import { loadEnv } from "../../config/env.js";
-import { currentTenantStore } from "../../tenancy/tenant-context.js";
-import { compareInSql, type VectorDedupePort } from "../../lib/promptgen/vector-dedupe.js";
-import { PROMPT_CANDIDATE_EMBEDDER, type CandidateEmbedder } from "./ports/candidate-embedder.js";
-import { PROMPT_NATURALISER, type PromptNaturaliser } from "./ports/naturaliser.js";
+import { failGeneration, promptGenerateKey } from "../../lib/promptgen/generation-job.js";
+import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
+import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
+import { afterCommit, currentTenantStore, withTenantContext } from "../../tenancy/tenant-context.js";
 
-// STORY-045 — `POST /v1/projects/{id}/prompts/generate`.
-// api-specification.md §5, tracking-engine.md §4.
+// STORY-045 - `POST /v1/projects/{id}/prompts/generate` and `GET /v1/projects/{id}/prompts/generations/{id}`.
+// api-specification.md §5, tracking-engine.md §4; OWNER DECISION 95(a) (2026-11-10): generation is a background job.
 //
-// THIN BY DESIGN. Every decision the generator makes lives in
-// src/lib/promptgen/ as a pure function, so this file does four things and
-// nothing else: read the project's context and its live text hashes, run the
-// pass, insert the rows in one transaction, and shape the response. That
-// split is what makes the backfill loop, the anonymous floor and the
-// determinism guarantee testable without a database.
+// OWNS `prompt_generations` (coding-standards.md: one table, one owning service); the pass itself is src/lib/promptgen/, run by the
+// `prompt.generate` job (src/lib/queue/handlers/prompt-generate.handler.ts).
 //
-// §8's L5 cache TTL: 30 days.
-const L5_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// THE QUEUE BOUNDARY (KAD-06). Nothing here calls a model or an embedding provider, or waits for one: the request validates, records ONE pending
+// row in the ambient transaction and, AFTER the commit, enqueues a signed job and returns 202. That is why this service holds no naturaliser,
+// no embedder and no cache any more - the naturaliser and vector dedupe run in the job, outside any transaction (ADR-0003). A failed enqueue is
+// compensated (the generation is settled failed(dispatch_failed)), never left pending for ever.
+//
+// Tenancy: every query runs on the ambient context-carrying client and carries `workspace_id = app.current_workspace()`; RLS is the guarantee.
+// The route's `@ProjectParam` guard has already checked the project is inside a scoped caller's scope.
 
-interface ProjectContextRow {
-  name: string;
-  root_domain: string;
-  category_slug: string | null;
-  verticals: string[] | null;
-  locale: string | null;
-  brand_aliases: string[] | null;
-}
+const tracer = trace.getTracer("nominara.prompt-generation-http");
+const logger = new Logger("prompts.generation.http");
 
 @Injectable()
 export class PromptsService {
   constructor(
-    @Inject(CACHE) private readonly cache: Cache,
-    // OPTIONAL, and that is the whole state of §4 step 4 today: no adapter is
-    // bound because which model naturalises is a dependency decision
-    // (development-workflow.md §6). Absent means every pass runs the
-    // `template_only` path, which is not a degraded mode but FR-FAN-01d's
-    // determinism guarantee.
-    @Optional() @Inject(PROMPT_NATURALISER) private readonly naturaliser: PromptNaturaliser | null = null,
-    // OPTIONAL and UNBOUND (see ports/candidate-embedder.ts): absent = exact-hash dedupe, `novelty` not measured.
-    @Optional() @Inject(PROMPT_CANDIDATE_EMBEDDER) private readonly embedder: CandidateEmbedder | null = null,
+    @Optional() @Inject(PG_POOL) private readonly pool?: Pool,
+    @Optional() private readonly queues?: QueueProducer,
   ) {}
 
-  async generate(projectId: string, request: GeneratePromptsRequest): Promise<GeneratePromptsResponse> {
-    // BOTH REFUSALS BEFORE ANY WORK. A caller who asked for something this
-    // build cannot do gets told so, rather than a plausible-looking response
-    // that silently did something else.
-    this.refuseUnsupported(request);
+  /** `POST /v1/projects/{id}/prompts/generate` - records a PENDING generation and queues the job that runs it. Charges nothing, ever. */
+  async requestGeneration(projectId: string, request: GeneratePromptsRequest): Promise<GeneratePromptsAcceptedResponse> {
+    return tracer.startActiveSpan("prompts.generation.http.request", async (span) => {
+      try {
+        // BOTH REFUSALS BEFORE ANYTHING IS RECORDED. A caller who asked for something this build cannot do is told so, rather than handed a
+        // pointer to a pass that silently did something else.
+        this.refuseUnsupported(request);
 
-    const store = currentTenantStore();
-    if (store === undefined) throw new Error("PromptsService.generate requires an active tenant context");
-    const client = store.client;
+        const store = currentTenantStore();
+        if (store === undefined) throw new Error("PromptsService.requestGeneration requires an active tenant context");
+        const tx = store.client;
+        const workspaceId = store.context.workspaceId;
 
-    const project = await this.loadProjectContext(client, projectId);
-    const existingHashes = await this.loadExistingHashes(client, projectId);
+        const project = await tx.query<{ id: string }>(
+          `SELECT id FROM projects WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL`,
+          [projectId],
+        );
+        if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
 
-    // The schema defaults these when the object is PRESENT; an absent object
-    // means the documented defaults, restated here rather than duplicated as
-    // `?? "template_first"` at each use.
-    const generation = request.generation ?? {
-      strategy: "template_first" as const,
-      naturalizer_enabled: true,
-      temperature: DEFAULT_GENERATION_TEMPERATURE,
-      single_batched_call: true,
-    };
-    const naturaliserEnabled = generation.strategy !== "template_only" && generation.naturalizer_enabled;
+        const generationId = uuidV7();
+        await tx.query(
+          `INSERT INTO prompt_generations (id, workspace_id, project_id, status, request)
+           VALUES ($1, app.current_workspace(), $2, 'pending', $3::jsonb)`,
+          [generationId, projectId, JSON.stringify(request)],
+        );
 
-    const pass = await generatePass({
-      generationBatchId: uuidV7(),
-      workspaceId: store.context.workspaceId,
-      projectId,
-      context: this.slotContext(project, request),
-      existingHashes,
-      batchSize: request.batch_size ?? 1,
-      prioritySubsetSize: request.options?.priority_subset_size ?? DEFAULT_PRIORITY_SUBSET_SIZE,
-      naturaliser: naturaliserEnabled ? this.naturaliser : null,
-      temperature: generation.temperature,
-      ...(this.embedder === null ? {} : { vectorDedupe: this.vectorDedupe(this.embedder, client, projectId) }),
-      ...(request.topic_hint === undefined ? {} : { topicHint: request.topic_hint }),
-      ...(project.locale === null ? {} : { locale: project.locale }),
-      ...(request.archetype_plan?.include === undefined ? {} : { includeArchetypes: request.archetype_plan.include }),
-      ...(request.archetype_plan?.exclude === undefined ? {} : { excludeArchetypes: request.archetype_plan.exclude }),
-      // No cache when nothing will be naturalised — there is nothing worth
-      // storing, and a `template_only` pass is already free and deterministic.
-      ...(naturaliserEnabled && this.naturaliser !== null
-        ? { cache: this.templateCache(store.context.workspaceId) }
-        : {}),
-    });
+        afterCommit(() => this.dispatch(workspaceId, projectId, generationId));
 
-    // THE DATABASE TAIL, and the only part that holds the project-row lock. The lock is taken AFTER the naturaliser and the embedder
-    // have answered (a provider call must never run under a row lock: it would block discovery's prepare/commit, confirm and PATCH for
-    // its whole duration), then the hashes are re-read so a prompt another writer committed in the meantime is not inserted twice.
-    await this.lockProject(client, projectId);
-    const committed = await this.loadExistingHashes(client, projectId);
-    const kept: number[] = [];
-    const raced: RejectedCandidate[] = [];
-    pass.rows.forEach((row, index) => {
-      const owner = committed.get(row.textHash.toString("hex"));
-      if (owner === undefined) kept.push(index);
-      else {
-        const candidate = pass.candidates[index]!;
-        raced.push({
-          text: row.text,
-          text_hash: promptTextHash(row.text).wire,
-          intent_archetype: candidate.archetype,
-          template_id: candidate.templateId,
-          reason: "rejected_duplicate",
-          conflicting_prompt_id: owner,
-        });
+        incrementCounter("nominara_prompts_generation_requests_total", { outcome: "queued" });
+        logger.log({ event: "prompts.generation.requested", workspace_id: workspaceId, project_id: projectId, generation_id: generationId });
+        return {
+          generation_batch_id: generationId,
+          status: "pending" as const,
+          poll_url: `/v1/projects/${projectId}/prompts/generations/${generationId}`,
+        };
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
       }
     });
-    const rows = kept.map((index) => pass.rows[index]!);
-    const candidates = kept.map((index) => pass.candidates[index]!);
+  }
 
-    for (const row of rows) {
-      const { sql, params } = insertPromptStatement(row);
-      await client.query(sql, [...params]);
-    }
-
+  /** `GET /v1/projects/{id}/prompts/generations/{generation_batch_id}` - the status of one pass and, once it succeeded, its result. */
+  async readGeneration(projectId: string, generationId: string): Promise<PromptGeneration> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("PromptsService.readGeneration requires an active tenant context");
+    const result = await store.client.query<{
+      id: string;
+      project_id: string;
+      status: PromptGeneration["status"];
+      result: unknown;
+      failure_code: PromptGeneration["failure_code"];
+      created_at: Date;
+      completed_at: Date | null;
+    }>(
+      `SELECT id, project_id, status, result, failure_code, created_at, completed_at
+         FROM prompt_generations
+        WHERE id = $1 AND project_id = $2 AND workspace_id = app.current_workspace()`,
+      [generationId, projectId],
+    );
+    const row = result.rows[0];
+    if (row === undefined) throw new NotFoundError({ message: "no such prompt generation" });
     return {
-      generation_batch_id: pass.rows[0]?.generationBatchId ?? uuidV7(),
-      variants: rows.map((row, index) => this.toVariant(row, candidates[index]!.slots, candidates[index]!.novelty)),
-      rejected: [...pass.rejected, ...raced],
-      coverage: [...pass.coverage],
-      summary:
-        raced.length === 0
-          ? pass.summary
-          : {
-              ...pass.summary,
-              generated: candidates.length,
-              accepted: candidates.length,
-              rejected_duplicate: pass.summary.rejected_duplicate + raced.length,
-              priority_flagged: rows.filter((row) => row.isPriority).length,
-            },
-      cached: pass.cached,
+      generation_batch_id: row.id,
+      project_id: row.project_id,
+      status: row.status,
+      // Validated on the way out: a stored result that no longer fits the contract fails loudly here, not in a client.
+      result: row.result === null ? null : generatePromptsResponseSchema.parse(row.result),
+      failure_code: row.failure_code,
+      requested_at: new Date(row.created_at).toISOString(),
+      completed_at: row.completed_at === null ? null : new Date(row.completed_at).toISOString(),
     };
   }
 
   /**
-   * The two documented request members this build cannot honour.
-   *
-   * `422 precondition_unmet` and not a new error code: `error-code.schema.ts`
-   * is a closed union whose own header says "a new code is a specification
-   * change to §2 first, this file second — never the other way round".
-   *
-   * MESSAGE ONLY, no `details`. §2 states no details member for
-   * `precondition_unmet`, and `domain-errors.ts` types that as
-   * `details?: never` on purpose — "inventing one at a throw site is now a
-   * type error rather than a silent new contract nobody reviewed". A
-   * structured `{ reason }` was tried first and correctly refused to compile;
-   * the reason belongs in the message until §2 gives the code a shape.
-   *
-   * REFUSED RATHER THAN IGNORED. A caller who set `auto_activate` and
-   * received `activated: 0` cannot tell that apart from activation running
-   * and selecting nothing — the same shape of quiet lie as an empty project
-   * list over a populated database.
+   * The two documented request members this build cannot honour: `422 precondition_unmet` and not a new error code (`error-code.schema.ts` is a
+   * closed union). MESSAGE ONLY, no `details` (§2 states none for this code). REFUSED RATHER THAN IGNORED: a caller who set `auto_activate` and
+   * received `activated: 0` cannot tell that apart from activation running and selecting nothing.
    */
   private refuseUnsupported(request: GeneratePromptsRequest): void {
     if (request.options?.auto_activate === true) {
@@ -184,161 +134,31 @@ export class PromptsService {
     }
   }
 
-  /**
-   * The project's own vocabulary, with the request's `brand_context` on top.
-   *
-   * §5 documents `brand_context` on the wire because onboarding generates
-   * BEFORE the discovery confirm step has written anything — so a caller can
-   * supply what the row does not have yet. Where a key is absent the stored
-   * value is used, which is why a caller sending only `topic_hint` still gets
-   * a full pass.
-   *
-   * NO WORKSPACE PREDICATE in the query below: RLS scopes the tenant
-   * (`NFR-SEC-01`), and adding one would imply the boundary lives here.
-   */
-  private slotContext(project: ProjectContextRow, request: GeneratePromptsRequest): SlotContext {
-    const supplied = request.brand_context ?? {};
-    const value = <T>(from: T | undefined, fallback: T | null): T | undefined => from ?? fallback ?? undefined;
-
-    return {
-      ...optional("brandName", value(supplied.brand_name, project.name)),
-      ...optional("categorySlug", value(supplied.category_slug, project.category_slug)),
-      ...optional("verticals", value(supplied.verticals, project.verticals)),
-      ...optional("competitors", supplied.competitors?.map((competitor) => competitor.name)),
-      ...optional("personas", supplied.personas),
-      ...optional("sizeBands", supplied.size_bands),
-      ...optional("integrations", supplied.integrations),
-      ...optional("complianceTerms", supplied.compliance_terms),
-      ...optional("capabilities", supplied.capabilities),
+  /** After the commit: sign and enqueue the job. A failure is compensated, counted and logged with the error NAME only. */
+  private dispatch(workspaceId: string, projectId: string, generationId: string): void {
+    const fail = (error: unknown): Promise<void> => {
+      incrementCounter("nominara_prompts_generation_requests_total", { outcome: "dispatch_failed" });
+      logger.error({ event: "prompts.generation.dispatch_failed", workspace_id: workspaceId, generation_id: generationId, error: error instanceof Error ? error.name : "unknown" });
+      return this.inFreshTx(workspaceId, (tx) => failGeneration(tx, generationId, "dispatch_failed").then(() => undefined)).catch((compensationError: unknown) => {
+        logger.error({ event: "prompts.generation.compensation_failed", workspace_id: workspaceId, generation_id: generationId, error: compensationError instanceof Error ? compensationError.name : "unknown" });
+      });
     };
+    if (this.queues === undefined) {
+      void fail(new Error("no queue producer"));
+      return;
+    }
+    void this.queues
+      .enqueueTenantJob("prompt.generate", workspaceId, { generationId, projectId }, { idempotencyKey: promptGenerateKey(generationId) })
+      .catch(fail);
   }
 
-  /**
-   * FOR NO KEY UPDATE is the lock crawl.discover's free-allowance writer takes on the same row (src/lib/discovery/free-prompts.ts).
-   * Taken here, after the provider calls and before the hashes are RE-READ, two writers of generated prompts cannot both see "nothing
-   * yet" and collide on the project's text-hash index. It does not block readers or the foreign-key checks a prompt insert makes.
-   */
-  private async lockProject(client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> }, projectId: string): Promise<void> {
-    const result = await client.query<{ id: string }>(`SELECT id FROM projects WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE`, [projectId]);
-    if (result.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
+  private async inFreshTx(workspaceId: string, fn: (tx: ClientBase) => Promise<unknown>): Promise<void> {
+    if (this.pool === undefined) return;
+    const client = await this.pool.connect();
+    try {
+      await withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, fn);
+    } finally {
+      client.release();
+    }
   }
-
-  private async loadProjectContext(
-    client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> },
-    projectId: string,
-  ): Promise<ProjectContextRow> {
-    const result = await client.query<ProjectContextRow>(
-      `SELECT name, root_domain, category_slug, verticals, locale, brand_aliases
-         FROM projects
-        WHERE id = $1 AND deleted_at IS NULL`,
-      [projectId],
-    );
-    const project = result.rows[0];
-    if (project === undefined) throw new NotFoundError({ message: "no such project" });
-    return project;
-  }
-
-  /**
-   * Every live `text_hash` in the project, mapped to the prompt that owns it.
-   *
-   * Read in ONE query rather than probed per candidate: fifteen round trips
-   * on the request path to answer a question one query answers, and the
-   * pipeline needs the whole set anyway to dedupe within the batch.
-   *
-   * `deleted_at IS NULL` matches `ux_prompts_project_hash`'s own predicate
-   * exactly — a soft-deleted prompt does not hold its hash, so a candidate
-   * colliding with one must be ACCEPTED. Using a wider predicate here would
-   * reject a variant the index would have let through.
-   */
-  private async loadExistingHashes(
-    client: { query: <R>(sql: string, params: unknown[]) => Promise<{ rows: R[] }> },
-    projectId: string,
-  ): Promise<ReadonlyMap<string, string>> {
-    const result = await client.query<{ id: string; text_hash: Buffer }>(
-      `SELECT id, text_hash FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL`,
-      [projectId],
-    );
-    return new Map(result.rows.map((row) => [row.text_hash.toString("hex"), row.id]));
-  }
-
-  /** §4 step 5: the injected embedder for the vectors, Postgres (pgvector) for every comparison. */
-  private vectorDedupe(embedder: CandidateEmbedder, client: Pick<ClientBase, "query">, projectId: string): VectorDedupePort {
-    return {
-      embed: (texts) => embedder.embed(texts),
-      compare: (vectors) => compareInSql(client, projectId, embedder.model, vectors),
-    };
-  }
-
-  /** §8's L5 cache, tenant-scoped and 30-day, behind the pipeline's narrow port. */
-  private templateCache(workspaceId: string): TemplateCache {
-    const env = loadEnv();
-    const cache = this.cache;
-    return {
-      async get(suffix) {
-        const raw = await cache.get(l5TemplateCacheKey({ env: env.NODE_ENV, workspaceId, topicNorm: suffix, locale: "" }));
-        if (raw === undefined) return undefined;
-        try {
-          const parsed: unknown = JSON.parse(raw);
-          // A cache entry is not a contract. Anything that is not an array of
-          // strings is treated as a miss rather than trusted into prompt text
-          // — the entry may predate a code change, or have been written by a
-          // version that stored a different shape.
-          if (!Array.isArray(parsed) || parsed.some((line) => typeof line !== "string")) return undefined;
-          return parsed as readonly string[];
-        } catch {
-          return undefined;
-        }
-      },
-      async set(suffix, lines) {
-        await cache.set(
-          l5TemplateCacheKey({ env: env.NODE_ENV, workspaceId, topicNorm: suffix, locale: "" }),
-          JSON.stringify(lines),
-          { ttlMs: L5_TTL_MS },
-        );
-      },
-    };
-  }
-
-  /**
-   * A stored row as §5's `variants[]` entry.
-   *
-   * `novelty` is what the vector comparison measured, or null on both members when none ran (no embedder bound, or the embedding
-   * failed): `max_cosine_to_existing` was not MEASURED, and reporting 0 would claim "measured, and maximally distant from
-   * everything" - a novelty check that reads as passed. A MEASURED 0 stays 0.
-   */
-  private toVariant(
-    row: PromptRow,
-    slots: Readonly<Record<string, string>>,
-    novelty: Candidate["novelty"],
-  ): GeneratedVariant {
-    const meta = row.generatorMeta as {
-      template_id: string;
-      naturalized: boolean;
-      brand_named: boolean;
-      competitor_named: boolean;
-    };
-    return {
-      prompt_id: row.id,
-      text: row.text,
-      text_hash: promptTextHash(row.text).wire,
-      intent_archetype: row.intentArchetype as GeneratedVariant["intent_archetype"],
-      funnel_stage: row.funnelStage,
-      template_id: meta.template_id,
-      naturalized: meta.naturalized,
-      brand_named: meta.brand_named,
-      competitor_named: meta.competitor_named,
-      slots: { ...slots },
-      novelty: {
-        max_cosine_to_existing: novelty?.maxCosineToExisting ?? null,
-        nearest_prompt_id: novelty?.nearestPromptId ?? null,
-      },
-      is_priority: row.isPriority,
-      status: row.status,
-    };
-  }
-}
-
-/** `exactOptionalPropertyTypes` forbids an explicit undefined, so a key is present or absent. */
-function optional<K extends string, V>(key: K, value: V | undefined): Partial<Record<K, V>> {
-  return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
 }

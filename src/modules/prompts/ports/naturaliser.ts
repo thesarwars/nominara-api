@@ -15,25 +15,13 @@
 // FR-FAN-01d's determinism guarantee and the documented fallback for an open
 // circuit.
 //
-// TWO THINGS TO SETTLE BEFORE AN ADAPTER IS WIRED, both flagged in the story:
+// WHERE IT RUNS (settled, owner decision 95(a), 2026-11-10): in the `prompt.generate` job, outside any transaction. The route answers 202 and
+// never awaits a model (KAD-06, NFR-ARCH-04); src/lib/queue/handlers/prompt-generate.handler.ts selects the adapter by configuration.
 //
-//   1. WHERE IT RUNS. `POST /v1/projects/{id}/prompts/generate` is documented
-//      as synchronous, returning `variants[]` — so a naturaliser call would
-//      sit on the request path. NFR-ARCH-01 forbids a request handler calling
-//      "an engine, an embedding provider, or a crawl target", and a
-//      naturaliser is none of those three, so the letter permits it. KAD-06 —
-//      "nothing expensive on the request path; everything external is
-//      enqueued" — points the other way. Resolving it may mean the endpoint
-//      becomes 202-and-poll like project creation, which is a contract
-//      change and belongs with whoever picks the model.
-//
-//   2. WHAT IT COSTS. Generation "never charges" (FR-FAN-01g), so the model
-//      call is absorbed. It therefore needs metering on the internal-cost
-//      path the way `embed_tokens` is metered — absorbed, never billed, but
-//      visible so a runaway is not silent. No metric exists for it:
-//      USAGE_METRICS holds `embed_tokens` and `arbiter_tokens` and nothing
-//      for naturalisation, and adding one is a change to
-//      schemas/billing-and-credits.md first.
+// WHAT IT COSTS (STILL OPEN): generation "never charges" (FR-FAN-01g), so the model call is absorbed. It needs metering on the internal-cost
+// path the way `embed_tokens` is metered - absorbed, never billed, but visible so a runaway is not silent. No metric exists for it:
+// USAGE_METRICS holds `embed_tokens` and `arbiter_tokens` and nothing for naturalisation, and adding one is a change to
+// schemas/billing-and-credits.md first. It also draws from no engine rate-limit bucket yet.
 
 export const PROMPT_NATURALISER = Symbol("PROMPT_NATURALISER");
 

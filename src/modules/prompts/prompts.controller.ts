@@ -12,12 +12,15 @@ import {
   activatePromptsPreviewResponseSchema,
   activatePromptsResponseSchema,
   generatePromptsRequestSchema,
-  generatePromptsResponseSchema,
+  generatePromptsAcceptedResponseSchema,
+  promptGenerationIdParamSchema,
+  promptGenerationSchema,
   type ActivatePromptsPreviewResponse,
   type ActivatePromptsRequest,
   type ActivatePromptsResponse,
   type GeneratePromptsRequest,
-  type GeneratePromptsResponse,
+  type GeneratePromptsAcceptedResponse,
+  type PromptGeneration,
 } from "../../../contracts/prompts/index.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
@@ -54,39 +57,48 @@ export class PromptsController {
     private readonly list: PromptListService,
   ) {}
 
-  // 200, not 202. §5's response carries `variants[]` — the prompts exist and
-  // are readable the moment it returns, unlike project creation where
-  // discovery is still running behind a 202.
+  // 202, NOT 200 (owner decision 95(a), 2026-11-10). The pass is a background job: the naturaliser and vector dedupe are external calls that may
+  // run neither in a request handler (NFR-ARCH-01) nor under this request's transaction (NFR-ARCH-04), so the route records a PENDING generation
+  // and answers with a pointer; `poll_url` is where it says `succeeded` and carries §5's old response as `result`. The prompts exist and are
+  // readable only once it has.
   //
-  // NO `@RequireEntitlement`, and that is FR-FAN-01g rather than an omission:
-  // "Generation is never capped by packaging. All 15 variants are produced
-  // and persisted; the plan's cap binds only at ACTIVATION." Every row lands
-  // `archived`, which `PROMPT_OCCUPIES_SLOT` excludes, so a pass consumes no
-  // plan capacity at all. §3's route table marks activate with `⛨ ¢` and
-  // generate with neither.
+  // NO `@RequireEntitlement`, and that is FR-FAN-01g rather than an omission: "Generation is never capped by packaging. All 15 variants are
+  // produced and persisted; the plan's cap binds only at ACTIVATION." Every row lands `archived`, which `PROMPT_OCCUPIES_SLOT` excludes, so a pass
+  // consumes no plan capacity at all, and a failed pass charges nothing either. §3's route table marks activate with `⛨ ¢` and generate with neither.
   @Post("generate")
-  @HttpCode(200)
-  // §3 marks this route `✚` — the interceptor refuses a missing key with a
-  // 400 before validation runs. A pass writes fifteen rows, so a retried
-  // submission must replay rather than double them.
+  @HttpCode(202)
+  // §3 marks this route `✚` — the interceptor refuses a missing key with a 400 before validation runs. A pass writes fifteen rows, so a retried
+  // submission must replay the same pointer rather than start a second pass.
   @Idempotent()
   @RequirePermission("prompt:write")
   @ProjectParam("id")
-  // Audited because a pass writes fifteen rows that shape every subsequent
-  // measurement: which questions the engines are asked IS the measurement,
-  // and a changed prompt set changes the meaning of every number after it.
-  @Audit({ action: "prompt.generated", resourceType: "project" })
+  // Audited because a pass shapes every subsequent measurement: which questions the engines are asked IS the measurement. The request is what a
+  // person did; the rows the job writes carry the generation id that ties them back to this entry.
+  @Audit({ action: "prompt.generation_requested", resourceType: "project" })
   @ApiContract({
     operationId: "generatePrompts",
     requestSchema: generatePromptsRequestSchema,
-    responseSchema: generatePromptsResponseSchema,
+    responseSchema: generatePromptsAcceptedResponseSchema,
   })
   generate(
     @Req() _req: RbacScopedRequest,
     @Param("id") projectId: string,
     @Body(new ZodValidationPipe(generatePromptsRequestSchema)) body: GeneratePromptsRequest,
-  ): Promise<GeneratePromptsResponse> {
-    return this.service.generate(projectId, body);
+  ): Promise<GeneratePromptsAcceptedResponse> {
+    return this.service.requestGeneration(projectId, body);
+  }
+
+  // Where a generation is read back. `tracking:read` like the prompt list: whoever may see the prompts may see how they came to be.
+  // Declared with a literal `generations` segment, so it is never read as a prompt id.
+  @Get("generations/:generationId")
+  @RequirePermission("tracking:read")
+  @ProjectParam("id")
+  @ApiContract({ operationId: "getPromptGeneration", responseSchema: promptGenerationSchema })
+  getGeneration(
+    @Param("id") projectId: string,
+    @Param("generationId", new ZodValidationPipe(promptGenerationIdParamSchema)) generationId: string,
+  ): Promise<PromptGeneration> {
+    return this.service.readGeneration(projectId, generationId);
   }
 
   // STORY-046 — §3: "activate a chosen subset; `403 entitlement_exceeded`
