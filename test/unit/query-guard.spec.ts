@@ -39,7 +39,8 @@ describe("STORY-011 · fix pass item 11 — TENANT_TABLES is a real, generated 5
     // 66 with STORY-068's `notification_reads` and `notification_emails` (migration 0135).
     // 67 with STORY-067's `task_verifications` (migration 0163).
     // 68 with STORY-098's `share_token_email_codes` (migration 0169).
-    expect(TENANT_TABLES.size).toBe(68);
+    // 69 with STORY-045's `prompt_generations` (migration 0193).
+    expect(TENANT_TABLES.size).toBe(69);
     for (const name of [
       "workspaces",
       "projects",

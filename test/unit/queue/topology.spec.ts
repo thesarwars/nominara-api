@@ -370,6 +370,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "moves there and only there (once per 7 days per project), then each category is recomputed in its own short transaction with lock and statement timeouts. Not tenant-scoped; the " +
       "cross-tenant read is inside two SECURITY DEFINER functions (ADR-0005). A queue of its own so a failure never rolls a tenant's rollup back and a DLQ entry names the job.",
   },
+  "prompt.generate": {
+    workerGroup: "crawl",
+    because:
+      "STORY-045 / owner decision 95(a) (2026-11-10): prompt generation is a background job. The naturaliser (a model call) and vector dedupe (an embedding call) may run neither in a " +
+      "request handler (NFR-ARCH-01) nor under the request's transaction (NFR-ARCH-04, ADR-0003), and §4's table allocates the pass no queue. A queue of its own, in the crawl group with " +
+      "the other jobs that call out (crawl.discover already embeds in its no-transaction run phase), tenant-scoped and signed, so a DLQ entry names the generation that failed.",
+  },
   "retention.purge": {
     workerGroup: "rollup",
     because:

@@ -300,6 +300,7 @@ export const SUBJECT_INVENTORY: Readonly<Record<string, InventoryEntry>> = Objec
   share_token_views: exportOf("share_token_views"),
   share_tokens: exportOf("share_tokens"),
   source_domains: exempt(WORKSPACE_CONFIG),
+  prompt_generations: exempt("Background prompt-generation pass: the request and the result hold brand vocabulary and prompt text, no person."),
   sso_configurations: exportOf("sso_configurations"),
   stripe_subscription_syncs: exempt("Billing sync log keyed by workspace; references no person."),
   subscription_addons: exportOf("subscription_addons"), // created_by references users

@@ -547,6 +547,21 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "catbench:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // NOT IN §4 EITHER - STORY-045 / OWNER DECISION 95(a) (2026-11-10): prompt generation is a background job. The pass's two external calls (the
+  // naturaliser, a model; and vector dedupe's embedder) may not run in a request handler (NFR-ARCH-01) nor under a transaction (NFR-ARCH-04, ADR-0003),
+  // and the generate route's ambient transaction made both impossible. The route records a pending `prompt_generations` row and answers 202; this
+  // queue runs the pass. Crawl group, with the other jobs that call out (`crawl.discover` already embeds in its no-transaction `run` phase); priority 1
+  // because onboarding shows a "generating" state and a person is waiting. Tenant-scoped and signed. One job per generation (the idempotency key).
+  {
+    name: "prompt.generate",
+    producer: "API (STORY-045 decision 95a; not in §4)",
+    workerGroup: "crawl",
+    concurrency: 3,
+    retry: { delaysMs: doubling(2) },
+    priority: 1,
+    idempotencyKeyPattern: "promptgen:{generation}",
+    tenantScoped: true,
+  },
   {
     name: "deploy.cms",
     producer: "API",

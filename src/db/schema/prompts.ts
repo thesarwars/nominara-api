@@ -11,6 +11,19 @@ import { sql } from "drizzle-orm";
 import { boolean, date, halfvec, integer, jsonb, numeric, pgTable, primaryKey, real, smallint, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { bytea } from "./columns.js";
 
+export const promptGenerations = pgTable("prompt_generations", {
+  id: uuid("id").primaryKey(),
+  workspaceId: uuid("workspace_id").notNull(),
+  projectId: uuid("project_id").notNull(),
+  status: text("status").notNull().default(sql`'pending'::text`),
+  request: jsonb("request").notNull(),
+  result: jsonb("result"),
+  failureCode: text("failure_code"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+});
+
 export const promptStability = pgTable("prompt_stability", {
   workspaceId: uuid("workspace_id").notNull(),
   promptId: uuid("prompt_id").notNull(),

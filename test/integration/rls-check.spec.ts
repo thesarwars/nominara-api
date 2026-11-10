@@ -75,6 +75,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0178_portal_source_domains_policy",
       // STORY-176 (ADR-0005) — checkRls() expects the four platform_aggregate_* policies migration 0190 creates (computeDefinerOwnerPolicies).
       "0190_platform_metrics_aggregate",
+      // STORY-045 (owner decision 95a) - the tenth post-0006 tenant table (prompt_generations); its policy ships in migration 0193.
+      "0193_prompt_generations",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

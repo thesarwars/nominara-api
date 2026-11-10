@@ -4,9 +4,6 @@ import { Client, Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { compareInSql, judgeVectors } from "../../src/lib/promptgen/vector-dedupe.js";
-import { StandInEmbeddingProvider, STAND_IN_EMBEDDING_MODEL } from "../../src/modules/prompts/adapters/stand-in-embedding-provider.js";
-import type { CandidateEmbedder } from "../../src/modules/prompts/ports/candidate-embedder.js";
-import { PromptsService } from "../../src/modules/prompts/prompts.service.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-045 AC6 - the vector half of §4 step 5 against REAL pgvector. The SQL is the unit under test: every cosine below is computed
@@ -81,7 +78,9 @@ describe("STORY-045 AC6 · vector dedupe against pgvector", () => {
     return id;
   }
 
-  const compare = (vectors: readonly (readonly number[])[], model = MODEL) => compareInSql(db, projectId, model, vectors);
+  // Under a tenant context, as the job runs it: the comparison carries `workspace_id = app.current_workspace()`.
+  const compare = (vectors: readonly (readonly number[])[], model = MODEL) =>
+    withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => compareInSql(tx, projectId, model, vectors));
 
   it("scenario 10 - 0.93 is rejected by generation dedupe, 0.85 is not, and the nearest prompt is named", async () => {
     const existing = await addPrompt("existing");
@@ -151,52 +150,6 @@ describe("STORY-045 AC6 · vector dedupe against pgvector", () => {
   it("an empty batch makes no query", async () => {
     expect(await compare([])).toEqual({ nearest: [], batchPairs: [] });
   });
-
-  it("scenario 6, end to end - the SERVICE rejects a near-duplicate of an existing prompt, keeps the earlier one, and reports why", async () => {
-    const embedder: CandidateEmbedder & { calls: number } = {
-      model: STAND_IN_EMBEDDING_MODEL,
-      calls: 0,
-      async embed(texts) {
-        this.calls += 1;
-        return (await new StandInEmbeddingProvider().embed(texts)).vectors;
-      },
-    };
-    // 14 of the 15 words of a candidate template plus one more word: a different text_hash (so exact-hash dedupe cannot catch it) and a
-    // bag-of-words cosine of 14/sqrt(14*15) = 0.966.
-    const nearText = "Shortlist 3 crm options for mid market b2b saas teams and explain the trade-offs please";
-    const stand = new StandInEmbeddingProvider();
-    const existingId = await addPrompt(nearText, { vector: (await stand.embed([nearText])).vectors[0]!, model: STAND_IN_EMBEDDING_MODEL });
-
-    const cache = { get: async () => undefined, set: async () => undefined } as never;
-    const service = new PromptsService(cache, null, embedder);
-    const client = await pool.connect();
-    try {
-      await db.query("UPDATE projects SET category_slug = 'crm', verticals = ARRAY['b2b_saas'] WHERE id = $1", [projectId]);
-      const response = await withTenantContext(client, { workspaceId, actorId: randomUUID() }, () =>
-        service.generate(projectId, {
-          brand_context: {
-            competitors: [{ name: "Salesforce" }],
-            personas: ["marketing_director"],
-            size_bands: ["mid_market"],
-            integrations: ["slack"],
-            compliance_terms: ["soc2"],
-            capabilities: ["pipeline_automation"],
-          },
-        } as never),
-      );
-
-      const rejected = response.rejected.find((row) => row.intent_archetype === "buyer_shortlist");
-      expect(rejected).toMatchObject({ reason: "rejected_duplicate", conflicting_prompt_id: existingId });
-      expect(response.summary.rejected_duplicate).toBe(response.rejected.length);
-      // The earlier prompt is untouched and the rejected text was never inserted.
-      const stored = await db.query<{ text: string }>("SELECT text FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL", [projectId]);
-      expect(stored.rows.map((r) => r.text)).toContain(nearText);
-      expect(stored.rows.map((r) => r.text)).not.toContain(rejected!.text);
-      // Measured, so a number - never the not-measured null.
-      expect(response.variants.every((v) => v.novelty.max_cosine_to_existing !== null)).toBe(true);
-      expect(response.variants.length).toBeGreaterThan(0);
-    } finally {
-      client.release();
-    }
-  });
+  // Scenario 6 end to end (the service rejecting a near-duplicate of an existing prompt) moved to test/integration/prompt-generation-job.spec.ts (D95a-2):
+  // generation is a background job now (owner decision 95a), so that is where the pass runs.
 });

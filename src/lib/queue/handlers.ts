@@ -32,6 +32,7 @@ import { createRollupCategoryBenchmarkHandler } from "./handlers/rollup-category
 import { createCrawlDiscoverHandler } from "./handlers/crawl-discover.handler.js";
 import { createRollupMetricDailyHandler } from "./handlers/rollup-metric-daily.handler.js";
 import { createSourceVerifyPresenceHandler } from "./handlers/source-verify-presence.handler.js";
+import { createPromptGenerateHandler } from "./handlers/prompt-generate.handler.js";
 import { createTaskGenerateHandler } from "./handlers/task-generate.handler.js";
 import { QUEUE_TOPOLOGY } from "./topology.js";
 import type { JobProcessor } from "./worker-factory.js";
@@ -127,6 +128,9 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  * waits for vectors. The daily GEO analyses still run inside the rollup (`refreshProjectGeo`); a `geo.analyze` payload that is not an alignment job is
  * ignored, not retried.
  *
+ * `prompt.generate` lands with STORY-045 (owner decision 95(a)): the background half of POST /projects/{id}/prompts/generate - the naturaliser and vector dedupe, outside
+ * any transaction. Its only producer is that route (after commit); a tick is refused because it is tenant-scoped.
+ *
  * `maintenance.partition` is the obvious first real entry — non-tenant-
  * scoped, and its logic already exists in src/workers/rollup/maintenance.ts,
  * invoked today only by a hand-run script (README gap G-10). Wiring it is a
@@ -134,6 +138,7 @@ export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor
  */
 export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "crawl.discover": (context) => createCrawlDiscoverHandler(context),
+  "prompt.generate": (context) => createPromptGenerateHandler(context),
   "geo.analyze": (context) => createGeoAnalyzeHandler(context),
   "capture.plan": (context) => createCapturePlanHandler(context),
   "crawl.audit": (context) => createCrawlAuditHandler(context),

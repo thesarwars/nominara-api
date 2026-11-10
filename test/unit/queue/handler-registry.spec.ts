@@ -87,6 +87,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "maintenance.integrity",
       "maintenance.partition",
       "notify.dispatch",
+      // STORY-045 / decision 95(a) - the background half of POST /projects/{id}/prompts/generate.
+      "prompt.generate",
       "report.build",
       "report.cleanup",
       "retention.purge",
@@ -157,6 +159,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "credit.verify",
       // STORY-176 / decision 93 — declared after credit.verify in topology.ts.
       "rollup.category_benchmark",
+      // STORY-045 / decision 95(a) - prompt.generate, declared after rollup.category_benchmark in topology.ts.
+      "prompt.generate",
     ]);
   });
 
