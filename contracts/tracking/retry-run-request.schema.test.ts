@@ -7,6 +7,9 @@ describe("STORY-195-AC4 retryRunRequestSchema", () => {
     expect(retryRunRequestSchema.parse({})).toEqual({});
     expect(retryRunRequestSchema.safeParse({ engines: ["x"] }).success).toBe(false);
   });
+  it("a first run that failed for a reason other than every engine degrading has its own refusal reason (decision 96b)", () => {
+    expect(conflictDetailsSchema.safeParse({ reason: "failure_not_degradation" }).success).toBe(true);
+  });
   it("the two distinct refusals are accepted conflict reasons", () => {
     for (const reason of ["no_first_run", "run_since_first_run"]) expect(conflictDetailsSchema.safeParse({ reason }).success, reason).toBe(true);
   });

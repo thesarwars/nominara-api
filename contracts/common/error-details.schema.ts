@@ -235,6 +235,7 @@ export const featureNotInPlanDetailsSchema = z
 //   not_all_degraded                    POST /projects/{id}/runs/retry: the project's first run did not end with every engine degraded
 //   run_in_progress                     the same: that first run has not finished
 //   retry_already_used                  the same: the one free retry of the first run was already taken
+//   failure_not_degradation             the same: the first run failed, but not because every engine degraded (the stale-run reaper's `stale_queued`, a failed dispatch, or no cell outcome showing a degraded engine; decision 96b "failed completely")
 //   no_first_run                        the same: the project has no run yet, so there is no first run to retry
 //   run_since_first_run                 the same: the project has run again since its first run, which is therefore not its latest outcome
 export const CONFLICT_REASONS = [
@@ -265,6 +266,7 @@ export const CONFLICT_REASONS = [
   "retry_already_used",
   "no_first_run",
   "run_since_first_run",
+  "failure_not_degradation",
 ] as const;
 
 export const conflictDetailsSchema = z
