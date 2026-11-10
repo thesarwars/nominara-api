@@ -28,6 +28,7 @@ import {
   type ExistingFinding,
   type FindingStatus,
   type LifecycleAction,
+  LIVE_FINDING_STATUSES,
 } from "../../aux/lifecycle.js";
 import { crawlPages, NOMINARA_USER_AGENT, type PageRecord } from "../../aux/page-crawl.js";
 import { pageFindingFingerprint, runPageRules, type PageRulesResult } from "../../aux/page-rules.js";
@@ -127,7 +128,7 @@ const TOKENIZER = AUX_AUDIT_TOKENIZER;
 const AUDIT_TRACKED_PATHS: readonly string[] = ["/"];
 const RAN_RULES = ["AUX-R-001", "AUX-R-002", "AUX-R-003", "AUX-R-004", "AUX-R-007"] as const;
 const TERMINAL_STATUSES = ["completed", "partial", "failed"];
-const OPEN_STATUSES = ["open", "acknowledged", "in_progress", "regressed"];
+const OPEN_STATUSES: readonly string[] = LIVE_FINDING_STATUSES;
 /**
  * The statuses the published crawler_access subscore and the critical cap read. A STALE finding is one we could not re-observe, not one
  * that was fixed: it must score exactly as it did while open, or an unreachable file reads as a fix (STORY-052 "stale versus resolved").

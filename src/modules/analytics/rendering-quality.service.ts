@@ -11,6 +11,7 @@ import {
   type OpenFinding,
 } from "../../lib/analytics/rendering-quality.js";
 import { measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
+import { LIVE_FINDING_STATUSES } from "../../lib/aux/lifecycle.js";
 import { ATTRIBUTE_CAPABLE_ENGINES } from "../../lib/parser/rendering.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { ScorecardsService } from "./scorecards.service.js";
@@ -118,16 +119,16 @@ export class RenderingQualityService {
     }));
   }
 
-  /** OPEN findings of the mapped rules, newest first (the pure builder picks by severity). */
+  /** LIVE findings (open, acknowledged, in progress, regressed) of the mapped rules, newest first (the pure builder picks by severity). */
   private async openCauseFindings(tx: ClientBase, projectId: string): Promise<OpenFinding[]> {
     const result = await tx.query<{ id: string; rule_code: string; severity: OpenFinding["severity"]; title: string }>(
       `SELECT f.id::text, f.rule_code, f.severity, f.title
          FROM aux_findings f
         WHERE f.project_id = $1
-          AND f.status = 'open'
           AND f.rule_code = ANY($2::text[])
+          AND f.status = ANY($3::text[])
         ORDER BY f.last_detected_at DESC, f.id ASC`,
-      [projectId, CAUSE_RULES],
+      [projectId, CAUSE_RULES, [...LIVE_FINDING_STATUSES]],
     );
     return result.rows.map((row) => ({ id: row.id, ruleCode: row.rule_code, severity: row.severity, title: row.title }));
   }
