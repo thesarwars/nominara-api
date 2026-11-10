@@ -229,6 +229,15 @@ export const featureNotInPlanDetailsSchema = z
 //   plan_change_not_pending             cancelling when nothing is pending
 // STORY-055 (review r3) - completing a seeding task with a contribution URL:
 //   no_source_domain                    the task has a playbook but no source domain to hold the URL to, so it cannot be verified
+// STORY-195 - onboarding surfaces:
+//   slug_taken                          POST /workspaces: the chosen workspace address is already in use; nothing was created
+//   slug_reserved                       POST /workspaces: the chosen address is one the product keeps (decision 96c); nothing was created
+//   not_all_degraded                    POST /projects/{id}/runs/retry: the project's first run did not end with every engine degraded
+//   run_in_progress                     the same: that first run has not finished
+//   retry_already_used                  the same: the one free retry of the first run was already taken
+//   failure_not_degradation             the same: the first run failed, but not because every engine degraded (the stale-run reaper's `stale_queued`, a failed dispatch, or no cell outcome showing a degraded engine; decision 96b "failed completely")
+//   no_first_run                        the same: the project has no run yet, so there is no first run to retry
+//   run_since_first_run                 the same: the project has run again since its first run, which is therefore not its latest outcome
 export const CONFLICT_REASONS = [
   "member_suspended",
   "already_member",
@@ -250,6 +259,14 @@ export const CONFLICT_REASONS = [
   "plan_change_pending",
   "plan_change_not_pending",
   "no_source_domain",
+  "slug_taken",
+  "slug_reserved",
+  "not_all_degraded",
+  "run_in_progress",
+  "retry_already_used",
+  "no_first_run",
+  "run_since_first_run",
+  "failure_not_degradation",
 ] as const;
 
 export const conflictDetailsSchema = z

@@ -8,6 +8,7 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { generateFreeAllowance } from "../../src/lib/discovery/free-prompts.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { reapStaleGenerations, STALE_GENERATION_AFTER_MINUTES } from "../../src/lib/promptgen/stale-generation-reaper.js";
 import { createPromptGenerateHandler, type PromptGenerateDeps } from "../../src/lib/queue/handlers/prompt-generate.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
@@ -99,7 +100,7 @@ describe("STORY-045 / decision 95(a) · the prompt.generate job", () => {
   const standInEmbedder = { model: STAND_IN_EMBEDDING_MODEL, embed: (texts: readonly string[]) => standIn.embed(texts) };
 
   /** One delivery of the job, signed for `ws`, through the real processor. `attemptsMade` 0 of 3 unless told. */
-  async function deliver(ws: string, project: string, generationId: string, deps: PromptGenerateDeps = {}, attemptsMade = 0): Promise<void> {
+  async function deliver(ws: string, project: string, generationId: string, deps: PromptGenerateDeps = {}, attemptsMade = 0, opts: Record<string, unknown> = { attempts: 3 }): Promise<void> {
     const context = { pool: appPool, env: { NODE_ENV: "test" } } as unknown as QueueHandlerContext;
     const process = createJobProcessor(ENTRY, {
       keys: KEYS,
@@ -108,7 +109,7 @@ describe("STORY-045 / decision 95(a) · the prompt.generate job", () => {
       process: createPromptGenerateHandler(context, { naturaliser: null, embedder: standInEmbedder, ...deps }),
     });
     const payload = { generationId, projectId: project, workspaceId: ws, kid: "k1" };
-    await process({ data: signQueueJobPayload(payload, KEYS.current.key), attemptsMade, opts: { attempts: 3 } } as unknown as Job);
+    await process({ data: signQueueJobPayload(payload, KEYS.current.key), attemptsMade, opts } as unknown as Job);
   }
 
   const generation = async (id: string): Promise<PromptGeneration | undefined> => {
@@ -352,4 +353,48 @@ describe("STORY-045 / decision 95(a) · the prompt.generate job", () => {
       await discoveryConn.end();
     }
   }, 60_000);
+
+  const age = (id: string, mins: number) => db.query("UPDATE prompt_generations SET created_at = now() - make_interval(mins => $2::int), updated_at = now() - make_interval(mins => $2::int) WHERE id = $1", [id, mins]);
+
+  it("D95a-15 · a generation left pending or running past the stale bound is settled failed(generation_failed); a fresh one is not", async () => {
+    const stale = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
+    const fresh = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
+    const staleRunning = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
+    await db.query("UPDATE prompt_generations SET status = 'running' WHERE id = $1", [staleRunning]);
+    await age(stale, STALE_GENERATION_AFTER_MINUTES + 1);
+    await age(staleRunning, STALE_GENERATION_AFTER_MINUTES + 1);
+    await age(fresh, STALE_GENERATION_AFTER_MINUTES - 5);
+
+    expect(await reapStaleGenerations(db, new Date())).toEqual({ reaped: 2 });
+
+    for (const id of [stale, staleRunning]) {
+      expect(await generation(id)).toMatchObject({ status: "failed", failure_code: "generation_failed", result: null });
+      expect((await generation(id))?.completed_at).not.toBeNull();
+    }
+    expect((await generation(fresh))?.status).toBe("pending");
+    expect(await reapStaleGenerations(db, new Date())).toEqual({ reaped: 0 });
+  });
+
+  it("D95a-16 · a settled generation is never touched by the sweep, however old", async () => {
+    const id = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
+    await deliver(workspaceId, projectId, id);
+    await age(id, 10_000);
+    expect(await reapStaleGenerations(db, new Date())).toEqual({ reaped: 0 });
+    expect((await generation(id))?.status).toBe("succeeded");
+  });
+
+  it("D95a-17 · a job redelivered after the sweep settled the generation does nothing: no prompts, the failure stands", async () => {
+    const id = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
+    await age(id, STALE_GENERATION_AFTER_MINUTES + 1);
+    await reapStaleGenerations(db, new Date());
+    await deliver(workspaceId, projectId, id);
+    expect(await generation(id)).toMatchObject({ status: "failed", failure_code: "generation_failed", result: null });
+    expect(await promptCount()).toBe(0);
+  });
+
+  it("D95a-18 · a job whose attempt count is unknown is treated as final: its failure settles the generation instead of leaving it running", async () => {
+    const id = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
+    await expect(deliver(workspaceId, projectId, id, { embedder: brokenCompare }, 0, {})).resolves.toBeUndefined();
+    expect(await generation(id)).toMatchObject({ status: "failed", failure_code: "generation_failed" });
+  });
 });

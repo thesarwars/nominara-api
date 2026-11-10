@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { ConflictException, Inject, Injectable, Logger, NotFoundException, Optional } from "@nestjs/common";
 import type { ClientBase, Pool } from "pg";
-import { DegradedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
+import { ConflictError, DegradedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { entityTagFor } from "../../api/etag/entity-tag.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
@@ -30,6 +30,7 @@ import { SessionService } from "../identity/session.service.js";
 import { DEK_PROVISIONER, type DekProvisioner } from "./ports/dek-provisioner.js";
 import { isWorkspaceUsable, MembershipService } from "./membership.service.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import { isReservedWorkspaceSlug } from "../../../contracts/workspaces/reserved-slugs.js";
 import type {
   CreateWorkspaceRequest,
   MemberResponse,
@@ -259,13 +260,19 @@ export class WorkspacesService {
    */
   async create(userId: string, input: CreateWorkspaceRequest, meta: AuditRequestMeta): Promise<WorkspaceResponse> {
     const workspaceId = uuidV7();
-    const baseSlug = kebabCase(input.name);
+    const supplied = input.slug !== undefined;
+    const baseSlug = input.slug ?? kebabCase(input.name);
+    // Decision 96(c): a reserved address the caller chose is refused, naming why; one derived from the name takes a suffix from the start.
+    if (supplied && isReservedWorkspaceSlug(baseSlug)) {
+      throw new ConflictError({ message: "this workspace address is reserved", details: { reason: "slug_reserved" } });
+    }
+    const derivedReserved = !supplied && isReservedWorkspaceSlug(baseSlug);
     const orgType = input.org_type ?? "in_house";
     const region = input.region ?? "us-east-1";
     const timezone = input.timezone ?? "UTC";
 
     for (let attempt = 0; attempt < MAX_SLUG_ATTEMPTS; attempt++) {
-      const slug = attempt === 0 ? baseSlug : `${baseSlug}-${randomBytes(3).toString("hex")}`;
+      const slug = attempt === 0 && !derivedReserved ? baseSlug : `${baseSlug}-${randomBytes(3).toString("hex")}`;
       const client = await this.pool.connect();
       try {
         return await withTenantContext(client, { workspaceId, actorId: userId }, (tx) =>
@@ -274,6 +281,10 @@ export class WorkspacesService {
       } catch (error) {
         const pg = error as { code?: string; constraint?: string };
         if (pg?.code === "23505" && pg.constraint === "ux_workspaces_slug") {
+          // A slug the caller chose is never silently altered (STORY-195 AC2): refuse it, naming why.
+          if (supplied) {
+            throw new ConflictError({ message: "this workspace address is already taken", details: { reason: "slug_taken" } });
+          }
           continue;
         }
         if (pg?.code === "23505" && pg.constraint === "ux_one_owned_workspace_per_user") {

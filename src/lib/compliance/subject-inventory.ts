@@ -67,7 +67,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   capture_runs: {
     columns:
-      "id workspace_id project_id trigger triggered_by engine_keys prompt_scope scope_ref planned_cells skipped_cells captured_cells failed_cells scoring_version status error_summary started_at finished_at created_at",
+      "id workspace_id project_id trigger triggered_by engine_keys prompt_scope scope_ref planned_cells skipped_cells captured_cells failed_cells scoring_version status error_summary started_at finished_at created_at retry_of",
     omit: "",
   },
   competitors: {
@@ -222,7 +222,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   workspace_members: {
     columns:
-      "id workspace_id user_id role project_scope status invited_by joined_at last_active_at created_at updated_at digest_cadence",
+      "id workspace_id user_id role project_scope status invited_by joined_at last_active_at created_at updated_at digest_cadence sentiment_alerts_enabled",
     omit: "",
   },
   workspaces: {

@@ -68,6 +68,7 @@ export const captureRuns = pgTable("capture_runs", {
   startedAt: timestamp("started_at", { withTimezone: true }),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  retryOf: uuid("retry_of"),
 });
 
 export const citationFacts = pgTable("citation_facts", {

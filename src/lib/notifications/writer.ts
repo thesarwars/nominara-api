@@ -3,7 +3,7 @@ import type { ClientBase } from "pg";
 import { notificationDeepLinkSchema, type NotificationDeepLink, type NotificationSeverity } from "../../../contracts/notifications/index.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { incrementCounter } from "../telemetry/metrics.js";
-import { emailableMembers, seesProject } from "./audience.js";
+import { emailableMembers, SENTIMENT_ALERT_KIND, seesProject } from "./audience.js";
 import { renderImmediateEmail } from "./render.js";
 import { channelsFor, emailJobKey, emailsImmediately, NOTIFY_DISPATCH_QUEUE, type EnqueueNotifyDispatch } from "./routing.js";
 
@@ -73,6 +73,7 @@ export async function writeNotification(tx: ClientBase, input: NotificationInput
   const emailIds: string[] = [];
   for (const member of await emailableMembers(tx, input.workspaceId, input.userId)) {
     if (!seesProject(member.visible, input.projectId)) continue;
+    if (input.kind === SENTIMENT_ALERT_KIND && !member.sentimentAlerts) continue;
     const row = await tx.query<{ id: string }>(
       `INSERT INTO notification_emails (workspace_id, user_id, kind, dedupe_key, notification_id, notification_count, status, subject, text_body)
        VALUES ($1, $2, 'immediate', $3, $4, 1, 'pending', $5, $6)

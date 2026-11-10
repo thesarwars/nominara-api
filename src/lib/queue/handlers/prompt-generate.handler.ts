@@ -53,10 +53,12 @@ export interface PromptGenerateDeps {
   readonly cache?: Cache;
 }
 
-/** BullMQ increments `attemptsMade` when an attempt fails, so during attempt N it is N-1. An unknown attempt count is "not known to be final". */
+/**
+ * BullMQ increments `attemptsMade` when an attempt fails, so during attempt N it is N-1. An unknown attempt count is ONE attempt (the same default as
+ * willBullmqRetry), so a failure always settles the generation rather than leaving it `running`.
+ */
 function isFinalAttempt(job: Pick<Job, "attemptsMade" | "opts">): boolean {
-  const attempts = job.opts?.attempts;
-  if (attempts === undefined) return false;
+  const attempts = job.opts?.attempts ?? 1;
   return (job.attemptsMade ?? 0) + 1 >= attempts;
 }
 

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { NotFoundException } from "@nestjs/common";
+import { ConflictError } from "../../src/api/errors/domain-errors.js";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Client, Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -194,6 +195,56 @@ describe("STORY-021 · workspace creation and the one-owned invariant", () => {
 
     expect(second.slug).not.toBe(first.slug);
     expect(await countRows("workspaces", second.id, "id")).toBe(1);
+  });
+
+  it("STORY-195-AC2 a supplied slug is stored as given, and a taken one is refused with slug_taken and creates nothing", async () => {
+    const service = makeService();
+    const ownerA = await createUser();
+    const ownerB = await createUser();
+
+    const first = await service.create(ownerA, { name: "Anything", slug: "my-chosen-slug" }, meta);
+    expect(first.slug).toBe("my-chosen-slug");
+
+    const refusal = await service.create(ownerB, { name: "Other", slug: "my-chosen-slug" }, meta).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(ConflictError);
+    expect((refusal as { details: unknown }).details).toEqual({ reason: "slug_taken" });
+
+    const owned = await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [ownerB]);
+    expect(owned.rowCount).toBe(0);
+    // The refusal did not trip the one-owned invariant: ownerB can still create.
+    const retry = await service.create(ownerB, { name: "Other", slug: "other-slug" }, meta);
+    expect(retry.slug).toBe("other-slug");
+  });
+
+  it("STORY-195-AC2 a taken slug is refused for a second caller too (the unique index, not a pre-check, decides)", async () => {
+    const service = makeService();
+    const ownerA = await createUser();
+    const ownerB = await createUser();
+    await service.create(ownerA, { name: "A", slug: "acme" }, meta);
+    await expect(service.create(ownerB, { name: "B", slug: "acme" }, meta)).rejects.toBeInstanceOf(ConflictError);
+  });
+
+  it.each(["admin", "api", "www", "app", "support", "help", "billing", "status", "auth", "onboarding"])(
+    "[decision 96c] a supplied reserved slug %s is refused 409 slug_reserved and creates nothing",
+    async (reserved) => {
+      const service = makeService();
+      const owner = await createUser();
+      const refusal = await service.create(owner, { name: "Acme", slug: reserved }, meta).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(ConflictError);
+      expect((refusal as { details: unknown }).details).toEqual({ reason: "slug_reserved" });
+      expect((await db.query("SELECT 1 FROM workspace_members WHERE user_id = $1", [owner])).rowCount).toBe(0);
+    },
+  );
+
+  it("[decision 96c] a server-derived slug that would be reserved takes a suffix instead", async () => {
+    const service = makeService();
+    const created = await service.create(await createUser(), { name: "Admin" }, meta);
+    expect(created.slug).toMatch(/^admin-[0-9a-f]{6}$/);
+  });
+
+  it("[decision 96c] a slug that merely contains a reserved word is not reserved", async () => {
+    const created = await makeService().create(await createUser(), { name: "Admin Co", slug: "admin-co" }, meta);
+    expect(created.slug).toBe("admin-co");
   });
 
   // ---- scenario 3 ---------------------------------------------------------

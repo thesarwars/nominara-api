@@ -48,9 +48,17 @@ export interface PhaseFailure<Prepared, Fetched> {
   readonly fetched?: Fetched;
 }
 
+/**
+ * STORY-195 - what `run` is handed so it can WRITE progress without holding a transaction across its own awaits: `fn` runs in its own short
+ * tenant transaction (the same workspace, signature already verified) that commits when `fn` returns. Called as a plain function on one
+ * client, it simply runs `fn` on that client.
+ */
+export type TenantStep = <T>(fn: (tx: ClientBase) => Promise<T>) => Promise<T>;
+
 export interface JobPhases<Prepared, Fetched> {
   prepare(tx: ClientBase, job: Job): Promise<Prepared | typeof PHASES_DONE>;
-  run(prepared: Prepared, job: Job): Promise<Fetched>;
+  /** `step` is optional: a handler with no progress to write ignores it, and a direct caller may omit it. */
+  run(prepared: Prepared, job: Job, step?: TenantStep): Promise<Fetched>;
   commit(tx: ClientBase, prepared: Prepared, fetched: Fetched, job: Job): Promise<void>;
   /**
    * Optional. Called when ANY phase throws, in a FRESH tenant transaction (the failed one is rolled back and may be aborted),
@@ -71,7 +79,7 @@ export function phasedProcessor<Prepared, Fetched>(phases: JobPhases<Prepared, F
   const composed: JobProcessor<void> = async (tx, job) => {
     const prepared = await phases.prepare(tx, job);
     if (prepared === PHASES_DONE) return;
-    const fetched = await phases.run(prepared, job);
+    const fetched = await phases.run(prepared, job, (fn) => fn(tx));
     await phases.commit(tx, prepared, fetched, job);
   };
   return Object.assign(composed, { [PHASES]: phases });
@@ -151,7 +159,7 @@ export function createJobProcessor(entry: QueueTopologyEntry, options: JobProces
         const prepared = await inTenantTransaction((tx) => phases.prepare(tx, job));
         if (prepared === PHASES_DONE) return undefined;
         at = { error: undefined, phase: "run", prepared };
-        const fetched = await phases.run(prepared, job);
+        const fetched = await phases.run(prepared, job, inTenantTransaction);
         at = { error: undefined, phase: "commit", prepared, fetched };
         await inTenantTransaction((tx) => phases.commit(tx, prepared, fetched, job));
         return undefined;

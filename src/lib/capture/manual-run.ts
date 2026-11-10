@@ -254,7 +254,7 @@ export async function estimateManualRun(
 }
 
 /** `no_shared_cache` inverted — the plan key is a negative, the planner's flag is a positive. */
-function sharedCacheEnabled(entitlements: ResolvedEntitlementsResponse["entitlements"]): boolean {
+export function sharedCacheEnabled(entitlements: ResolvedEntitlementsResponse["entitlements"]): boolean {
   return entitlements["no_shared_cache"]?.value !== true;
 }
 

@@ -37,7 +37,16 @@ describe("STORY-021 · createWorkspaceRequestSchema (scenario 1 — create a wor
   });
 
   it("rejects an unrecognized key (.strict())", () => {
-    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: "acme" }).success).toBe(false);
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", owner: "x" }).success).toBe(false);
+  });
+
+  it("STORY-195-AC2 accepts an optional kebab-case slug and rejects a malformed one", () => {
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: "acme-2" }).success).toBe(true);
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme" }).success).toBe(true);
+    for (const bad of ["", "Acme", "-acme", "acme-", "a--b", "a b", "a_b", "a".repeat(61)]) {
+      expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: bad }).success, bad).toBe(false);
+    }
+    expect(createWorkspaceRequestSchema.safeParse({ name: "Acme", slug: "a".repeat(60) }).success).toBe(true);
   });
 
   it("rejects a region outside the two CHECK-legal values", () => {
@@ -261,5 +270,14 @@ describe("STORY-021 · acceptInvitationRequestSchema (scenario 11 — accepting 
 
   it("rejects an unrecognized key (.strict())", () => {
     expect(acceptInvitationRequestSchema.safeParse({ token: "raw-secret", role: "manager" }).success).toBe(false);
+  });
+});
+
+describe("STORY-195 · the conflict reasons onboarding adds are in the closed enum", () => {
+  it("STORY-195-AC2/AC4 slug_taken and the three free-retry refusals are accepted conflict reasons", async () => {
+    const { conflictDetailsSchema } = await import("../../contracts/common/error-details.schema.js");
+    for (const reason of ["slug_taken", "not_all_degraded", "run_in_progress", "retry_already_used", "no_first_run", "run_since_first_run"]) {
+      expect(conflictDetailsSchema.safeParse({ reason }).success, reason).toBe(true);
+    }
   });
 });
