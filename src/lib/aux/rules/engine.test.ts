@@ -100,7 +100,7 @@ describe("STORY-051 · the rule engine", () => {
   });
 
   it("STORY-051 AC1, AC10 · rules built on an interim reading are recorded as PARTIAL with the document-model field they need", () => {
-    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027", "AUX-R-029"]);
+    expect(Object.keys(AUX_RULES_PARTIAL).sort()).toEqual(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027", "AUX-R-029"]);
     const built = new Set(AUX_RULES.map((r) => r.code));
     for (const [code, why] of Object.entries(AUX_RULES_PARTIAL)) {
       expect(built.has(code), code).toBe(true);

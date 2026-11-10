@@ -1314,7 +1314,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     it("STORY-051 AC13 · AUX_RULES_PARTIAL is surfaced as its own annotation: error_summary.rules_partial names the partly-checked rules that ran, not the ones that were excluded", async () => {
       await run(job(), depsServing(healthy(OPEN)));
       const partial: string[] = (await audits())[0].error_summary.rules_partial;
-      expect(partial).toEqual(expect.arrayContaining(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-021", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027"]));
+      expect(partial).toEqual(expect.arrayContaining(["AUX-R-006", "AUX-R-013", "AUX-R-016", "AUX-R-017", "AUX-R-018", "AUX-R-019", "AUX-R-020", "AUX-R-023", "AUX-R-025", "AUX-R-026", "AUX-R-027"]));
       expect(partial).not.toContain("AUX-R-029"); // no timing: it did not run, so it is excluded, not partial
             expect(partial).toEqual([...partial].sort());
       expect(new Set(partial).size).toBe(partial.length);

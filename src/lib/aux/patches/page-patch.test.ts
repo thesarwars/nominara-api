@@ -75,7 +75,7 @@ describe("STORY-053 scenario 1 / 2 · AUX-R-014 produces a jsonld patch from the
 });
 
 describe("STORY-053 scenario 1 · AUX-R-023 produces a markdown structure patch", () => {
-  const longBlocks = { tokens: 900, sentences: { count: 30, meanWords: 20, maxWords: 40 } };
+  const longBlocks = { tokens: 900, longestUnstructuredTokens: 900, sentences: { count: 30, meanWords: 20, maxWords: 40 } };
   const textDoc = (): AuxDocument =>
     makeDoc({
       raw: variant({ mainText: "Acme Widgets\nAcme builds widgets for teams. We ship every week and we support every plan with care across all regions.\nPipeline analytics\nSee every deal." }),

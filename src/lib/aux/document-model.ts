@@ -84,6 +84,11 @@ export interface ContentBlock {
   /** 1-6; 0 for the content before the first heading. */
   readonly level: number;
   readonly tokens: number;
+  /**
+   * Tokens in the longest run of text with no intervening list or table (the section itself ends at its next heading). The text inside a list or
+   * table is not part of any run. 0 for a section with no text of its own: a measured 0, never null (AUX-R-021).
+   */
+  readonly longestUnstructuredTokens: number;
   readonly sentences: { readonly count: number; /** null = no sentences, which is not a mean of 0. */ readonly meanWords: number | null; readonly maxWords: number };
   readonly longestParagraphChars: number;
   readonly tables: number;
@@ -251,6 +256,9 @@ interface BlockDraft {
   heading: string | null;
   level: number;
   parts: string[];
+  /** The text of the run in progress (outside any list or table), and the longest run closed so far, in tokens. */
+  run: string[];
+  longestRunTokens: number;
   longestParagraphChars: number;
   tables: number;
   ordered: number;
@@ -259,7 +267,7 @@ interface BlockDraft {
   codeSpans: number;
 }
 
-const newDraft = (heading: string | null, level: number): BlockDraft => ({ heading, level, parts: [], longestParagraphChars: 0, tables: 0, ordered: 0, unordered: 0, definition: 0, codeSpans: 0 });
+const newDraft = (heading: string | null, level: number): BlockDraft => ({ heading, level, parts: [], run: [], longestRunTokens: 0, longestParagraphChars: 0, tables: 0, ordered: 0, unordered: 0, definition: 0, codeSpans: 0 });
 
 const SENTENCE_BREAK = /(?<=[.!?])["')\]]*\s+(?=\S)/u;
 
@@ -284,20 +292,33 @@ function contentBlocks(body: Element, tokenizer: Tokenizer): ContentBlock[] {
   const drafts: BlockDraft[] = [];
   let current = newDraft(null, 0);
 
-  const visit = (node: Node, inPre: boolean): void => {
+  const closeRun = (): void => {
+    current.longestRunTokens = Math.max(current.longestRunTokens, tokenizer.count(normalise(current.run)));
+    current.run = [];
+  };
+  // `inBreak`: inside a list or table, whose text is part of the section but of no run.
+  const emit = (text: string, inBreak: boolean): void => {
+    current.parts.push(text);
+    if (!inBreak) current.run.push(text);
+  };
+
+  const visit = (node: Node, inPre: boolean, inBreak: boolean): void => {
     for (const child of childrenOf(node)) {
       if (isText(child)) {
-        current.parts.push(child.value);
+        emit(child.value, inBreak);
         continue;
       }
       if (!isElement(child) || INVISIBLE.has(child.tagName) || skip(child)) continue;
       const tag = child.tagName;
       const h = /^h([1-6])$/u.exec(tag);
       if (h !== null) {
+        closeRun();
         drafts.push(current);
         current = newDraft(inline(child), Number(h[1]));
         continue;
       }
+      const breaks = tag === "table" || tag === "ul" || tag === "ol" || tag === "dl";
+      if (breaks && !inBreak) closeRun();
       if (tag === "table") current.tables += 1;
       else if (tag === "ul") current.unordered += 1;
       else if (tag === "ol") current.ordered += 1;
@@ -306,12 +327,13 @@ function contentBlocks(body: Element, tokenizer: Tokenizer): ContentBlock[] {
       else if (tag === "code" && !inPre) current.codeSpans += 1;
       else if (tag === "p") current.longestParagraphChars = Math.max(current.longestParagraphChars, [...inline(child)].length);
       const block = BLOCK.has(tag);
-      if (block) current.parts.push("\n");
-      visit(child, inPre || tag === "pre");
-      if (block) current.parts.push("\n");
+      if (block) emit("\n", inBreak);
+      visit(child, inPre || tag === "pre", inBreak || breaks);
+      if (block) emit("\n", inBreak);
     }
   };
-  visit(root, false);
+  visit(root, false, false);
+  closeRun();
   drafts.push(current);
 
   const blocks: ContentBlock[] = [];
@@ -323,6 +345,7 @@ function contentBlocks(body: Element, tokenizer: Tokenizer): ContentBlock[] {
       heading: d.heading,
       level: d.level,
       tokens: tokenizer.count(text),
+      longestUnstructuredTokens: d.longestRunTokens,
       sentences: sentenceStats(text),
       longestParagraphChars: d.longestParagraphChars,
       tables: d.tables,

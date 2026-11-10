@@ -68,7 +68,6 @@ const PARTIAL_READINGS: Readonly<Record<string, string>> = {
   "AUX-R-018": "Compares only the catalog singleton_types (Organization, WebSite and similar), so two Product blocks with different names are not reported: a listing page legitimately describes many products, and a page with exactly one Product block that two plugins both emit is missed. The reference says any @type; narrowing it needs a rule for telling a listing from a duplicate.",
   "AUX-R-019": "Measures the raw copy's token count while no renderer is installed; the reference defines it on rendered.tokenCount.",
   "AUX-R-020": "Measures the raw copy's main-content ratio while no renderer is installed; the reference defines it on rendered tokens.",
-  "AUX-R-021": "A list or table anywhere in a section counts as a break, so a long wall of text with one list at its end passes. Needs the longest unstructured token run per content block (a STORY-050 ContentBlock field).",
   "AUX-R-023": "A whole short section stands in for the summary paragraph. Needs sentence counts per paragraph (a STORY-050 ContentBlock field).",
   "AUX-R-025": "Sees images in the plain HTML only, so script-injected images are missed. Needs per-image records (source, alt, adjacent text) in the document model.",
   "AUX-R-026": "Undecidable without a rendered copy: with rendered null (STORY-049 has no renderer) it returns no finding, so it can never fire today. A page with no rendered copy keeps AUX-R-026 in excluded_rules for that audit; it is not a pass.",

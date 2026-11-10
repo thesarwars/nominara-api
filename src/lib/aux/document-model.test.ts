@@ -185,6 +185,29 @@ describe("STORY-050 document model", () => {
     expect(b!.sentences.meanWords).not.toBeNull();
   });
 
+  it("STORY-051 AC10 · longestUnstructuredTokens is the longest run of text between breaks (a list, a table), not the section's total, and the text inside a list or table is no run", () => {
+    const html = `<html><body><main><h2>S</h2><p>a b c d e</p><ul><li>x y z</li></ul><p>f g</p><table><tr><td>t u v w</td></tr></table><p>h i j</p></main></body></html>`;
+    const [b] = build({ rawHtml: html }).blocks;
+    expect(b!.longestUnstructuredTokens).toBe(5);
+    expect(b!.tokens).toBe(5 + 3 + 2 + 4 + 3);
+  });
+  it("STORY-051 AC10 · a section with no structure is one run: the run equals the section's tokens; an empty section is 0, not null", () => {
+    const [a] = build({ rawHtml: `<html><body><main><h2>S</h2><p>one two three</p><p>four five</p></main></body></html>` }).blocks;
+    expect(a!.longestUnstructuredTokens).toBe(5);
+    expect(a!.longestUnstructuredTokens).toBe(a!.tokens);
+    const [e] = build({ rawHtml: `<html><body><main><h2>Empty</h2></main></body></html>` }).blocks;
+    expect(e!.longestUnstructuredTokens).toBe(0);
+  });
+  it("STORY-051 AC10 · a subheading ends the run: the next section starts its own", () => {
+    const blocks = build({ rawHtml: `<html><body><main><h2>A</h2><p>a b c</p><h3>B</h3><p>d e f g</p></main></body></html>` }).blocks;
+    expect(blocks.map((b) => [b.heading, b.longestUnstructuredTokens])).toEqual([["A", 3], ["B", 4]]);
+  });
+  it("STORY-051 AC10 · a list nested in a list does not restart the count, and a paragraph after a list is a new run", () => {
+    const html = `<html><body><main><h2>S</h2><ul><li>a b<ul><li>c d</li></ul></li></ul><p>e f g h i j</p></main></body></html>`;
+    const [b] = build({ rawHtml: html }).blocks;
+    expect(b!.longestUnstructuredTokens).toBe(6);
+  });
+
   it("STORY-050 #8b · a section with no sentences has meanWords null (not 0) and a paragraph length", () => {
     const [b] = build({ rawHtml: `<html><body><main><h2>Empty</h2></main></body></html>` }).blocks;
     expect(b!.sentences).toEqual({ count: 0, meanWords: null, maxWords: 0 });
