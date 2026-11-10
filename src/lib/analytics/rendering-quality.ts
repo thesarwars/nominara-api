@@ -47,7 +47,7 @@ export interface EngineCounts {
   readonly withAttr: Readonly<Partial<Record<RenderingAttribute, number>>>;
 }
 
-export interface OpenFinding {
+export interface LiveFinding {
   readonly id: string;
   readonly ruleCode: string;
   readonly severity: RenderingCause["severity"];
@@ -65,8 +65,8 @@ export interface EngineInput {
 export interface RenderingQualityInput {
   readonly engines: readonly EngineInput[];
   readonly counts: readonly EngineCounts[];
-  /** Open findings of the mapped rules, newest first. */
-  readonly findings: readonly OpenFinding[];
+  /** Live findings (open, acknowledged, in progress, regressed) of the mapped rules, newest first. */
+  readonly findings: readonly LiveFinding[];
   readonly blendedScore: number | null;
   readonly blendedDataSource: DataSource | null;
 }
@@ -86,13 +86,13 @@ function surfaceUnavailable(engineKey: string, attribute: RenderingAttribute): b
 }
 
 /** The most severe open finding of the attribute's mapped rules; ties keep input (newest-first) order. */
-function causeFor(attribute: RenderingAttribute, coverage: number | null, findings: readonly OpenFinding[]): RenderingCause | null {
+function causeFor(attribute: RenderingAttribute, coverage: number | null, findings: readonly LiveFinding[]): RenderingCause | null {
   // Only a MISSING attribute has a cause: coverage 1 means nothing is missing,
   // and null means nothing was measured to be missing.
   if (coverage === null || coverage >= 1) return null;
   if (attribute !== "price" && attribute !== "rating") return null;
   const rules = RENDERING_CAUSE_RULES[attribute];
-  let best: OpenFinding | null = null;
+  let best: LiveFinding | null = null;
   for (const finding of findings) {
     if (!rules.includes(finding.ruleCode)) continue;
     if (best === null || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[best.severity]) best = finding;
