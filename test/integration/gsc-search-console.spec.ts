@@ -287,6 +287,48 @@ describe("STORY-115 - Search Console", () => {
       expect(String(row.refresh_enc)).not.toContain("REFRESH-TOKEN");
     });
 
+    describe("finding a project's connection (GET /projects/{id}/gsc)", () => {
+      const lookup = (a: { cookie: string }, projectId: string) => harness.app().inject({ method: "GET", url: apiUrl(`/projects/${projectId}/gsc`), headers: { cookie: a.cookie } });
+
+      it("S115-7a - the project's active connection is found, in the connection's own shape, with no credential", async () => {
+        const a = await owner();
+        const connected = await connect(a);
+        const res = await lookup(a, a.projectId);
+        expect(res.statusCode, res.body).toBe(200);
+        expect(res.body).not.toMatch(/ACCESS-TOKEN|REFRESH-TOKEN|credentials|refresh_enc|dek_id/);
+        expect(data<{ connection: Connection }>(res).connection).toEqual(
+          data<Connection>(await harness.app().inject({ method: "GET", url: apiUrl(`/integrations/gsc/${connected.id}`), headers: { cookie: a.cookie } })),
+        );
+      });
+
+      it("S115-7b - a project with no connection answers 200 with connection null, never 404", async () => {
+        const a = await owner();
+        const res = await lookup(a, a.projectId);
+        expect(res.statusCode, res.body).toBe(200);
+        expect(data<unknown>(res)).toEqual({ connection: null });
+      });
+
+      it("S115-7c - a disconnected connection is not the active one: null, and a reconnect is found", async () => {
+        const a = await owner();
+        const first = await connect(a);
+        const del = await harness.app().inject({ method: "DELETE", url: apiUrl(`/integrations/gsc/${first.id}`), headers: bare(a) });
+        expect(del.statusCode).toBe(204);
+        expect(data<unknown>(await lookup(a, a.projectId))).toEqual({ connection: null });
+        const second = await connect(a);
+        expect(data<{ connection: Connection }>(await lookup(a, a.projectId)).connection.id).toBe(second.id);
+      });
+
+      it("S115-7d - a viewer may read it (project:read); another workspace's project is a 404 and an unknown one is a 404", async () => {
+        const a = await owner();
+        const connected = await connect(a);
+        const v = await viewer(a.workspaceId);
+        expect(data<{ connection: Connection }>(await lookup(v, a.projectId)).connection.id).toBe(connected.id);
+        const stranger = await owner();
+        expect((await lookup(stranger, a.projectId)).statusCode).toBe(404);
+        expect((await lookup(a, uuidV7())).statusCode).toBe(404);
+      });
+    });
+
     it("S115-5 - a second connection for one project is refused while the first is active", async () => {
       const a = await owner();
       await connect(a);
