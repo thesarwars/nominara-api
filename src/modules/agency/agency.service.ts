@@ -55,10 +55,12 @@ interface ThemeRow {
   readonly custom_css: string | null;
   readonly email_footer_html: string | null;
   readonly logo_light_key: string | null;
+  readonly logo_dark_key: string | null;
+  readonly favicon_key: string | null;
 }
 
 const COLUMNS =
-  "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to, custom_css, email_footer_html, logo_light_key";
+  "id, name, is_default, color_primary, color_accent, color_bg, color_fg, font_family, hide_nominara_brand, email_from_name, email_reply_to, custom_css, email_footer_html, logo_light_key, logo_dark_key, favicon_key";
 
 const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -98,6 +100,8 @@ function toTheme(row: ThemeRow): AgencyThemeAdmin {
     email_reply_to: row.email_reply_to,
     custom_css: row.custom_css,
     email_footer_html: row.email_footer_html,
+    logo_dark_url: row.logo_dark_key === null ? null : themeAssetPath(row.id, "logo_dark"),
+    favicon_url: row.favicon_key === null ? null : themeAssetPath(row.id, "favicon"),
   };
 }
 
@@ -484,6 +488,8 @@ function platformDefaultTheme(): AgencyThemeAdmin {
     email_reply_to: null,
     custom_css: null,
     email_footer_html: null,
+    logo_dark_url: null,
+    favicon_url: null,
   };
 }
 

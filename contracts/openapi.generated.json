@@ -138,6 +138,26 @@
                                 "type": "null"
                               }
                             ]
+                          },
+                          "logo_dark_url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "favicon_url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           }
                         },
                         "required": [
@@ -154,7 +174,9 @@
                           "custom_css",
                           "email_from_name",
                           "email_reply_to",
-                          "email_footer_html"
+                          "email_footer_html",
+                          "logo_dark_url",
+                          "favicon_url"
                         ],
                         "additionalProperties": false
                       }
@@ -597,6 +619,26 @@
                             }
                           ]
                         },
+                        "logo_dark_url": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "favicon_url": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "dropped": {
                           "type": "object",
                           "properties": {
@@ -672,6 +714,8 @@
                         "email_from_name",
                         "email_reply_to",
                         "email_footer_html",
+                        "logo_dark_url",
+                        "favicon_url",
                         "dropped"
                       ],
                       "additionalProperties": false
@@ -69249,55 +69293,25 @@
       "get": {
         "operationId": "fetchThemeAsset",
         "responses": {
-          "302": {
-            "description": "fetchThemeAsset redirect",
-            "headers": {
-              "Location": {
-                "required": true,
+          "200": {
+            "description": "fetchThemeAsset response",
+            "content": {
+              "image/png": {
                 "schema": {
                   "type": "string",
-                  "format": "uri"
+                  "format": "binary"
                 }
-              }
-            },
-            "content": {
-              "application/json": {
+              },
+              "image/jpeg": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "data": {
-                      "type": "null"
-                    },
-                    "meta": {
-                      "type": "object",
-                      "properties": {
-                        "request_id": {
-                          "type": "string",
-                          "pattern": "^[0-9a-f]{32}$"
-                        },
-                        "scoring_version": {
-                          "type": "string",
-                          "minLength": 1
-                        },
-                        "computed_at": {
-                          "type": "string",
-                          "format": "date-time",
-                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
-                        }
-                      },
-                      "required": [
-                        "request_id",
-                        "scoring_version",
-                        "computed_at"
-                      ],
-                      "additionalProperties": false
-                    }
-                  },
-                  "required": [
-                    "data",
-                    "meta"
-                  ],
-                  "additionalProperties": false
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
                 }
               }
             }

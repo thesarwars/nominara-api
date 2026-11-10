@@ -82,6 +82,13 @@ export interface ApiContractOptions {
    * and `voidResponse`, and the route is NOT `@NoEnvelope()` (that marker is for the health probes alone).
    */
   readonly redirect?: boolean;
+  /**
+   * STORY-097 / owner decision 69 (c) - the route STREAMS a file from the platform origin (`StreamableFile`): the success body is the bytes
+   * themselves, not a JSON envelope, and these are the media types it can carry. Declared, never inferred from the absence of a
+   * `responseSchema`; it excludes `responseSchema`, `voidResponse`, `redirect` and `@NoEnvelope()`. Errors are still the enveloped problem
+   * details. The envelope interceptor passes a `StreamableFile` through untouched, so no exemption marker is needed.
+   */
+  readonly binary?: readonly string[];
 }
 
 export const API_CONTRACT_KEY = "apiContract";

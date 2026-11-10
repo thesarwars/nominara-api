@@ -16,6 +16,9 @@ export type ThemeAssetSlotName = z.infer<typeof themeAssetSlotSchema>;
 export const THEME_ASSET_CONTENT_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
 
 /** 1 MiB decoded is 1,398,102 base64 characters; the margin is for padding and nothing else. */
+/** The media types `GET /v1/themes/{id}/assets/{slot}` streams (owner decision 69 (c)): the same three the upload accepts. */
+export const THEME_ASSET_MEDIA_TYPES = THEME_ASSET_CONTENT_TYPES;
+
 export const MAX_THEME_ASSET_BASE64_LENGTH = 1_400_000;
 
 export const themeAssetParamsSchema = z.object({ id: lowercaseUuidSchema }).strict();
@@ -37,7 +40,7 @@ export const uploadThemeAssetResponseSchema = z
   .object({
     theme_id: z.uuid(),
     slot: themeAssetSlotSchema,
-    /** A path on the platform's own origin; it answers 302 to a short-lived presigned URL (never a stored key, never a third-party host in the theme). */
+    /** A path on the platform's own origin; a GET on it streams the image itself (owner decision 69 (c)); never a stored key, never a third-party host. */
     url: z.string().min(1),
     content_type: z.enum(THEME_ASSET_CONTENT_TYPES),
     width: z.number().int().positive(),

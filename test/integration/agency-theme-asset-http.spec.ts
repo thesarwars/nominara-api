@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { vi } from "vitest";
 import { AgencyService } from "../../src/modules/agency/agency.service.js";
 import { Pool } from "pg";
@@ -15,7 +16,7 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
-import { fetchStored, reportStorageEnv } from "../support/report-storage-env.js";
+import { reportStorageEnv } from "../support/report-storage-env.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
 
 // STORY-097 scenarios 9-11 · owner decision 67 (n): POST /v1/themes/{id}/assets and the platform-origin fetch route, through the
@@ -127,7 +128,7 @@ describe("STORY-097 · theme assets over HTTP", () => {
     return { a, themeId: data<{ theme_id: string }>(saved).theme_id };
   }
 
-  it("STORY-097 s11 · an uploaded logo is stored, the theme points at a platform-origin path, and the fetch route redirects to a short presign that serves the same bytes", async () => {
+  it("STORY-097 s11 / decision 69 (c) · an uploaded logo is stored, the theme points at a platform-origin path, and the fetch route STREAMS the same bytes from the platform origin (no redirect, no storage host)", async () => {
     const { a, themeId } = await themed();
     const file = png(300, 100);
     const res = await upload(a, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(file) });
@@ -138,11 +139,128 @@ describe("STORY-097 · theme assets over HTTP", () => {
     expect(data<Array<{ logo_url: string | null }>>(list)[0]!.logo_url).toBe(`/v1/themes/${themeId}/assets/logo_light`);
 
     const served = await fetchAsset(a, themeId, "logo_light");
-    expect(served.statusCode, served.body).toBe(302);
-    expect(served.headers["cache-control"]).toBe("no-store");
-    const stored = await fetchStored(String(served.headers.location));
-    expect(stored.equals(file)).toBe(true);
-    expect(new URL(String(served.headers.location)).searchParams.get("X-Amz-Expires")).toBe("60");
+    expect(served.statusCode, served.body).toBe(200);
+    expect(served.headers.location).toBeUndefined();
+    expect(served.headers["content-type"]).toBe("image/png");
+    expect(served.headers["cache-control"]).toBe("private, no-store");
+    expect(served.headers["x-content-type-options"]).toBe("nosniff");
+    expect(served.headers["content-security-policy"]).toBe("default-src 'none'; sandbox");
+    expect(served.headers["referrer-policy"]).toBe("no-referrer");
+    expect(served.rawPayload.equals(file)).toBe(true);
+    expect(Number(served.headers["content-length"])).toBe(file.length);
+  }, 120_000);
+
+  it("STORY-097 s11 / ADR-0003 · the streamed fetch reads storage AFTER the request transaction has ended: no transaction is open while the object is read", async () => {
+    const { a, themeId } = await themed();
+    expect((await upload(a, themeId, { slot: "favicon", content_type: "image/png", data_base64: b64(png(32, 32)) })).statusCode).toBe(201);
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const real = port.get.bind(port);
+    let open = -1;
+    const spy = vi.spyOn(port, "get").mockImplementation(async (bucket, key) => {
+      open = Number((await harness.db().query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname = current_database() AND usename = 'nominara_app' AND state LIKE 'idle in transaction%'")).rows[0].n);
+      return real(bucket, key);
+    });
+    try {
+      expect((await fetchAsset(a, themeId, "favicon")).statusCode).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(open).toBe(0);
+  }, 120_000);
+
+  it("STORY-097 s11 · the fetch is observable: one span-shaped log line with the workspace ID, the slot and the outcome, and never the object key", async () => {
+    const { a, themeId } = await themed();
+    expect((await upload(a, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10)) })).statusCode).toBe(201);
+    const key = (await harness.db().query(`SELECT logo_light_key FROM brand_themes WHERE id = $1`, [themeId])).rows[0].logo_light_key as string;
+    const log = vi.spyOn(Logger.prototype, "log");
+    try {
+      expect((await fetchAsset(a, themeId, "logo_light")).statusCode).toBe(200);
+      const lines = (log.mock.calls as unknown[][]).map((c) => c[0]).filter((l): l is Record<string, unknown> => typeof l === "object" && l !== null && (l as { span?: string }).span === "agency.theme_asset_fetch");
+      expect(lines).toEqual([{ span: "agency.theme_asset_fetch", workspace_id: a.workspaceId, slot: "logo_light", outcome: "served" }]);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(key);
+    } finally {
+      log.mockRestore();
+    }
+  }, 120_000);
+
+  it("STORY-097 s11 · each slot streams its own bytes with the type the BYTES decide (a JPEG logo_dark is image/jpeg, a WebP favicon is image/webp)", async () => {
+    const { a, themeId } = await themed();
+    const jpeg = Buffer.alloc(2 + 18 + 19 + 2);
+    jpeg.writeUInt16BE(0xffd8, 0);
+    jpeg.writeUInt16BE(0xffe0, 2);
+    jpeg.writeUInt16BE(16, 4);
+    jpeg.write("JFIF", 6, "ascii");
+    jpeg.writeUInt16BE(0xffc0, 20);
+    jpeg.writeUInt16BE(17, 22);
+    jpeg[24] = 8;
+    jpeg.writeUInt16BE(100, 25);
+    jpeg.writeUInt16BE(300, 27);
+    jpeg[29] = 3;
+    jpeg.writeUInt16BE(0xffd9, jpeg.length - 2);
+    const webp = Buffer.alloc(30);
+    webp.write("RIFF", 0, "ascii");
+    webp.writeUInt32LE(22, 4);
+    webp.write("WEBP", 8, "ascii");
+    webp.write("VP8L", 12, "ascii");
+    webp.writeUInt32LE(10, 16);
+    webp[20] = 0x2f;
+    webp.writeUInt32LE((31 | (31 << 14)) >>> 0, 21);
+    const up1 = await upload(a, themeId, { slot: "logo_dark", content_type: "image/jpeg", data_base64: b64(jpeg) });
+    expect(up1.statusCode, up1.body).toBe(201);
+    const up2 = await upload(a, themeId, { slot: "favicon", content_type: "image/webp", data_base64: b64(webp) });
+    expect(up2.statusCode, up2.body).toBe(201);
+    const dark = await fetchAsset(a, themeId, "logo_dark");
+    expect(dark.headers["content-type"]).toBe("image/jpeg");
+    expect(dark.rawPayload.equals(jpeg)).toBe(true);
+    const fav = await fetchAsset(a, themeId, "favicon");
+    expect(fav.headers["content-type"]).toBe("image/webp");
+    expect(fav.rawPayload.equals(webp)).toBe(true);
+    // A slot with no upload is 404, not an empty 200.
+    const other = await themed();
+    expect((await fetchAsset(other.a, other.themeId, "logo_dark")).statusCode).toBe(404);
+  }, 120_000);
+
+  it("STORY-097 s11 · a stored object whose bytes no longer validate is not served (fail closed, never a 200 with the bad bytes); a storage outage is a 5xx", async () => {
+    const { a, themeId } = await themed();
+    expect((await upload(a, themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10)) })).statusCode).toBe(201);
+    const port = harness.app().get<ObjectStoragePort>(OBJECT_STORAGE, { strict: false });
+    const swapped = vi.spyOn(port, "get").mockResolvedValueOnce(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'));
+    try {
+      const res = await fetchAsset(a, themeId, "logo_light");
+      expect(res.statusCode).toBeGreaterThanOrEqual(500);
+      expect(res.body).not.toContain("<svg");
+    } finally {
+      swapped.mockRestore();
+    }
+    const down = vi.spyOn(port, "get").mockRejectedValueOnce(new Error("s3 down"));
+    try {
+      expect((await fetchAsset(a, themeId, "logo_light")).statusCode).toBeGreaterThanOrEqual(500);
+    } finally {
+      down.mockRestore();
+    }
+  }, 120_000);
+
+  it("STORY-097 s11 · a forged key naming ANOTHER workspace's object is never streamed (the bound store refuses it)", async () => {
+    const mine = await themed();
+    const theirs = await themed();
+    expect((await upload(theirs.a, theirs.themeId, { slot: "logo_light", content_type: "image/png", data_base64: b64(png(10, 10)) })).statusCode).toBe(201);
+    const foreignKey = (await harness.db().query(`SELECT logo_light_key FROM brand_themes WHERE id = $1`, [theirs.themeId])).rows[0].logo_light_key as string;
+    await harness.db().query(`UPDATE brand_themes SET logo_light_key = $2 WHERE id = $1`, [mine.themeId, foreignKey]);
+    const res = await fetchAsset(mine.a, mine.themeId, "logo_light");
+    expect(res.statusCode).toBeGreaterThanOrEqual(400);
+    expect(res.rawPayload.length).not.toBe(png(10, 10).length);
+  }, 120_000);
+
+  it("STORY-097 · the editor's theme list names the logo_dark and favicon paths once uploaded (null before), so a reload can show them", async () => {
+    const { a, themeId } = await themed();
+    const before = data<Array<{ logo_dark_url: string | null; favicon_url: string | null }>>(await harness.app().inject({ method: "GET", url: apiUrl("/agency/theme"), headers: { cookie: a.cookie } }));
+    expect(before[0]).toMatchObject({ logo_dark_url: null, favicon_url: null });
+    expect((await upload(a, themeId, { slot: "logo_dark", content_type: "image/png", data_base64: b64(png(20, 20)) })).statusCode).toBe(201);
+    expect((await upload(a, themeId, { slot: "favicon", content_type: "image/png", data_base64: b64(png(32, 32)) })).statusCode).toBe(201);
+    const after = data<Array<{ logo_url: string | null; logo_dark_url: string | null; favicon_url: string | null }>>(await harness.app().inject({ method: "GET", url: apiUrl("/agency/theme"), headers: { cookie: a.cookie } }));
+    expect(after[0]).toMatchObject({ logo_url: null, logo_dark_url: `/v1/themes/${themeId}/assets/logo_dark`, favicon_url: `/v1/themes/${themeId}/assets/favicon` });
+    const saved = await put(a, { theme_id: themeId, name: "Renamed" });
+    expect(data<Record<string, unknown>>(saved)).toMatchObject({ logo_dark_url: `/v1/themes/${themeId}/assets/logo_dark`, favicon_url: `/v1/themes/${themeId}/assets/favicon` });
   }, 120_000);
 
   it("STORY-097 s9 · an SVG is refused naming the file type; nothing is stored", async () => {
@@ -235,7 +353,7 @@ describe("STORY-097 · theme assets over HTTP", () => {
     // Once the owner uploads, the other workspace still cannot fetch it.
     expect((await upload(theirs.a, theirs.themeId, file)).statusCode).toBe(201);
     expect((await fetchAsset(mine.a, theirs.themeId, "logo_light")).statusCode).toBe(404);
-    expect((await fetchAsset(theirs.a, theirs.themeId, "logo_light")).statusCode).toBe(302);
+    expect((await fetchAsset(theirs.a, theirs.themeId, "logo_light")).statusCode).toBe(200);
   }, 120_000);
 
   it("STORY-097 · a manager is 403 naming agency:branding; an unknown theme is 404; unknown body keys are 400", async () => {
