@@ -220,7 +220,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `GET` | `/projects/{id}/scorecards` | `tracking:read` | per-engine and blended score, presence, share of voice, sentiment, citations, rendering, with deltas and confidence |
 | `GET` | `/projects/{id}/growth-map` | `tracking:read` | §7 — series, milestone pins, data gaps |
 | `GET` | `/projects/{id}/competitors/panel` | `tracking:read` | per-engine comparison, head-to-head win rate, detection variance |
-| `GET` | `/projects/{id}/displacements` | `tracking:read` | Displacement feed (**D1**) |
+| `GET` | `/projects/{id}/displacements` | `tracking:read` | Displacement feed (**D1**). The response carries `passage_scoped_engines` (`google_aio`, `google_ai_mode`: the engines whose captures carry per-element references). Each citation-gap entry may carry `scope`: `passage` (cited in the passage naming the displacing entity), `outside_passage`, or `answer` (no passage located; also how an absent `scope` reads). **The scope is a display label only** (STORY-057 AC3, decision 99i): the impact score and concept gap use the whole-answer gap |
 | `GET` | `/projects/{id}/rendering-quality` | `tracking:read` | per-engine breakdown and attribute coverage (**D4**) |
 | `GET` | `/projects/{id}/sources` | `aux:read` | Source Citation Index with gap severity |
 | `GET` | `/projects/{id}/topics` · `PATCH /topics/{id}` | `tracking:read` / `prompt:write` | clusters with per-topic visibility, ownership, gap priority; rename |
@@ -503,7 +503,7 @@ Content-Type: application/json
       "robots_state":{ "value": "gptbot_allowed", "confidence": 1.0 },
       "sitemap_urls":{ "value": 1204, "confidence": 1.0 } },
     "competitors_proposed": [
-      { "name": "Salesforce", "root_domain": "salesforce.com", "confidence": 0.94, "basis": "own comparison page" },
+      { "name": "Salesforce", "root_domain": "salesforce.com", "confidence": 0.94, "basis": "own comparison page", "basis_url": "https://acme.example/compare/salesforce" },
       { "name": "Pipedrive",  "root_domain": "pipedrive.com",  "confidence": 0.72, "basis": "category peers" } ],
     "prompts_generated": [
       { "prompt_id": "5c2e…", "text": "most reliable CRM for a 50-rep sales team",
@@ -516,6 +516,7 @@ Content-Type: application/json
 | Rule | Behaviour |
 |---|---|
 | Non-blocking | The project exists and is usable the moment `POST /projects` returns; discovery streams in. Each field is written as it is found (STORY-195 AC6), so a poll while `discovery_status` is `running` returns the fields found so far with their confidences; a field confirmed mid-pass is kept. |
+| `basis_url` | Optional on a proposed competitor (STORY-190): the same-site comparison page the rival was read from. Absent for a home-page link or any other basis. |
 | Supplied wins | A field supplied at creation is never overwritten by discovery, and is not re-proposed for review. |
 | Timeout | Discovery failing still leaves a usable project — `discovery_status: "partial"` with whatever it obtained. |
 | Never silent | Nothing discovered is applied without appearing in this payload with a confidence. Values below 0.60 are listed in `low_confidence_fields`. |
