@@ -5,7 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { geoAnalysisSchema, geoDivergenceDetailSchema, geoTopicsDetailSchema, geoSentimentDetailSchema } from "../../contracts/analytics/index.js";
 import { taskGenerationConditionSchema } from "../../contracts/tasks/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { refreshProjectGeo } from "../../src/lib/rollup/refresh-project-geo.js";
+import { refreshProjectGeo, refreshProjectGeoWindows } from "../../src/lib/rollup/refresh-project-geo.js";
 import { generateTasksForProject } from "../../src/lib/taskgen/generate.js";
 import { createTaskGenerateHandler } from "../../src/lib/queue/handlers/task-generate.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -716,6 +716,25 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     await runJob();
     expect(await alertsOf("alert.topic_gap_high")).toHaveLength(0);
     expect(await taskRows("TG-TOPIC-CONTENT")).toHaveLength(0);
+  });
+
+  it("[STORY-062 AC10] end to end: refresh -> generateTasks -> GeoService.digest, the promoted lever links the task the generator wrote (no task row is inserted by hand)", async () => {
+    await weight("docs.acme.com", 0.9);
+    await divergentPrompts(10);
+    await enable("TG-DIVERGENCE"); // restamps the non-retroactive watermark so the result does not depend on test order
+    // The rollup's own entry point: it persists every window AND promotes the levers the digest reads.
+    await as((c) => refreshProjectGeoWindows(c, projectId, { asOf: AS_OF }));
+    const digest = () => withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService(tasks).digest(projectId, { timeframe: "30d" }));
+    // Before generation there is no task behind the lever: the link is null, never invented.
+    const before = (await digest()).levers.find((l) => l.analysis_href === "geo?analysis=divergence");
+    expect(before).toBeDefined();
+    expect(before!.task).toBeNull();
+    await generate();
+    const generated = await taskRows("TG-DIVERGENCE");
+    expect(generated).toHaveLength(1);
+    expect(generated[0]).toMatchObject({ origin: "auto", source_geo_analysis: "divergence", status: "todo" });
+    const lever = (await digest()).levers.find((l) => l.analysis_href === "geo?analysis=divergence")!;
+    expect(lever.task).toEqual({ task_id: generated[0].id, label: generated[0].title, href: `plan?task=${generated[0].id}` });
   });
 
   it("[A6c] the prior window trends a theme: present before, absent before, and nothing measured before", async () => {
