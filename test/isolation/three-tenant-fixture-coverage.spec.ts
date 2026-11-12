@@ -29,7 +29,8 @@ describe("STORY-012 T5 · three-tenant fixture coverage", () => {
       // 69 since STORY-045 (decision 95a) added `prompt_generations` (migration 0193).
       // 70 since STORY-191 (decision 99c) added `name_match_verdicts` (migration 0197).
       // 71 since the STORY-191 fix round (decision 99l) added `name_match_judge_usage` (migration 0202).
-      expect(tenantTables.length).toBe(71);
+      // 72 since STORY-185 (decision 100) added `retention_exports` (migration 0203).
+      expect(tenantTables.length).toBe(72);
 
       for (const tenant of [ctx.fixture.a, ctx.fixture.b, ctx.fixture.c]) {
         for (const table of tenantTables) {

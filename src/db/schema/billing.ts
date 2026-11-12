@@ -152,6 +152,21 @@ export const plans = pgTable("plans", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const retentionExports = pgTable("retention_exports", {
+  id: uuid("id").primaryKey(),
+  workspaceId: uuid("workspace_id").notNull(),
+  requestedBy: uuid("requested_by"),
+  status: text("status").notNull().default(sql`'requested'::text`),
+  objectKey: text("object_key"),
+  coverage: jsonb("coverage"),
+  errorCode: text("error_code"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  readyAt: timestamp("ready_at", { withTimezone: true }),
+  emailedAt: timestamp("emailed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
 export const stripeSubscriptionSyncs = pgTable("stripe_subscription_syncs", {
   workspaceId: uuid("workspace_id").notNull(),
   stripeSubscriptionId: text("stripe_subscription_id").notNull(),
