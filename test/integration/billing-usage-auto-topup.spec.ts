@@ -235,7 +235,90 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
     await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'pdf_exports',$2,25,7)", [workspaceId, start]);
     const res = await get(owner, "/billing/usage");
     expect(res.statusCode, res.body).toBe(200);
-    expect(usageResponseSchema.parse(dataOf(res))).toEqual({ period_start: start, pdf_exports: { used: 7, cap: 25 }, share_links_active: 0 });
+    // A paid plan has no daily cap (STORY-096 AC15): both meters read `cap: null`, never 0.
+    expect(usageResponseSchema.parse(dataOf(res))).toEqual({
+      period_start: start,
+      pdf_exports: { used: 7, cap: 25 },
+      share_links_active: 0,
+      daily_lookups: { used: 0, cap: null },
+      daily_nlp_parses: { used: 0, cap: null },
+      daily_resets_at: expect.stringMatching(/T00:00:00\.000Z$/u),
+    });
+  });
+
+  // ---- STORY-096 AC15: the customer-visible daily caps ----------------------------------------
+  // plans-and-entitlements.md section 2 names two: capture-backed tool runs (credits.lookups_per_day_max, action_code 'lookup', shared across every
+  // tool) and model-resolved command parses (credits.nlp_parses_per_day_max, 'nlp_command'). They live in credit_daily_counters, NOT usage_counters
+  // (billing-and-credits.md: the two mechanisms must never overlap), and fair_use_captures stays hidden.
+  const daily = async (a: Actor) => dataOf<{ daily_lookups: unknown; daily_nlp_parses: unknown; daily_resets_at: string }>(await get(a, "/billing/usage"));
+  const today = "(now() AT TIME ZONE 'UTC')::date";
+  const dayRow = (workspaceId: string, action: string, used: number, limit: number, when = today) =>
+    harness.db().query(`INSERT INTO credit_daily_counters (workspace_id, utc_date, action_code, used_count, limit_count) VALUES ($1, ${when}, $2, $3, $4)`, [workspaceId, action, used, limit]);
+
+  it("STORY-096 AC15 · a free workspace with no use today reads 0 of 3 tool runs and 0 of 20 command parses, and the read creates no row", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    const body = await daily(owner);
+    expect(body.daily_lookups).toEqual({ used: 0, cap: 3 });
+    expect(body.daily_nlp_parses).toEqual({ used: 0, cap: 20 });
+    expect((await harness.db().query("SELECT 1 FROM credit_daily_counters WHERE workspace_id = $1", [workspaceId])).rowCount).toBe(0);
+  });
+
+  it("STORY-096 AC15 · today's counters are read per action: 2 of 3, and exactly at the cap 20 of 20", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    await dayRow(workspaceId, "lookup", 2, 3);
+    await dayRow(workspaceId, "nlp_command", 20, 20);
+    const body = await daily(owner);
+    expect(body.daily_lookups).toEqual({ used: 2, cap: 3 });
+    expect(body.daily_nlp_parses).toEqual({ used: 20, cap: 20 });
+  });
+
+  it("STORY-096 AC15 · yesterday's row is not today's use (the counter rolls at UTC midnight)", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    await dayRow(workspaceId, "lookup", 3, 3, `${today} - 1`);
+    expect((await daily(owner)).daily_lookups).toEqual({ used: 0, cap: 3 });
+  });
+
+  it("STORY-096 AC15 · the cap is the plan's CURRENT one: a paid plan reads cap null (not 0) even beside a row written under the free limit", async () => {
+    const { workspaceId, owner } = await newWorkspace("growth");
+    await dayRow(workspaceId, "lookup", 1, 3);
+    const body = await daily(owner);
+    expect(body.daily_lookups).toEqual({ used: 1, cap: null });
+    expect(body.daily_nlp_parses).toEqual({ used: 0, cap: null });
+  });
+
+  it("STORY-096 AC15 · daily_resets_at is the next UTC midnight", async () => {
+    const { owner } = await newWorkspace("free");
+    const before = Date.now();
+    const { daily_resets_at } = await daily(owner);
+    const after = Date.now();
+    const next = (t: number) => { const d = new Date(t); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); };
+    expect([next(before), next(after)]).toContain(Date.parse(daily_resets_at));
+  });
+
+  it("STORY-096 AC15 · a purchased pack does not move a daily meter (it raises the monthly ceiling only)", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    await harness.db().query("UPDATE credit_wallets SET purchased_balance = purchased_balance + 5000 WHERE workspace_id = $1", [workspaceId]);
+    expect((await daily(owner)).daily_lookups).toEqual({ used: 0, cap: 3 });
+  });
+
+  it("STORY-096 AC15 · the response states exactly the published meters: no fair-use counter and no raw action codes", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'fair_use_captures',$2,500,321)", [workspaceId, await periodStart(workspaceId)]);
+    const res = await get(owner, "/billing/usage");
+    expect(Object.keys(dataOf<object>(res)).sort()).toEqual(["daily_lookups", "daily_nlp_parses", "daily_resets_at", "pdf_exports", "period_start", "share_links_active"]);
+    expect(res.body).not.toContain("fair_use");
+    expect(res.body).not.toContain("nlp_command");
+  });
+
+  it("STORY-096 AC15 · another workspace's daily counters never appear (RLS, not a filter)", async () => {
+    const a = await newWorkspace("free");
+    const b = await newWorkspace("free");
+    await dayRow(b.workspaceId, "lookup", 3, 3);
+    await dayRow(b.workspaceId, "nlp_command", 19, 20);
+    const body = await daily(a.owner);
+    expect(body.daily_lookups).toEqual({ used: 0, cap: 3 });
+    expect(body.daily_nlp_parses).toEqual({ used: 0, cap: 20 });
+    expect((await daily(b.owner)).daily_lookups).toEqual({ used: 3, cap: 3 });
   });
 
   it("NEW-D-6 · cap null means unlimited and cap 0 means the tier has none: they are different answers", async () => {
