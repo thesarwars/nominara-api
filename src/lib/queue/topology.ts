@@ -404,6 +404,21 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "dgnotice:{workspace}:{request}:{kind}",
     tenantScoped: true,
   },
+  // ⚠ A QUEUE §4 DOES NOT CONTAIN, added by the same precedent and approved by the owner (decision 100(c), 2026-11-12): the full-data export a
+  // customer may take while a retention-shortening purge is pending (STORY-185). ONE job per export request: it reads every raw object the purge
+  // will remove from the object store, so it runs in the `report` group (the heavy builds), concurrency 1, and is PHASED (ADR-0003): short tenant
+  // reads page by page, the upload with no transaction open, the project's purge lock (EC-40) held around each project's reads only. A failed
+  // attempt retries down this ladder; the last attempt marks the export failed so the owner can ask again. 0 credits.
+  {
+    name: "billing.retention_export",
+    producer: "POST /v1/billing/retention-export, after commit (STORY-185, decision 100(c); not in §4)",
+    workerGroup: "report",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 8,
+    idempotencyKeyPattern: "retexp:{workspace}:{export}",
+    tenantScoped: true,
+  },
   // ⚠ A QUEUE §4 DOES NOT CONTAIN, added by the same precedent and approved by the owner (decision 83(a), 2026-11-09): deleting a
   // workspace must stop its Stripe subscription renewing. The deletion request commits, then enqueues ONE signed tenant job; the
   // handler sets `cancel_at_period_end` (no immediate cancel, no refund) with no transaction open (KAD-06 / ADR-0003). Setting a

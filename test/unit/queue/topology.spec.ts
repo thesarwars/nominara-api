@@ -341,6 +341,14 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "email in downgrade_notices inside its transaction (keyed by the Stripe event id or the operator's ticket) and enqueues one signed tenant job after " +
       "commit; the worker sends it with no transaction open (ADR-0003). §4's table allocates no queue to it. A queue of its own so a DLQ entry names it.",
   },
+  "billing.retention_export": {
+    workerGroup: "report",
+    because:
+      "STORY-185 / owner decision 100(c): a customer whose plan change shortens retention may take a full copy of what the purge removes while the deferral is pending. " +
+      "It reads every raw object the purge will remove, so it must never run on a request path (KAD-06): the request records the export and enqueues one signed tenant job " +
+      "after commit; the worker builds it in phases (ADR-0003) under each project's purge lock (EC-40) and stores the zip. §4's table allocates no queue to it. A queue of its own " +
+      "so a DLQ entry names the job that failed; the report worker group because it is a heavy build, not a short billing call.",
+  },
   "billing.cancel_on_deletion": {
     workerGroup: "rollup",
     because:

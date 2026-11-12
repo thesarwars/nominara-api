@@ -20,7 +20,8 @@ const FORMULA_START = /^[=+\-@\t\r]/;
 /** A plain decimal number with a leading minus; anything else starting `-` can still be read as a formula. */
 const NEGATIVE_NUMBER = /^-(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
 
-function cell(value: string): string {
+/** One CSV field, quoted when it needs it and defanged when a spreadsheet would run it as a formula. Shared by the full-data export (STORY-185). */
+export function csvCell(value: string): string {
   const needsQuote = FORMULA_START.test(value) && !NEGATIVE_NUMBER.test(value);
   const safe = needsQuote ? `'${value}` : value;
   return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
@@ -31,7 +32,7 @@ function num(value: number | null): string {
 }
 
 function row(fields: readonly string[]): string {
-  return fields.map(cell).join(",");
+  return fields.map(csvCell).join(",");
 }
 
 const METRICS: ReadonlyArray<readonly [string, (summary: MetricSummary) => number | null]> = [
