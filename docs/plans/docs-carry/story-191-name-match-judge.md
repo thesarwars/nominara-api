@@ -1,0 +1,17 @@
+# STORY-191 - carry to the docs repo (api batch10/s1)
+
+Status line: `Done`, apart from the owner's confirmation of the provisional values below.
+
+What was built (owner decision 99c, 2026-11-12):
+
+- **Judge port** `NameMatchJudge` (`src/lib/geo/name-match-judge/port.ts`), bound by `NAME_MATCH_JUDGE=none|gemini` (+ `NAME_MATCH_JUDGE_MODEL`, `NAME_MATCH_JUDGE_TIMEOUT_MS`). `none`, or `gemini` with no `GEMINI_API_KEY`, keeps the v1 heuristic (`judgeNameMatch`) as the judge. The Gemini adapter is a `fetch` adapter on the naturaliser's pattern, not the capture adapter.
+- **Only ambiguous matches go to the model** (`isAmbiguousNameMatch`): a lowercase-only brand, and a capitalised span at the start of a sentence or line or wrapped in markup. A mid-sentence capitalised use, a URL/domain, a lowercase common word and a misread offset are settled by the heuristic and never sent.
+- **Phased job**, a second kind on the existing `geo.analyze` queue (`name_match_judge`, contract `contracts/analytics/name-match-judge-job.schema.ts`): `prepare` and `commit` are short tenant transactions, `run` holds none (test: no `idle in transaction` backend, no checked-out pool client during the model call). Producer: the daily rollup, after its commit, only when a model judge is bound. Key `geo:{project}:name-match:{judge version}.{UTC day}`.
+- **Table `name_match_verdicts`** (migration 0197; tenant, RLS forced, policy in the migration, not portal-readable; subject inventory `exempt`): `(mention_fact_id, judge_version)` unique; `judge_model`, `verdict`. Only model verdicts are stored; the heuristic is pure and recomputed on read. Census 95 / 70 tenant / 25 global.
+- **Read path** (`loadEntityInput(..., judge)`): a stored model verdict wins; with a model judge in force an ambiguous match with no verdict yet is `unjudged` (outside the risk denominator), never the heuristic's guess. The 30-match minimum is over judged matches.
+- **Publish guard** (owner decision 17): `EntityInput.judge` is required; `buildEntity` withholds the score (null, `authority.suppressed`, reason names the v1 heuristic) whenever the judge in force is `heuristic-v1`. `refreshProjectGeo` defaults to the heuristic, so a caller that does not pass a judge publishes nothing. Binding the model judge lifts it, and only that does.
+- **Bounds**, all provisional and marked in `src/lib/geo/name-match-judge/constants.ts`: monthly cap per workspace 2,000 model-judged matches (counted from stored verdicts, UTC month); 20 matches per call; 200 per job; window 120 characters before and 60 after the span; one `gemini` engine-bucket token per call (3 attempts, bounded wait, then the rest waits for the next job). Metrics: `nominara_geo_name_match_judge_{calls,jobs,requested,request_failed,cap_reached}_total`, `nominara_geo_name_match_judged_total{verdict}`, `nominara_geo_name_match_judge_tokens_spent`. Logs carry workspace and project ids and counts only.
+
+For the owner: the cap value; whether judging should have its own engine bucket rather than sharing `gemini`'s; retention of verdict rows after their `mention_facts` partition is dropped (they hold ids and a label, no text; not yet swept).
+
+Reference text to correct: `references/security-and-tenancy.md` ISO-06 census line (95 / 70 / 25; `name_match_verdicts`, migration 0197).

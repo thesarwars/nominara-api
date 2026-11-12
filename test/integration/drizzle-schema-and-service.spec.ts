@@ -42,7 +42,7 @@ async function refusalFrom(promise: Promise<unknown>): Promise<unknown> {
 // context succeeds as the owner and returns zero rows in production. A
 // schema layer proven only against the owner would prove the wrong thing.
 
-const EXPECTED_TABLE_COUNT = 94; // 77 + stripe_webhook_events (NEW-D-2, 0048) + scheduled_report_deliveries (NEW-E-1, 0051) + stripe_subscription_syncs (NEW-D-2 checkpoint-1, 0074) + audit_chain_marks (STORY-143, 0123) + credit_hold_carries (STORY-072, 0125) + downgrade_notices (STORY-077, 0134) + notification_reads, notification_emails (STORY-068, 0135) + email_suppressions (STORY-178, 0141) + task_verifications (STORY-067, 0163) + legal_holds, purge_runs, subject_erasure_queue (STORY-111, 0165) + share_token_email_codes (STORY-098, 0169) + business_categories, category_peers (STORY-189, 0187, 0188) + prompt_generations (STORY-045, 0193)
+const EXPECTED_TABLE_COUNT = 95; // 77 + stripe_webhook_events (NEW-D-2, 0048) + scheduled_report_deliveries (NEW-E-1, 0051) + stripe_subscription_syncs (NEW-D-2 checkpoint-1, 0074) + audit_chain_marks (STORY-143, 0123) + credit_hold_carries (STORY-072, 0125) + downgrade_notices (STORY-077, 0134) + notification_reads, notification_emails (STORY-068, 0135) + email_suppressions (STORY-178, 0141) + task_verifications (STORY-067, 0163) + legal_holds, purge_runs, subject_erasure_queue (STORY-111, 0165) + share_token_email_codes (STORY-098, 0169) + business_categories, category_peers (STORY-189, 0187, 0188) + prompt_generations (STORY-045, 0193) + name_match_verdicts (STORY-191, 0197)
 
 describe("STORY-122 · the Drizzle schema layer", () => {
   let container: StartedPostgreSqlContainer;

@@ -2,13 +2,20 @@ import { Logger } from "@nestjs/common";
 import type { Job } from "bullmq";
 import type { Pool } from "pg";
 import type { ClientBase } from "pg";
-import { geoAnalyzeJobPayloadSchema, geoAnalyzeKey, type GeoAnalyzeJobPayload } from "../../../../contracts/analytics/index.js";
+import { Redis } from "ioredis";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { geoAnalyzeJobPayloadSchema, geoAnalyzeKey, nameMatchJudgeJobPayloadSchema, type GeoAnalyzeJobPayload } from "../../../../contracts/analytics/index.js";
 import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
 import { withTenantContext } from "../../../tenancy/tenant-context.js";
 import { cl100kTokenizer } from "../../aux/tokenizer-cl100k.js";
 import { advanceAlignmentDraft, advanceAlignmentSession, ALIGNMENT_JOB, failStrandedDraft, failStrandedSession, type AdvanceOutcome, type DraftOutcome } from "../../geo/alignment/index.js";
 import { createGuardedPageFetcher, type PageFetcher } from "../../geo/corpus/page-fetcher.js";
 import { embedBatchEnqueuerFor, type EnqueueEmbedBatch } from "../../embedding/prompt-embedding-request.js";
+import { commitJudging, prepareJudging, runJudging, type EngineBucketPort, type JudgingPrepared, type JudgingResult } from "../../geo/name-match-judge/judging.js";
+import type { NameMatchJudge } from "../../geo/name-match-judge/port.js";
+import { selectNameMatchJudge } from "../../geo/name-match-judge/select.js";
+import { geminiPacingConfig } from "../../engines/engine-lease.js";
+import { TokenBucket } from "../../engines/token-bucket.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import type { QueueHandlerContext } from "../handlers.js";
@@ -30,10 +37,16 @@ import { selectedEmbeddingModel } from "./embed-batch.handler.js";
 //
 // EMBEDDING MODEL. The session is compared with `selectedEmbeddingModel(env)`, the provider's own model; a mismatch is `stale`, never waited on.
 //
+// STORY-191 (owner decision 99c) - the same queue carries ONE more job, `name_match_judge`: it judges a project's ambiguous brand-name matches with a model,
+// as a phased job of its own kind (src/lib/geo/name-match-judge/judging.ts): `prepare` reads the matches and the month's remaining budget in a short tenant
+// transaction, `run` calls the model with NO transaction and NO pooled client (each call takes a token from the gemini engine bucket), `commit` stores the
+// verdicts in a second short one. Its producer is the daily rollup, after its commit, and only when a model judge is configured.
+//
 // IDEMPOTENT under at-least-once delivery: every step of the library is (a re-run of a finished session is `settled`, the corpus is built on the first step only, a
 // re-recompute of an unchanged draft is `idle`), and the re-queue key is per step.
 
 const logger = new Logger("geo.analyze");
+const tracer = trace.getTracer("nominara.geo-analyze");
 
 /** A chain of re-queues this long is a bug or a runaway, not a slow embed: it stops and is counted. */
 const MAX_ATTEMPTS = 500;
@@ -48,11 +61,17 @@ export interface GeoAnalyzeDeps {
   readonly requeue?: (payload: GeoAnalyzeJobPayload, delayMs: number) => Promise<unknown>;
   readonly pool?: Pool;
   readonly now?: () => Date;
+  /** STORY-191 test seams: the model judge (production selects it from env) and the engine bucket (production is the cache Valkey's). */
+  readonly judge?: NameMatchJudge | null;
+  readonly bucket?: EngineBucketPort;
+  readonly monthlyCap?: number;
 }
 
-interface Prepared {
-  readonly payload: GeoAnalyzeJobPayload;
-}
+type Prepared =
+  | { readonly kind: "alignment"; readonly payload: GeoAnalyzeJobPayload }
+  | { readonly kind: "name_match"; readonly workspaceId: string; readonly projectId: string; readonly judge: NameMatchJudge; readonly work: JudgingPrepared };
+
+type Ran = AdvanceOutcome | DraftOutcome | "stopped" | JudgingResult;
 
 export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoAnalyzeDeps = {}): JobProcessor {
   // Built on the first job that needs it: constructing a producer at registration would open a connection in every process that merely imports
@@ -78,19 +97,83 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
     }
   };
 
-  return phasedProcessor<Prepared, AdvanceOutcome | DraftOutcome | "stopped">({
-    async prepare(_tx: ClientBase, job: Job) {
-      const parsed = geoAnalyzeJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload);
+  // The model judge and its bucket are built on the first judging job: constructing them at registration would open a connection in every process that
+  // merely imports the registry.
+  let judgeChosen: NameMatchJudge | null | undefined = deps.judge;
+  const judgeFor = (): NameMatchJudge | null => (judgeChosen === undefined ? (judgeChosen = selectNameMatchJudge(context.env)) : judgeChosen);
+  let bucketOpen: EngineBucketPort | undefined = deps.bucket;
+  const bucketFor = (): EngineBucketPort => {
+    if (bucketOpen === undefined) {
+      // The cache instance (STORY-031 D6), over a connection that rejects rather than blocks; TokenBucket fails OPEN on a store error (D19).
+      const redis = new Redis(context.env.VALKEY_CACHE_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
+      redis.on("error", () => undefined);
+      const bucket = new TokenBucket(redis);
+      const config = geminiPacingConfig(context.env.GEMINI_REQUESTS_PER_MINUTE);
+      bucketOpen = { tryAcquire: () => bucket.tryAcquire("gemini", config) };
+    }
+    return bucketOpen;
+  };
+
+  return phasedProcessor<Prepared, Ran>({
+    async prepare(tx: ClientBase, job: Job) {
+      const rawPayload = (job.data as { payload: unknown }).payload;
+      const judging = nameMatchJudgeJobPayloadSchema.safeParse(rawPayload);
+      if (judging.success) {
+        return tracer.startActiveSpan("geo.name_match_judge.prepare", async (span) => {
+          try {
+            const judge = judgeFor();
+            // The job judges under the judge THIS process is configured with. A job queued for another version (the model was changed, or unbound) is a no-op:
+            // the new judge's own job is queued by the next rollup.
+            if (judge === null || judge.version !== judging.data.judgeVersion) {
+              incrementCounter("nominara_geo_name_match_judge_jobs_total", { outcome: "judge_mismatch" });
+              return PHASES_DONE;
+            }
+            const work = await prepareJudging(tx, {
+              projectId: judging.data.projectId,
+              judgeVersion: judge.version,
+              judgeModel: judge.model,
+              ...(deps.monthlyCap === undefined ? {} : { monthlyCap: deps.monthlyCap }),
+            });
+            if (work === null) {
+              incrementCounter("nominara_geo_name_match_judge_jobs_total", { outcome: "nothing_to_judge" });
+              return PHASES_DONE;
+            }
+            return { kind: "name_match" as const, workspaceId: judging.data.workspaceId, projectId: judging.data.projectId, judge, work };
+          } catch (error) {
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw error;
+          } finally {
+            span.end();
+          }
+        });
+      }
+      const parsed = geoAnalyzeJobPayloadSchema.safeParse(rawPayload);
       if (!parsed.success) {
         // Not an alignment job (the queue also carries the daily geo analyses): not this handler's to run, and not a reason to retry.
         incrementCounter("nominara_geo_analyze_jobs_total", { outcome: "unrecognised" });
         logger.warn({ event: "geo.analyze.unrecognised_payload" });
         return PHASES_DONE;
       }
-      return { payload: parsed.data };
+      return { kind: "alignment" as const, payload: parsed.data };
     },
 
-    async run({ payload }) {
+    async run(prepared) {
+      if (prepared.kind === "name_match") {
+        return tracer.startActiveSpan("geo.name_match_judge.run", async (span) => {
+          try {
+            // NO transaction and NO pooled client in here: the model is awaited with neither held (ADR-0003).
+            const result = await runJudging(prepared.work, { judge: prepared.judge, bucket: bucketFor() });
+            span.setAttributes({ "nominara.name_match_judge.judged": result.verdicts.length, "nominara.name_match_judge.deferred": result.deferred });
+            return result;
+          } catch (error) {
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw error;
+          } finally {
+            span.end();
+          }
+        });
+      }
+      const { payload } = prepared;
       if (payload.attempt > MAX_ATTEMPTS) {
         incrementCounter("nominara_geo_analyze_jobs_total", { outcome: "attempt_cap" });
         return "stopped" as const;
@@ -131,7 +214,8 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
     async recover(tx, job, failure) {
       const attempts = job.opts?.attempts;
       if (attempts === undefined || (job.attemptsMade ?? 0) + 1 < attempts) return false;
-      const parsed = failure.prepared?.payload ?? geoAnalyzeJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload).data;
+      // A judging job has nothing to settle: it is idempotent and a retry re-reads what is still unjudged.
+      const parsed = (failure.prepared?.kind === "alignment" ? failure.prepared.payload : undefined) ?? geoAnalyzeJobPayloadSchema.safeParse((job.data as { payload: unknown }).payload).data;
       if (parsed === undefined) return false;
       incrementCounter("nominara_geo_analyze_jobs_total", { outcome: "retries_exhausted", kind: parsed.kind });
       logger.error({ event: "geo.analyze.retries_exhausted", workspace_id: parsed.workspaceId, session_id: parsed.sessionId, kind: parsed.kind, error: failure.error instanceof Error ? failure.error.name : "unknown" });
@@ -140,8 +224,28 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
       return true;
     },
 
-    async commit(_tx, { payload }, outcome) {
-      incrementCounter("nominara_geo_analyze_jobs_total", { outcome: typeof outcome === "string" ? outcome : outcome.state, kind: payload.kind });
+    async commit(tx, prepared, outcome) {
+      if (prepared.kind === "name_match") {
+        const result = outcome as JudgingResult;
+        const written = await commitJudging(tx, prepared.work, result);
+        incrementCounter("nominara_geo_name_match_judge_jobs_total", { outcome: result.bucketDenied ? "bucket_denied" : result.failedBatches > 0 ? "partial" : "judged" });
+        // IDs and counts only: never the span, its window, the alias or a model answer.
+        logger.log({
+          event: "geo.name_match_judge.settled",
+          workspace_id: prepared.workspaceId,
+          project_id: prepared.projectId,
+          judge_version: prepared.work.judgeVersion,
+          judged: result.verdicts.length,
+          written,
+          deferred: result.deferred,
+          model_calls: result.modelCalls,
+          failed_batches: result.failedBatches,
+          bucket_denied: result.bucketDenied,
+        });
+        return;
+      }
+      const { payload } = prepared;
+      incrementCounter("nominara_geo_analyze_jobs_total", { outcome: typeof outcome === "string" ? outcome : "state" in outcome ? outcome.state : "judged", kind: payload.kind });
     },
   });
 }

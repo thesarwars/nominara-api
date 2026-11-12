@@ -115,6 +115,18 @@ export const geoAnalyses = pgTable("geo_analyses", {
   computedAt: timestamp("computed_at", { withTimezone: true }).notNull().default(sql`now()`),
 }, (table) => [primaryKey({ columns: [table.projectId, table.analysis, table.windowStart, table.windowDays, table.scoringVersion] })]);
 
+export const nameMatchVerdicts = pgTable("name_match_verdicts", {
+  id: uuid("id").primaryKey(),
+  workspaceId: uuid("workspace_id").notNull(),
+  projectId: uuid("project_id").notNull(),
+  mentionFactId: uuid("mention_fact_id").notNull(),
+  capturedAt: timestamp("captured_at", { withTimezone: true }).notNull(),
+  judgeVersion: text("judge_version").notNull(),
+  judgeModel: text("judge_model").notNull(),
+  verdict: text("verdict").notNull(),
+  judgedAt: timestamp("judged_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
 export const patches = pgTable("patches", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
   workspaceId: uuid("workspace_id").notNull(),
