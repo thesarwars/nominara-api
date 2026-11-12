@@ -739,7 +739,7 @@ describe("STORY-047 - topic.cluster", () => {
     expect(await assignments()).toEqual(assigned);
   });
 
-  it("preservation (NOT AC9 coverage; AC9 is open) - recomputation keeps a cluster's denormalised performance columns instead of clearing them", async () => {
+  it("preservation (AC9's refresh itself is STORY-188, test/integration/topic-cluster-performance.spec.ts) - recomputation keeps a cluster's denormalised performance columns instead of clearing them", async () => {
     await seedGroups(2, 3);
     await run();
     await db.query("UPDATE topic_clusters SET visibility_score = 42.5, gap_priority = 0.3 WHERE project_id = $1", [projectId]);
