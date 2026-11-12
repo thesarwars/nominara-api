@@ -64735,6 +64735,16 @@
                             "normalized_text_offsets": {
                               "type": "boolean",
                               "const": true
+                            },
+                            "excerpt": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             }
                           },
                           "required": [
@@ -65257,6 +65267,9 @@
                           "items": {
                             "type": "string"
                           }
+                        },
+                        "raw_expired": {
+                          "type": "boolean"
                         }
                       },
                       "required": [

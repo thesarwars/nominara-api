@@ -25,11 +25,12 @@ import { TenantObjectStore } from "../../src/lib/storage/tenant-object-store.js"
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
 import type { DirtyEntry } from "../../src/lib/rollup/dirty-dates.js";
 import { ReparseService } from "../../src/modules/tracking/reparse.service.js";
+import { rawRetentionCutoff } from "../../src/modules/tracking/raw-retention.js";
 import { ResultDocumentService } from "../../src/modules/tracking/result-document.service.js";
 import { ResultsListService } from "../../src/modules/tracking/results-list.service.js";
 import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
-import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { currentTenantStore, withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-034 - the remaining read/maintenance ACs: AC7 (the cursor list), AC9 (re-parse with a diff, free) and AC10 (retention
 // failure, not an empty result). Run under the shared docker lock.
@@ -381,16 +382,57 @@ describe("STORY-034 · results list, re-parse and retention", () => {
     expect((await list(projectId, { run_id: uuidV7() })).items).toEqual([]); // a run with no captures is "nothing yet", not "expired"
   });
 
-  it("034-AC10d · the result document past retention is 507, and inside it is served", async () => {
+  // Owner decision 100(f) (2026-11-12) replaced the 507 on THIS route only: past the window the document is served with its facts and excerpt, no raw
+  // text, and `raw_expired: true`. /raw, /reparse and the list stay 507 (034-AC9j, 034-AC10a/f/g, 181-AC4c/e).
+  it("034-AC10d · the result document past retention is served WITHOUT its text and says raw_expired, and inside it is served whole with raw_expired false", async () => {
     const old = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
     const recent = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 5 * DAY) });
-    await expect(as(() => new ResultDocumentService().get(old))).rejects.toBeInstanceOf(RetentionExceededError);
-    await expect(as(() => new ResultDocumentService().get(recent))).resolves.toMatchObject({ result_id: recent });
+    const expired = await as(() => new ResultDocumentService().get(old));
+    expect(expired).toMatchObject({ result_id: old, raw_expired: true });
+    expect(expired.raw_response.text).toBe("");
+    expect(expired.raw_response.excerpt).toBe(ANSWER.slice(0, 280));
+    expect(expired.highlight_map).toEqual([]);
+    const fresh = await as(() => new ResultDocumentService().get(recent));
+    expect(fresh).toMatchObject({ result_id: recent, raw_expired: false });
+    expect(fresh.raw_response.text).toContain("HubSpot");
+    expect(fresh.raw_response.excerpt).toBeUndefined();
   });
 
-  it("034-AC10e · a capture the retention sweep already expired (payload.raw_expired) is 507 on the document too", async () => {
+  it("034-AC10d · the boundary: a capture one second inside the window is whole, one second past it is raw_expired (the cutoff the sweep and /raw use)", async () => {
+    const cutoff = (await as(() => rawRetentionCutoff(currentTenantStore()!.client, workspaceId)))!;
+    expect(cutoff).toBeInstanceOf(Date);
+    const inside = await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() + 5_000) });
+    const past = await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() - 5_000) });
+    expect((await as(() => new ResultDocumentService().get(inside))).raw_expired).toBe(false);
+    expect((await as(() => new ResultDocumentService().get(past))).raw_expired).toBe(true);
+  });
+
+  it("034-AC10d · past the window the FACTS are kept: entities and citations still come back, only the text and its offsets go", async () => {
+    const id = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await seedStaleFacts(id);
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.entities.length).toBeGreaterThan(0);
+    expect(doc.metrics.brand_present).toBe(true);
+    expect(doc.highlight_map).toEqual([]);
+    expect(doc.capture.response_chars).toBe(0);
+  });
+
+  it("034-AC10d · an expired document is still tenant-checked: another workspace's capture is 404, never its excerpt", async () => {
+    const id = await seed({ ws: otherWorkspaceId, project: otherProjectId, status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await expect(as(() => new ResultDocumentService().get(id))).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("034-AC10d · a cell that was never captured is still 422 past the window (there is no document to expire)", async () => {
+    const id = await seed({ status: "failed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await expect(as(() => new ResultDocumentService().get(id))).rejects.toBeInstanceOf(PreconditionUnmetError);
+  });
+
+  it("034-AC10e · a capture the retention sweep already expired (payload.raw_expired) is served as raw_expired too, even inside the window", async () => {
     const id = await seed({ status: "parsed", payloadExtra: { raw_expired: true } });
-    await expect(as(() => new ResultDocumentService().get(id))).rejects.toBeInstanceOf(RetentionExceededError);
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.raw_response.text).toBe("");
   });
 
   // ---------------------------------------------------------- AC9: re-parse

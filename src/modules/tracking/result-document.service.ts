@@ -10,7 +10,7 @@ import { NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-e
 import { assertProjectInScope } from "../../tenancy/project-scope.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { normalize, requiresReparse } from "../../lib/parser/normalize.js";
-import { assertWithinRawRetention } from "./raw-retention.js";
+import { isRawExpired } from "./raw-retention.js";
 
 /**
  * Appended to `flags` when the highlight map is WITHHELD because the stored offsets were computed under another normaliser version
@@ -50,6 +50,7 @@ interface CaptureRow {
   truncated: boolean;
   content_hash: Buffer;
   raw_object_key: string | null;
+  response_excerpt: string | null;
   payload: { text?: unknown; format?: unknown; raw_expired?: unknown } | null;
   status: "captured" | "parsed" | "failed" | "blocked" | "skipped";
   error_code: string | null;
@@ -105,7 +106,7 @@ export class ResultDocumentService {
       `SELECT c.id, c.project_id, c.run_id, c.prompt_id, c.engine_key, c.sample_index, c.captured_at,
               c.capture_mode, c.adapter_version, c.model_fingerprint, c.normalizer_version, c.scoring_version,
               c.latency_ms, c.response_tokens_est, c.truncated, c.content_hash, c.raw_object_key,
-              c.payload, c.status, c.error_code, c.cache_layer, c.source_result_id,
+              c.payload, c.response_excerpt, c.status, c.error_code, c.cache_layer, c.source_result_id,
               c.brand_present, c.brand_rank_position, c.sov, c.sentiment_label, c.sentiment_score,
               c.citation_count, c.owned_citation_count, c.flags,
               p.text AS prompt_text, p.intent_archetype, p.funnel_stage, p.cluster_id,
@@ -121,14 +122,15 @@ export class ResultDocumentService {
     if (capture === undefined) throw new NotFoundError({ message: "no such result" });
     // The id names a result, not a project: a scoped member is checked against the row's own project.
     await assertProjectInScope(store.client, capture.project_id);
-    // STORY-034 AC10 - past the plan's raw-capture retention the document is gone BY POLICY: 507, never a document with the answer
-    // quietly missing and never an empty result.
-    await assertWithinRawRetention(store.client, store.context.workspaceId, { capturedAt: capture.captured_at, rawExpired: capture.payload?.raw_expired }, "result_document");
+    // Owner decision 100(f) (STORY-077 R2; replaces the 507 THIS route gave under STORY-034 AC10): past the plan's raw-capture retention the document is
+    // served with its facts and excerpt, no raw text, and `raw_expired: true`. The text is not read at all (an L2 row's source is not touched), and the
+    // answer is never quietly empty: the flag says why. /raw, /reparse and the list stay 507.
+    const rawExpired = await isRawExpired(store.client, store.context.workspaceId, { capturedAt: capture.captured_at, rawExpired: capture.payload?.raw_expired });
 
     // THE TEXT EVERY OFFSET INDEXES. `mention_facts.char_*` and `evidence_*` are computed against normalize(raw) by the parse stage, and
     // the document asserts `normalized_text_offsets: true`; serving the raw text shifted every highlight after the first CRLF, zero-width
     // space, NFD sequence or 3+ newline run. An L2 row has no text of its own and reads its source's, scoped to this workspace and project.
-    const resolved = await resolveRawText(store.client, capture);
+    const resolved = rawExpired ? { text: "", format: typeof capture.payload?.format === "string" ? capture.payload.format : "markdown" } : await resolveRawText(store.client, capture);
     const text = normalize(resolved.text);
     // Offsets written under another normaliser version index a string this normaliser no longer produces: serve the text, withhold the
     // highlights, and say so. A wrong highlight is worse than none.
@@ -211,7 +213,10 @@ export class ResultDocumentService {
         char_count: text.length,
         text,
         normalized_text_offsets: true,
+        // The excerpt outlives the raw text (data-model.md retention); served only when the text is gone.
+        ...(rawExpired ? { excerpt: capture.response_excerpt } : {}),
       },
+      raw_expired: rawExpired,
       entities: groupEntities(mentions.rows, withheld),
       citations: citations.rows.map(toCitation),
       metrics: {
@@ -228,7 +233,7 @@ export class ResultDocumentService {
         sentiment_label: capture.sentiment_label,
         sentiment_score: capture.sentiment_score,
       },
-      highlight_map: withheld ? [] : buildHighlightMap(mentions.rows, text.length),
+      highlight_map: withheld || rawExpired ? [] : buildHighlightMap(mentions.rows, text.length),
       flags: withheld && !capture.flags.includes(HIGHLIGHTS_WITHHELD_FLAG) ? [...capture.flags, HIGHLIGHTS_WITHHELD_FLAG] : capture.flags,
     };
   }
