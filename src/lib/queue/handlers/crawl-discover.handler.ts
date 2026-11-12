@@ -154,7 +154,17 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
           fieldsSupplied: [...prepared.payload.fieldsSupplied, ...prepared.humanDecided],
           knownBrandNames: prepared.knownBrandNames,
         },
-        { ...(deps ?? DEFAULT_DISCOVER_DEPS), ...(classify === undefined ? {} : { classify }), ...(onFields === undefined ? {} : { onFields }) },
+        {
+          ...(deps ?? DEFAULT_DISCOVER_DEPS),
+          ...(classify === undefined ? {} : { classify }),
+          ...(onFields === undefined ? {} : { onFields }),
+          // STORY-190 - counts and ids only: never a page URL, its text or a competitor name.
+          onComparisonPages: (s) =>
+            logger.log(
+              `workspace ${prepared.payload.workspaceId} project ${prepared.payload.projectId}: comparison pages ${String(s.selected)} selected, ${String(s.fetched)} read, ` +
+                `${String(s.offSite)} off-site, ${String(s.redirectedOff)} redirected off-site, ${String(s.refused)} refused, ${String(s.failed)} failed, ${String(s.skippedBudget)} over budget`,
+            ),
+        },
       );
       const category = result.fields.category;
       const outcome = categoryIsDecided(prepared.payload.fieldsSupplied, prepared.humanDecided)

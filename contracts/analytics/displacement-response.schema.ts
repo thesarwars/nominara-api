@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { dataSourceSchema } from "./data-source.schema.js";
-import { citationGapEntrySchema, conceptGapEntrySchema, displacedByEntrySchema } from "./displacement-event.schema.js";
+import { citationGapEntrySchema, conceptGapEntrySchema, displacedByEntrySchema, PASSAGE_SCOPED_ENGINES } from "./displacement-event.schema.js";
 
 // NEW-C-5 — the displacement feed (`GET /v1/projects/{id}/displacements`) and
 // the dismiss/restore pair. `api-specification.md` §3 (feed, `tracking:read`),
@@ -47,6 +47,8 @@ export const displacementItemSchema = z
     takers: z.array(displacedByEntrySchema),
     /** `{url, domain, source_class, held_by, brand_present}`; `brand_present` null = never verified. */
     citation_gap: z.array(citationGapEntrySchema),
+    /** STORY-057 AC3: the engines whose citation gap is scoped to the recommending passage where it can be. Every other engine's is answer-scoped. */
+    passage_scoped_engines: z.array(z.enum(PASSAGE_SCOPED_ENGINES)),
     concept_gap: z.array(conceptGapEntrySchema),
     impact_score: z.number(),
     /** Non-null = a later capture restored what was lost. */

@@ -521,6 +521,21 @@ describe("STORY-059 - alignment, coverage, semantic nodes, projected gain", () =
     expect((await nodeByPhrase("audit logging")).present_in_content, "a live analysis reports the LIVE page's coverage, whatever draft exists").toBe(true);
   }, 60_000);
 
+  it("decision 99f - a LIVE analysis re-judges the nodes, so it clears the session's draft marker (the draft text stays); a pending draft recompute is left to run", async () => {
+    await addNode("audit logging", { embedding: vec({ 0: 1 }) });
+    const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "We offer audit logging.", draft: "A draft." });
+    await db.query(`UPDATE geo_alignments SET draft_state = 'ready' WHERE id = $1`, [session]);
+    await inTx((tx) => analyseNodes(tx, session, words, { draft: true }));
+    expect((await db.query(`SELECT draft_state FROM geo_alignments WHERE id = $1`, [session])).rows[0].draft_state).toBe("ready"); // a draft analysis keeps it
+    await inTx((tx) => analyseNodes(tx, session, words));
+    const live = (await db.query(`SELECT draft_state, draft_content_md FROM geo_alignments WHERE id = $1`, [session])).rows[0];
+    expect(live.draft_state).toBeNull();
+    expect(live.draft_content_md).toBe("A draft.");
+    await db.query(`UPDATE geo_alignments SET draft_state = 'pending' WHERE id = $1`, [session]);
+    await inTx((tx) => analyseNodes(tx, session, words));
+    expect((await db.query(`SELECT draft_state FROM geo_alignments WHERE id = $1`, [session])).rows[0].draft_state).toBe("pending");
+  }, 60_000);
+
   it("scenario 6 - a draft analysis of a session with no draft falls back to the live page", async () => {
     await addNode("audit logging", { embedding: vec({ 0: 1 }) });
     const session = await addSession({ centroid: vec({ 0: 1 }), sourceCount: 9, live: "We offer audit logging." });

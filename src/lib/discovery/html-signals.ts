@@ -168,3 +168,36 @@ export function extractHtmlSignals(html: string): HtmlSignals {
     comparisonLinks: comparisonLinks(root),
   };
 }
+
+/** What a comparison page says about itself, read from its structure only (STORY-190 AC3): never from the URL or the running prose. */
+export interface ComparisonPageSignals {
+  /** The `<title>` and every h1-h3, as text: where an "X vs Y" pairing is stated. */
+  readonly headings: string[];
+  /** One entry per table: the text of its header cells (`<th>`), in order. */
+  readonly tableHeaders: string[][];
+}
+
+const MAX_PAGE_HEADINGS = 60;
+const MAX_PAGE_TABLES = 10;
+const MAX_TABLE_HEADERS = 12;
+
+export function extractComparisonPageSignals(html: string): ComparisonPageSignals {
+  const root = parse(html) as unknown as Node;
+  const headings: string[] = [];
+  walk(root, (el) => {
+    if (headings.length >= MAX_PAGE_HEADINGS) return;
+    if (el.tagName === "title" || el.tagName === "h1" || el.tagName === "h2" || el.tagName === "h3") {
+      const text = collapse(textOf(el));
+      if (text !== "") headings.push(text);
+    }
+  });
+  const tableHeaders: string[][] = [];
+  for (const table of descendants(root, "table").slice(0, MAX_PAGE_TABLES)) {
+    const cells = descendants(table, "th")
+      .slice(0, MAX_TABLE_HEADERS)
+      .map((th) => collapse(textOf(th)))
+      .filter((t) => t !== "");
+    if (cells.length > 0) tableHeaders.push(cells);
+  }
+  return { headings, tableHeaders };
+}

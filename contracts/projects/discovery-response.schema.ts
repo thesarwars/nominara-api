@@ -35,6 +35,8 @@ export const proposedCompetitorSchema = z
     // is not something a customer can judge, and the story calls the basis out
     // as the thing that makes the list credible.
     basis: z.string(),
+    // STORY-190 - the comparison page a rival was read from, when the basis is a page the site published. Absent for a home-page link.
+    basis_url: z.string().optional(),
   })
   .strict();
 
