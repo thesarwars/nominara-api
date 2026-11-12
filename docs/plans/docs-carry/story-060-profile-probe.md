@@ -1,6 +1,6 @@
 # STORY-060 - carry to the docs repo (api batch10/s1)
 
-Status line: stays `Partial`. E1 and E3 are met for the two probed nodes only; E4 (a published score) is withheld by design; E7 is met; S3 (the structure-match gap) is NOT built, see the open question.
+Status line: stays `Partial`. E1 and E3 are met for the two probed nodes only; E4 (a published score) is withheld by design; E7 and S3 (the structure-match gap, owner decision 99k) are met.
 
 Owner decision 99(b), built:
 
@@ -10,7 +10,9 @@ Owner decision 99(b), built:
 - **Authority stays withheld**: only two of seven nodes are ever checked, so `Entity Authority` is null whatever the judge. The owner-decision-17 guard (STORY-191) is also in `buildEntity`; a test shows the probe alone cannot publish.
 - **E7**: `buildEntity` now emits `entity-node-missing-<node>` for a CHECKED absent node of weight >= 0.18 (Wikidata, 0.22) without waiting for all seven nodes. Migration **0198** retargets `TG-ENTITY-NODE` from `pending_analysis` to `geo_finding` on the entity analysis and enables it (data only; the `entity_node_missing` alert is raised from that task by the existing alert catalog). Tested: one task and one warning alert, once, and none for a present, unchecked or low-weight node.
 
-Open question for the owner (S3, the structure-match gap): `loadStructureInput` needs, per cluster, whether the brand's page for that cluster has a table or spec list. `geo_alignments.live_content_md` (the page text per cluster target URL) is flattened text with no table or list markup, so it cannot answer; the STORY-050 document model needs the page's HTML, which the AUX crawl keeps in the object store, and a rollup transaction may not read that. A page-structure fact has to be stored by something that fetches or reads the snapshot outside a transaction, and there is no column or table for it. Options are in the task report.
+## S3, the structure-match gap (owner decision 99k)
+
+Migration **0201** adds a nullable `geo_alignments.page_structure` jsonb (`{tables, lists: {ordered, unordered, definition}}`, zod `contracts/analytics/geo-page-structure.schema.ts`; NULL = never read for structure). The alignment session (`openAlignmentSession`) builds the STORY-050 document model from the HTML it **already fetched** and writes the summary with the live page, on both its insert and its write-onto-a-pending-row paths: no new fetch. `loadStructureInput` reads the **latest** summary per cluster (`DISTINCT ON (prompt_cluster_id)`, scoped to the project) into `StructureInput.clusterPages`; `buildStructure` judges each table-dominant, sufficient cluster against **its own page only** (never a union). A cluster with no page read, a NULL summary or one that does not parse is not assessed and asserts no gap. The `pages` field of the earlier shape is still accepted. The page for a cluster is its alignment target URL (as decision 99f states for 057). The subject inventory classes the column `omit` (derived counts); a draft does not rewrite it.
 
 ## Robots exemption for the Wikimedia APIs (owner decision 99j)
 

@@ -296,6 +296,49 @@ describe("STORY-060 · A3 structure-match gap (pure)", () => {
   });
 });
 
+describe("STORY-060 S3 / owner decision 99k · the structure-match gap is evaluated PER CLUSTER against that cluster's own page", () => {
+  const A = { id: "11111111-1111-4111-8111-111111111111", label: "CRM pricing" };
+  const B = { id: "22222222-2222-4222-8222-222222222222", label: "CRM integrations" };
+  const C = { id: "33333333-3333-4333-8333-333333333333", label: "CRM security" };
+  const forms = (): StructureInput["forms"] => [f("gemini", "comparison_table", 30, "live", A), f("gemini", "comparison_table", 30, "live", B), f("gemini", "comparison_table", 30, "live", C)];
+  const prose = (url: string) => ({ url, tables: 0, lists: { ordered: 0, unordered: 2, definition: 0 } });
+  const table = (url: string) => ({ url, tables: 1, lists: { ordered: 0, unordered: 0, definition: 0 } });
+  const gaps = (r: ReturnType<typeof buildStructure>) => r.write.findings.filter((x) => x.id.startsWith("structure-gap-")).map((x) => x.id).sort();
+
+  it("a table on cluster A's page does NOT cover cluster B's prose-only page: the gap fires for B only (never a union)", () => {
+    const r = buildStructure(input({ forms: forms(), clusterPages: [{ clusterId: A.id, page: table("https://acme.com/pricing") }, { clusterId: B.id, page: prose("https://acme.com/integrations") }] }));
+    expect(gaps(r)).toEqual([`structure-gap-${B.id}`]);
+    const gap = r.write.findings.find((x) => x.id === `structure-gap-${B.id}`)!;
+    expect(gap.task_rule_code).toBe("TG-STRUCTURE-TEMPLATE");
+    expect(gap.evidence[0]!.url).toBe("https://acme.com/integrations");
+    expect(r.detail!.template).toMatch(/CRM integrations/u);
+    expect(r.detail!.page_forms).toEqual(["table", "unordered_list"]);
+    expect(geoAnalysisWriteSchema.safeParse(r.write).success).toBe(true);
+  });
+
+  it("a cluster with no page read asserts NO gap (not assessed is not 'a page with no table'), while a cluster whose page was read does", () => {
+    const r = buildStructure(input({ forms: forms(), clusterPages: [{ clusterId: A.id, page: prose("https://acme.com/pricing") }] }));
+    expect(gaps(r)).toEqual([`structure-gap-${A.id}`]);
+  });
+
+  it("a definition (spec) list or a table on the cluster's own page closes its gap", () => {
+    const spec = { url: "https://acme.com/spec", tables: 0, lists: { ordered: 0, unordered: 0, definition: 1 } };
+    expect(gaps(buildStructure(input({ forms: forms(), clusterPages: [{ clusterId: A.id, page: spec }, { clusterId: B.id, page: table("https://acme.com/b") }] })))).toEqual([]);
+  });
+
+  it("a page for a cluster that is not table-dominant, or is below the evidence minimum, raises nothing", () => {
+    const thin: StructureInput["forms"] = [f("gemini", "comparison_table", 20, "live", A), f("gemini", "narrative", 5, "live", A), f("gemini", "narrative", 30, "live", B)];
+    expect(gaps(buildStructure(input({ forms: thin, clusterPages: [{ clusterId: A.id, page: prose("https://acme.com/p") }] })))).toEqual([]);
+    expect(gaps(buildStructure(input({ forms: [f("gemini", "narrative", 30, "live", A)], clusterPages: [{ clusterId: A.id, page: prose("https://acme.com/p") }] })))).toEqual([]);
+  });
+
+  it("no cluster page and no pages: unassessed, with the stated reason (unchanged)", () => {
+    const r = buildStructure(input({ forms: forms(), clusterPages: [] }));
+    expect(gaps(r)).toEqual([]);
+    expect(r.detail!.rationale).toMatch(/No page crawl/u);
+  });
+});
+
 describe("STORY-060 · a document model becomes an assessed page", () => {
   it("sums tables and each list kind over every block, and keeps the URL", () => {
     const block = (tables: number, ordered: number, unordered: number, definition: number) => ({ tables, lists: { ordered, unordered, definition } });

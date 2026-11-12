@@ -278,6 +278,23 @@ describe("STORY-192 - the alignment job and the debounced draft recompute", () =
     expect(await inTx((tx) => readSessionPayload(tx, b))).toMatchObject({ status: "ready" });
   }, 120_000);
 
+  it("STORY-060 S3 / decision 99k - the session records the page's tables and lists from the HTML it ALREADY fetched: no extra request, zeros for a bare page, and a redelivery does not rewrite it", async () => {
+    const rich = `<html><body><main><h2>Compare</h2><p>Teams compare reporting tools.</p><table><tr><td>A</td><td>B</td></tr></table><table><tr><td>C</td></tr></table><ul><li>x</li></ul><ol><li>y</li></ol><dl><dt>k</dt><dd>v</dd></dl></main></body></html>`;
+    pages.set(PAGE_URL, { kind: "html", html: rich });
+    const id = await pendingSession();
+    const input = { projectId, clusterId, targetUrl: PAGE_URL, engineKeys: ["chatgpt"], createdBy: null, sessionId: id };
+    await openAlignmentSession({ ...deps(), embeddingModel: MODEL }, input);
+    expect(fetchCalls.filter((u) => u === PAGE_URL)).toHaveLength(1);
+    expect((await sessionRow(id)).page_structure).toEqual({ tables: 2, lists: { ordered: 1, unordered: 1, definition: 1 } });
+    pages.set(PAGE_URL, { kind: "html", html: livePage });
+    await openAlignmentSession({ ...deps(), embeddingModel: MODEL }, input);
+    expect((await sessionRow(id)).page_structure).toEqual({ tables: 2, lists: { ordered: 1, unordered: 1, definition: 1 } });
+    // a session the library inserts itself (no pre-made row) records it too; a bare page is zeros, not null
+    pages.set(PAGE_URL, { kind: "html", html: livePage });
+    const own = await openAlignmentSession({ ...deps(), embeddingModel: MODEL }, { projectId, clusterId, targetUrl: PAGE_URL, engineKeys: ["chatgpt"], createdBy: null });
+    expect((await sessionRow(own.sessionId)).page_structure).toEqual({ tables: 0, lists: { ordered: 0, unordered: 0, definition: 0 } });
+  }, 60_000);
+
   it("AC job-1b - a redelivered open writes the page ONCE: a second open of the same session id adds no chunk and does not rewrite the live page", async () => {
     pages.set(PAGE_URL, { kind: "html", html: livePage });
     const id = await pendingSession();

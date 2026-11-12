@@ -9,6 +9,10 @@ import { incrementCounter } from "../../telemetry/metrics.js";
 import { chunkDocument, type TokenCounter } from "../corpus/chunker.js";
 import type { PageFetcher } from "../corpus/page-fetcher.js";
 import { extractReadable } from "../corpus/readable.js";
+import { buildAuxDocument } from "../../aux/document-model.js";
+import { cl100kTokenizer } from "../../aux/tokenizer-cl100k.js";
+import { structurePageFrom } from "../structure.js";
+import type { GeoPageStructure } from "../../../../contracts/analytics/index.js";
 
 // STORY-059 AC2 - open an alignment session for ONE URL and ONE cluster: fetch and chunk the LIVE page and ask for its chunks'
 // vectors.
@@ -78,6 +82,20 @@ export async function openAlignmentSession(deps: AlignmentDeps, input: OpenSessi
   });
 }
 
+/**
+ * STORY-060 S3 / owner decision 99(k): the tables and lists the STORY-050 document model finds on the page, from the HTML this session ALREADY fetched (no new
+ * request). Null when the model cannot be built: the structure summary is an extra, and a page it cannot read never fails the session.
+ */
+export function pageStructureOf(html: string, url: string): GeoPageStructure | null {
+  try {
+    const doc = buildAuxDocument({ url, finalUrl: url, httpStatus: 200, redirectChain: [], headers: {}, rawHtml: html, renderedHtml: null, timing: { ttfbMs: null, loadMs: null } }, cl100kTokenizer);
+    const { tables, lists } = structurePageFrom({ url, blocks: doc.blocks });
+    return { tables, lists };
+  } catch {
+    return null;
+  }
+}
+
 export const hashOf = (text: string): Buffer => createHash("sha256").update(text.replace(/\s+/g, " ").trim(), "utf8").digest();
 
 async function run(deps: AlignmentDeps, input: OpenSessionInput): Promise<OpenSessionResult> {
@@ -90,16 +108,17 @@ async function run(deps: AlignmentDeps, input: OpenSessionInput): Promise<OpenSe
     });
   }
   const markdown = extractReadable(page.html);
+  const pageStructure = pageStructureOf(page.html, input.targetUrl);
   const chunks = chunkDocument(markdown, deps.tokenizer);
 
   const written = await deps.runInTx(async (tx) => {
     if (input.sessionId !== undefined) {
       // The row exists (the request made it). Write the page onto it ONCE: a redelivery finds it written and adds no chunk.
       const written = await tx.query<{ id: string }>(
-        `UPDATE geo_alignments g SET live_content_md = $2, updated_at = now()
+        `UPDATE geo_alignments g SET live_content_md = $2, page_structure = $3::jsonb, updated_at = now()
           WHERE g.id = $1 AND g.workspace_id = app.current_workspace() AND g.live_content_md IS NULL AND g.analysis_state = 'pending'
           RETURNING g.id`,
-        [input.sessionId, markdown],
+        [input.sessionId, markdown, pageStructure === null ? null : JSON.stringify(pageStructure)],
       );
       if (written.rows[0] === undefined) return { sessionId: input.sessionId, ids: [] as string[] };
     }
@@ -107,11 +126,11 @@ async function run(deps: AlignmentDeps, input: OpenSessionInput): Promise<OpenSe
       input.sessionId !== undefined
         ? { rows: [{ id: input.sessionId }] }
         : await tx.query<{ id: string }>(
-            `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, live_content_md, created_by)
-             SELECT p.workspace_id, p.id, $2, $3, $4::text[], $5, $6, $7
+            `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, live_content_md, created_by, page_structure)
+             SELECT p.workspace_id, p.id, $2, $3, $4::text[], $5, $6, $7, $8::jsonb
                FROM projects p WHERE p.id = $1 AND p.workspace_id = app.current_workspace() AND p.deleted_at IS NULL
              RETURNING id`,
-            [input.projectId, input.targetUrl, input.clusterId, [...input.engineKeys], deps.embeddingModel, markdown, input.createdBy],
+            [input.projectId, input.targetUrl, input.clusterId, [...input.engineKeys], deps.embeddingModel, markdown, input.createdBy, pageStructure === null ? null : JSON.stringify(pageStructure)],
           );
     const sessionId = session.rows[0]?.id;
     if (sessionId === undefined) throw new ValidationFailedError({ message: "no such project", details: { issues: [{ path: ["project_id"], message: "no such project" }] } });

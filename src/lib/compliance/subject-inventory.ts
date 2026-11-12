@@ -108,7 +108,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   geo_alignments: {
     columns:
       "id workspace_id project_id task_id target_url prompt_cluster_id engine_keys embedding_model embedding_dims centroid_source_count centroid_domains live_content_md draft_content_md baseline_alignment current_alignment target_band_low target_band_high percentile_vs_corpus coverage_ratio recommendations status created_by created_at updated_at",
-    omit: "centroid analysis_state analysis_reason draft_state draft_recompute_due_at",
+    omit: "centroid analysis_state analysis_reason draft_state draft_recompute_due_at page_structure",
   },
   geo_analyses: {
     columns:

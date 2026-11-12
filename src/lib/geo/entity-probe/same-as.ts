@@ -18,7 +18,7 @@ function urlsOf(value: unknown, out: string[]): void {
   if (typeof raw !== "string") return;
   try {
     const url = new URL(raw.trim());
-    if (url.protocol === "http:" || url.protocol === "https:") out.push(url.href === `${url.origin}/` && !raw.trim().endsWith("/") ? url.origin : url.href);
+    if (url.protocol === "http:" || url.protocol === "https:") out.push(url.href);
   } catch {
     // not a URL: not a link
   }

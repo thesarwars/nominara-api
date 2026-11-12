@@ -95,6 +95,7 @@ export const geoAlignments = pgTable("geo_alignments", {
   analysisReason: text("analysis_reason"),
   draftState: text("draft_state"),
   draftRecomputeDueAt: timestamp("draft_recompute_due_at", { withTimezone: true }),
+  pageStructure: jsonb("page_structure"),
 });
 
 export const geoAnalyses = pgTable("geo_analyses", {

@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import {
+  geoPageStructureSchema,
   type AnswerFormValue,
   type GeoAnalysisWrite,
   type GeoFinding,
@@ -91,6 +92,12 @@ export interface StructureInput {
    * nothing) and never means "a page with no table": a gap is only asserted against a page that was actually read.
    */
   pages?: readonly StructurePage[] | null;
+  /**
+   * STORY-060 S3 / owner decision 99k - the page each prompt cluster points at (its alignment target URL), as read by the alignment session that fetched it.
+   * The gap for a cluster is judged against ITS page alone, never a union: a table on one cluster's page says nothing about another's. A cluster with no
+   * entry here is NOT ASSESSED and asserts no gap.
+   */
+  clusterPages?: readonly { clusterId: string; page: StructurePage }[] | null;
 }
 
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
@@ -222,12 +229,27 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
         ? ` The brand sits in the recommendation clause in ${pct(rec.share)} of its answers (no prior window to compare).`
         : ` The brand's recommendation-clause share moved from ${pct(rec.prior)} to ${pct(rec.share)}.`;
 
-  const pages = input.pages ?? [];
+  const clusterPages = input.clusterPages ?? [];
+  const pages = [...(input.pages ?? []), ...clusterPages.map((c) => c.page)];
   const assessed = pages.length > 0;
   const pageForms = pageFormsOf(pages);
-  const providesStructure = pageForms.includes("table") || pageForms.includes("definition_list");
   const clusters = clusterDistributions(input.forms);
-  const gaps = assessed && !providesStructure ? clusters.filter((c) => c.sufficient && c.dominant_form === "comparison_table") : [];
+  // A cluster's page: its own (S3), else the project-level pages as one (the earlier shape, still accepted from a caller that supplies `pages`).
+  const legacyPages = input.pages ?? [];
+  const pageFor = (clusterId: string | null): StructurePage[] | null => {
+    const own = clusterId === null ? undefined : clusterPages.find((c) => c.clusterId === clusterId);
+    if (own !== undefined) return [own.page];
+    return legacyPages.length > 0 ? [...legacyPages] : null;
+  };
+  const providesStructureOf = (list: readonly StructurePage[]): boolean => {
+    const forms = pageFormsOf(list);
+    return forms.includes("table") || forms.includes("definition_list");
+  };
+  const gaps = clusters.filter((c) => {
+    if (!c.sufficient || c.dominant_form !== "comparison_table") return false;
+    const page = pageFor(c.cluster_id);
+    return page !== null && !providesStructureOf(page);
+  });
   const firstGap = gaps[0];
   const rationale = !assessed
     ? NO_PAGE_CRAWL_REASON
@@ -275,7 +297,7 @@ export function buildStructure(input: StructureInput): { write: GeoAnalysisWrite
       severity: "medium" as const,
       headline: `Answers for ${label} are mostly comparison tables (${pct(tables / g.total)} of ${String(g.total)}), and the brand's page provides neither a table nor a spec list.`,
       detail: structureTemplate(label),
-      evidence: [{ url: pages[0]!.url, snippet: `Provides: ${pageForms.length === 0 ? "no tables or lists" : pageForms.join(", ")}.` }],
+      evidence: [{ url: pageFor(g.cluster_id)![0]!.url, snippet: `Provides: ${pageFormsOf(pageFor(g.cluster_id)!).length === 0 ? "no tables or lists" : pageFormsOf(pageFor(g.cluster_id)!).join(", ")}.` }],
       metric: { name: "cluster_table_share", value: round4(tables / g.total) },
       task_rule_code: STRUCTURE_TASK_RULE,
     };
@@ -347,6 +369,21 @@ export async function loadStructureInput(
     [projectId, windowStart, windowDays, DEMO_NORMALIZER_VERSION, SCORING_VERSION],
   );
 
+  // STORY-060 S3 / owner decision 99(k): the page each cluster points at, as the alignment session that fetched it read it (migration 0201). The LATEST session
+  // per cluster with a stored summary; a cluster none has read is simply absent (not assessed). No fetching happens here.
+  const pageRows = await tx.query<{ prompt_cluster_id: string; target_url: string; page_structure: unknown }>(
+    `SELECT DISTINCT ON (prompt_cluster_id) prompt_cluster_id, target_url, page_structure
+       FROM geo_alignments
+      WHERE project_id = $1 AND prompt_cluster_id IS NOT NULL AND page_structure IS NOT NULL
+      ORDER BY prompt_cluster_id, created_at DESC, id DESC`,
+    [projectId],
+  );
+  const clusterPages = pageRows.rows.flatMap((r) => {
+    const parsed = geoPageStructureSchema.safeParse(r.page_structure);
+    // A summary that does not parse is a page not assessed, never a gap and never a throw.
+    return parsed.success ? [{ clusterId: r.prompt_cluster_id, page: { url: r.target_url, tables: parsed.data.tables, lists: parsed.data.lists } }] : [];
+  });
+
   // The brand's FIRST mention in each answer decides its position class.
   const positionIn = async (offsetDays: number): Promise<ClassRow[]> =>
     (
@@ -374,6 +411,7 @@ export async function loadStructureInput(
       answers: r.answers,
       cluster: r.cluster_id === null ? null : { id: r.cluster_id, label: r.cluster_label ?? "" },
     })),
+    clusterPages,
     position: (await positionIn(0)).map((r) => ({ cls: r.position_class, answers: r.answers })),
     priorPosition: (await positionIn(windowDays)).map((r) => ({ cls: r.position_class, answers: r.answers })),
   };
