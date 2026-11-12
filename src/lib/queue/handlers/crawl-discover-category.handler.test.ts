@@ -226,5 +226,26 @@ describe("STORY-189 · crawl.discover classifies and proposes peers", () => {
       expect(line).toBeDefined();
       expect(line).not.toMatch(/hubspot|pipedrive|salesforce|contacts and deals/i);
     });
+
+    it("STORY-190 - logs the comparison-page counts with the workspace id and never a URL or a competitor name", async () => {
+      const { Logger } = await import("@nestjs/common");
+      const lines: string[] = [];
+      vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(typeof m === "string" ? m : JSON.stringify(m)));
+      const home = `<html><body><a href="/compare">Compare</a></body></html>`;
+      const fetched: string[] = [];
+      const deps: DiscoverDeps = {
+        fetch: (async (url: string) => {
+          fetched.push(url);
+          const body = url.endsWith("/compare") ? "<h1>HubSpot vs Salesforce</h1>" : home;
+          return { status: 200, headers: {}, body: Buffer.from(body), finalUrl: url };
+        }) as never,
+        now: () => Date.now(),
+      };
+      await createCrawlDiscoverHandler(CONTEXT, deps)(txFor([]), job());
+      const line = lines.find((l) => l.includes("comparison pages"))!;
+      expect(line).toContain(WORKSPACE);
+      expect(line).toMatch(/1 selected, 1 read/);
+      expect(line).not.toMatch(/salesforce|\/compare/i);
+    });
   });
 });

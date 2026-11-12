@@ -43908,6 +43908,9 @@
                               },
                               "basis": {
                                 "type": "string"
+                              },
+                              "basis_url": {
+                                "type": "string"
                               }
                             },
                             "required": [
@@ -44313,6 +44316,9 @@
                                 "maximum": 1
                               },
                               "basis": {
+                                "type": "string"
+                              },
+                              "basis_url": {
                                 "type": "string"
                               }
                             },
