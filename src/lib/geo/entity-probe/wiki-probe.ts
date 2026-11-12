@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { toRegistrableDomain } from "../../net/registrable-domain.js";
 import { fold } from "../../parser/fold.js";
 import type { EntityCheck, StoredEntityNode } from "../entity.js";
 import type { JsonFetcher, JsonFetchResult } from "./json-fetcher.js";
@@ -11,6 +12,8 @@ import type { JsonFetcher, JsonFetchResult } from "./json-fetcher.js";
 // domain: a name alone matches namesakes ("Notion" the concept) and would score false presence. A Wikipedia article is the brand's when the brand's
 // Wikidata entity links to it, or, with no Wikidata match, when an English article that links to the brand's domain is titled by the brand's name.
 // A candidate that names no website cannot be told from a namesake and is not the brand's profile.
+// ABSENT means an EMPTY search result only. When candidates exist and none verifies the node is UNCHECKED (`no_verified_match`): the real profile may rank below
+// namesakes, or state no website, or another domain, and a false "absent" would raise the missing-profile alert and task.
 //
 // FAIL CLOSED. A node is reported ABSENT (a check with no url) only when every request it needed was answered and none matched. A refused, blocked,
 // failed or malformed answer leaves the node UNCHECKED, so a blocked probe can never raise a "missing profile" alert.
@@ -87,10 +90,19 @@ const hostOf = (raw: string): string | null => {
     return null;
   }
 };
+/** The project's registrable domain, or null for one that is no site's (a bare public suffix such as "com" or "co.uk", an IP literal, garbage). */
+const registrable = (rootDomain: string): string | null => {
+  try {
+    return toRegistrableDomain(rootDomain.trim().toLowerCase());
+  } catch {
+    return null;
+  }
+};
+/** Is `url` on the brand's own site? Never true for a root domain that is only a public suffix: "com" would match every .com website. */
 const onDomain = (url: string, rootDomain: string): boolean => {
   const host = hostOf(url);
-  const root = rootDomain.toLowerCase().replace(/^www\./u, "");
-  return host !== null && (host === root || host.endsWith(`.${root}`));
+  const root = registrable(rootDomain);
+  return host !== null && root !== null && (host === root || host.endsWith(`.${root}`));
 };
 const api = (base: string, params: Record<string, string>): string => {
   const url = new URL(base);
@@ -134,7 +146,9 @@ export function createWikiProfileProbe(fetchJson: JsonFetcher): WikiProfileProbe
       ];
       return { check: { node: "wikidata", url: `https://www.wikidata.org/wiki/${id}`, missingFields }, enwiki: entity.sitelinks?.enwiki?.title ?? null };
     }
-    return absent;
+    // CANDIDATES EXIST BUT NONE VERIFIES: the brand may rank below namesakes in the top results, or its entity may state no website or another domain. That is
+    // "could not verify", NOT "absent": absence would raise a false "create your profile" alert and task.
+    throw new Unanswered("no_verified_match");
   }
 
   async function wikipedia(subject: ProbeSubject, title: string): Promise<EntityCheck> {
@@ -158,11 +172,18 @@ export function createWikiProfileProbe(fetchJson: JsonFetcher): WikiProfileProbe
     const usage = await get(api(WIKIPEDIA_API, { action: "query", list: "exturlusage", euquery: subject.rootDomain, eunamespace: "0", eulimit: "20", format: "json" }), extUsageSchema);
     const wanted = new Set(names.map((n) => fold(n).folded));
     const hit = usage.query.exturlusage.find((u) => wanted.has(titleKey(u.title)));
-    return hit === undefined ? { node: "wikipedia", url: null, missingFields: [] } : wikipedia(subject, hit.title);
+    if (hit !== undefined) return wikipedia(subject, hit.title);
+    // Articles link the domain but none is titled by the brand: unverified, not absent. Only an EMPTY result is an answer of "none".
+    if (usage.query.exturlusage.length > 0) throw new Unanswered("no_verified_match");
+    return { node: "wikipedia", url: null, missingFields: [] };
   }
 
   return {
     async probe(subject) {
+      // A root domain that is only a public suffix identifies no site: nothing could be verified against it, so nothing is asked.
+      if (registrable(subject.rootDomain) === null) {
+        return { checks: [], unchecked: [{ node: "wikidata", reason: "unusable_domain" }, { node: "wikipedia", reason: "unusable_domain" }] };
+      }
       const names = [...new Set([subject.name, ...subject.aliases].map((n) => n.trim()).filter((n) => n !== ""))];
       const terms: string[] = [];
       for (const name of names) if (!terms.some((t) => fold(t).folded === fold(name).folded)) terms.push(name);

@@ -15,6 +15,12 @@ import type { NameMatchJudge, NameMatchQuery, NameMatchVerdict } from "./port.js
 // (AC6). A longer window is refused here, so a caller cannot widen what leaves the process. There is no `tools` member, so no search grounding: the
 // model's context never contains web text. The response is constrained to the three verdicts by `responseSchema` and parsed again here.
 //
+// PROMPT INJECTION (residual risk, accepted). The window is text from an engine's answer, which can say anything. It is sent as quoted data after an instruction
+// that says so, and the output is constrained by `responseSchema` to an enum of exactly three verdicts and re-parsed here, so an injected string can never
+// become free text, a tool call or a leaked value. What it CAN still do is sway the model to pick `about_brand` or `not_about_brand` for that ONE match. The
+// damage is bounded: it moves one match in the A2 disambiguation ratio (which needs 30 judged matches and is reported separately, never folded into the score),
+// the window is at most 180 characters, only ambiguous matches are asked, and `unjudged` is always a legal answer. It does not touch another match's verdict.
+//
 // FAILURE. One attempt, a hard timeout, and a circuit breaker (NFR-ARCH-05). A failure carries the HTTP status and nothing else - a provider error body
 // can quote the input back - and the key is never placed anywhere but the request header.
 

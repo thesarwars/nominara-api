@@ -18,14 +18,15 @@ import { createCrawlGate, type CrawlGateOptions, type FetchLike } from "../../ne
 
 export const WIKIMEDIA_API_CRAWL_DELAY_SECONDS = 1;
 
-const ENDPOINTS: Readonly<Record<string, readonly string[]>> = {
-  "www.wikidata.org": ["wbsearchentities", "wbgetentities"],
-  "en.wikipedia.org": ["query"],
-};
+// A Map, not an object literal: a plain-object lookup answers for inherited names ("constructor", "__proto__") and an enumeration must not.
+const ENDPOINTS: ReadonlyMap<string, readonly string[]> = new Map([
+  ["www.wikidata.org", ["wbsearchentities", "wbgetentities"]],
+  ["en.wikipedia.org", ["query"]],
+]);
 
 export function isWikimediaApiEndpoint(url: URL): boolean {
   if (url.protocol !== "https:" || url.port !== "" || url.pathname !== "/w/api.php" || url.username !== "" || url.password !== "") return false;
-  const actions = ENDPOINTS[url.hostname.toLowerCase()];
+  const actions = ENDPOINTS.get(url.hostname.toLowerCase());
   const action = url.searchParams.get("action");
   return actions !== undefined && action !== null && actions.includes(action);
 }

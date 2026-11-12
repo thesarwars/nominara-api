@@ -85,17 +85,40 @@ describe("STORY-060 E1 · the Wikidata and Wikipedia probe", () => {
     expect(wikidata.missingFields).toEqual([]);
   });
 
-  it("a brand with NO matching entity is affirmatively ABSENT (a check with no url), because every request was answered", async () => {
-    const { fetchJson } = fixtureFetcher(world({ search: [{ id: "Q2" }] }));
+  it("ABSENT is reserved for an EMPTY search: no entity answers to the brand's name or aliases at all", async () => {
+    const { fetchJson } = fixtureFetcher(world({ search: [] }));
     const out = await createWikiProfileProbe(fetchJson).probe(SUBJECT);
     expect(out.checks.find((c) => c.node === "wikidata")).toEqual({ node: "wikidata", url: null, missingFields: [] });
-    expect(out.unchecked).toEqual([]);
+    expect(out.unchecked.find((u) => u.node === "wikidata")).toBeUndefined();
   });
 
-  it("a candidate that states no official website cannot be told from a namesake, so it is not the brand's profile", async () => {
-    const bare = entity("Q1", { description: "software company" });
-    const { fetchJson } = fixtureFetcher(world({ q1: bare }));
-    expect((await createWikiProfileProbe(fetchJson).probe(SUBJECT)).checks.find((c) => c.node === "wikidata")!.url).toBeNull();
+  it("FALSE-ABSENCE GUARD: candidates exist but none verifies (a namesake only, or a candidate with no or another website) is UNCHECKED (no_verified_match), never absent", async () => {
+    for (const [label, q1, search] of [
+      ["namesake only", entity("Q1", { website: "https://acme.com/", description: "d" }), [{ id: "Q2" }]],
+      ["no website claim", entity("Q1", { description: "software company" }), [{ id: "Q1" }]],
+      ["another domain", entity("Q1", { website: "https://acme-corp.example/", description: "d" }), [{ id: "Q1" }]],
+    ] as const) {
+      const { fetchJson } = fixtureFetcher(world({ q1, search: [...search] }));
+      const out = await createWikiProfileProbe(fetchJson).probe(SUBJECT);
+      expect(out.checks.find((c) => c.node === "wikidata"), label).toBeUndefined();
+      expect(out.unchecked.find((u) => u.node === "wikidata"), label).toEqual({ node: "wikidata", reason: "no_verified_match" });
+    }
+  });
+
+  it("a top-5 CROWDED by namesakes, with the real profile ranked below them, is unchecked and raises no absence", async () => {
+    const namesakes = ["Q11", "Q12", "Q13", "Q14", "Q15"];
+    const base = world();
+    const { fetchJson } = fixtureFetcher((url) => {
+      if (url.searchParams.get("action") === "wbsearchentities") return json({ search: namesakes.map((id) => ({ id })) });
+      if (url.searchParams.get("action") === "wbgetentities") {
+        const ids = (url.searchParams.get("ids") ?? "").split("|");
+        return json({ entities: Object.fromEntries(ids.map((id) => [id, entity(id, { website: `https://namesake-${id}.example/` })])) });
+      }
+      return base(url);
+    });
+    const out = await createWikiProfileProbe(fetchJson).probe(SUBJECT);
+    expect(out.checks.find((c) => c.node === "wikidata")).toBeUndefined();
+    expect(out.unchecked.find((u) => u.node === "wikidata")?.reason).toBe("no_verified_match");
   });
 
   it("completeness: the core fields the entity lacks are recorded, separate from presence", async () => {
@@ -117,6 +140,15 @@ describe("STORY-060 E1 · the Wikidata and Wikipedia probe", () => {
     const noArticle = entity("Q1", { website: "https://acme.com", description: "d" });
     expect((await createWikiProfileProbe(fixtureFetcher(world({ q1: noArticle })).fetchJson).probe(SUBJECT)).checks.find((c) => c.node === "wikipedia")).toEqual({ node: "wikipedia", url: null, missingFields: [] });
     expect((await createWikiProfileProbe(fixtureFetcher(world({ wikipediaMissing: true })).fetchJson).probe(SUBJECT)).checks.find((c) => c.node === "wikipedia")!.url).toBeNull();
+  });
+
+  it("Wikipedia by domain: an EMPTY external-link search is absent, but articles that link the domain with none titled by the brand are UNCHECKED (no_verified_match)", async () => {
+    const empty = fixtureFetcher((url) => (url.searchParams.get("list") === "exturlusage" ? json({ query: { exturlusage: [] } }) : world({ search: [] })(url)));
+    expect((await createWikiProfileProbe(empty.fetchJson).probe(SUBJECT)).checks.find((c) => c.node === "wikipedia")).toEqual({ node: "wikipedia", url: null, missingFields: [] });
+    const crowded = fixtureFetcher((url) => (url.searchParams.get("list") === "exturlusage" ? json({ query: { exturlusage: [{ title: "Some blog" }, { title: "Another page" }] } }) : world({ search: [] })(url)));
+    const out = await createWikiProfileProbe(crowded.fetchJson).probe(SUBJECT);
+    expect(out.checks.find((c) => c.node === "wikipedia")).toBeUndefined();
+    expect(out.unchecked.find((u) => u.node === "wikipedia")).toEqual({ node: "wikipedia", reason: "no_verified_match" });
   });
 
   it("Wikipedia without a Wikidata match: an article that links to the brand's domain and is titled by its name is found", async () => {
@@ -165,6 +197,17 @@ describe("STORY-060 E1 · the Wikidata and Wikipedia probe", () => {
     expect(searches.length).toBeLessThanOrEqual(3);
     expect(new Set(searches).size).toBe(searches.length);
     expect(searches[0]).toBe("Acme");
+  });
+});
+
+describe("STORY-060 E1 · a root domain that is only a public suffix is never a brand's website (fix round)", () => {
+  it.each(["com", "co.uk", "com.au"])("%s: nothing matches it, and the probe checks nothing", async (rootDomain) => {
+    const entityOnSuffix = entity("Q1", { website: `https://www.example.${rootDomain}/`, description: "d", enwiki: "X" });
+    const { fetchJson, requested } = fixtureFetcher(world({ q1: entityOnSuffix }));
+    const out = await createWikiProfileProbe(fetchJson).probe({ ...SUBJECT, rootDomain });
+    expect(out.checks).toEqual([]);
+    expect(out.unchecked.map((u) => u.reason)).toEqual(["unusable_domain", "unusable_domain"]);
+    expect(requested).toEqual([]);
   });
 });
 

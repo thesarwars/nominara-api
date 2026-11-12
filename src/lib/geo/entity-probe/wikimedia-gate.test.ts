@@ -34,6 +34,10 @@ describe("isWikimediaApiEndpoint: exact hosts, exact path, enumerated actions", 
     "https://www.wikidata.org.evil.example/w/api.php?action=wbgetentities",
     "http://en.wikipedia.org/w/api.php?action=query",
     "https://en.wikipedia.org:8443/w/api.php?action=query",
+    // inherited Object members are not hosts (a plain-object lookup would find `constructor`)
+    "https://constructor/w/api.php?action=query",
+    "https://__proto__/w/api.php?action=query",
+    "https://tostring/w/api.php?action=query",
   ])("is NOT exempt: %s", (url) => expect(isWikimediaApiEndpoint(new URL(url))).toBe(false));
 });
 
