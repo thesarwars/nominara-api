@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { InMemorySpanExporter, SimpleSpanProcessor, BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { trace } from "@opentelemetry/api";
 import { MIGRATIONS_DIR, migrateUp } from "../../src/db/migrate-runner.js";
+import { TASK_TRIGGER_KINDS } from "../../contracts/tasks/task-generate-job.schema.js";
 import { taskBaselineMetricsSchema, taskGenerationConditionSchema, taskPlaybookPayloadSchema } from "../../contracts/tasks/index.js";
 import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
@@ -298,6 +299,19 @@ describe("STORY-063 · task generation engine", () => {
     expect((await rule("TG-SOURCE-ABSENCE")).cooldown_days).toBe(30);
     expect((await rule("TG-DISPLACEMENT-RECOVER")).cooldown_days).toBe(0);
     expect((await rule("TG-DISPLACEMENT-RECOVER")).condition).toMatchObject({ min_impact: 60 });
+  });
+
+  it("[STORY-193 AC1] TASK_TRIGGER_KINDS is exactly the trigger_kind CHECK of task_generation_rules, as pg_constraint reports it", async () => {
+    const { rows } = await db.query<{ def: string }>(
+      `SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c
+        WHERE c.conrelid = 'task_generation_rules'::regclass AND c.contype = 'c' AND pg_get_constraintdef(c.oid) LIKE '%trigger_kind%'`);
+    expect(rows).toHaveLength(1);
+    const kinds = [...rows[0]!.def.matchAll(/'([a-z_]+)'::text/gu)].map((x) => x[1]!);
+    expect(kinds.length).toBeGreaterThan(0);
+    expect([...TASK_TRIGGER_KINDS].sort()).toEqual([...kinds].sort());
+    // Every seeded rule's trigger_kind is one the constant admits (the borrowed kinds included, owner decision 98c).
+    const used = (await db.query<{ trigger_kind: string }>(`SELECT DISTINCT trigger_kind FROM task_generation_rules`)).rows.map((r) => r.trigger_kind);
+    for (const k of used) expect(TASK_TRIGGER_KINDS as readonly string[]).toContain(k);
   });
 
   it("[STORY-063 AC2] the category CHECK admits exactly content / technical / authority / monitoring — never the classic search dichotomy", async () => {
