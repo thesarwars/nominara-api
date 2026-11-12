@@ -7351,6 +7351,376 @@
                             }
                           ]
                         },
+                        "evidence": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "finding",
+                                    "displacement",
+                                    "geo_analysis",
+                                    "source_gap"
+                                  ]
+                                },
+                                "id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "id"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "measured_impact": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "visibility_before": {
+                                  "type": "number"
+                                },
+                                "visibility_after_14d": {
+                                  "type": "number"
+                                },
+                                "delta": {
+                                  "type": "number"
+                                },
+                                "window_days": {
+                                  "type": "integer",
+                                  "exclusiveMinimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "confidence": {
+                                  "type": "string",
+                                  "enum": [
+                                    "low",
+                                    "medium",
+                                    "high"
+                                  ]
+                                },
+                                "method": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "scoring_version": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "caveat": {
+                                  "type": "string",
+                                  "const": "Observational; concurrent changes are not controlled for."
+                                },
+                                "n_before": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "n_after": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "other_milestones_nearby": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                }
+                              },
+                              "required": [
+                                "visibility_before",
+                                "visibility_after_14d",
+                                "delta",
+                                "window_days",
+                                "confidence",
+                                "method",
+                                "scoring_version",
+                                "caveat",
+                                "n_before",
+                                "n_after",
+                                "other_milestones_nearby"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "patch": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "patch_id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "finding_id": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "project_id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "rule_code": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "markdown",
+                                    "html_fragment",
+                                    "jsonld",
+                                    "robots"
+                                  ]
+                                },
+                                "target_url": {
+                                  "type": "string"
+                                },
+                                "content_before_hash": {
+                                  "type": "string",
+                                  "pattern": "^sha256:[0-9a-f]{64}$"
+                                },
+                                "content_after": {
+                                  "type": "string"
+                                },
+                                "unified_diff": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "jsonld_blocks": {
+                                  "anyOf": [
+                                    {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "object",
+                                        "propertyNames": {
+                                          "type": "string"
+                                        },
+                                        "additionalProperties": {}
+                                      }
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "reversal": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "operation": {
+                                          "type": "string",
+                                          "enum": [
+                                            "remove_block",
+                                            "delete_file",
+                                            "replace_file",
+                                            "remove_fragment",
+                                            "remove_jsonld",
+                                            "restore_jsonld"
+                                          ]
+                                        },
+                                        "content": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "operation",
+                                        "content"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "preconditions": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "file_hash",
+                                          "page_hash",
+                                          "file_absent"
+                                        ]
+                                      },
+                                      "value": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "pattern": "^sha256:[0-9a-f]{64}$"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "value"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "explanation": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "derivation": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "requires_human_review": {
+                                  "type": "boolean"
+                                },
+                                "review_reason": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "risk_flags": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  }
+                                },
+                                "page_matches": {
+                                  "anyOf": [
+                                    {
+                                      "type": "boolean"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "earlier_patch_ids": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  }
+                                },
+                                "free": {
+                                  "type": "boolean",
+                                  "const": true
+                                },
+                                "credits_charged": {
+                                  "type": "number",
+                                  "const": 0
+                                },
+                                "created_at": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "patch_id",
+                                "finding_id",
+                                "project_id",
+                                "rule_code",
+                                "kind",
+                                "target_url",
+                                "content_before_hash",
+                                "content_after",
+                                "unified_diff",
+                                "jsonld_blocks",
+                                "reversal",
+                                "preconditions",
+                                "explanation",
+                                "derivation",
+                                "requires_human_review",
+                                "review_reason",
+                                "risk_flags",
+                                "page_matches",
+                                "earlier_patch_ids",
+                                "free",
+                                "credits_charged",
+                                "created_at"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "playbook_slug": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "created_at": {
                           "type": "string"
                         },
@@ -7382,6 +7752,10 @@
                         "affected_url",
                         "seeding",
                         "review",
+                        "evidence",
+                        "measured_impact",
+                        "patch",
+                        "playbook_slug",
                         "created_at",
                         "updated_at"
                       ],
@@ -20656,6 +21030,376 @@
                               }
                             ]
                           },
+                          "evidence": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "finding",
+                                      "displacement",
+                                      "geo_analysis",
+                                      "source_gap"
+                                    ]
+                                  },
+                                  "id": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  }
+                                },
+                                "required": [
+                                  "kind",
+                                  "id"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "measured_impact": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "visibility_before": {
+                                    "type": "number"
+                                  },
+                                  "visibility_after_14d": {
+                                    "type": "number"
+                                  },
+                                  "delta": {
+                                    "type": "number"
+                                  },
+                                  "window_days": {
+                                    "type": "integer",
+                                    "exclusiveMinimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "confidence": {
+                                    "type": "string",
+                                    "enum": [
+                                      "low",
+                                      "medium",
+                                      "high"
+                                    ]
+                                  },
+                                  "method": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "scoring_version": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "caveat": {
+                                    "type": "string",
+                                    "const": "Observational; concurrent changes are not controlled for."
+                                  },
+                                  "n_before": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "n_after": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "other_milestones_nearby": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  }
+                                },
+                                "required": [
+                                  "visibility_before",
+                                  "visibility_after_14d",
+                                  "delta",
+                                  "window_days",
+                                  "confidence",
+                                  "method",
+                                  "scoring_version",
+                                  "caveat",
+                                  "n_before",
+                                  "n_after",
+                                  "other_milestones_nearby"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "patch": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "patch_id": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  },
+                                  "finding_id": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "project_id": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  },
+                                  "rule_code": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "markdown",
+                                      "html_fragment",
+                                      "jsonld",
+                                      "robots"
+                                    ]
+                                  },
+                                  "target_url": {
+                                    "type": "string"
+                                  },
+                                  "content_before_hash": {
+                                    "type": "string",
+                                    "pattern": "^sha256:[0-9a-f]{64}$"
+                                  },
+                                  "content_after": {
+                                    "type": "string"
+                                  },
+                                  "unified_diff": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "jsonld_blocks": {
+                                    "anyOf": [
+                                      {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "object",
+                                          "propertyNames": {
+                                            "type": "string"
+                                          },
+                                          "additionalProperties": {}
+                                        }
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "reversal": {
+                                    "anyOf": [
+                                      {
+                                        "type": "object",
+                                        "properties": {
+                                          "operation": {
+                                            "type": "string",
+                                            "enum": [
+                                              "remove_block",
+                                              "delete_file",
+                                              "replace_file",
+                                              "remove_fragment",
+                                              "remove_jsonld",
+                                              "restore_jsonld"
+                                            ]
+                                          },
+                                          "content": {
+                                            "anyOf": [
+                                              {
+                                                "type": "string"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "required": [
+                                          "operation",
+                                          "content"
+                                        ],
+                                        "additionalProperties": false
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "preconditions": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "kind": {
+                                          "type": "string",
+                                          "enum": [
+                                            "file_hash",
+                                            "page_hash",
+                                            "file_absent"
+                                          ]
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "pattern": "^sha256:[0-9a-f]{64}$"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "value"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  },
+                                  "explanation": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "derivation": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "requires_human_review": {
+                                    "type": "boolean"
+                                  },
+                                  "review_reason": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "risk_flags": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 200
+                                    }
+                                  },
+                                  "page_matches": {
+                                    "anyOf": [
+                                      {
+                                        "type": "boolean"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "earlier_patch_ids": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    }
+                                  },
+                                  "free": {
+                                    "type": "boolean",
+                                    "const": true
+                                  },
+                                  "credits_charged": {
+                                    "type": "number",
+                                    "const": 0
+                                  },
+                                  "created_at": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "patch_id",
+                                  "finding_id",
+                                  "project_id",
+                                  "rule_code",
+                                  "kind",
+                                  "target_url",
+                                  "content_before_hash",
+                                  "content_after",
+                                  "unified_diff",
+                                  "jsonld_blocks",
+                                  "reversal",
+                                  "preconditions",
+                                  "explanation",
+                                  "derivation",
+                                  "requires_human_review",
+                                  "review_reason",
+                                  "risk_flags",
+                                  "page_matches",
+                                  "earlier_patch_ids",
+                                  "free",
+                                  "credits_charged",
+                                  "created_at"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "playbook_slug": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "created_at": {
                             "type": "string"
                           },
@@ -20687,6 +21431,10 @@
                           "affected_url",
                           "seeding",
                           "review",
+                          "evidence",
+                          "measured_impact",
+                          "patch",
+                          "playbook_slug",
                           "created_at",
                           "updated_at"
                         ],
@@ -59716,6 +60464,376 @@
                               }
                             ]
                           },
+                          "evidence": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "finding",
+                                      "displacement",
+                                      "geo_analysis",
+                                      "source_gap"
+                                    ]
+                                  },
+                                  "id": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  }
+                                },
+                                "required": [
+                                  "kind",
+                                  "id"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "measured_impact": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "visibility_before": {
+                                    "type": "number"
+                                  },
+                                  "visibility_after_14d": {
+                                    "type": "number"
+                                  },
+                                  "delta": {
+                                    "type": "number"
+                                  },
+                                  "window_days": {
+                                    "type": "integer",
+                                    "exclusiveMinimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "confidence": {
+                                    "type": "string",
+                                    "enum": [
+                                      "low",
+                                      "medium",
+                                      "high"
+                                    ]
+                                  },
+                                  "method": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "scoring_version": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "caveat": {
+                                    "type": "string",
+                                    "const": "Observational; concurrent changes are not controlled for."
+                                  },
+                                  "n_before": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "n_after": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "other_milestones_nearby": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  }
+                                },
+                                "required": [
+                                  "visibility_before",
+                                  "visibility_after_14d",
+                                  "delta",
+                                  "window_days",
+                                  "confidence",
+                                  "method",
+                                  "scoring_version",
+                                  "caveat",
+                                  "n_before",
+                                  "n_after",
+                                  "other_milestones_nearby"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "patch": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "patch_id": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  },
+                                  "finding_id": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "project_id": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  },
+                                  "rule_code": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "markdown",
+                                      "html_fragment",
+                                      "jsonld",
+                                      "robots"
+                                    ]
+                                  },
+                                  "target_url": {
+                                    "type": "string"
+                                  },
+                                  "content_before_hash": {
+                                    "type": "string",
+                                    "pattern": "^sha256:[0-9a-f]{64}$"
+                                  },
+                                  "content_after": {
+                                    "type": "string"
+                                  },
+                                  "unified_diff": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "jsonld_blocks": {
+                                    "anyOf": [
+                                      {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "object",
+                                          "propertyNames": {
+                                            "type": "string"
+                                          },
+                                          "additionalProperties": {}
+                                        }
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "reversal": {
+                                    "anyOf": [
+                                      {
+                                        "type": "object",
+                                        "properties": {
+                                          "operation": {
+                                            "type": "string",
+                                            "enum": [
+                                              "remove_block",
+                                              "delete_file",
+                                              "replace_file",
+                                              "remove_fragment",
+                                              "remove_jsonld",
+                                              "restore_jsonld"
+                                            ]
+                                          },
+                                          "content": {
+                                            "anyOf": [
+                                              {
+                                                "type": "string"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "required": [
+                                          "operation",
+                                          "content"
+                                        ],
+                                        "additionalProperties": false
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "preconditions": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "kind": {
+                                          "type": "string",
+                                          "enum": [
+                                            "file_hash",
+                                            "page_hash",
+                                            "file_absent"
+                                          ]
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "pattern": "^sha256:[0-9a-f]{64}$"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "value"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  },
+                                  "explanation": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "derivation": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "requires_human_review": {
+                                    "type": "boolean"
+                                  },
+                                  "review_reason": {
+                                    "anyOf": [
+                                      {
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "risk_flags": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 200
+                                    }
+                                  },
+                                  "page_matches": {
+                                    "anyOf": [
+                                      {
+                                        "type": "boolean"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "earlier_patch_ids": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    }
+                                  },
+                                  "free": {
+                                    "type": "boolean",
+                                    "const": true
+                                  },
+                                  "credits_charged": {
+                                    "type": "number",
+                                    "const": 0
+                                  },
+                                  "created_at": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "patch_id",
+                                  "finding_id",
+                                  "project_id",
+                                  "rule_code",
+                                  "kind",
+                                  "target_url",
+                                  "content_before_hash",
+                                  "content_after",
+                                  "unified_diff",
+                                  "jsonld_blocks",
+                                  "reversal",
+                                  "preconditions",
+                                  "explanation",
+                                  "derivation",
+                                  "requires_human_review",
+                                  "review_reason",
+                                  "risk_flags",
+                                  "page_matches",
+                                  "earlier_patch_ids",
+                                  "free",
+                                  "credits_charged",
+                                  "created_at"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "playbook_slug": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "created_at": {
                             "type": "string"
                           },
@@ -59747,6 +60865,10 @@
                           "affected_url",
                           "seeding",
                           "review",
+                          "evidence",
+                          "measured_impact",
+                          "patch",
+                          "playbook_slug",
                           "created_at",
                           "updated_at"
                         ],
@@ -60337,6 +61459,376 @@
                             }
                           ]
                         },
+                        "evidence": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "finding",
+                                    "displacement",
+                                    "geo_analysis",
+                                    "source_gap"
+                                  ]
+                                },
+                                "id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "id"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "measured_impact": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "visibility_before": {
+                                  "type": "number"
+                                },
+                                "visibility_after_14d": {
+                                  "type": "number"
+                                },
+                                "delta": {
+                                  "type": "number"
+                                },
+                                "window_days": {
+                                  "type": "integer",
+                                  "exclusiveMinimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "confidence": {
+                                  "type": "string",
+                                  "enum": [
+                                    "low",
+                                    "medium",
+                                    "high"
+                                  ]
+                                },
+                                "method": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "scoring_version": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "caveat": {
+                                  "type": "string",
+                                  "const": "Observational; concurrent changes are not controlled for."
+                                },
+                                "n_before": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "n_after": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "other_milestones_nearby": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                }
+                              },
+                              "required": [
+                                "visibility_before",
+                                "visibility_after_14d",
+                                "delta",
+                                "window_days",
+                                "confidence",
+                                "method",
+                                "scoring_version",
+                                "caveat",
+                                "n_before",
+                                "n_after",
+                                "other_milestones_nearby"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "patch": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "patch_id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "finding_id": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "project_id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "rule_code": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "markdown",
+                                    "html_fragment",
+                                    "jsonld",
+                                    "robots"
+                                  ]
+                                },
+                                "target_url": {
+                                  "type": "string"
+                                },
+                                "content_before_hash": {
+                                  "type": "string",
+                                  "pattern": "^sha256:[0-9a-f]{64}$"
+                                },
+                                "content_after": {
+                                  "type": "string"
+                                },
+                                "unified_diff": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "jsonld_blocks": {
+                                  "anyOf": [
+                                    {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "object",
+                                        "propertyNames": {
+                                          "type": "string"
+                                        },
+                                        "additionalProperties": {}
+                                      }
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "reversal": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "operation": {
+                                          "type": "string",
+                                          "enum": [
+                                            "remove_block",
+                                            "delete_file",
+                                            "replace_file",
+                                            "remove_fragment",
+                                            "remove_jsonld",
+                                            "restore_jsonld"
+                                          ]
+                                        },
+                                        "content": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "operation",
+                                        "content"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "preconditions": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "file_hash",
+                                          "page_hash",
+                                          "file_absent"
+                                        ]
+                                      },
+                                      "value": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "pattern": "^sha256:[0-9a-f]{64}$"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "value"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "explanation": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "derivation": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "requires_human_review": {
+                                  "type": "boolean"
+                                },
+                                "review_reason": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "risk_flags": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  }
+                                },
+                                "page_matches": {
+                                  "anyOf": [
+                                    {
+                                      "type": "boolean"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "earlier_patch_ids": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  }
+                                },
+                                "free": {
+                                  "type": "boolean",
+                                  "const": true
+                                },
+                                "credits_charged": {
+                                  "type": "number",
+                                  "const": 0
+                                },
+                                "created_at": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "patch_id",
+                                "finding_id",
+                                "project_id",
+                                "rule_code",
+                                "kind",
+                                "target_url",
+                                "content_before_hash",
+                                "content_after",
+                                "unified_diff",
+                                "jsonld_blocks",
+                                "reversal",
+                                "preconditions",
+                                "explanation",
+                                "derivation",
+                                "requires_human_review",
+                                "review_reason",
+                                "risk_flags",
+                                "page_matches",
+                                "earlier_patch_ids",
+                                "free",
+                                "credits_charged",
+                                "created_at"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "playbook_slug": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "created_at": {
                           "type": "string"
                         },
@@ -60368,6 +61860,10 @@
                         "affected_url",
                         "seeding",
                         "review",
+                        "evidence",
+                        "measured_impact",
+                        "patch",
+                        "playbook_slug",
                         "created_at",
                         "updated_at"
                       ],
@@ -69909,6 +71405,376 @@
                             }
                           ]
                         },
+                        "evidence": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "finding",
+                                    "displacement",
+                                    "geo_analysis",
+                                    "source_gap"
+                                  ]
+                                },
+                                "id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "id"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "measured_impact": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "visibility_before": {
+                                  "type": "number"
+                                },
+                                "visibility_after_14d": {
+                                  "type": "number"
+                                },
+                                "delta": {
+                                  "type": "number"
+                                },
+                                "window_days": {
+                                  "type": "integer",
+                                  "exclusiveMinimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "confidence": {
+                                  "type": "string",
+                                  "enum": [
+                                    "low",
+                                    "medium",
+                                    "high"
+                                  ]
+                                },
+                                "method": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "scoring_version": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "caveat": {
+                                  "type": "string",
+                                  "const": "Observational; concurrent changes are not controlled for."
+                                },
+                                "n_before": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "n_after": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                },
+                                "other_milestones_nearby": {
+                                  "type": "integer",
+                                  "minimum": 0,
+                                  "maximum": 9007199254740991
+                                }
+                              },
+                              "required": [
+                                "visibility_before",
+                                "visibility_after_14d",
+                                "delta",
+                                "window_days",
+                                "confidence",
+                                "method",
+                                "scoring_version",
+                                "caveat",
+                                "n_before",
+                                "n_after",
+                                "other_milestones_nearby"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "patch": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "patch_id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "finding_id": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "project_id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                },
+                                "rule_code": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "markdown",
+                                    "html_fragment",
+                                    "jsonld",
+                                    "robots"
+                                  ]
+                                },
+                                "target_url": {
+                                  "type": "string"
+                                },
+                                "content_before_hash": {
+                                  "type": "string",
+                                  "pattern": "^sha256:[0-9a-f]{64}$"
+                                },
+                                "content_after": {
+                                  "type": "string"
+                                },
+                                "unified_diff": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "jsonld_blocks": {
+                                  "anyOf": [
+                                    {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "object",
+                                        "propertyNames": {
+                                          "type": "string"
+                                        },
+                                        "additionalProperties": {}
+                                      }
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "reversal": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "operation": {
+                                          "type": "string",
+                                          "enum": [
+                                            "remove_block",
+                                            "delete_file",
+                                            "replace_file",
+                                            "remove_fragment",
+                                            "remove_jsonld",
+                                            "restore_jsonld"
+                                          ]
+                                        },
+                                        "content": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "operation",
+                                        "content"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "preconditions": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "file_hash",
+                                          "page_hash",
+                                          "file_absent"
+                                        ]
+                                      },
+                                      "value": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "pattern": "^sha256:[0-9a-f]{64}$"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "value"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "explanation": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "derivation": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "requires_human_review": {
+                                  "type": "boolean"
+                                },
+                                "review_reason": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "risk_flags": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200
+                                  }
+                                },
+                                "page_matches": {
+                                  "anyOf": [
+                                    {
+                                      "type": "boolean"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "earlier_patch_ids": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string",
+                                    "format": "uuid",
+                                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                  }
+                                },
+                                "free": {
+                                  "type": "boolean",
+                                  "const": true
+                                },
+                                "credits_charged": {
+                                  "type": "number",
+                                  "const": 0
+                                },
+                                "created_at": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "patch_id",
+                                "finding_id",
+                                "project_id",
+                                "rule_code",
+                                "kind",
+                                "target_url",
+                                "content_before_hash",
+                                "content_after",
+                                "unified_diff",
+                                "jsonld_blocks",
+                                "reversal",
+                                "preconditions",
+                                "explanation",
+                                "derivation",
+                                "requires_human_review",
+                                "review_reason",
+                                "risk_flags",
+                                "page_matches",
+                                "earlier_patch_ids",
+                                "free",
+                                "credits_charged",
+                                "created_at"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "playbook_slug": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "created_at": {
                           "type": "string"
                         },
@@ -69940,6 +71806,10 @@
                         "affected_url",
                         "seeding",
                         "review",
+                        "evidence",
+                        "measured_impact",
+                        "patch",
+                        "playbook_slug",
                         "created_at",
                         "updated_at"
                       ],
@@ -70936,6 +72806,376 @@
                                 }
                               ]
                             },
+                            "evidence": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "kind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "finding",
+                                        "displacement",
+                                        "geo_analysis",
+                                        "source_gap"
+                                      ]
+                                    },
+                                    "id": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    }
+                                  },
+                                  "required": [
+                                    "kind",
+                                    "id"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "measured_impact": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "visibility_before": {
+                                      "type": "number"
+                                    },
+                                    "visibility_after_14d": {
+                                      "type": "number"
+                                    },
+                                    "delta": {
+                                      "type": "number"
+                                    },
+                                    "window_days": {
+                                      "type": "integer",
+                                      "exclusiveMinimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "confidence": {
+                                      "type": "string",
+                                      "enum": [
+                                        "low",
+                                        "medium",
+                                        "high"
+                                      ]
+                                    },
+                                    "method": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    },
+                                    "scoring_version": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    },
+                                    "caveat": {
+                                      "type": "string",
+                                      "const": "Observational; concurrent changes are not controlled for."
+                                    },
+                                    "n_before": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "n_after": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    },
+                                    "other_milestones_nearby": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    }
+                                  },
+                                  "required": [
+                                    "visibility_before",
+                                    "visibility_after_14d",
+                                    "delta",
+                                    "window_days",
+                                    "confidence",
+                                    "method",
+                                    "scoring_version",
+                                    "caveat",
+                                    "n_before",
+                                    "n_after",
+                                    "other_milestones_nearby"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "patch": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "patch_id": {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    },
+                                    "finding_id": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string",
+                                          "format": "uuid",
+                                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "project_id": {
+                                      "type": "string",
+                                      "format": "uuid",
+                                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                    },
+                                    "rule_code": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "kind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "markdown",
+                                        "html_fragment",
+                                        "jsonld",
+                                        "robots"
+                                      ]
+                                    },
+                                    "target_url": {
+                                      "type": "string"
+                                    },
+                                    "content_before_hash": {
+                                      "type": "string",
+                                      "pattern": "^sha256:[0-9a-f]{64}$"
+                                    },
+                                    "content_after": {
+                                      "type": "string"
+                                    },
+                                    "unified_diff": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "jsonld_blocks": {
+                                      "anyOf": [
+                                        {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "object",
+                                            "propertyNames": {
+                                              "type": "string"
+                                            },
+                                            "additionalProperties": {}
+                                          }
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "reversal": {
+                                      "anyOf": [
+                                        {
+                                          "type": "object",
+                                          "properties": {
+                                            "operation": {
+                                              "type": "string",
+                                              "enum": [
+                                                "remove_block",
+                                                "delete_file",
+                                                "replace_file",
+                                                "remove_fragment",
+                                                "remove_jsonld",
+                                                "restore_jsonld"
+                                              ]
+                                            },
+                                            "content": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "string"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "operation",
+                                            "content"
+                                          ],
+                                          "additionalProperties": false
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "preconditions": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "object",
+                                        "properties": {
+                                          "kind": {
+                                            "type": "string",
+                                            "enum": [
+                                              "file_hash",
+                                              "page_hash",
+                                              "file_absent"
+                                            ]
+                                          },
+                                          "value": {
+                                            "anyOf": [
+                                              {
+                                                "type": "string",
+                                                "pattern": "^sha256:[0-9a-f]{64}$"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        "required": [
+                                          "kind",
+                                          "value"
+                                        ],
+                                        "additionalProperties": false
+                                      }
+                                    },
+                                    "explanation": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "derivation": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "requires_human_review": {
+                                      "type": "boolean"
+                                    },
+                                    "review_reason": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "risk_flags": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 200
+                                      }
+                                    },
+                                    "page_matches": {
+                                      "anyOf": [
+                                        {
+                                          "type": "boolean"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "earlier_patch_ids": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      }
+                                    },
+                                    "free": {
+                                      "type": "boolean",
+                                      "const": true
+                                    },
+                                    "credits_charged": {
+                                      "type": "number",
+                                      "const": 0
+                                    },
+                                    "created_at": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "patch_id",
+                                    "finding_id",
+                                    "project_id",
+                                    "rule_code",
+                                    "kind",
+                                    "target_url",
+                                    "content_before_hash",
+                                    "content_after",
+                                    "unified_diff",
+                                    "jsonld_blocks",
+                                    "reversal",
+                                    "preconditions",
+                                    "explanation",
+                                    "derivation",
+                                    "requires_human_review",
+                                    "review_reason",
+                                    "risk_flags",
+                                    "page_matches",
+                                    "earlier_patch_ids",
+                                    "free",
+                                    "credits_charged",
+                                    "created_at"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "playbook_slug": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "created_at": {
                               "type": "string"
                             },
@@ -70967,6 +73207,10 @@
                             "affected_url",
                             "seeding",
                             "review",
+                            "evidence",
+                            "measured_impact",
+                            "patch",
+                            "playbook_slug",
                             "created_at",
                             "updated_at"
                           ],
@@ -90689,6 +92933,376 @@
                                   }
                                 ]
                               },
+                              "evidence": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "finding",
+                                          "displacement",
+                                          "geo_analysis",
+                                          "source_gap"
+                                        ]
+                                      },
+                                      "id": {
+                                        "type": "string",
+                                        "minLength": 1
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "id"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "measured_impact": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "visibility_before": {
+                                        "type": "number"
+                                      },
+                                      "visibility_after_14d": {
+                                        "type": "number"
+                                      },
+                                      "delta": {
+                                        "type": "number"
+                                      },
+                                      "window_days": {
+                                        "type": "integer",
+                                        "exclusiveMinimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "confidence": {
+                                        "type": "string",
+                                        "enum": [
+                                          "low",
+                                          "medium",
+                                          "high"
+                                        ]
+                                      },
+                                      "method": {
+                                        "type": "string",
+                                        "minLength": 1
+                                      },
+                                      "scoring_version": {
+                                        "type": "string",
+                                        "minLength": 1
+                                      },
+                                      "caveat": {
+                                        "type": "string",
+                                        "const": "Observational; concurrent changes are not controlled for."
+                                      },
+                                      "n_before": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "n_after": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "other_milestones_nearby": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      }
+                                    },
+                                    "required": [
+                                      "visibility_before",
+                                      "visibility_after_14d",
+                                      "delta",
+                                      "window_days",
+                                      "confidence",
+                                      "method",
+                                      "scoring_version",
+                                      "caveat",
+                                      "n_before",
+                                      "n_after",
+                                      "other_milestones_nearby"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "patch": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "patch_id": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      },
+                                      "finding_id": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "format": "uuid",
+                                            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "project_id": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                      },
+                                      "rule_code": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "kind": {
+                                        "type": "string",
+                                        "enum": [
+                                          "markdown",
+                                          "html_fragment",
+                                          "jsonld",
+                                          "robots"
+                                        ]
+                                      },
+                                      "target_url": {
+                                        "type": "string"
+                                      },
+                                      "content_before_hash": {
+                                        "type": "string",
+                                        "pattern": "^sha256:[0-9a-f]{64}$"
+                                      },
+                                      "content_after": {
+                                        "type": "string"
+                                      },
+                                      "unified_diff": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "jsonld_blocks": {
+                                        "anyOf": [
+                                          {
+                                            "type": "array",
+                                            "items": {
+                                              "type": "object",
+                                              "propertyNames": {
+                                                "type": "string"
+                                              },
+                                              "additionalProperties": {}
+                                            }
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "reversal": {
+                                        "anyOf": [
+                                          {
+                                            "type": "object",
+                                            "properties": {
+                                              "operation": {
+                                                "type": "string",
+                                                "enum": [
+                                                  "remove_block",
+                                                  "delete_file",
+                                                  "replace_file",
+                                                  "remove_fragment",
+                                                  "remove_jsonld",
+                                                  "restore_jsonld"
+                                                ]
+                                              },
+                                              "content": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "string"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "required": [
+                                              "operation",
+                                              "content"
+                                            ],
+                                            "additionalProperties": false
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "preconditions": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "object",
+                                          "properties": {
+                                            "kind": {
+                                              "type": "string",
+                                              "enum": [
+                                                "file_hash",
+                                                "page_hash",
+                                                "file_absent"
+                                              ]
+                                            },
+                                            "value": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "string",
+                                                  "pattern": "^sha256:[0-9a-f]{64}$"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "kind",
+                                            "value"
+                                          ],
+                                          "additionalProperties": false
+                                        }
+                                      },
+                                      "explanation": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "derivation": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "requires_human_review": {
+                                        "type": "boolean"
+                                      },
+                                      "review_reason": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "risk_flags": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "string",
+                                          "minLength": 1,
+                                          "maxLength": 200
+                                        }
+                                      },
+                                      "page_matches": {
+                                        "anyOf": [
+                                          {
+                                            "type": "boolean"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "earlier_patch_ids": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "string",
+                                          "format": "uuid",
+                                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                                        }
+                                      },
+                                      "free": {
+                                        "type": "boolean",
+                                        "const": true
+                                      },
+                                      "credits_charged": {
+                                        "type": "number",
+                                        "const": 0
+                                      },
+                                      "created_at": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "patch_id",
+                                      "finding_id",
+                                      "project_id",
+                                      "rule_code",
+                                      "kind",
+                                      "target_url",
+                                      "content_before_hash",
+                                      "content_after",
+                                      "unified_diff",
+                                      "jsonld_blocks",
+                                      "reversal",
+                                      "preconditions",
+                                      "explanation",
+                                      "derivation",
+                                      "requires_human_review",
+                                      "review_reason",
+                                      "risk_flags",
+                                      "page_matches",
+                                      "earlier_patch_ids",
+                                      "free",
+                                      "credits_charged",
+                                      "created_at"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "playbook_slug": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "created_at": {
                                 "type": "string"
                               },
@@ -90720,6 +93334,10 @@
                               "affected_url",
                               "seeding",
                               "review",
+                              "evidence",
+                              "measured_impact",
+                              "patch",
+                              "playbook_slug",
                               "created_at",
                               "updated_at"
                             ],

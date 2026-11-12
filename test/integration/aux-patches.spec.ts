@@ -251,11 +251,28 @@ describe("STORY-053 · patches — real SQL under RLS", () => {
     expect(page.items[0]!.patch).not.toBeNull();
   });
 
-  it("STORY-053 · a finding with nothing to offer reads patch null and guidance null (the honest empty)", async () => {
+  it("STORY-194 AC2 · a fixable finding with no patch reads guidance (the catalog rationale plus the alignment link), never neither", async () => {
     const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
     await createFinding(ws, p, await createAudit(ws, p));
     const page = await inTenant(CTX(ws, actor), () => service.listProjectFindings(p, { limit: 10 }));
-    expect(page.items[0]).toMatchObject({ patch: null, guidance: null });
+    const f = auxFindingSchema.parse(page.items[0]);
+    expect(f.patch).toBeNull();
+    expect(f.guidance).not.toBeNull();
+    expect(f.guidance!.alignment_link).toMatchObject({ path: "/geo/alignment" });
+  });
+
+  it("STORY-194 AC2 · every rule in the seeded catalog reads a patch or guidance, never neither", async () => {
+    const ws = await createWorkspace(); const actor = await createUser(); const p = await createProject(ws);
+    const audit = await createAudit(ws, p);
+    const codes = (await client.query<{ code: string }>(`SELECT code FROM aux_rule_catalog ORDER BY code`)).rows.map((r) => r.code);
+    expect(codes.length).toBeGreaterThan(0);
+    for (const code of codes) await createFinding(ws, p, audit, code);
+    const page = await inTenant(CTX(ws, actor), () => service.listProjectFindings(p, { limit: 100 }));
+    expect(page.items).toHaveLength(codes.length);
+    for (const item of page.items) {
+      const f = auxFindingSchema.parse(item);
+      expect(f.patch !== null || f.guidance !== null, f.rule_code).toBe(true);
+    }
   });
 
   it("STORY-053 · another workspace's patch is a 404 under RLS, and a scoped caller outside the project gets a 403 naming nothing about the patch", async () => {

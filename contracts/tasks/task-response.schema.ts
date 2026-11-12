@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { taskStatusSchema } from "./task-list-query.schema.js";
+import { auxPatchSchema } from "../aux/patch.schema.js";
+import { measuredImpactSchema } from "./task-verification.schema.js";
 import { actionItemEffortSchema, actionItemKindSchema, actionItemSeveritySchema, actionItemSourceSchema } from "./action-item-response.schema.js";
 
 // STORY-064 (task API, step A) — one task on the wire.
@@ -31,6 +33,17 @@ export const taskVerificationSchema = z
   })
   .strict();
 export type TaskVerification = z.infer<typeof taskVerificationSchema>;
+
+/**
+ * STORY-194 AC1 / owner decision 98(d) - the ONE evidence record an auto task points at, from the `tasks` columns that already hold it
+ * (no new column). `kind` says which table `id` names: `finding` = `aux_findings.id`, `displacement` = the displacement event id,
+ * `geo_analysis` = the analysis SLUG (`tasks.source_geo_analysis` is text, not a uuid), `source_gap` = `source_domains.id` (the client
+ * links `/sources?domain=<id>`). A task that records several resolves by this precedence, in this order: finding, displacement,
+ * geo_analysis, source_gap. A manual task has none, so `evidence` is null.
+ */
+export const TASK_EVIDENCE_KINDS = ["finding", "displacement", "geo_analysis", "source_gap"] as const;
+export const taskEvidenceSchema = z.object({ kind: z.enum(TASK_EVIDENCE_KINDS), id: z.string().min(1) }).strict();
+export type TaskEvidence = z.infer<typeof taskEvidenceSchema>;
 
 export const taskPrioritySchema = z.number().int().min(1).max(5);
 
@@ -67,6 +80,17 @@ export const taskSchema = z
     seeding: z.boolean(),
     /** Owner decision 30: why a seeding task is `in_review`. Null on every other task. (Not the STORY-067 `verification` of the complete response.) */
     review: taskVerificationSchema.nullable(),
+    /** STORY-194 AC1: the record this task came from; null for a manual task (and a command-bar task with no source). */
+    evidence: taskEvidenceSchema.nullable(),
+    /**
+     * STORY-194 AC6: the delta STORY-067 measured for this task's completion (`milestones.measured_impact`), with its confidence and the
+     * mandatory caveat. NULL until measured (not completed, not yet due, or an insufficient sample) - never a 0 delta standing in for "not measured".
+     */
+    measured_impact: measuredImpactSchema.nullable(),
+    /** STORY-194 AC6: the latest copy-ready patch of the task's source finding, same shape (preconditions included) as on the AUX finding. Null where there is none. */
+    patch: auxPatchSchema.nullable(),
+    /** STORY-194 AC6: the playbook an authority task carries (STORY-055); null on every other task. */
+    playbook_slug: z.string().nullable(),
     created_at: z.string(),
     updated_at: z.string(),
   })
