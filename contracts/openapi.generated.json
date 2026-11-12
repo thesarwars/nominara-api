@@ -44993,6 +44993,13 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "scope": {
+                                "type": "string",
+                                "enum": [
+                                  "passage",
+                                  "answer"
+                                ]
                               }
                             },
                             "required": [
@@ -45003,6 +45010,12 @@
                               "brand_present"
                             ],
                             "additionalProperties": false
+                          }
+                        },
+                        "passage_scoped_engines": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
                           }
                         },
                         "concept_gap": {
@@ -45103,6 +45116,7 @@
                         "after_position_class",
                         "takers",
                         "citation_gap",
+                        "passage_scoped_engines",
                         "concept_gap",
                         "impact_score",
                         "recovered_at",

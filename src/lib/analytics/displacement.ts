@@ -135,3 +135,36 @@ export function restoresSlot(kind: DetectedKind, before: CaptureSnapshot, later:
       return renderLevel(later.brandRenderForm) >= renderLevel(before.brandRenderForm);
   }
 }
+
+/** One element of a structured answer (STORY-029), reduced to what passage scoping reads: its words and the citation URLs it references. */
+export interface PassageElement {
+  /** The element's text; the same text the parser matches a mention against. */
+  readonly description: string | undefined;
+  /** The element's OWN references, in the terms of the capture's stored citation URLs (the caller resolves them). */
+  readonly citedUrls: readonly string[];
+}
+
+export type CitationScope = "passage" | "answer";
+
+/**
+ * STORY-057 AC3 - scopes one displacing entity's citations to the passage where it is named.
+ *
+ * Only ever NARROWS: every returned citation is one the entity already held, and a URL the passage cites that the entity does not hold
+ * is never added. With no elements (every conversational engine) or no element naming the entity, the passage cannot be located, so
+ * the citations come back untouched and `answer`-scoped: guessing a passage would name a source the competitor may not hold there.
+ * A passage that names the entity but cites nothing gives an empty `passage` result: zero is a finding, not a reason to fall back.
+ */
+export function scopeCitationsToPassage(
+  entityLabel: string,
+  citations: readonly SnapshotCitation[],
+  elements: readonly PassageElement[] | undefined,
+): { readonly citations: readonly SnapshotCitation[]; readonly scope: CitationScope } {
+  const label = entityLabel.trim().toLowerCase();
+  const passages =
+    elements === undefined || label === ""
+      ? []
+      : elements.filter((element) => element.description !== undefined && element.description.toLowerCase().includes(label));
+  if (passages.length === 0) return { citations, scope: "answer" };
+  const cited = new Set(passages.flatMap((passage) => passage.citedUrls));
+  return { citations: citations.filter((citation) => cited.has(citation.url)), scope: "passage" };
+}

@@ -15,6 +15,8 @@ import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rol
 import { asTenantJob } from "../support/tenant-job.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { backfillProjectDisplacements, refreshProjectDisplacements } from "../../src/lib/rollup/refresh-project-displacements.js";
+import { mapSerpAnswer } from "../../src/lib/engines/serp/serp-mapper.js";
+import { aiModePriced } from "../../src/lib/engines/serp/fixtures/serp-recorded.js";
 
 // NEW-C-3 — STORY-056 scenarios 8, 9, 10 (and the persisted halves of 1, 5, 6,
 // 7) and STORY-057 scenarios 1, 2, 3. Scenario 11 (the recovery milestone) and 12 (detection lag) are here;
@@ -122,6 +124,8 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     status?: string;
     flags?: string[];
     text?: string; // payload.text; "" is an empty answer
+    elements?: unknown[]; // payload.structured_elements: what the adapter stored (STORY-057 AC3)
+    rivalLabel?: string; // the competitor's mention label (default "Rival")
     rival?: { position: number; cls?: string };
     other?: { label: string; position: number };
   }
@@ -134,7 +138,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
          (id, workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version,
           normalizer_version, content_hash, brand_present, brand_rank_position, status, flags, payload)
        VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,'api','1','n1',$8,$9,$10,$11,$12::text[],$13::jsonb)`,
-      [id, workspaceId, projectId, randomUUID(), spec.prompt ?? promptId, engine, spec.at, createHash("sha256").update(id).digest(), spec.present, spec.position ?? null, spec.status ?? "parsed", spec.flags ?? [], JSON.stringify(spec.text === undefined ? {} : { text: spec.text })],
+      [id, workspaceId, projectId, randomUUID(), spec.prompt ?? promptId, engine, spec.at, createHash("sha256").update(id).digest(), spec.present, spec.position ?? null, spec.status ?? "parsed", spec.flags ?? [], JSON.stringify({ ...(spec.text === undefined ? {} : { text: spec.text }), ...(spec.elements === undefined ? {} : { structured_elements: spec.elements }) })],
     );
     const mention = async (type: string, entityId: string | null, label: string, position: number, cls: string, render: string): Promise<void> => {
       await db.query(
@@ -147,7 +151,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       );
     };
     if (spec.present === true) await mention("brand", null, "Acme", spec.position ?? 1, spec.cls ?? "ranked", spec.render ?? "described");
-    if (spec.rival) await mention("competitor", rivalId, "Rival", spec.rival.position, spec.rival.cls ?? "ranked", "described");
+    if (spec.rival) await mention("competitor", rivalId, spec.rivalLabel ?? "Rival", spec.rival.position, spec.rival.cls ?? "ranked", "described");
     if (spec.other) await mention("other", null, spec.other.label, spec.other.position, "ranked", "described");
     return id;
   }
@@ -713,7 +717,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/guide", sourceClass: "vendor_owned" });
     await run(D2);
     const gap = citationGapSchema.parse((await events())[0]!.citation_gap);
-    expect(gap).toEqual([{ url: "https://rival.com/guide", domain: "rival.com", source_class: "vendor_owned", held_by: ["Rival"], brand_present: null }]);
+    expect(gap).toEqual([{ url: "https://rival.com/guide", domain: "rival.com", source_class: "vendor_owned", held_by: ["Rival"], brand_present: null, scope: "answer" }]);
   });
 
   it("STORY-057 #2 · a citation the competitor does not hold NEVER appears in the gap", async () => {
@@ -1033,6 +1037,156 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(all).toContain("dropped_no_evidence");
     expect(all).not.toContain("secret phrase");
     expect(all).not.toContain("secret-path");
+  });
+
+  // ---- STORY-057 AC3: the citation gap scoped to the passage, from the stored raw capture's structured_elements ---------------------
+
+  async function engine(key: string, mode: string): Promise<void> {
+    await db.query(
+      `INSERT INTO engines (key, display_name, vendor, capture_mode, adapter_version, cache_ttl_seconds, volatility_band, min_plan_key, status)
+       VALUES ($1,$1,'v',$2,'1',86400,'medium','free','active') ON CONFLICT (key) DO NOTHING`,
+      [key, mode],
+    );
+  }
+  const element = (kind: string, description: string, links: string[]) => ({ kind, description, links: links.map((url) => ({ url })) });
+
+  async function elementLoss(engineKey: string, elements: unknown[] | undefined, cited: string[], rivalLabel = "Rival"): Promise<void> {
+    await engine(engineKey, "licensed_serp");
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, engine: engineKey });
+    const after = await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 }, engine: engineKey, ...(elements === undefined ? {} : { elements }), rivalLabel });
+    for (const [i, url] of cited.entries()) await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url, slot: i + 1, engine: engineKey });
+    await run(D2);
+  }
+  const gapOf = async () => citationGapSchema.parse((await events())[0]!.citation_gap);
+
+  it("STORY-057 #4 / AC3 · on an engine with per-element references the gap is scoped to the passage that recommends the competitor", async () => {
+    await elementLoss(
+      "google_aio",
+      [
+        element("ai_overview_element", "Rival is the strongest pick for a small team", ["https://rival.com/pick"]),
+        element("ai_overview_element", "Another vendor also cites us", ["https://rival.com/elsewhere"]),
+      ],
+      ["https://rival.com/pick", "https://rival.com/elsewhere"],
+    );
+    const gap = await gapOf();
+    expect(gap.map((g) => [g.url, g.scope])).toEqual([["https://rival.com/pick", "passage"]]);
+  });
+
+  it("STORY-057 #5 / AC3 · an engine without per-element references stays answer-scoped, and says so on the entry", async () => {
+    await elementLoss("gemini", undefined, ["https://rival.com/pick", "https://rival.com/elsewhere"]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/elsewhere", "answer"], ["https://rival.com/pick", "answer"]]);
+  });
+
+  it("STORY-057 AC3 · elements exist but none names the competitor: answer-scoped, never guessed", async () => {
+    await elementLoss("google_aio", [element("ai_overview_element", "Nobody is named here", ["https://rival.com/pick"])], ["https://rival.com/pick"]);
+    expect((await gapOf()).map((g) => g.scope)).toEqual(["answer"]);
+  });
+
+  it("STORY-057 AC3 · the passage cites a URL the competitor does not hold (another domain): it never enters the gap", async () => {
+    await elementLoss("google_aio", [element("ai_overview_element", "Rival wins", ["https://rival.com/pick", "https://reddit.com/r/x"])], ["https://rival.com/pick"]);
+    expect((await gapOf()).map((g) => g.url)).toEqual(["https://rival.com/pick"]);
+  });
+
+  it("STORY-057 AC3 · a passage that names the competitor but cites nothing leaves an empty gap, and 0 is not the answer-scoped fallback", async () => {
+    await elementLoss("google_aio", [element("ai_overview_element", "Rival wins", []), element("ai_overview_element", "other", ["https://rival.com/pick"])], ["https://rival.com/pick"]);
+    expect(await gapOf()).toEqual([]);
+  });
+
+  it("STORY-057 AC3 · a malformed stored element is skipped, not a failed rollup; the valid ones still scope the gap", async () => {
+    await elementLoss(
+      "google_aio",
+      [{ kind: "ai_overview_element" }, "junk", element("ai_overview_element", "Rival wins", ["https://rival.com/pick"])],
+      ["https://rival.com/pick", "https://rival.com/other"],
+    );
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/pick", "passage"]]);
+  });
+
+  it("STORY-057 AC3 · the element link is matched to the stored citation by its raw URL as well as its normalised form", async () => {
+    await engine("google_aio", "licensed_serp");
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, engine: "google_aio" });
+    const after = await capture({
+      at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 }, engine: "google_aio",
+      elements: [element("ai_overview_element", "Rival wins", ["https://www.rival.com/pick/?utm_source=x"])],
+    });
+    // The parser stored the NORMALISED url (www, tracking parameter and trailing slash gone); the element holds the raw one.
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/pick", slot: 1, engine: "google_aio" });
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/other", slot: 2, engine: "google_aio" });
+    await run(D2);
+    expect((await gapOf()).map((g) => g.url)).toEqual(["https://rival.com/pick"]);
+  });
+
+  it("STORY-057 AC3 · SerpApi fixture (recorded AI Mode answer): the gap shrinks from the answer's citations to the passage naming the competitor", async () => {
+    // The recorded answer through the SerpApi mapper, stored the way the adapter stores an element (kind, links, description).
+    const elements: { kind: string; description: string; links: { url: string }[] }[] = mapSerpAnswer(aiModePriced as never).elements.map((e) => ({
+      kind: e.kind === "table" ? "table_element" : e.kind === "product" ? "shopping_element" : "ai_overview_element",
+      description: e.kind === "product" ? (e.product?.title ?? e.text) : e.text,
+      links: e.links.map((l) => ({ url: l.url })),
+    }));
+    const linksOf = (label: string) => elements.filter((e) => e.description?.includes(label) === true).flatMap((e) => e.links.map((l) => l.url));
+    const everyUrl = [...new Set(elements.flatMap((e) => e.links.map((l) => l.url)))];
+    const soundcore = [...new Set(linksOf("Soundcore Life Q30"))];
+    expect(soundcore.length).toBeGreaterThan(0);
+    expect(everyUrl.length).toBeGreaterThan(soundcore.length); // the answer cites more than this passage does
+
+    await db.query(`UPDATE competitors SET root_domain = 'google.com' WHERE id = $1`, [rivalId]);
+    await engine("google_ai_mode", "licensed_serp");
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, engine: "google_ai_mode" });
+    const after = await capture({
+      at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 }, engine: "google_ai_mode", elements, rivalLabel: "Soundcore Life Q30",
+    });
+    for (const [i, url] of everyUrl.entries()) await cite(after, `${D2}T10:00:00Z`, { domain: "google.com", url, slot: i + 1, engine: "google_ai_mode" });
+    await run(D2);
+    const gap = await gapOf();
+    expect(gap.every((g) => g.scope === "passage")).toBe(true);
+    expect(gap.map((g) => g.url).sort()).toEqual([...soundcore].sort());
+    expect(gap.length).toBeLessThan(everyUrl.length);
+  });
+
+  it("STORY-057 AC3 · observability: a counter per scope outcome, counts only", async () => {
+    const lines: unknown[] = [];
+    const spy = vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(m));
+    await elementLoss("google_aio", [element("ai_overview_element", "Rival wins", ["https://rival.com/pick"])], ["https://rival.com/pick"]);
+    spy.mockRestore();
+    const line = lines.find((l) => typeof l === "object" && l !== null && (l as { event?: string }).event === "displacements_refreshed") as Record<string, unknown>;
+    expect(line.passage_scoped_gaps).toBe(1);
+    expect(line.answer_scoped_gaps).toBe(0);
+    expect(JSON.stringify(line)).not.toMatch(/rival\.com|Rival/);
+  });
+
+  // ---- decision 99f: a draft alignment does not count as judged ----------------------------------------------------------------------
+
+  async function alignment(over: { draft_state?: string | null; coverage?: number | null; updated?: string; target?: string }): Promise<void> {
+    await db.query(
+      `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, coverage_ratio, centroid_source_count, draft_state, updated_at)
+       VALUES ($1,$2,$3,$4,'{gemini}','m',$5,9,$6,$7::timestamptz)`,
+      [workspaceId, projectId, over.target ?? "https://acme.com/p", clusterId, over.coverage === undefined ? 0.5 : over.coverage, over.draft_state ?? null, over.updated ?? "2026-10-01T00:00:00Z"],
+    );
+  }
+
+  it("decision 99f · an alignment whose coverage came from an unsaved draft does not count as judged: no concept gap is claimed from draft presence", async () => {
+    await inCluster(clusterId);
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
+    await alignment({ draft_state: "ready" });
+    await lossWithConcepts(["https://rival.com/rbac"]);
+    expect(await conceptGap()).toEqual([]);
+  });
+
+  it("decision 99f · a live-judged alignment made stale by a LATER draft analysis of the scope is not judged either (the shared nodes carry the draft's presence)", async () => {
+    await inCluster(clusterId);
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
+    await alignment({ updated: "2026-10-01T00:00:00Z" });
+    await alignment({ draft_state: "ready", updated: "2026-10-02T00:00:00Z", target: "https://acme.com/other" });
+    await lossWithConcepts(["https://rival.com/rbac"]);
+    expect(await conceptGap()).toEqual([]);
+  });
+
+  it("decision 99f · a live analysis AFTER the draft re-judges the nodes on the page: judged again, and the gap is claimed", async () => {
+    await inCluster(clusterId);
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
+    await alignment({ draft_state: "ready", updated: "2026-10-01T00:00:00Z" });
+    await alignment({ updated: "2026-10-02T00:00:00Z", target: "https://acme.com/other" });
+    await lossWithConcepts(["https://rival.com/rbac"]);
+    expect((await conceptGap()).map((c) => c.concept)).toEqual(["role based access"]);
   });
 
   it("the rollup handler persists displacements for the date it rolls up", async () => {

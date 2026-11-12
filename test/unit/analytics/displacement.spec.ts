@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectDisplacement, type CaptureSnapshot, type SnapshotEntity } from "../../../src/lib/analytics/displacement.js";
+import { detectDisplacement, scopeCitationsToPassage, type CaptureSnapshot, type PassageElement, type SnapshotEntity } from "../../../src/lib/analytics/displacement.js";
 
 // STORY-056 scenarios 1-5 — each capture is compared with the previous capture
 // of the same prompt and engine.
@@ -102,5 +102,50 @@ describe("STORY-056 · displacement detection", () => {
     const copy = JSON.stringify([before, after]);
     detectDisplacement(before, after);
     expect(JSON.stringify([before, after])).toBe(copy);
+  });
+});
+
+
+// STORY-057 AC3 / scenarios 4 and 5 - the citation gap, scoped to the passage that recommends the competitor where the engine
+// exposes per-element references, answer-scoped (and said to be) where it does not.
+describe("STORY-057 AC3 · scopeCitationsToPassage", () => {
+  const cite = (path: string) => ({ url: `https://r.example/${path}`, domain: "r.example", sourceClass: "editorial" });
+  const [a, b, c] = [cite("a"), cite("b"), cite("c")];
+  const passage = (description: string | undefined, ...urls: string[]): PassageElement => ({ description, citedUrls: urls.map((u) => `https://r.example/${u}`) });
+
+  it("scenario 4 - keeps only the citations of the elements that name the competitor", () => {
+    const out = scopeCitationsToPassage("Rival", [a, b, c], [passage("Rival is the best fit for small teams", "a"), passage("Something else entirely", "b")]);
+    expect(out).toEqual({ scope: "passage", citations: [a] });
+  });
+
+  it("scenario 5 - an engine with no elements (undefined or empty) is answer-scoped and keeps every citation", () => {
+    expect(scopeCitationsToPassage("Rival", [a, b], undefined)).toEqual({ scope: "answer", citations: [a, b] });
+    expect(scopeCitationsToPassage("Rival", [a, b], [])).toEqual({ scope: "answer", citations: [a, b] });
+  });
+
+  it("an engine with elements where none names the competitor cannot locate the passage: answer-scoped, never guessed", () => {
+    expect(scopeCitationsToPassage("Rival", [a, b], [passage("Unrelated", "a")])).toEqual({ scope: "answer", citations: [a, b] });
+    expect(scopeCitationsToPassage("Rival", [a, b], [passage(undefined, "a")])).toEqual({ scope: "answer", citations: [a, b] });
+  });
+
+  it("the passages of every element that names the competitor are unioned, and the label match ignores case", () => {
+    const out = scopeCitationsToPassage("Rival", [a, b, c], [passage("RIVAL leads", "a"), passage("also rival here", "c"), passage("nothing", "b")]);
+    expect(out).toEqual({ scope: "passage", citations: [a, c] });
+  });
+
+  it("a passage that names the competitor but cites nothing gives an empty passage-scoped gap (0 is a result, not a fallback)", () => {
+    expect(scopeCitationsToPassage("Rival", [a, b], [passage("Rival wins", ), passage("other", "a")])).toEqual({ scope: "passage", citations: [] });
+  });
+
+  it("a URL the passage cites that the competitor does not hold is never added (never inferred)", () => {
+    expect(scopeCitationsToPassage("Rival", [a], [passage("Rival wins", "a", "zzz")])).toEqual({ scope: "passage", citations: [a] });
+  });
+
+  it("does not mutate its inputs", () => {
+    const citations = [a, b];
+    const elements = [passage("Rival", "a")];
+    const copy = JSON.stringify([citations, elements]);
+    scopeCitationsToPassage("Rival", citations, elements);
+    expect(JSON.stringify([citations, elements])).toBe(copy);
   });
 });

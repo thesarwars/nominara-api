@@ -47,6 +47,8 @@ export const displacementItemSchema = z
     takers: z.array(displacedByEntrySchema),
     /** `{url, domain, source_class, held_by, brand_present}`; `brand_present` null = never verified. */
     citation_gap: z.array(citationGapEntrySchema),
+    /** STORY-057 AC3: the engines whose citation gap is scoped to the recommending passage where it can be. Every other engine's is answer-scoped. */
+    passage_scoped_engines: z.array(z.string()),
     concept_gap: z.array(conceptGapEntrySchema),
     impact_score: z.number(),
     /** Non-null = a later capture restored what was lost. */
