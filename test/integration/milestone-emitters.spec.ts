@@ -250,4 +250,72 @@ describe("STORY-066 · configuration milestones from the rollup", () => {
       expect(await pins("prompt_set_change")).toHaveLength(1);
     });
   });
+
+  // Owner decision 99(e) (2026-11-12): `tracked_prompts.status_changed_at` (migration 0199) is the archive time, written on every status
+  // change, so a later edit of an archived row (which bumps `updated_at`) can no longer move the day the prompt left the set. A paused
+  // prompt (a downgrade or retention pause) is not removed from the prompt set.
+  describe("tracked_prompts.status_changed_at (decision 99e, migration 0199)", () => {
+    const status = async (to: string, where = "TRUE") => db.query(`UPDATE tracked_prompts SET status = $2 WHERE project_id = $1 AND ${where}`, [projectId, to]);
+    const column = async () => (await db.query("SELECT status_changed_at FROM tracked_prompts WHERE project_id = $1 ORDER BY created_at, id", [projectId])).rows.map((r) => r.status_changed_at as Date | null);
+
+    it("[AC9] the column is nullable, and a row inserted or edited without a status change keeps it NULL", async () => {
+      await prompts(2, daysAgo(5));
+      expect(await column()).toEqual([null, null]);
+      await db.query("UPDATE tracked_prompts SET text = text || '!' WHERE project_id = $1", [projectId]);
+      await db.query("UPDATE tracked_prompts SET status = status WHERE project_id = $1", [projectId]); // same value: not a change
+      expect(await column()).toEqual([null, null]);
+    });
+
+    it("[AC9] every status change stamps status_changed_at with the change's time, whoever wrote it (archive, pause, restore)", async () => {
+      await prompts(1, daysAgo(5));
+      for (const to of ["archived", "paused", "active"]) {
+        const before = Date.now();
+        await status(to);
+        const [stamped] = await column();
+        expect(stamped, to).not.toBeNull();
+        expect(stamped!.getTime(), to).toBeGreaterThanOrEqual(before - 5_000);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+    });
+
+    it("[AC9] a writer that sets status_changed_at itself in the same statement is not overwritten (a backfill or a replay keeps its own time)", async () => {
+      await prompts(1, daysAgo(5));
+      await db.query("UPDATE tracked_prompts SET status = 'archived', status_changed_at = $2::timestamptz WHERE project_id = $1", [projectId, daysAgo(3)]);
+      expect((await column())[0]!.toISOString()).toBe(new Date(daysAgo(3)).toISOString());
+    });
+
+    it("[AC9] the removal day is the archive time: editing the archived row afterwards moves neither the day nor pins a spurious change today", async () => {
+      await prompts(18, daysAgo(10));
+      await prompts(2, daysAgo(10), { status: "archived" });
+      await db.query("UPDATE tracked_prompts SET status_changed_at = $2::timestamptz WHERE project_id = $1 AND status = 'archived'", [projectId, daysAgo(4)]);
+      // a later edit of the archived rows: `touch_updated_at` moves updated_at to now, which used to stand in for the archive time
+      await db.query("UPDATE tracked_prompts SET text = text || ' (edited)' WHERE project_id = $1 AND status = 'archived'", [projectId]);
+      await capture(daysAgo(6), "gemini", "fp");
+      await rollup(daysAgo(4).slice(0, 10));
+      expect((await pins("prompt_set_change")).map((p) => p.detail)).toEqual(["0 added, 2 removed of 20"]);
+      expect((await pins("prompt_set_change"))[0]!.occurred_at.toISOString()).toBe(new Date(daysAgo(4)).toISOString());
+      await rollup(); // today: the edit is not a removal
+      expect(await pins("prompt_set_change")).toHaveLength(1);
+    });
+
+    it("[AC9 / decision 99e] a paused prompt is not removed from the prompt set: pausing 5 of 20 pins nothing, and they stay in the before count", async () => {
+      await prompts(20, daysAgo(10));
+      await status("paused", "id IN (SELECT id FROM tracked_prompts WHERE project_id = '" + projectId + "' ORDER BY id LIMIT 5)");
+      await rollup();
+      expect(await pins("prompt_set_change")).toEqual([]);
+      // ...and a day that really removes two (deleted) still counts the paused five in the set it measures against: 2 of 20, not 2 of 15.
+      await db.query("UPDATE tracked_prompts SET deleted_at = now() WHERE id IN (SELECT id FROM tracked_prompts WHERE project_id = $1 AND status = 'active' ORDER BY id LIMIT 2)", [projectId]);
+      await rollup();
+      expect((await pins("prompt_set_change")).map((p) => p.detail)).toEqual(["0 added, 2 removed of 20"]);
+    });
+
+    it("[AC9] a legacy archived row (status_changed_at NULL, written before 0199) still falls back to updated_at, as it did before", async () => {
+      await prompts(18, daysAgo(5));
+      await prompts(2, daysAgo(5), { status: "archived" });
+      await db.query("UPDATE tracked_prompts SET updated_at = $2::timestamptz WHERE project_id = $1 AND status = 'archived'", [projectId, daysAgo(0, 3)]);
+      expect((await column()).every((c) => c === null)).toBe(true);
+      await rollup();
+      expect((await pins("prompt_set_change")).map((p) => p.detail)).toEqual(["0 added, 2 removed of 20"]);
+    });
+  });
 });
