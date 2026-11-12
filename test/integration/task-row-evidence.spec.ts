@@ -231,4 +231,15 @@ describe("STORY-194 · the task row serves evidence, measured impact, patch and 
     expect(row.patch).toBeNull();
     expect(row.measured_impact).toBeNull();
   });
+
+  it("[STORY-194 AC6] a task in one project whose finding is in another project of the same workspace is not served that project's patch", async () => {
+    const ws = await createWorkspace(); const p1 = await createProject(ws); const p2 = await createProject(ws);
+    const robots = sha("robots-v1");
+    // P2's audit matches the patch; P1's audit would not. Judged by P1's audit the patch would be wrongly dropped or kept - it must not be offered at all.
+    await createAudit(ws, p1, { robotsHash: robots });
+    const finding2 = await createFinding(ws, p2, await createAudit(ws, p2, { robotsHash: robots }));
+    await createPatch(ws, p2, finding2, { before: robots });
+    const task = await createTask(ws, p1, { findingId: finding2 });
+    expect((await list(ws, p1)).get(task)!.patch).toBeNull();
+  });
 });

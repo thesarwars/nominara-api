@@ -70,7 +70,7 @@ export function toPatch(row: PatchRow, audit: LatestAuditFacts | null, earlier: 
 export async function latestAuditFacts(client: ClientBase, projectId: string): Promise<LatestAuditFacts | null> {
   const audit = await client.query<{ robots_hash: Buffer | null; llms_txt_present: boolean | null }>(
     `SELECT robots_hash, llms_txt_present FROM aux_audits
-      WHERE project_id = $1 AND status IN ('completed', 'partial')
+      WHERE project_id = $1 AND workspace_id = app.current_workspace() AND status IN ('completed', 'partial')
       ORDER BY created_at DESC, id DESC LIMIT 1`,
     [projectId],
   );
@@ -80,7 +80,7 @@ export async function latestAuditFacts(client: ClientBase, projectId: string): P
 
 /**
  * The newest patch of each finding, with the ids of the ones before it. One bounded query for the set (21 rows a finding at most), and
- * one for the project's latest audit, which is what `page_matches` is judged against. A latest patch made against a file that has since
+ * one for the project's latest audit (a finding of another project is not offered: its patch is only ever judged against its own project's audit), which is what `page_matches` is judged against. A latest patch made against a file that has since
  * changed is not offered: the audit would have made a new one, so its absence means today's gate refused or found nothing. It stays
  * readable by id.
  */
@@ -90,9 +90,9 @@ export async function latestPatches(client: ClientBase, projectId: string, findi
   const rows = await client.query<PatchRow & { rn: number }>(
     `SELECT * FROM (
        SELECT p.*, row_number() OVER (PARTITION BY p.finding_id ORDER BY p.created_at DESC, p.id DESC) AS rn
-         FROM (${PATCH_SELECT} WHERE p.finding_id = ANY($1::uuid[])) p
+         FROM (${PATCH_SELECT} WHERE p.finding_id = ANY($1::uuid[]) AND p.project_id = $2 AND p.workspace_id = app.current_workspace()) p
      ) ranked WHERE rn <= ${EARLIER_PATCHES_MAX + 1} ORDER BY finding_id, rn`,
-    [findingIds],
+    [findingIds, projectId],
   );
   if (rows.rows.length === 0) return out;
   const audit = await latestAuditFacts(client, projectId);
