@@ -5,7 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { geoAnalysisSchema, geoDivergenceDetailSchema, geoTopicsDetailSchema, geoSentimentDetailSchema } from "../../contracts/analytics/index.js";
 import { taskGenerationConditionSchema } from "../../contracts/tasks/index.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { refreshProjectGeo } from "../../src/lib/rollup/refresh-project-geo.js";
+import { refreshProjectGeo, refreshProjectGeoWindows } from "../../src/lib/rollup/refresh-project-geo.js";
 import { generateTasksForProject } from "../../src/lib/taskgen/generate.js";
 import { createTaskGenerateHandler } from "../../src/lib/queue/handlers/task-generate.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -646,6 +646,95 @@ describe("STORY-061 - A4 divergence, A5 topics, A6 threshold (persisted, read, t
     await refresh();
     await runJob();
     expect(await spikeAlerts()).toHaveLength(0);
+  });
+
+  // STORY-068 AC1 - the two content alerts whose task rules 0152 enabled: divergence_high (TG-DIVERGENCE) and topic_gap_high (TG-TOPIC-CONTENT).
+  const alertsOf = async (kind: string) => (await db.query("SELECT * FROM notifications WHERE kind = $1 AND project_id = $2", [kind, projectId])).rows;
+  async function addOwner(): Promise<void> {
+    const owner = randomUUID();
+    await db.query("INSERT INTO users (id,email,email_verified_at) VALUES ($1,$2,now())", [owner, `o-${owner.slice(0, 8)}@example.com`]);
+    await db.query("INSERT INTO workspace_members (workspace_id,user_id,role) VALUES ($1,$2,'owner')", [workspaceId, owner]);
+  }
+
+  it("[STORY-068 AC1] divergence_high: a divergent project raises ONE warning alert linked to its TG-DIVERGENCE task, and a retried job writes nothing twice", async () => {
+    await addOwner();
+    await weight("docs.acme.com", 0.9);
+    await divergentPrompts(10);
+    await enable("TG-DIVERGENCE"); // restamps the non-retroactive watermark so the result does not depend on test order
+    await refresh();
+    await runJob();
+    const task = (await taskRows("TG-DIVERGENCE"))[0];
+    expect(task).toBeDefined();
+    const alerts = await alertsOf("alert.divergence_high");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ severity: "warning", user_id: null });
+    expect(alerts[0].payload).toMatchObject({ alert_rule: "divergence_high", task_id: task.id });
+    await runJob();
+    expect(await alertsOf("alert.divergence_high")).toHaveLength(1);
+  });
+
+  it("[STORY-068 AC1] divergence_high: below the 10-prompt minimum raises no alert and no task", async () => {
+    await addOwner();
+    await weight("docs.acme.com", 0.9);
+    await divergentPrompts(9);
+    await refresh();
+    await runJob();
+    expect(await alertsOf("alert.divergence_high")).toHaveLength(0);
+    expect(await taskRows("TG-DIVERGENCE")).toHaveLength(0);
+  });
+
+  it("[STORY-068 AC1] topic_gap_high: a dominated, winnable topic raises ONE info alert linked to its TG-TOPIC-CONTENT task, and a retried job writes nothing twice", async () => {
+    await addOwner();
+    const rival = await competitor();
+    const winnable = await cluster("CRM pricing");
+    const other = await cluster("Enterprise security", 1); // the analysis needs >= 2 topics to be sufficient
+    await rivalAnswers(winnable, rival);
+    await rivalAnswers(other, rival);
+    await alignment(winnable, 0.62, 0.7);
+    await alignment(other, 0.3, 0.7);
+    await concept(winnable, "usage based pricing", "pricing_term", 0.6);
+    await enable("TG-TOPIC-CONTENT"); // restamps the non-retroactive watermark so the result does not depend on test order
+    await refresh();
+    await runJob();
+    const task = (await taskRows("TG-TOPIC-CONTENT"))[0];
+    expect(task).toBeDefined();
+    const alerts = await alertsOf("alert.topic_gap_high");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ severity: "info", user_id: null });
+    expect(alerts[0].payload).toMatchObject({ alert_rule: "topic_gap_high", task_id: task.id });
+    await runJob();
+    expect(await alertsOf("alert.topic_gap_high")).toHaveLength(1);
+  });
+
+  it("[STORY-068 AC1] topic_gap_high: an unwinnable topic (achievability under 0.5) raises no alert and no task", async () => {
+    await addOwner();
+    const rival = await competitor();
+    const unwinnable = await cluster("Enterprise security", 1);
+    await rivalAnswers(unwinnable, rival);
+    await alignment(unwinnable, 0.3, 0.7);
+    await refresh();
+    await runJob();
+    expect(await alertsOf("alert.topic_gap_high")).toHaveLength(0);
+    expect(await taskRows("TG-TOPIC-CONTENT")).toHaveLength(0);
+  });
+
+  it("[STORY-062 AC10] end to end: refresh -> generateTasks -> GeoService.digest, the promoted lever links the task the generator wrote (no task row is inserted by hand)", async () => {
+    await weight("docs.acme.com", 0.9);
+    await divergentPrompts(10);
+    await enable("TG-DIVERGENCE"); // restamps the non-retroactive watermark so the result does not depend on test order
+    // The rollup's own entry point: it persists every window AND promotes the levers the digest reads.
+    await as((c) => refreshProjectGeoWindows(c, projectId, { asOf: AS_OF }));
+    const digest = () => withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService(tasks).digest(projectId, { timeframe: "30d" }));
+    // Before generation there is no task behind the lever: the link is null, never invented.
+    const before = (await digest()).levers.find((l) => l.analysis_href === "geo?analysis=divergence");
+    expect(before).toBeDefined();
+    expect(before!.task).toBeNull();
+    await generate();
+    const generated = await taskRows("TG-DIVERGENCE");
+    expect(generated).toHaveLength(1);
+    expect(generated[0]).toMatchObject({ origin: "auto", source_geo_analysis: "divergence", status: "todo" });
+    const lever = (await digest()).levers.find((l) => l.analysis_href === "geo?analysis=divergence")!;
+    expect(lever.task).toEqual({ task_id: generated[0].id, label: generated[0].title, href: `plan?task=${generated[0].id}` });
   });
 
   it("[A6c] the prior window trends a theme: present before, absent before, and nothing measured before", async () => {

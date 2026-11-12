@@ -202,7 +202,8 @@ async function toTaskInput(
 
   // AC12 (alignment-session reference on content tasks that would benefit) is DEFERRED, not met: there is no `alignment_sessions`
   // table yet, so `rule.opens_alignment` is read but `tasks.alignment_session_id` is never written. The only rules that set
-  // `opens_alignment` (TG-ENTITY-NODE, TG-TOPIC-CONTENT) are `pending_analysis` and disabled, so no such task exists today.
+  // `opens_alignment` (TG-ENTITY-NODE, TG-TOPIC-CONTENT, the 0176 alignment rule) are NOT all disabled: migration 0152 enabled
+  // TG-TOPIC-CONTENT, so tasks from an `opens_alignment` rule do exist; they just carry no session reference yet.
   // Revisit when the alignment-session story ships.
   return {
     projectId: ctx.projectId,

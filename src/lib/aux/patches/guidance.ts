@@ -157,3 +157,21 @@ export function guidanceFor(ruleCode: string, context: { readonly projectId: str
     alignment_link: guidanceOnly ? null : { path: "/geo/alignment", target_url: context.url },
   };
 }
+
+// STORY-194 AC2 / owner decision 98b - a finding read serves a patch or guidance, never neither. Where a rule has no curated text, or a
+// fixable rule has no patch to serve (none generated, or the gate refused it), the fallback is the rule's catalog rationale plus the
+// alignment link. The contract is unchanged: `steps` needs one entry, so the single step says plainly that the fix is manual.
+export function guidanceForFinding(
+  ruleCode: string,
+  context: { readonly projectId: string; readonly url: string | null; readonly title: string; readonly rationale: string | null; readonly hasPatch: boolean },
+): Guidance | null {
+  if (context.hasPatch) return null;
+  const curated = guidanceFor(ruleCode, context);
+  if (curated !== null) return curated;
+  const summary = context.rationale !== null && context.rationale.trim() !== "" ? context.rationale : context.title;
+  return {
+    summary,
+    steps: [`Fix "${context.title}" on the page by hand; no copy-ready patch is available for this finding.`],
+    alignment_link: { path: "/geo/alignment", target_url: context.url },
+  };
+}
