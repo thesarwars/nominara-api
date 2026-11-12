@@ -212,7 +212,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   tracked_prompts: {
     columns:
-      "id workspace_id project_id generation_batch_id generation_source text intent_archetype funnel_stage generator_meta cluster_id is_priority stability_score superseded_by last_captured_at status created_at updated_at deleted_at first_activated_at activation_credits paused_by_downgrade_at embedding_model",
+      "id workspace_id project_id generation_batch_id generation_source text intent_archetype funnel_stage generator_meta cluster_id is_priority stability_score superseded_by last_captured_at status created_at updated_at deleted_at first_activated_at activation_credits paused_by_downgrade_at embedding_model status_changed_at",
     omit: "text_hash embedding",
   },
   workspace_invitations: {
