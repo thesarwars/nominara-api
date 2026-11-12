@@ -225,6 +225,44 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
     expect(detail!.disambiguation.level).toBe("low");
   });
 
+  // STORY-060 E7 / owner decision 99(b): the profile probe checks Wikidata and Wikipedia ONLY, so the missing-node finding (and with it the alert and the
+  // task) must not wait for all seven nodes: a CHECKED, absent, high-weight node is a missing node whatever the other nodes' state.
+  it("E7 · a CHECKED absent high-weight node raises its finding and task rule while the other five nodes are unchecked and the score stays withheld", () => {
+    const { write, detail } = buildEntity(input({ nodes: [absent("wikidata"), absent("wikipedia")] }));
+    expect(write.score).toBeNull();
+    expect(detail!.authority).toMatchObject({ score: null });
+    const missing = write.findings.filter((f) => f.id.startsWith("entity-node-missing"));
+    // wikidata weighs 0.22 (>= 0.18): a finding with the task rule. wikipedia weighs 0.14: none.
+    expect(missing.map((f) => f.id)).toEqual(["entity-node-missing-wikidata"]);
+    expect(missing[0]).toMatchObject({ task_rule_code: ENTITY_NODE_TASK_RULE, severity: "medium", metric: { name: "node_weight", value: 0.22, target: 0.18 } });
+    expect(missing[0]!.evidence.length).toBeGreaterThan(0);
+    expect(detail!.nodes.filter((n) => n.status === "unchecked")).toHaveLength(5);
+    expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
+  });
+
+  it("E7 · a checked, absent, high-weight node is a measured fact: with risk UNMEASURED and no co-occurrence, the missing-node finding is still written (the analysis is not 'insufficient')", () => {
+    const { write, detail } = buildEntity(input({ nodes: [absent("wikidata"), absent("wikipedia")], nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } }));
+    expect(write.sufficient).toBe(true);
+    expect(write.score).toBeNull();
+    expect(write.findings.map((f) => f.id)).toContain("entity-node-missing-wikidata");
+    expect(detail!.disambiguation.level).toBe("unmeasured");
+    expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
+    // ...and with NO node checked, or only present or low-weight nodes, and nothing else measurable it stays insufficient, as before.
+    expect(buildEntity(input({ nodes: [node("wikidata"), absent("wikipedia")], nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } })).write.sufficient).toBe(false);
+    expect(buildEntity(input({ nodes: [], nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } })).write.sufficient).toBe(false);
+  });
+
+  it("E7 · an UNCHECKED node is never a missing one, and a present high-weight node raises nothing", () => {
+    expect(buildEntity(input({ nodes: [absent("wikipedia")] })).write.findings.some((f) => f.id.startsWith("entity-node-missing"))).toBe(false);
+    expect(buildEntity(input({ nodes: [node("wikidata"), absent("wikipedia")] })).write.findings.some((f) => f.id.startsWith("entity-node-missing"))).toBe(false);
+  });
+
+  it("E7 · the finding does not depend on the judge: the heuristic guard withholds the score, never the missing-node finding", () => {
+    const { write } = buildEntity(input({ nodes: [absent("wikidata")], judge: HEURISTIC_JUDGE }));
+    expect(write.score).toBeNull();
+    expect(write.findings.map((f) => f.id)).toContain("entity-node-missing-wikidata");
+  });
+
   it("co-occurrence: the brand's rate against each competitor's, over the passages that carry a category term", () => {
     const { detail } = buildEntity(input());
     expect(detail!.cooccurrence).toMatchObject({ sufficient: true, reason: null, terms: ["crm"], category_passages: 40 });

@@ -483,6 +483,10 @@ export const envSchema = z
     NAME_MATCH_JUDGE: z.enum(["none", "gemini"]).default("none"),
     NAME_MATCH_JUDGE_MODEL: requiredString.default("gemini-2.5-flash"),
     NAME_MATCH_JUDGE_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(8_000),
+    // STORY-060 E1/E3 (owner decision 99b) - whether the `entity_probe` job checks each project's Wikidata and Wikipedia profiles (free public APIs, through
+    // the SSRF guard, robots.txt and a per-host budget; the brand's name, aliases and domain are all that leave). `none` switches it off: no job is queued and
+    // a queued one does nothing. The other five authoritative nodes are not probed, so the Entity Authority score stays withheld whatever this is.
+    ENTITY_PROFILE_PROBE: z.enum(["none", "wikimedia"]).default("wikimedia"),
 
     // NEW-D-2 — Stripe (SANDBOX keys in every environment this week). All three
     // are OPTIONAL, deliberately: the API must boot without a payment provider,

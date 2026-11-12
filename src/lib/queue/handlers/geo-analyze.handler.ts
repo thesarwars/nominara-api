@@ -4,13 +4,16 @@ import type { Pool } from "pg";
 import type { ClientBase } from "pg";
 import { Redis } from "ioredis";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
-import { geoAnalyzeJobPayloadSchema, geoAnalyzeKey, nameMatchJudgeJobPayloadSchema, type GeoAnalyzeJobPayload } from "../../../../contracts/analytics/index.js";
+import { entityProbeJobPayloadSchema, geoAnalyzeJobPayloadSchema, geoAnalyzeKey, nameMatchJudgeJobPayloadSchema, type GeoAnalyzeJobPayload } from "../../../../contracts/analytics/index.js";
 import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
 import { withTenantContext } from "../../../tenancy/tenant-context.js";
 import { cl100kTokenizer } from "../../aux/tokenizer-cl100k.js";
 import { advanceAlignmentDraft, advanceAlignmentSession, ALIGNMENT_JOB, failStrandedDraft, failStrandedSession, type AdvanceOutcome, type DraftOutcome } from "../../geo/alignment/index.js";
 import { createGuardedPageFetcher, type PageFetcher } from "../../geo/corpus/page-fetcher.js";
 import { embedBatchEnqueuerFor, type EnqueueEmbedBatch } from "../../embedding/prompt-embedding-request.js";
+import { createGuardedJsonFetcher } from "../../geo/entity-probe/json-fetcher.js";
+import { commitProbe, prepareProbe, runProbe, type ProbePrepared, type ProbeResult } from "../../geo/entity-probe/job.js";
+import { createWikiProfileProbe, type WikiProfileProbe } from "../../geo/entity-probe/wiki-probe.js";
 import { commitJudging, prepareJudging, runJudging, type EngineBucketPort, type JudgingPrepared, type JudgingResult } from "../../geo/name-match-judge/judging.js";
 import type { NameMatchJudge } from "../../geo/name-match-judge/port.js";
 import { selectNameMatchJudge } from "../../geo/name-match-judge/select.js";
@@ -42,6 +45,11 @@ import { selectedEmbeddingModel } from "./embed-batch.handler.js";
 // transaction, `run` calls the model with NO transaction and NO pooled client (each call takes a token from the gemini engine bucket), `commit` stores the
 // verdicts in a second short one. Its producer is the daily rollup, after its commit, and only when a model judge is configured.
 //
+// STORY-060 E1/E3 (owner decision 99b) - and one more, `entity_probe`: it checks a project's Wikidata and Wikipedia profiles and reads the brand's own `sameAs`
+// links off its home page (src/lib/geo/entity-probe/job.ts), phased the same way: `prepare` and `commit` are short tenant transactions, `run` holds none and
+// reaches the two sites only through the guarded fetchers (SSRF guard, robots.txt, a per-host budget). Producer: the daily rollup, after its commit, when
+// ENTITY_PROFILE_PROBE is `wikimedia`.
+//
 // IDEMPOTENT under at-least-once delivery: every step of the library is (a re-run of a finished session is `settled`, the corpus is built on the first step only, a
 // re-recompute of an unchanged draft is `idle`), and the re-queue key is per step.
 
@@ -62,16 +70,19 @@ export interface GeoAnalyzeDeps {
   readonly pool?: Pool;
   readonly now?: () => Date;
   /** STORY-191 test seams: the model judge (production selects it from env) and the engine bucket (production is the cache Valkey's). */
+  /** STORY-060 test seams: the profile probe and the page fetcher (production: the Wikimedia probe and the guarded page fetcher). */
+  readonly probe?: WikiProfileProbe;
   readonly judge?: NameMatchJudge | null;
   readonly bucket?: EngineBucketPort;
   readonly monthlyCap?: number;
 }
 
 type Prepared =
+  | { readonly kind: "entity_probe"; readonly work: ProbePrepared }
   | { readonly kind: "alignment"; readonly payload: GeoAnalyzeJobPayload }
   | { readonly kind: "name_match"; readonly workspaceId: string; readonly projectId: string; readonly judge: NameMatchJudge; readonly work: JudgingPrepared };
 
-type Ran = AdvanceOutcome | DraftOutcome | "stopped" | JudgingResult;
+type Ran = AdvanceOutcome | DraftOutcome | "stopped" | JudgingResult | ProbeResult;
 
 export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoAnalyzeDeps = {}): JobProcessor {
   // Built on the first job that needs it: constructing a producer at registration would open a connection in every process that merely imports
@@ -99,6 +110,7 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
 
   // The model judge and its bucket are built on the first judging job: constructing them at registration would open a connection in every process that
   // merely imports the registry.
+  let probeChosen: WikiProfileProbe | undefined;
   let judgeChosen: NameMatchJudge | null | undefined = deps.judge;
   const judgeFor = (): NameMatchJudge | null => (judgeChosen === undefined ? (judgeChosen = selectNameMatchJudge(context.env)) : judgeChosen);
   let bucketOpen: EngineBucketPort | undefined = deps.bucket;
@@ -117,6 +129,29 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
   return phasedProcessor<Prepared, Ran>({
     async prepare(tx: ClientBase, job: Job) {
       const rawPayload = (job.data as { payload: unknown }).payload;
+      const probing = entityProbeJobPayloadSchema.safeParse(rawPayload);
+      if (probing.success) {
+        return tracer.startActiveSpan("geo.entity_probe.prepare", async (span) => {
+          try {
+            // A job queued before the probe was switched off does nothing. An injected probe (a test) is always on.
+            if (deps.probe === undefined && context.env.ENTITY_PROFILE_PROBE !== "wikimedia") {
+              incrementCounter("nominara_geo_entity_probe_jobs_total", { outcome: "disabled" });
+              return PHASES_DONE;
+            }
+            const work = await prepareProbe(tx, probing.data.projectId);
+            if (work === null) {
+              incrementCounter("nominara_geo_entity_probe_jobs_total", { outcome: "fresh_or_gone" });
+              return PHASES_DONE;
+            }
+            return { kind: "entity_probe" as const, work };
+          } catch (error) {
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw error;
+          } finally {
+            span.end();
+          }
+        });
+      }
       const judging = nameMatchJudgeJobPayloadSchema.safeParse(rawPayload);
       if (judging.success) {
         return tracer.startActiveSpan("geo.name_match_judge.prepare", async (span) => {
@@ -158,6 +193,25 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
     },
 
     async run(prepared) {
+      if (prepared.kind === "entity_probe") {
+        return tracer.startActiveSpan("geo.entity_probe.run", async (span) => {
+          try {
+            // NO transaction and NO pooled client in here: two public sites and the brand's home page are awaited with neither held (ADR-0003).
+            const result = await runProbe(prepared.work, {
+              probe: deps.probe ?? (probeChosen ??= createWikiProfileProbe(createGuardedJsonFetcher())),
+              fetchPage: deps.fetchPage ?? createGuardedPageFetcher(),
+              tokenizer: cl100kTokenizer,
+            });
+            span.setAttributes({ "nominara.entity_probe.checked": result.checks.length, "nominara.entity_probe.unchecked": result.unchecked.length });
+            return result;
+          } catch (error) {
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw error;
+          } finally {
+            span.end();
+          }
+        });
+      }
       if (prepared.kind === "name_match") {
         return tracer.startActiveSpan("geo.name_match_judge.run", async (span) => {
           try {
@@ -225,6 +279,12 @@ export function createGeoAnalyzeHandler(context: QueueHandlerContext, deps: GeoA
     },
 
     async commit(tx, prepared, outcome) {
+      if (prepared.kind === "entity_probe") {
+        const result = outcome as ProbeResult;
+        await commitProbe(tx, prepared.work, result);
+        incrementCounter("nominara_geo_entity_probe_jobs_total", { outcome: result.unchecked.length === 0 ? "probed" : result.checks.length === 0 ? "unchecked" : "partial" });
+        return;
+      }
       if (prepared.kind === "name_match") {
         const result = outcome as JudgingResult;
         const written = await commitJudging(tx, prepared.work, result);

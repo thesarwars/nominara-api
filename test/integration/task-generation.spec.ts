@@ -281,7 +281,9 @@ describe("STORY-063 · task generation engine", () => {
     expect(codes.filter((c) => c.startsWith("TG-AUX-")).length).toBeGreaterThan(0);
     for (const row of rows) expect(taskGenerationConditionSchema.safeParse(row.condition).success, row.code).toBe(true);
     // The rules whose facts need an analysis that has not shipped are seeded disabled.
-    for (const code of ["TG-RENDER-SCHEMA", "TG-ENTITY-NODE", "TG-SENTIMENT-NEGATIVE"]) expect((await rule(code)).enabled, code).toBe(false);
+    for (const code of ["TG-RENDER-SCHEMA", "TG-SENTIMENT-NEGATIVE"]) expect((await rule(code)).enabled, code).toBe(false);
+    // STORY-060 E7 / owner decision 99(b): TG-ENTITY-NODE is retargeted at the entity analysis's missing-node finding and ENABLED by migration 0198.
+    expect(await rule("TG-ENTITY-NODE")).toMatchObject({ enabled: true, condition: { kind: "geo_finding", analysis: "entity", finding_id_prefix: "entity-node-missing-" } });
     // STORY-061 / owner decision 20: the A4 and A5 rules are retargeted at their analyses and ENABLED by migration 0152.
     for (const code of ["TG-DIVERGENCE", "TG-TOPIC-CONTENT", "TG-SENTIMENT-REASON"]) expect((await rule(code)).enabled, code).toBe(true);
     // negative_cell_rate is not computable from metric_daily, so the alert is pending, never approximated by another formula.
@@ -935,7 +937,7 @@ describe("STORY-063 · task generation engine", () => {
   });
 
   it("[STORY-063 hazard] a rule for a not-yet-built analysis generates nothing even when enabled — it fails closed", async () => {
-    await db.query("UPDATE task_generation_rules SET enabled = true WHERE code IN ('TG-TOPIC-CONTENT','TG-DIVERGENCE','TG-ENTITY-NODE','TG-RENDER-SCHEMA','TG-SENTIMENT-NEGATIVE')");
+    await db.query("UPDATE task_generation_rules SET enabled = true WHERE code IN ('TG-TOPIC-CONTENT','TG-DIVERGENCE','TG-RENDER-SCHEMA','TG-SENTIMENT-NEGATIVE')");
     await expect(generate()).resolves.toBeDefined();
     expect(await taskRows()).toHaveLength(0);
   });

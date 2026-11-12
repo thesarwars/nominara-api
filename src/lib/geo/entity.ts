@@ -18,15 +18,15 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // withheld outright when the brand's name collides with common words (`high` disambiguation risk): a figure computed
 // over false positives is worse than none. The risk itself is reported next to the score and never folded into it.
 //
-// TWO GATES, NOT ONE. Only the SCORE (and sameAs coverage and the node-based findings) waits for all seven nodes to be
-// checked. Disambiguation risk and category co-occurrence read `mention_facts` and `corpus_passages`, need no profile
-// data, and are computed and persisted whether or not any node was ever checked: a brand whose name collides with a
-// common word gets its alias-tuning task today, not after a profile probe exists.
+// THREE GATES, NOT ONE. The SCORE and the sameAs coverage figure wait for all seven nodes to be checked, and (owner decision 17, STORY-191) for a MODEL
+// name-match judge: while the judge in force is the v1 heuristic no score is published at all. A missing-node finding waits only for THAT node to be
+// checked (owner decision 99b: the profile probe checks Wikidata and Wikipedia only). Disambiguation risk and category co-occurrence read
+// `mention_facts` and `corpus_passages`, need no profile data, and are computed and persisted whether or not any node was ever checked: a brand whose
+// name collides with a common word gets its alias-tuning task today, not after a profile probe exists.
 //
-// WHAT THIS FILE DOES NOT DO: probe Wikidata, Wikipedia, Crunchbase, LinkedIn, GitHub, G2/Capterra or a category
-// directory. That is network I/O and belongs to a job behind a port, outside any transaction (ADR-0003); the sources
-// and their access terms are an owner decision. `writeEntityNodes` is the one place a check result becomes an
-// `entity_nodes` row, so that job has a single, tested write path to call.
+// WHAT THIS FILE DOES NOT DO: probe Wikidata, Wikipedia, Crunchbase, LinkedIn, GitHub, G2/Capterra or a category directory. That is network I/O and
+// belongs to a job behind a port, outside any transaction (ADR-0003): src/lib/geo/entity-probe probes Wikidata and Wikipedia (STORY-060 E1/E3); the
+// other five are not probed. `writeEntityNodes` is the one place a check result becomes an `entity_nodes` row, so that job has a single, tested write path.
 
 /** The stored `entity_nodes.node` vocabulary. */
 export type StoredEntityNode = "wikidata" | "wikipedia" | "g2" | "capterra" | "crunchbase" | "linkedin" | "github" | "category_directory";
@@ -174,8 +174,10 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
       ? "Authoritative profiles have not been checked for this project yet; the Entity Authority score needs all seven nodes checked."
       : `These authoritative nodes have not been checked yet: ${unchecked.map((n) => n.node).join(", ")}. The score needs all seven.`;
 
-  // Nothing at all is measurable: say so, publish nothing else.
-  if (!allChecked && level === "unmeasured" && !coSufficient) {
+  // Nothing at all is measurable: say so, publish nothing else. The one exception is a CHECKED, ABSENT, high-weight node (owner decision 99b): that is a
+  // measured fact with a finding to raise, and it must be able to fire while risk and co-occurrence are still unmeasured.
+  const missingHighWeight = nodes.some((n) => n.checked && !n.present && ENTITY_NODE_WEIGHTS[n.node] >= ENTITY_ALERT_MIN_WEIGHT);
+  if (!allChecked && level === "unmeasured" && !coSufficient && !missingHighWeight) {
     return {
       write: {
         ...base,
@@ -281,8 +283,9 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
     });
   }
 
-  // Node-based findings need every node checked: an unchecked node is not an absent one.
-  for (const n of allChecked ? nodes : []) {
+  // A missing-node finding needs THAT node checked, not all seven (owner decision 99(b): the profile probe checks Wikidata and Wikipedia only, and the
+  // alert and task for a missing high-weight node must still fire): an unchecked node is not an absent one, a checked absent one is.
+  for (const n of nodes.filter((node) => node.checked)) {
     if (n.present || ENTITY_NODE_WEIGHTS[n.node] < ENTITY_ALERT_MIN_WEIGHT) continue;
     findings.push({
       id: `entity-node-missing-${n.node}`,

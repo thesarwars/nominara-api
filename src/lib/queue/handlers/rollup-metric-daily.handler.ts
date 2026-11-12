@@ -12,7 +12,7 @@ import { refreshProjectMilestones } from "../../rollup/refresh-project-milestone
 import { rollUpDay } from "../../rollup/roll-up-day.js";
 import { HEURISTIC_JUDGE } from "../../geo/entity.js";
 import { judgeInForce } from "../../geo/name-match-judge/select.js";
-import { nameMatchJudgeKey } from "../../../../contracts/analytics/index.js";
+import { entityProbeKey, nameMatchJudgeKey } from "../../../../contracts/analytics/index.js";
 import { afterCommit, currentTenantStore } from "../../../tenancy/tenant-context.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { withProjectQueueLock } from "../locks.js";
@@ -59,6 +59,9 @@ export type EnqueueTaskGenerate = (workspaceId: string, payload: { projectId: st
 /** STORY-191 - enqueues one `geo.analyze` name-match judging job for a project (owner decision 99c). Injected in tests. */
 export type EnqueueNameMatchJudge = (workspaceId: string, payload: { kind: "name_match_judge"; projectId: string; judgeVersion: string; day: string }, idempotencyKey: string) => Promise<unknown>;
 
+/** STORY-060 E1 - enqueues one `geo.analyze` entity-profile probe job for a project (owner decision 99b). Injected in tests. */
+export type EnqueueEntityProbe = (workspaceId: string, payload: { kind: "entity_probe"; projectId: string; day: string }, idempotencyKey: string) => Promise<unknown>;
+
 /** SLO-14: parse to metric visible, p95 at most 15 minutes. */
 export const ROLLUP_FRESHNESS_SLO_SECONDS = 15 * 60;
 
@@ -66,6 +69,7 @@ export interface RollupMetricDailyDeps {
   readonly enqueueVerifyPresence?: EnqueueVerifyPresence;
   readonly enqueueTaskGenerate?: EnqueueTaskGenerate;
   readonly enqueueNameMatchJudge?: EnqueueNameMatchJudge;
+  readonly enqueueEntityProbe?: EnqueueEntityProbe;
 }
 
 export function createRollupMetricDailyHandler(context: QueueHandlerContext, deps?: RollupMetricDailyDeps): JobProcessor {
@@ -99,6 +103,17 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
 
   const enqueueNameMatchJudge: EnqueueNameMatchJudge =
     deps?.enqueueNameMatchJudge ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("geo.analyze", workspaceId, payload, { idempotencyKey });
+    });
+
+  const enqueueEntityProbe: EnqueueEntityProbe =
+    deps?.enqueueEntityProbe ??
     (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
       producer ??= new QueueProducer(
         createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
@@ -255,6 +270,22 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
               .catch((error: unknown) => {
                 incrementCounter("nominara_geo_name_match_judge_request_failed_total");
                 logger.error({ event: "geo.name_match_judge.request_failed", workspace_id: workspaceId, project_id: projectId, error: error instanceof Error ? error.name : "unknown" });
+              });
+          });
+        }
+        // STORY-060 E1/E3 (owner decision 99b) - the Wikidata and Wikipedia profile probe makes network calls, so like the judge it is queued once this transaction
+        // has committed (never awaited inside it, KAD-06). One key per project and UTC day; the job itself skips a project probed within the last week. A failed
+        // enqueue is logged, never thrown. Only when ENTITY_PROFILE_PROBE is `wikimedia`.
+        if (context.env.ENTITY_PROFILE_PROBE === "wikimedia") {
+          const probeRequest = { kind: "entity_probe" as const, projectId, day: new Date().toISOString().slice(0, 10) };
+          afterCommit(() => {
+            void enqueueEntityProbe(workspaceId, probeRequest, entityProbeKey(probeRequest))
+              .then(() => {
+                incrementCounter("nominara_geo_entity_probe_requested_total");
+              })
+              .catch((error: unknown) => {
+                incrementCounter("nominara_geo_entity_probe_request_failed_total");
+                logger.error({ event: "geo.entity_probe.request_failed", workspace_id: workspaceId, project_id: projectId, error: error instanceof Error ? error.name : "unknown" });
               });
           });
         }
