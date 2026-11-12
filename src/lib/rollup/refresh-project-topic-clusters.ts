@@ -21,6 +21,17 @@ import { blendEngineParts, toMetricRow, type EnginePart } from "./roll-up-day.js
 //   achievability      from the A1 alignment distance (`geo_alignments`), NULL (not 0) until one was measured.
 //   computed_at        stamped on every refreshed cluster.
 //
+// LOCKS. This step holds the rollup's queue lock (`rollup.metric_daily`, per project); the clustering job (`topic.cluster`) takes its OWN
+// per-project lock, so the two CAN interleave. The interleavings, and why each is safe:
+//   - clustering commits AFTER this step listed the clusters: a cluster it created is not in this run's list and keeps NULL columns until
+//     the next rollup fills it in (AC4); a cluster it dissolved is updated as a no-op (the row is gone) and any reference to it is nulled
+//     by the next rollup's dangling pass, which re-reads `topic_clusters` in its own statement.
+//   - clustering commits BEFORE: this step simply sees the new clusters.
+//   - both transactions write `tracked_prompts` / `topic_clusters` / the referring tables in a different order, so Postgres may pick one
+//     as a deadlock victim (40P01). That aborts one whole transaction (nothing partial is committed) and the queue retries the job; both
+//     steps are idempotent, so the retry converges.
+// No lock is added here: serialising the two would couple the rollup's latency to a multi-minute embedding job.
+//
 // One transaction, the rollup's, under its per-project advisory lock; reads only this database (no network: KAD-06 / ADR-0003). Idempotent:
 // every value is a function of the stored facts, so a re-run writes the same values (and a new `computed_at`). `updated_at` is NOT moved
 // (migration 0200): `min(updated_at)` is how the weekly clustering sweep reads "the last clustering".
@@ -64,7 +75,7 @@ async function nullDanglingClusterReferences(tx: ClientBase, projectId: string):
     );
     nulled += result.rowCount ?? 0;
   }
-  const passages = await tx.query(
+  const passages = await tx.query<{ nulled: number; dropped: number }>(
     `WITH dangling AS (
        SELECT cp.id, cp.content_hash, cp.embedding_model FROM corpus_passages cp
         WHERE cp.project_id = $1 AND cp.workspace_id = app.current_workspace() AND cp.prompt_cluster_id IS NOT NULL
@@ -77,11 +88,14 @@ async function nullDanglingClusterReferences(tx: ClientBase, projectId: string):
         ORDER BY d.content_hash, d.embedding_model, d.id
      ), dropped AS (
        DELETE FROM corpus_passages WHERE id IN (SELECT id FROM dangling) AND id NOT IN (SELECT id FROM keep) RETURNING 1
+     ), nulled AS (
+       UPDATE corpus_passages SET prompt_cluster_id = NULL WHERE id IN (SELECT id FROM keep) RETURNING 1
      )
-     UPDATE corpus_passages SET prompt_cluster_id = NULL WHERE id IN (SELECT id FROM keep)`,
+     SELECT (SELECT count(*) FROM nulled)::int AS nulled, (SELECT count(*) FROM dropped)::int AS dropped`,
     [projectId],
   );
-  return nulled + (passages.rowCount ?? 0);
+  // A dropped duplicate is a cleared dangling reference too: it is counted with the nulled ones (the log line, the span, the counter).
+  return nulled + (passages.rows[0]?.nulled ?? 0) + (passages.rows[0]?.dropped ?? 0);
 }
 
 /** One cluster's visibility score; null when none of its member prompts was answered in the window. */

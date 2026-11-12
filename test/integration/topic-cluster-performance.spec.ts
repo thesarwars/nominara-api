@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -301,9 +304,69 @@ describe("STORY-188 - topic cluster performance refreshed by the rollup", () => 
       await insert(null); // already cluster-less, same content
       await insert(gone); //  would duplicate it when nulled
       await insert(randomUUID()); // two dissolved clusters, same content
-      await expect(refresh()).resolves.toBeDefined();
+      // the two dangling rows are duplicates of the cluster-less one: both are dropped, and counted as cleared references
+      await expect(refresh()).resolves.toMatchObject({ danglingNulled: 2 });
       expect(Number((await db.query("SELECT count(*) FROM corpus_passages WHERE content_hash = '\\x0b' AND prompt_cluster_id IS NOT NULL")).rows[0].count)).toBe(0);
       expect(Number((await db.query("SELECT count(*) FROM corpus_passages WHERE content_hash = '\\x0b'")).rows[0].count)).toBe(1);
+    });
+  });
+
+  describe("observability (span, counters, redacted log line)", () => {
+    const exporter = new InMemorySpanExporter();
+    // No trace.disable(): it would orphan the module-level tracer.
+    trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+    let lines: unknown[];
+    beforeEach(() => {
+      exporter.reset();
+      lines = [];
+      vi.spyOn(Logger.prototype, "log").mockImplementation((m: unknown) => void lines.push(m));
+    });
+    afterEach(() => vi.restoreAllMocks());
+    const spans = () => exporter.getFinishedSpans().filter((x) => x.name === "topic_clusters.refresh");
+    const metric = (name: string) => lines.filter((l): l is Record<string, unknown> => typeof l === "object" && l !== null && (l as { metric?: unknown }).metric === name);
+
+    it("one topic_clusters.refresh span with the counts, the ok counter, a duration observation, and one log line of ids and counts only", async () => {
+      await fixture();
+      await refresh();
+      expect(spans()).toHaveLength(1);
+      expect(spans()[0]!.attributes).toMatchObject({ "nominara.topic_clusters.refreshed": 4, "nominara.topic_clusters.dangling_nulled": 0 });
+      expect(metric("nominara_topic_clusters_refresh_total")).toEqual([{ metric: "nominara_topic_clusters_refresh_total", value: 1, outcome: "ok" }]);
+      expect(metric("nominara_topic_clusters_dangling_cleared_total")).toEqual([]);
+      const duration = metric("nominara_topic_clusters_refresh_duration_ms");
+      expect(duration).toHaveLength(1);
+      expect(duration[0]!.value).toBeGreaterThanOrEqual(0);
+
+      const logged = lines.filter((l) => (l as { event?: unknown })?.event === "topic_clusters.refreshed");
+      expect(logged).toHaveLength(1);
+      const line = logged[0] as Record<string, unknown>;
+      expect(Object.keys(line).sort()).toEqual(["clusters", "dangling_nulled", "duration_ms", "event", "project_id", "workspace_id"]);
+      expect(line).toMatchObject({ workspace_id: workspaceId, project_id: projectId, clusters: 4, dangling_nulled: 0 });
+      // never a label, the project's or workspace's name, or answer text
+      const text = JSON.stringify(lines);
+      for (const secret of ["A rival leads", "B brand leads", "Acme", "prompt "]) expect(text).not.toContain(secret);
+    });
+
+    it("a refresh that clears dangling references counts them in the span, the log line and the cleared counter", async () => {
+      await fixture();
+      await db.query("INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model) VALUES ($1,$2,'https://acme.com/p',$3,ARRAY['gemini'],'m')", [workspaceId, projectId, randomUUID()]);
+      await refresh();
+      expect(spans()[0]!.attributes["nominara.topic_clusters.dangling_nulled"]).toBe(1);
+      expect(metric("nominara_topic_clusters_dangling_cleared_total")).toHaveLength(1);
+      expect(lines.find((l) => (l as { event?: unknown })?.event === "topic_clusters.refreshed")).toMatchObject({ dangling_nulled: 1 });
+    });
+
+    it("a failing refresh is an error span and an error counter, and logs no success line", async () => {
+      await fixture();
+      await db.query("ALTER TABLE topic_clusters ADD CONSTRAINT ck_test_fail2 CHECK (visibility_score IS NULL OR visibility_score < 0) NOT VALID");
+      try {
+        await expect(refresh()).rejects.toThrow();
+      } finally {
+        await db.query("ALTER TABLE topic_clusters DROP CONSTRAINT ck_test_fail2");
+      }
+      expect(spans()).toHaveLength(1);
+      expect(spans()[0]!.status.code).toBe(SpanStatusCode.ERROR);
+      expect(metric("nominara_topic_clusters_refresh_total")).toEqual([{ metric: "nominara_topic_clusters_refresh_total", value: 1, outcome: "error" }]);
+      expect(lines.some((l) => (l as { event?: unknown })?.event === "topic_clusters.refreshed")).toBe(false);
     });
   });
 

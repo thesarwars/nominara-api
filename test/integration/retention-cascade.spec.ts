@@ -327,6 +327,20 @@ describe("STORY-013 · retention cascade, sole-owner block, orphan scan, export 
     expect(remaining.rowCount).toBe(0);
   });
 
+  it("[owner decision 99h / STORY-188] topic_clusters never expire: a cluster whose computed_at is older than the cutoff survives, and so does one never computed", async () => {
+    const workspaceId = await createWorkspace("starter");
+    const projectId = await createProject(workspaceId);
+    for (const [label, computedAt] of [["old", "2020-01-01T00:00:00.000Z"], ["never", null]] as const) {
+      await client.query("INSERT INTO topic_clusters (workspace_id, project_id, label, computed_at) VALUES ($1,$2,$3,$4)", [workspaceId, projectId, label, computedAt]);
+    }
+    await insertGeoAnalysis(workspaceId, projectId, new Date("2020-01-01T00:00:00.000Z"));
+
+    const result = await expireDerivedAnalyses(workerClient, workspaceId, 395, new Date("2025-01-01T00:00:00.000Z"));
+    expect(result.geoAnalyses).toBe(1); // the sweep still runs for the analyses it owns
+    const remaining = await client.query("SELECT label FROM topic_clusters WHERE workspace_id = $1 ORDER BY label", [workspaceId]);
+    expect(remaining.rows.map((r) => r.label)).toEqual(["never", "old"]);
+  });
+
   it("attribution_daily expiry at rollup-retention cadence", async () => {
     const workspaceId = await createWorkspace("starter");
     const projectId = await createProject(workspaceId);
