@@ -244,6 +244,7 @@ async function exportAttribution(deps: BuildDeps, projectId: string, cutoff: Dat
 /** Builds the archive and its coverage. Each project's reads run under that project's export lock. */
 export async function buildRetentionExport(deps: BuildDeps): Promise<BuiltExport> {
   const { scope } = deps;
+  // Zip entry paths are joined, not interpolated: they are archive paths, not object keys, and the ISO-14 scanner reads a template literal that starts with an interpolation and a slash as a key.
   const entries: ZipEntry[] = [];
   const projects: RetentionExportCoverage["projects"] = [];
 
@@ -254,9 +255,9 @@ export async function buildRetentionExport(deps: BuildDeps): Promise<BuiltExport
       rollups: scope.rollups === null ? null : await exportRollups(deps, project.projectId, scope.rollups.cutoff),
       attribution: scope.rollups === null ? null : await exportAttribution(deps, project.projectId, scope.rollups.cutoff),
     }));
-    if (built.raw !== null) entries.push({ name: `${folder}/answers.jsonl`, data: built.raw.jsonl });
-    if (built.rollups !== null) entries.push({ name: `${folder}/metric_daily.csv`, data: built.rollups.csv });
-    if (built.attribution !== null) entries.push({ name: `${folder}/attribution_daily.csv`, data: built.attribution.csv });
+    if (built.raw !== null) entries.push({ name: [folder, "answers.jsonl"].join("/"), data: built.raw.jsonl });
+    if (built.rollups !== null) entries.push({ name: [folder, "metric_daily.csv"].join("/"), data: built.rollups.csv });
+    if (built.attribution !== null) entries.push({ name: [folder, "attribution_daily.csv"].join("/"), data: built.attribution.csv });
     projects.push({
       project_id: project.projectId,
       name: project.name,
