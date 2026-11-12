@@ -9,6 +9,7 @@ import { datesWithFacts } from "../../rollup/aggregate-day.js";
 import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
 import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
 import { refreshProjectMilestones } from "../../rollup/refresh-project-milestones.js";
+import { refreshProjectTopicClusters } from "../../rollup/refresh-project-topic-clusters.js";
 import { rollUpDay } from "../../rollup/roll-up-day.js";
 import { HEURISTIC_JUDGE } from "../../geo/entity.js";
 import { judgeInForce } from "../../geo/name-match-judge/select.js";
@@ -172,6 +173,12 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       // project row N times for one rebuild and leave it holding whichever
       // date happened to be last rather than the most recent one.
       await denormalizeProject(tx, payload.projectId, timezone);
+
+      // STORY-188 / decision 99(d) — the per-cluster performance columns (visibility_score, authority_rank, leader_entity_id,
+      // gap_priority, achievability, computed_at), AFTER the project rollup, so reads of a cluster serve stored values and never compute.
+      // Same transaction and lock; a dissolved cluster's dangling prompt_cluster_id is nulled in it. It must run BEFORE refreshProjectGoals
+      // (a topic_authority goal reads topic_clusters.visibility_score). Reads only this database: no network call.
+      await refreshProjectTopicClusters(tx, payload.projectId, timezone);
 
       // NEW-C-4 — the Source Citation Index (and source_coverage) is derived
       // from citation_facts; recompute it here, inside the same tenant

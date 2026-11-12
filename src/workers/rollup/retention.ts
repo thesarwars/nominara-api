@@ -799,14 +799,16 @@ export async function expireRollups(
 }
 
 // ---------------------------------------------------------------------------
-// Derived-analysis expiry — geo_analyses, attribution_url_rollup,
-// topic_clusters, all at rollup-retention cadence (recomputable from facts).
+// Derived-analysis expiry — geo_analyses and attribution_url_rollup at
+// rollup-retention cadence (recomputable from facts).
+//
+// `topic_clusters` is DELIBERATELY NOT HERE (owner decision 99h, 2026-11-12): a cluster never expires. Its `computed_at` is stamped by
+// the STORY-188 rollup refresh, and expiring on it would delete user-renamed labels and the clustering itself with the stale stamp.
 // ---------------------------------------------------------------------------
 
 export interface DerivedAnalysesExpired {
   readonly geoAnalyses: number;
   readonly attributionUrlRollup: number;
-  readonly topicClusters: number;
 }
 
 export async function expireDerivedAnalyses(
@@ -816,7 +818,7 @@ export async function expireDerivedAnalyses(
   referenceDate: Date = new Date(),
 ): Promise<DerivedAnalysesExpired> {
   const cutoff = resolveRetentionCutoff(rollupsRetentionDays, referenceDate);
-  if (cutoff === null) return { geoAnalyses: 0, attributionUrlRollup: 0, topicClusters: 0 };
+  if (cutoff === null) return { geoAnalyses: 0, attributionUrlRollup: 0 };
   return withTenantContext(client, { workspaceId, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
     const geo = await tx.query("DELETE FROM geo_analyses WHERE workspace_id = $1 AND computed_at < $2", [
       workspaceId,
@@ -826,14 +828,9 @@ export async function expireDerivedAnalyses(
       "DELETE FROM attribution_url_rollup WHERE workspace_id = $1 AND computed_at < $2",
       [workspaceId, cutoff.toISOString()],
     );
-    const topics = await tx.query("DELETE FROM topic_clusters WHERE workspace_id = $1 AND computed_at < $2", [
-      workspaceId,
-      cutoff.toISOString(),
-    ]);
     return {
       geoAnalyses: geo.rowCount ?? 0,
       attributionUrlRollup: attribution.rowCount ?? 0,
-      topicClusters: topics.rowCount ?? 0,
     };
   });
 }
@@ -1146,10 +1143,9 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
   let toolSnapshotsExpired = 0;
   let toolRunsReaped = 0;
   const toolSweepFailedWorkspaces: string[] = [];
-  const derivedAnalysesExpired: { geoAnalyses: number; attributionUrlRollup: number; topicClusters: number } = {
+  const derivedAnalysesExpired: { geoAnalyses: number; attributionUrlRollup: number } = {
     geoAnalyses: 0,
     attributionUrlRollup: 0,
-    topicClusters: 0,
   };
 
   let workspacesDeferred = 0;
@@ -1176,7 +1172,6 @@ export async function runNightlySweep(privilegedClient: ClientBase, referenceDat
     const derived = await expireDerivedAnalyses(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
     derivedAnalysesExpired.geoAnalyses += derived.geoAnalyses;
     derivedAnalysesExpired.attributionUrlRollup += derived.attributionUrlRollup;
-    derivedAnalysesExpired.topicClusters += derived.topicClusters;
     attributionDailyExpired += await expireAttributionDaily(privilegedClient, workspaceId, retention.rollupsDays, referenceDate);
     try {
       toolRunsReaped += await reapStaleToolRuns(privilegedClient, workspaceId, referenceDate);
