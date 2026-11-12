@@ -496,7 +496,10 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
     );
   }
   // STORY-191 fix round (migration 0202, decision 99l) - the workspace's monthly judging meter. Tenant-scoped, not portal-readable.
-  await client.query("INSERT INTO name_match_judge_usage (workspace_id, month, matches_sent) VALUES ($1, date_trunc('month', now())::date, 3)", [workspaceId]);
+  await client.query(
+    "INSERT INTO name_match_judge_usage (workspace_id, month, matches_sent) SELECT $1, (date_trunc('month', now()) - make_interval(months => g))::date, 3 FROM generate_series(0, $2::int - 1) g",
+    [workspaceId, R],
+  );
   // STORY-191 (migration 0197, decision 99c) - a model verdict per project. Tenant-scoped, not portal-readable.
   for (let i = 0; i < R; i++) {
     await client.query(
