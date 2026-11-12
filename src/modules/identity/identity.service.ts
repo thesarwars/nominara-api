@@ -22,6 +22,7 @@ import { nextCounter } from "../../lib/webauthn/sign-counter-policy.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import type { SessionStrongAuth } from "../../api/guards/auth.guard.js";
 import { refuse, requireFreshStrongAuth, requireProvedAccount } from "./account-proof.js";
+import type { SessionListItem } from "../../../contracts/identity/session-list-response.schema.js";
 import { SessionService, type SessionTokens } from "./session.service.js";
 import type {
   MeResponse,
@@ -683,5 +684,27 @@ export class IdentityService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * STORY-096 AC4 — GET /me/sessions: the caller's own live sessions. Reading needs no step-up: it shows the signed-in person nothing they cannot
+   * already do (the revoke is what is gated). The account and the current session both come from the verified token.
+   */
+  listSessions(userId: string, currentSessionId: string, pagination: PaginationRequest): Promise<Page<SessionListItem>> {
+    return this.sessions.listForUser(userId, currentSessionId, pagination);
+  }
+
+  /**
+   * STORY-096 AC7 — DELETE /me/sessions/{id}: end one of the caller's own sessions, behind the same fresh step-up as revoke-others. The step-up is
+   * checked BEFORE the lookup, so a session that has not stepped up cannot learn which session ids exist.
+   */
+  async revokeSession(
+    userId: string,
+    sessionId: string,
+    session: SessionStrongAuth | undefined,
+    currentSessionId: string,
+  ): Promise<void> {
+    requireFreshStrongAuth(userId, session, this.logger, "session_revoke");
+    await this.sessions.revokeOne(userId, sessionId, currentSessionId);
   }
 }

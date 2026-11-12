@@ -83,3 +83,9 @@ export {
   sessionsRevokeOthersResponseSchema,
   type SessionsRevokeOthersResponse,
 } from "../../../../contracts/identity/sessions-revoke-others-response.schema.js";
+export {
+  sessionIdParamsSchema,
+  sessionListResponseSchema,
+  type SessionIdParams,
+  type SessionListItem,
+} from "../../../../contracts/identity/session-list-response.schema.js";

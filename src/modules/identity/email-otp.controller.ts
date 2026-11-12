@@ -5,6 +5,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
+import { SessionService } from "./session.service.js";
 import { setAuthCookies } from "../../lib/auth/cookies.js";
 import {
   emailOtpRequestResponseSchema,
@@ -31,7 +32,10 @@ function requestIdOf(req: EmailOtpRequestReq): string {
 
 @Controller()
 export class EmailOtpController {
-  constructor(private readonly service: EmailOtpService) {}
+  constructor(
+    private readonly service: EmailOtpService,
+    private readonly sessions: SessionService,
+  ) {}
 
   @Post("auth/otp/request")
   @Public()
@@ -57,6 +61,7 @@ export class EmailOtpController {
     @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<void> {
     const tokens = await this.service.verifyCode(body.email, body.code, requestIdOf(req));
+    await this.sessions.recordUserAgent(tokens.sid, req.headers?.["user-agent"]);
     setAuthCookies(reply, tokens);
   }
 }

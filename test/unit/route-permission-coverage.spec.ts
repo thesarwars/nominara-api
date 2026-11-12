@@ -47,6 +47,8 @@ const EXEMPT: Readonly<Record<string, string>> = Object.freeze({
   "IdentityController.addOptions": "POST /me/passkeys/options — adds a credential to the caller's OWN account (STORY-173); gated by step-up and proof of the address in IdentityService, not by a workspace role",
   "IdentityController.addVerify": "POST /me/passkeys/verify — completes the caller's OWN registration ceremony (STORY-173); same gates",
   "IdentityController.revokeOthers": "POST /me/sessions/revoke-others — ends the CALLER's own other sessions (STORY-018); a session belongs to a person, not a workspace; gated by step-up in IdentityService",
+  "IdentityController.listSessions": "GET /me/sessions — the CALLER's own live sessions (STORY-096 AC4), selected by the token's sub; a session belongs to a person, not a workspace",
+  "IdentityController.revokeSession": "DELETE /me/sessions/:id — ends one of the CALLER's own sessions (STORY-096 AC7); the row is selected by id AND the token's sub; gated by step-up in IdentityService",
   "OauthController.linkStart": "links a provider to the CALLER's identity, not to a workspace",
   "OauthController.listLinks": "GET /me/oauth — which providers can sign the CALLER in; a credential belongs to a person",
   "OauthController.unlink": "DELETE /me/oauth/:provider — the caller's own identity link",

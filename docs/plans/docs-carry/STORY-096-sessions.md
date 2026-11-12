@@ -1,0 +1,8 @@
+# STORY-096 AC4/AC7 - sessions list and single revoke (batch 11 S3, owner decision 100(d)), to carry to the docs repo
+
+api-specification.md, the identity table (next to `POST /me/sessions/revoke-others`):
+
+| `GET` | `/me/sessions` | session | the caller's OWN live sessions across every workspace (not revoked, and holding an unexpired unconsumed refresh token), newest first, cursor-paginated: `{id, browser, os, device_type, created_at, last_active_at, current}`. `browser`, `os` and `device_type` (`desktop`, `mobile`, `tablet`) are parsed from the stored User-Agent and are `null` where it was absent or not recognised; the raw header and any IP are never returned. `last_active_at` is the last sign-in or refresh, not the last request. `current` marks the calling session. No step-up |
+| `DELETE` | `/me/sessions/{id}` | session | ends ONE of the caller's own sessions: `200`, same fresh step-up as revoke-others (checked before the lookup, so a stale session cannot probe ids). A session that is not the caller's, and an unknown id, are the same `404 not_found`. Revoking an already-ended own session is a no-op that keeps its first reason. **Revoking the CURRENT session is allowed** and signs it out like logout (builder reading, spec silent: owner to confirm). `revoked_reason = 'user_revoked'` |
+
+schemas/identity-and-tenancy.md, `sessions`: new column `user_agent text` (at most 512 characters, set at sign-in and refresh, never logged, no IP stored) and `'user_revoked'` in the `revoked_reason` CHECK (migration 0204).

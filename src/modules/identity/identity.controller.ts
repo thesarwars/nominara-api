@@ -26,6 +26,10 @@ import {
   type PasskeyOptionsRequest,
   type PasskeyRenameRequest,
   type PasskeyVerifyRequest,
+  sessionIdParamsSchema,
+  sessionListResponseSchema,
+  type SessionIdParams,
+  type SessionListItem,
   sessionsRevokeOthersResponseSchema,
   type SessionsRevokeOthersResponse,
 } from "./dto/index.js";
@@ -65,10 +69,12 @@ export class IdentityController {
   @HttpCode(200)
   @ApiContract({ operationId: "verifyPasskey", requestSchema: passkeyVerifyRequestSchema, voidResponse: true })
   async verify(
+    @Req() req: AuthenticatedRequest,
     @Body(new ZodValidationPipe(passkeyVerifyRequestSchema)) body: PasskeyVerifyRequest,
     @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<void> {
     const tokens = await this.service.verifyPasskey(body);
+    await this.sessions.recordUserAgent(tokens.sid, req.headers?.["user-agent"]);
     setAuthCookies(reply, tokens);
   }
 
@@ -85,6 +91,7 @@ export class IdentityController {
       throw new UnauthorizedException("missing refresh token cookie");
     }
     const tokens = await this.sessions.refresh(rawRefreshToken);
+    await this.sessions.recordUserAgent(tokens.sid, req.headers?.["user-agent"]);
     setAuthCookies(reply, tokens);
   }
 
@@ -198,5 +205,32 @@ export class IdentityController {
   @ApiContract({ operationId: "revokeOtherSessions", responseSchema: sessionsRevokeOthersResponseSchema })
   revokeOthers(@Req() req: AuthenticatedRequest): Promise<SessionsRevokeOthersResponse> {
     return this.service.revokeOtherSessions(req.auth!.sub, req.session, req.auth!.sid);
+  }
+
+  // STORY-096 AC4/AC7 — the caller's own sessions. Tenant-less like the rest of /me/*; the account and the current session come from the verified
+  // token. `:id` selects a row only together with that account (SessionService.revokeOne), never alone.
+  @Get("me/sessions")
+  @SkipTenantContext()
+  @ApiContract({
+    operationId: "listSessions",
+    querySchema: paginationRequestSchema,
+    responseSchema: sessionListResponseSchema,
+    listOf: true,
+  })
+  listSessions(
+    @Req() req: AuthenticatedRequest,
+    @Query(new ZodValidationPipe(paginationRequestSchema)) pagination: PaginationRequest,
+  ): Promise<Page<SessionListItem>> {
+    return this.service.listSessions(req.auth!.sub, req.auth!.sid, pagination);
+  }
+
+  @Delete("me/sessions/:id")
+  @SkipTenantContext()
+  @ApiContract({ operationId: "revokeSession", paramsSchema: sessionIdParamsSchema, voidResponse: true })
+  revokeSession(
+    @Req() req: AuthenticatedRequest,
+    @Param(new ZodValidationPipe(sessionIdParamsSchema)) params: SessionIdParams,
+  ): Promise<void> {
+    return this.service.revokeSession(req.auth!.sub, params.id, req.session, req.auth!.sid);
   }
 }
