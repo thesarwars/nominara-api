@@ -31,7 +31,7 @@ import {
 } from "../../../contracts/tasks/index.js";
 import { GOAL_CONTRIBUTES_SQL } from "../../lib/goals/contribution.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
-import { latestPatches } from "../../lib/aux/patches/read.js";
+import { latestPatches } from "../../lib/aux/patch-read.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import type { AuxPatch } from "../../../contracts/aux/index.js";

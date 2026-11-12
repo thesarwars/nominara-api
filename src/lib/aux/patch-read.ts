@@ -1,8 +1,8 @@
 import type { ClientBase } from "pg";
 import { z } from "zod";
-import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, patchRiskFlagSchema, type AuxPatch } from "../../../../contracts/aux/index.js";
-import { incrementCounter } from "../../telemetry/metrics.js";
-import { pageMatches, sha256Tag, type LatestAuditFacts } from "./precondition.js";
+import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, patchRiskFlagSchema, type AuxPatch } from "../../../contracts/aux/index.js";
+import { incrementCounter } from "../telemetry/metrics.js";
+import { pageMatches, sha256Tag, type LatestAuditFacts } from "./patches/precondition.js";
 
 // STORY-053 / STORY-194 - the ONE patch reader. `AuxService` (the finding and `GET /patches/{id}`) and `TasksService` (the patch on a
 // task row) both serve the same shape, so the shape is built here, from a tenant-context client the caller passes; nothing here opens a

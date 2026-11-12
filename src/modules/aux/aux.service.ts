@@ -16,7 +16,7 @@ import type {
 import { AUX_CATEGORIES } from "../../../contracts/aux/index.js";
 import type { AuxPatch } from "../../../contracts/aux/index.js";
 import { guidanceForFinding } from "../../lib/aux/patches/guidance.js";
-import { EARLIER_PATCHES_MAX, PATCH_SELECT, latestAuditFacts, latestPatches, toPatch, type PatchRow } from "../../lib/aux/patches/read.js";
+import { EARLIER_PATCHES_MAX, PATCH_SELECT, latestAuditFacts, latestPatches, toPatch, type PatchRow } from "../../lib/aux/patch-read.js";
 import { failManualAudit } from "../../lib/aux/fail-manual-audit.js";
 import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, PriceChangedError, UnauthenticatedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
