@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectDisplacement, scopeCitationsToPassage, type CaptureSnapshot, type PassageElement, type SnapshotEntity } from "../../../src/lib/analytics/displacement.js";
+import { detectDisplacement, classifyCitationScopes, type CaptureSnapshot, type PassageElement, type SnapshotEntity } from "../../../src/lib/analytics/displacement.js";
 
 // STORY-056 scenarios 1-5 — each capture is compared with the previous capture
 // of the same prompt and engine.
@@ -106,50 +106,56 @@ describe("STORY-056 · displacement detection", () => {
 });
 
 
-// STORY-057 AC3 / scenarios 4 and 5 - the citation gap, scoped to the passage that recommends the competitor where the engine
-// exposes per-element references, answer-scoped (and said to be) where it does not. `mentions` are the entity labels the PARSER'S
-// matcher found in the element (word boundaries, aliases, negative aliases): this function never matches text itself.
-describe("STORY-057 AC3 · scopeCitationsToPassage", () => {
+// STORY-057 AC3 / scenarios 4 and 5, owner decision 99i - the passage view of the citation gap is DISPLAY ONLY. Every citation the entity
+// holds stays in the gap (impact and the concept gap read the whole answer); each is LABELLED: `passage` (cited by an element that
+// mentions the entity), `outside_passage` (a passage was located and this source is cited elsewhere in the answer), `answer` (no passage
+// could be located, or the citing element is unlocatable). `mentions` are the labels the PARSER'S matcher found in the element.
+describe("STORY-057 AC3 · classifyCitationScopes", () => {
   const cite = (path: string) => ({ url: `https://r.example/${path}`, domain: "r.example", sourceClass: "editorial" });
   const [a, b, c] = [cite("a"), cite("b"), cite("c")];
   const passage = (mentions: string[], ...urls: string[]): PassageElement => ({ mentions, citedUrls: urls.map((u) => `https://r.example/${u}`) });
+  const scopes = (label: string, cites: ReturnType<typeof cite>[], els: readonly PassageElement[] | undefined) =>
+    classifyCitationScopes(label, cites, els).map((x) => [x.citation.url.slice(-1), x.scope]);
 
-  it("scenario 4 - keeps only the citations of the elements that mention the competitor", () => {
-    const out = scopeCitationsToPassage("Rival", [a, b, c], [passage(["Rival"], "a"), passage([], "b")]);
-    expect(out).toEqual({ scope: "passage", citations: [a] });
+  it("scenario 4 - never drops a citation: the passage's is labelled passage, the rest outside_passage", () => {
+    expect(scopes("Rival", [a, b, c], [passage(["Rival"], "a"), passage([], "b")])).toEqual([["a", "passage"], ["b", "outside_passage"], ["c", "outside_passage"]]);
   });
 
-  it("scenario 5 - an engine with no elements (undefined or empty) is answer-scoped and keeps every citation", () => {
-    expect(scopeCitationsToPassage("Rival", [a, b], undefined)).toEqual({ scope: "answer", citations: [a, b] });
-    expect(scopeCitationsToPassage("Rival", [a, b], [])).toEqual({ scope: "answer", citations: [a, b] });
+  it("scenario 5 - an engine with no elements (undefined or empty) labels every citation answer", () => {
+    expect(scopes("Rival", [a, b], undefined)).toEqual([["a", "answer"], ["b", "answer"]]);
+    expect(scopes("Rival", [a, b], [])).toEqual([["a", "answer"], ["b", "answer"]]);
   });
 
-  it("elements exist but none mentions the competitor: the passage cannot be located, so answer-scoped, never guessed", () => {
-    expect(scopeCitationsToPassage("Rival", [a, b], [passage([], "a"), passage(["Other Rival"], "b")])).toEqual({ scope: "answer", citations: [a, b] });
+  it("elements exist but none mentions the competitor: the passage cannot be located, so answer, never guessed", () => {
+    expect(scopes("Rival", [a, b], [passage([], "a"), passage(["Other Rival"], "b")])).toEqual([["a", "answer"], ["b", "answer"]]);
   });
 
   it("the passages of every element that mentions the competitor are unioned", () => {
-    const out = scopeCitationsToPassage("Rival", [a, b, c], [passage(["Rival"], "a"), passage(["Rival", "X"], "c"), passage([], "b")]);
-    expect(out).toEqual({ scope: "passage", citations: [a, c] });
+    expect(scopes("Rival", [a, b, c], [passage(["Rival"], "a"), passage(["Rival", "X"], "c"), passage([], "b")])).toEqual([["a", "passage"], ["b", "outside_passage"], ["c", "passage"]]);
   });
 
-  it("a passage that mentions the competitor but cites nothing gives an empty passage-scoped gap (0 is a result, not a fallback)", () => {
-    expect(scopeCitationsToPassage("Rival", [a, b], [passage(["Rival"]), passage([], "a")])).toEqual({ scope: "passage", citations: [] });
+  it("a passage that mentions the competitor but cites nothing leaves every citation outside_passage (the passage was located)", () => {
+    expect(scopes("Rival", [a, b], [passage(["Rival"]), passage([], "a")])).toEqual([["a", "outside_passage"], ["b", "outside_passage"]]);
   });
 
   it("a URL the passage cites that the competitor does not hold is never added (never inferred)", () => {
-    expect(scopeCitationsToPassage("Rival", [a], [passage(["Rival"], "a", "zzz")])).toEqual({ scope: "passage", citations: [a] });
+    expect(classifyCitationScopes("Rival", [a], [passage(["Rival"], "a", "zzz")]).map((x) => x.citation)).toEqual([a]);
+  });
+
+  it("an element with links but no text is unlocatable: what it cites is answer-scoped, never silently outside the passage", () => {
+    const unlocatable: PassageElement = { mentions: [], citedUrls: ["https://r.example/b"], unlocatable: true };
+    expect(scopes("Rival", [a, b, c], [passage(["Rival"], "a"), unlocatable])).toEqual([["a", "passage"], ["b", "answer"], ["c", "outside_passage"]]);
   });
 
   it("an entity label is matched whole: 'Zoho' is not the entity 'Zoho CRM' (labels compare equal, never by substring)", () => {
-    expect(scopeCitationsToPassage("Zoho", [a, b], [passage(["Zoho CRM"], "a")])).toEqual({ scope: "answer", citations: [a, b] });
+    expect(scopes("Zoho", [a, b], [passage(["Zoho CRM"], "a")])).toEqual([["a", "answer"], ["b", "answer"]]);
   });
 
   it("does not mutate its inputs", () => {
     const citations = [a, b];
     const elements = [passage(["Rival"], "a")];
     const copy = JSON.stringify([citations, elements]);
-    scopeCitationsToPassage("Rival", citations, elements);
+    classifyCitationScopes("Rival", citations, elements);
     expect(JSON.stringify([citations, elements])).toBe(copy);
   });
 });

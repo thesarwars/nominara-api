@@ -106,6 +106,7 @@ describe("NEW-C-5 · contract (AC1)", () => {
     const entry = { url: "https://r.example/a", domain: "r.example", source_class: "vendor_owned", held_by: ["Rival"], brand_present: null };
     expect(displacementItemSchema.safeParse({ ...item, citation_gap: [{ ...entry, scope: "passage" }] }).success).toBe(true);
     expect(displacementItemSchema.safeParse({ ...item, citation_gap: [entry] }).success).toBe(true);
+    expect(displacementItemSchema.safeParse({ ...item, citation_gap: [{ ...entry, scope: "outside_passage" }] }).success).toBe(true);
     expect(displacementItemSchema.safeParse({ ...item, citation_gap: [{ ...entry, scope: "paragraph" }] }).success).toBe(false);
   });
 

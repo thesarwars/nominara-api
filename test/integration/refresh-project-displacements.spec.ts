@@ -14,6 +14,11 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { createRollupMetricDailyHandler } from "../../src/lib/queue/handlers/rollup-metric-daily.handler.js";
 import { asTenantJob } from "../support/tenant-job.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+const parseContextSpy = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("../../src/lib/parser/parse-capture.js", async (original) => {
+  const actual = await original<typeof import("../../src/lib/parser/parse-capture.js")>();
+  return { ...actual, loadParseContext: (...args: Parameters<typeof actual.loadParseContext>) => { parseContextSpy.calls += 1; return actual.loadParseContext(...args); } };
+});
 import { backfillProjectDisplacements, refreshProjectDisplacements } from "../../src/lib/rollup/refresh-project-displacements.js";
 import { mapSerpAnswer } from "../../src/lib/engines/serp/serp-mapper.js";
 import { aiModePriced } from "../../src/lib/engines/serp/fixtures/serp-recorded.js";
@@ -1059,7 +1064,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
   }
   const gapOf = async () => citationGapSchema.parse((await events())[0]!.citation_gap);
 
-  it("STORY-057 #4 / AC3 · on an engine with per-element references the gap is scoped to the passage that recommends the competitor", async () => {
+  it("STORY-057 #4 / AC3 / 99i · on an engine with per-element references the whole gap is kept and each source is LABELLED: passage, or outside_passage", async () => {
     await elementLoss(
       "google_aio",
       [
@@ -1069,7 +1074,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       ["https://rival.com/pick", "https://rival.com/elsewhere"],
     );
     const gap = await gapOf();
-    expect(gap.map((g) => [g.url, g.scope])).toEqual([["https://rival.com/pick", "passage"]]);
+    expect(gap.map((g) => [g.url, g.scope])).toEqual([["https://rival.com/elsewhere", "outside_passage"], ["https://rival.com/pick", "passage"]]);
   });
 
   it("STORY-057 #5 / AC3 · an engine without per-element references stays answer-scoped, and says so on the entry", async () => {
@@ -1087,9 +1092,9 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect((await gapOf()).map((g) => g.url)).toEqual(["https://rival.com/pick"]);
   });
 
-  it("STORY-057 AC3 · a passage that names the competitor but cites nothing leaves an empty gap, and 0 is not the answer-scoped fallback", async () => {
+  it("STORY-057 AC3 · a passage that names the competitor but cites nothing: the whole gap stays, every source outside_passage (the passage WAS located)", async () => {
     await elementLoss("google_aio", [element("ai_overview_element", "Rival wins", []), element("ai_overview_element", "other", ["https://rival.com/pick"])], ["https://rival.com/pick"]);
-    expect(await gapOf()).toEqual([]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/pick", "outside_passage"]]);
   });
 
   it("STORY-057 AC3 · a malformed stored element is skipped, not a failed rollup; the valid ones still scope the gap", async () => {
@@ -1098,7 +1103,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       [{ kind: "ai_overview_element" }, "junk", element("ai_overview_element", "Rival wins", ["https://rival.com/pick"])],
       ["https://rival.com/pick", "https://rival.com/other"],
     );
-    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/pick", "passage"]]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/other", "outside_passage"], ["https://rival.com/pick", "passage"]]);
   });
 
   it("STORY-057 AC3 · the element link is matched to the stored citation by its raw URL as well as its normalised form", async () => {
@@ -1112,7 +1117,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/pick", slot: 1, engine: "google_aio" });
     await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/other", slot: 2, engine: "google_aio" });
     await run(D2);
-    expect((await gapOf()).map((g) => g.url)).toEqual(["https://rival.com/pick"]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/other", "outside_passage"], ["https://rival.com/pick", "passage"]]);
   });
 
   it("STORY-057 AC3 review · the passage is found with the parser's matcher: 'HP' is not inside 'shape', and 'Box' is not inside 'inbox'", async () => {
@@ -1123,7 +1128,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       ["https://rival.com/wrong", "https://rival.com/right"],
       "HP",
     );
-    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/right", "passage"]]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/right", "passage"], ["https://rival.com/wrong", "outside_passage"]]);
   });
 
   it("STORY-057 AC3 review · only a lookalike substring in the text: no passage is located, so the gap stays answer-scoped", async () => {
@@ -1144,13 +1149,13 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
       ["https://rival.com/crm", "https://rival.com/zoho"],
       "Zoho",
     );
-    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/zoho", "passage"]]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/crm", "outside_passage"], ["https://rival.com/zoho", "passage"]]);
   });
 
   it("STORY-057 AC3 review · an alias of the competitor names the passage", async () => {
     await db.query(`UPDATE competitors SET aliases = ARRAY['RVL'] WHERE id = $1`, [rivalId]);
     await elementLoss("google_aio", [element("ai_overview_element", "RVL is the pick", ["https://rival.com/alias"]), element("ai_overview_element", "other", ["https://rival.com/x"])], ["https://rival.com/alias", "https://rival.com/x"]);
-    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/alias", "passage"]]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/alias", "passage"], ["https://rival.com/x", "outside_passage"]]);
   });
 
   it("STORY-057 AC3 review · a negative alias suppresses the match, as it does in the parser", async () => {
@@ -1159,7 +1164,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect((await gapOf()).map((g) => g.scope)).toEqual(["answer"]);
   });
 
-  it("STORY-057 AC3 · SerpApi fixture (recorded AI Mode answer): the gap shrinks from the answer's citations to the passage naming the competitor", async () => {
+  it("STORY-057 AC3 · SerpApi fixture (recorded AI Mode answer): every citation of the answer stays in the gap, and the ones in the passage naming the competitor are labelled passage", async () => {
     // The recorded answer through the SerpApi mapper, stored the way the adapter stores an element (kind, links, description).
     const elements: { kind: string; description: string; links: { url: string }[] }[] = mapSerpAnswer(aiModePriced as never).elements.map((e) => ({
       kind: e.kind === "table" ? "table_element" : e.kind === "product" ? "shopping_element" : "ai_overview_element",
@@ -1181,9 +1186,9 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     for (const [i, url] of everyUrl.entries()) await cite(after, `${D2}T10:00:00Z`, { domain: "google.com", url, slot: i + 1, engine: "google_ai_mode" });
     await run(D2);
     const gap = await gapOf();
-    expect(gap.every((g) => g.scope === "passage")).toBe(true);
-    expect(gap.map((g) => g.url).sort()).toEqual([...soundcore].sort());
-    expect(gap.length).toBeLessThan(everyUrl.length);
+    expect(gap.map((g) => g.url).sort()).toEqual([...everyUrl].sort());
+    expect(gap.filter((g) => g.scope === "passage").map((g) => g.url).sort()).toEqual([...soundcore].sort());
+    expect(gap.filter((g) => g.scope === "outside_passage").length).toBe(everyUrl.length - soundcore.length);
   });
 
   it("STORY-057 AC3 · observability: a counter per scope outcome, counts only", async () => {
@@ -1193,8 +1198,85 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     spy.mockRestore();
     const line = lines.find((l) => typeof l === "object" && l !== null && (l as { event?: string }).event === "displacements_refreshed") as Record<string, unknown>;
     expect(line.passage_scoped_gaps).toBe(1);
+    expect(line.outside_passage_gaps).toBe(0);
     expect(line.answer_scoped_gaps).toBe(0);
     expect(JSON.stringify(line)).not.toMatch(/rival\.com|Rival/);
+  });
+
+  it("STORY-057 AC3 review · an element with links but no text is unlocatable: what it cites is answer-scoped, not silently outside the passage", async () => {
+    await elementLoss(
+      "google_aio",
+      [element("ai_overview_element", "Rival wins", ["https://rival.com/pick"]), { kind: "ai_overview_element", links: [{ url: "https://rival.com/unknown" }] }, element("ai_overview_element", "other", ["https://rival.com/x"])],
+      ["https://rival.com/pick", "https://rival.com/unknown", "https://rival.com/x"],
+    );
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/pick", "passage"], ["https://rival.com/unknown", "answer"], ["https://rival.com/x", "outside_passage"]]);
+  });
+
+  it("STORY-057 AC3 review · LABEL DRIFT: a competitor renamed since the capture was parsed is not found by the matcher, so the gap falls back to answer scope", async () => {
+    await engine("google_aio", "licensed_serp");
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, engine: "google_aio" });
+    const after = await capture({ at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 }, engine: "google_aio", rivalLabel: "Old Name", elements: [element("ai_overview_element", "Old Name wins", ["https://rival.com/pick"])] });
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/pick", slot: 1, engine: "google_aio" });
+    await run(D2);
+    expect((await gapOf()).map((g) => g.scope)).toEqual(["answer"]); // the competitor is now named "Rival": "Old Name" matches nothing
+  });
+
+  it("STORY-057 AC3 review · a capture with no structured elements never loads the parse context (the matcher is lazy)", async () => {
+    parseContextSpy.calls = 0;
+    await elementLoss("gemini", undefined, ["https://rival.com/pick"]);
+    expect(parseContextSpy.calls).toBe(0);
+    parseContextSpy.calls = 0;
+    await db.query("TRUNCATE displacement_events");
+    await db.query(`UPDATE answer_captures SET payload = jsonb_set(payload, '{structured_elements}', '[{"kind":"ai_overview_element","description":"Rival","links":[]}]'::jsonb)`);
+    await run(D2);
+    expect(parseContextSpy.calls).toBe(1); // loaded once for the refresh, however many events
+  });
+
+  it("decision 99i · the passage view is DISPLAY ONLY: an AIO event whose rival holds 5 sources across the answer but whose passage cites 1 has the SAME impact_score and citation count as without elements (scoring v1, as on b570603e)", async () => {
+    const urls = [1, 2, 3, 4, 5].map((i) => `https://rival.com/s${i}`);
+    await elementLoss("google_aio", [element("ai_overview_element", "Rival wins", [urls[0]!]), element("ai_overview_element", "other", urls.slice(1))], urls);
+    const withElements = (await events())[0]!;
+    expect(citationGapSchema.parse(withElements.citation_gap)).toHaveLength(5); // the whole-answer gap, not the passage's 1
+    expect(citationGapSchema.parse(withElements.citation_gap).filter((g) => g.scope === "passage")).toHaveLength(1);
+    await db.query("TRUNCATE displacement_events");
+    await db.query(`UPDATE answer_captures SET payload = payload - 'structured_elements'`);
+    await run(D2);
+    const without = (await events())[0]!;
+    expect(withElements.impact_score).toBe(without.impact_score);
+    expect(citationGapSchema.parse(without.citation_gap)).toHaveLength(5);
+    expect((await db.query<{ v: string }>(`SELECT scoring_version AS v FROM displacement_events`)).rows[0]!.v).toBe("v1");
+  });
+
+  it("decision 99i · concept_gap is derived from the WHOLE-answer gap: a concept evidenced by a source cited outside the passage is kept", async () => {
+    await inCluster(clusterId);
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
+    await analysed();
+    await engine("google_aio", "licensed_serp");
+    await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, engine: "google_aio" });
+    const after = await capture({
+      at: `${D2}T10:00:00Z`, present: false, rival: { position: 1 }, engine: "google_aio",
+      elements: [element("ai_overview_element", "Rival wins", ["https://rival.com/pick"]), element("ai_overview_element", "other", ["https://rival.com/rbac"])],
+    });
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/pick", slot: 1, engine: "google_aio" });
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/rbac", slot: 2, engine: "google_aio" });
+    await run(D2);
+    expect((await conceptGap()).map((c) => c.concept)).toEqual(["role based access"]);
+  });
+
+  it("decision 99i · a re-rollup of an existing event keeps concept_gap evidence consistent with the citation gap it is derived from", async () => {
+    await inCluster(clusterId);
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
+    await analysed();
+    await lossWithConcepts(["https://rival.com/rbac"]);
+    expect((await conceptGap()).map((c) => c.evidence_url)).toEqual(["https://rival.com/rbac"]);
+    // The after-capture's citations change (a re-parse): the evidence source is no longer cited.
+    await db.query(`DELETE FROM citation_facts WHERE normalized_url = 'https://rival.com/rbac'`);
+    const after = (await db.query<{ id: string }>(`SELECT id FROM answer_captures WHERE project_id = $1 ORDER BY captured_at DESC LIMIT 1`, [projectId])).rows[0]!.id;
+    await cite(after, `${D2}T10:00:00Z`, { domain: "rival.com", url: "https://rival.com/new", slot: 5 });
+    await run(D2);
+    const gapUrls = new Set(citationGapSchema.parse((await events())[0]!.citation_gap).map((g) => g.url));
+    expect(gapUrls.has("https://rival.com/new")).toBe(true);
+    for (const c of await conceptGap()) expect(gapUrls.has(c.evidence_url)).toBe(true);
   });
 
   // ---- decision 99f: a draft alignment does not count as judged ----------------------------------------------------------------------

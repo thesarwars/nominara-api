@@ -136,7 +136,7 @@ export function restoresSlot(kind: DetectedKind, before: CaptureSnapshot, later:
   }
 }
 
-/** One element of a structured answer (STORY-029), reduced to what passage scoping reads: its words and the citation URLs it references. */
+/** One element of a structured answer (STORY-029), reduced to what the passage view reads: who it names and the citation URLs it references. */
 export interface PassageElement {
   /**
    * The entity labels the parser's matcher (`matchEntities`: word boundaries, aliases, negative aliases) found in this element's text.
@@ -145,25 +145,33 @@ export interface PassageElement {
   readonly mentions: readonly string[];
   /** The element's OWN references, in the terms of the capture's stored citation URLs (the caller resolves them). */
   readonly citedUrls: readonly string[];
+  /** It cites sources but has no text to match a mention against: what it cites cannot be placed in or outside a passage. */
+  readonly unlocatable?: boolean;
 }
 
-export type CitationScope = "passage" | "answer";
+/**
+ * `passage`: cited by an element that mentions the entity. `outside_passage`: a passage WAS located and this source is cited only elsewhere
+ * in the answer. `answer`: no passage could be located (no elements, none names the entity, or the citing element has no text).
+ */
+export type CitationScope = "passage" | "outside_passage" | "answer";
 
 /**
- * STORY-057 AC3 - scopes one displacing entity's citations to the passage where it is named.
- *
- * Only ever NARROWS: every returned citation is one the entity already held, and a URL the passage cites that the entity does not hold
- * is never added. With no elements (every conversational engine) or no element naming the entity, the passage cannot be located, so
- * the citations come back untouched and `answer`-scoped: guessing a passage would name a source the competitor may not hold there.
- * A passage that names the entity but cites nothing gives an empty `passage` result: zero is a finding, not a reason to fall back.
+ * STORY-057 AC3 / owner decision 99i - the PASSAGE VIEW of one displacing entity's citations. DISPLAY ONLY: every citation comes back, in
+ * order, with a label; none is dropped, because the impact score and the concept gap read the whole-answer gap and must not move with it.
+ * Never adds a citation: the labels are over the entity's own. With no elements (every conversational engine), or none naming the entity,
+ * the passage cannot be located and everything is `answer`; guessing a passage would be a claim the capture does not support.
  */
-export function scopeCitationsToPassage(
+export function classifyCitationScopes(
   entityLabel: string,
   citations: readonly SnapshotCitation[],
   elements: readonly PassageElement[] | undefined,
-): { readonly citations: readonly SnapshotCitation[]; readonly scope: CitationScope } {
+): readonly { readonly citation: SnapshotCitation; readonly scope: CitationScope }[] {
   const passages = elements === undefined ? [] : elements.filter((element) => element.mentions.includes(entityLabel));
-  if (passages.length === 0) return { citations, scope: "answer" };
-  const cited = new Set(passages.flatMap((passage) => passage.citedUrls));
-  return { citations: citations.filter((citation) => cited.has(citation.url)), scope: "passage" };
+  if (passages.length === 0) return citations.map((citation) => ({ citation, scope: "answer" as const }));
+  const inPassage = new Set(passages.flatMap((passage) => passage.citedUrls));
+  const unplaced = new Set((elements ?? []).filter((element) => element.unlocatable === true).flatMap((element) => element.citedUrls));
+  return citations.map((citation) => ({
+    citation,
+    scope: inPassage.has(citation.url) ? ("passage" as const) : unplaced.has(citation.url) ? ("answer" as const) : ("outside_passage" as const),
+  }));
 }

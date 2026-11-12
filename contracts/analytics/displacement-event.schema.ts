@@ -53,10 +53,12 @@ export const citationGapEntrySchema = z
     held_by: z.array(z.string().min(1)).min(1),
     brand_present: z.boolean().nullable(),
     /**
-     * STORY-057 AC3: `passage` = held in the passage that names the displacing entity (engines in PASSAGE_SCOPED_ENGINES, when the
-     * passage could be located); `answer` = held somewhere in the answer. Absent on rows stored before this field: read as `answer`.
+     * STORY-057 AC3 / decision 99i - the PASSAGE VIEW, display only (the gap itself, the impact score and the concept gap are whole-answer).
+     * `passage` = cited in the passage that names the displacing entity (engines in PASSAGE_SCOPED_ENGINES); `outside_passage` = a passage was
+     * located and this source is cited elsewhere in the answer; `answer` = no passage could be located. Absent on rows stored before this
+     * field: read as `answer`.
      */
-    scope: z.enum(["passage", "answer"]).optional(),
+    scope: z.enum(["passage", "outside_passage", "answer"]).optional(),
   })
   .strict();
 

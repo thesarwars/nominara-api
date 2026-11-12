@@ -12,7 +12,7 @@ import {
   detectDisplacement,
   restoresSlot,
   type CaptureSnapshot,
-  scopeCitationsToPassage,
+  classifyCitationScopes,
   type CitationScope,
   type DetectedDisplacement,
   type PassageElement,
@@ -129,10 +129,11 @@ export async function refreshProjectDisplacements(
   return tracer.startActiveSpan("displacement.refresh", async (span) => {
     try {
       const lags: number[] = [];
-      const scopes = { passage: 0, answer: 0 };
+      const scopes = { passage: 0, outside_passage: 0, answer: 0 };
       const persisted = await refreshProjectDisplacementsInner(tx, projectId, date, timezone, options.observeLag ?? true, lags, options.scopesLocked ?? false, scopes);
       emitLagObservations(lags);
       span.setAttribute("nominara.displacement.citation_gaps_passage_scoped", scopes.passage);
+      span.setAttribute("nominara.displacement.citation_gaps_outside_passage", scopes.outside_passage);
       span.setAttribute("nominara.displacement.citation_gaps_answer_scoped", scopes.answer);
       span.setAttribute("nominara.project_id", projectId);
       span.setAttribute("nominara.displacement.events", persisted);
@@ -169,7 +170,7 @@ async function refreshProjectDisplacementsInner(
   observeLag: boolean,
   lags: number[],
   scopesLocked: boolean,
-  scopes: { passage: number; answer: number },
+  scopes: { passage: number; outside_passage: number; answer: number },
 ): Promise<number> {
   const project = await tx.query<{ workspace_id: string }>(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId]);
   const workspaceId = project.rows[0]?.workspace_id;
@@ -205,6 +206,7 @@ async function refreshProjectDisplacementsInner(
 
   // The parser's own alias set (brand, every competitor and their aliases, negative aliases), loaded once and only if an event needs it.
   let matching: Promise<EntityMatching> | undefined;
+  // A thunk, started only by a capture that HAS structured elements: no promise is created (or left unawaited) for the rest.
   const matcher = (): Promise<EntityMatching> =>
     (matching ??= loadParseContext(tx, projectId).then(({ context }) => ({
       automaton: buildMatcher(context.aliases),
@@ -238,11 +240,11 @@ async function refreshProjectDisplacementsInner(
     const context = await cellContext(tx, projectId, after, maxEngineWeight);
     const afterCitations = await loadCitationSlots(tx, after.id);
     // STORY-057 AC3 - read once per after-capture, from the DB copy of the stored raw capture (no object-store read inside this transaction).
-    const passageElements = await loadPassageElements(tx, after, matcher());
+    const passageElements = await loadPassageElements(tx, after, matcher);
     const conceptNodes = await loadConceptNodes(tx, workspaceId, projectId, after.prompt_id);
     for (const event of detected) {
       const gap = await citationGap(tx, workspaceId, event, afterCitations, passageElements);
-      for (const entry of gap) scopes[entry.scope === "passage" ? "passage" : "answer"] += 1;
+      for (const entry of gap) scopes[entry.scope ?? "answer"] += 1;
       const conceptGap = conceptGapFor(conceptNodes, gap.map((g) => g.url));
       const impact = displacementImpactForEvent({
         kind: event.kind,
@@ -263,7 +265,12 @@ async function refreshProjectDisplacementsInner(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16)
          ON CONFLICT (project_id, prompt_id, engine_key, kind, before_result_id, after_result_id) DO UPDATE
            SET displaced_by = EXCLUDED.displaced_by, citation_gap = EXCLUDED.citation_gap,
-               concept_gap = CASE WHEN jsonb_array_length(displacement_events.concept_gap) = 0 THEN EXCLUDED.concept_gap ELSE displacement_events.concept_gap END,
+               -- Kept (the diagnosis is stable) only while every evidence URL is still in the citation gap it was derived from; a re-parse that
+               -- dropped the evidence source re-derives it, so concept_gap never cites a source the stored gap no longer holds.
+               concept_gap = CASE WHEN jsonb_array_length(displacement_events.concept_gap) = 0
+                                    OR EXISTS (SELECT 1 FROM jsonb_array_elements(displacement_events.concept_gap) c
+                                                WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(EXCLUDED.citation_gap) g WHERE g->>'url' = c->>'evidence_url'))
+                                  THEN EXCLUDED.concept_gap ELSE displacement_events.concept_gap END,
                impact_score = EXCLUDED.impact_score, scoring_version = EXCLUDED.scoring_version
          RETURNING (xmax = 0) AS inserted, extract(epoch FROM (detected_at - $17::timestamptz))::float8 AS lag_seconds`,
         [
@@ -283,8 +290,9 @@ async function refreshProjectDisplacementsInner(
   incrementCounter("nominara_rollup_displacements_persisted_total", { outcome: "ok" });
   // STORY-057 AC3 - counts only. Zero is a measurement and is emitted.
   observeValue("nominara_displacement_citation_gap_entries", scopes.passage, { scope: "passage" });
+  observeValue("nominara_displacement_citation_gap_entries", scopes.outside_passage, { scope: "outside_passage" });
   observeValue("nominara_displacement_citation_gap_entries", scopes.answer, { scope: "answer" });
-  logger.log({ event: "displacements_refreshed", workspaceId, projectId, date, events: persisted, passage_scoped_gaps: scopes.passage, answer_scoped_gaps: scopes.answer });
+  logger.log({ event: "displacements_refreshed", workspaceId, projectId, date, events: persisted, passage_scoped_gaps: scopes.passage, outside_passage_gaps: scopes.outside_passage, answer_scoped_gaps: scopes.answer });
   return persisted;
 }
 
@@ -461,7 +469,7 @@ async function loadCitationSlots(tx: ClientBase, resultId: string): Promise<Cita
  * dropped: a passage cites only what the capture recorded as a resolved source. A stored element that is not a valid AnswerElement is
  * skipped (never a failed rollup, never a guess at its meaning).
  */
-async function loadPassageElements(tx: ClientBase, capture: CaptureRow, matching: Promise<EntityMatching>): Promise<PassageElement[] | undefined> {
+async function loadPassageElements(tx: ClientBase, capture: CaptureRow, matching: () => Promise<EntityMatching>): Promise<PassageElement[] | undefined> {
   const stored = (
     await tx.query<{ elements: unknown }>(
       `SELECT payload->'structured_elements' AS elements FROM answer_captures WHERE id = $1 AND captured_at = $2::timestamptz`,
@@ -469,7 +477,7 @@ async function loadPassageElements(tx: ClientBase, capture: CaptureRow, matching
     )
   ).rows[0]?.elements;
   if (!Array.isArray(stored) || stored.length === 0) return undefined;
-  const found = await matching;
+  const found = await matching();
 
   const keyToUrl = new Map<string, string>();
   const slots = await tx.query<{ normalized_url: string; raw_url: string }>(
@@ -494,7 +502,8 @@ async function loadPassageElements(tx: ClientBase, capture: CaptureRow, matching
     const mentions = text === "" ? [] : matchEntities({ text, aliases: found.aliases, negativeAliases: found.negativeAliases }, found.automaton)
       .filter((m) => m.entityType !== "other")
       .map((m) => m.entityLabel);
-    elements.push({ mentions: [...new Set(mentions)], citedUrls });
+    // Links but no text: nothing to match, so what it cites is "answer"-scoped rather than silently placed outside the passage.
+    elements.push({ mentions: [...new Set(mentions)], citedUrls, ...(text === "" && citedUrls.length > 0 ? { unlocatable: true } : {}) });
   }
   return elements.length === 0 ? undefined : elements;
 }
@@ -538,21 +547,23 @@ async function citationGap(
   passageElements: readonly PassageElement[] | undefined,
 ): Promise<CitationGapEntry[]> {
   const brandUrls = new Set(afterSlots.filter((s) => s.isOwned).map((s) => s.url));
-  const byUrl = new Map<string, { slot: SnapshotCitation; heldBy: string[]; scope: CitationScope }>();
+  const byUrl = new Map<string, { slot: SnapshotCitation; heldBy: string[]; scopes: CitationScope[] }>();
   for (const entity of event.displacedBy) {
-    // AC3: where the engine exposes per-element references, only what the passage naming this entity cites. Narrows, never adds.
-    const scoped = scopeCitationsToPassage(entity.entityLabel, entity.citations, passageElements);
-    for (const citation of scoped.citations) {
+    // THE GAP IS THE WHOLE ANSWER's (owner decision 99i): the impact score and the concept gap read it, and must not move with the passage
+    // view. AC3's passage view is only a LABEL on each entry. LABEL DRIFT: a competitor renamed since the capture was parsed is not found
+    // by the parser's matcher in the stored element text, so its entries fall back to `answer` scope (never a wrong passage).
+    for (const { citation, scope } of classifyCitationScopes(entity.entityLabel, entity.citations, passageElements)) {
       if (brandUrls.has(citation.url)) continue;
-      const entry = byUrl.get(citation.url) ?? { slot: citation, heldBy: [], scope: scoped.scope };
+      const entry = byUrl.get(citation.url) ?? { slot: citation, heldBy: [], scopes: [] };
       if (!entry.heldBy.includes(entity.entityLabel)) entry.heldBy.push(entity.entityLabel);
-      // A source is passage-scoped only when every holder was located in a passage.
-      if (scoped.scope === "answer") entry.scope = "answer";
+      entry.scopes.push(scope);
       byUrl.set(citation.url, entry);
     }
   }
   const gap: CitationGapEntry[] = [];
-  for (const { slot, heldBy, scope } of byUrl.values()) {
+  for (const { slot, heldBy, scopes } of byUrl.values()) {
+    // In the passage of ANY holder = passage; else unplaced for any holder = answer; else outside the located passage.
+    const scope: CitationScope = scopes.includes("passage") ? "passage" : scopes.includes("answer") ? "answer" : "outside_passage";
     gap.push({
       url: slot.url,
       domain: slot.domain,

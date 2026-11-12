@@ -44998,6 +44998,7 @@
                                 "type": "string",
                                 "enum": [
                                   "passage",
+                                  "outside_passage",
                                   "answer"
                                 ]
                               }
