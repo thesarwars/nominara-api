@@ -12,12 +12,13 @@ import { judgeInForce, selectNameMatchJudge } from "./select.js";
 
 const q = (i: number): NameMatchQuery => ({ alias: "Notion", span: "Notion", before: `before ${String(i)} `, after: ` after ${String(i)}` });
 const pending = (n: number): PendingMatch[] => Array.from({ length: n }, (_, i) => ({ mentionFactId: `00000000-0000-7000-8000-${String(i).padStart(12, "0")}`, capturedAt: "2026-11-01 10:00:00+00", query: q(i) }));
-const prepared = (matches: PendingMatch[], budget = 1_000): JudgingPrepared => ({
+const prepared = (matches: PendingMatch[], reserved = matches.length): JudgingPrepared => ({
   workspaceId: "0198a1f0-0000-7000-8000-0000000000aa",
   projectId: "0198a1f0-0000-7000-8000-0000000000bb",
   judgeVersion: "fixture:name-match-v1",
   judgeModel: "fixture",
-  budget,
+  reserved,
+  month: "2026-11-01",
   matches,
 });
 
@@ -43,7 +44,7 @@ describe("STORY-191 AC7 · the run phase: batches, a bucket token per model call
     expect(judge.calls.map((c) => c.length)).toEqual([JUDGE_BATCH_SIZE, JUDGE_BATCH_SIZE, 5]);
     expect(tokens).toHaveBeenCalledTimes(3);
     expect(out.verdicts).toHaveLength(JUDGE_BATCH_SIZE * 2 + 5);
-    expect(out).toMatchObject({ modelCalls: 3, failedBatches: 0, bucketDenied: false, deferred: 0 });
+    expect(out).toMatchObject({ modelCalls: 3, failedBatches: 0, bucketDenied: false, deferred: 0, attempted: JUDGE_BATCH_SIZE * 2 + 5 });
   });
 
   it("a denied token waits (bounded) and retries; a bucket that stays closed stops the run with the rest DEFERRED and never calls the model", async () => {
@@ -57,10 +58,11 @@ describe("STORY-191 AC7 · the run phase: batches, a bucket token per model call
     expect(out.verdicts).toHaveLength(JUDGE_BATCH_SIZE);
     expect(out.deferred).toBe(JUDGE_BATCH_SIZE);
     expect(out.bucketDenied).toBe(true);
+    expect(out.attempted, "a batch that was never sent is not metered").toBe(JUDGE_BATCH_SIZE);
     expect(sleeps.every((ms) => ms > 0 && ms <= 10_000)).toBe(true);
   });
 
-  it("never judges more than the remaining monthly budget: the rest is deferred, and a zero budget makes no model call", async () => {
+  it("never judges more than it RESERVED: the rest is deferred, and a zero reservation makes no model call", async () => {
     const judge = new FakeJudge();
     const out = await runJudging(prepared(pending(50), 30), { judge, bucket: granted, sleep: async () => {} });
     expect(out.verdicts).toHaveLength(30);
@@ -81,6 +83,8 @@ describe("STORY-191 AC7 · the run phase: batches, a bucket token per model call
     expect(out.failedBatches).toBe(1);
     expect(out.verdicts).toHaveLength(JUDGE_BATCH_SIZE * 2);
     expect(out.deferred).toBe(JUDGE_BATCH_SIZE);
+    // METERED BY ATTEMPT: the failed batch was a billed call, so its matches count although nothing was stored.
+    expect(out.attempted).toBe(JUDGE_BATCH_SIZE * 3);
   });
 
   it("a wrong-length answer is discarded whole: pairing survivors against matches would attach a verdict to the wrong match", async () => {
@@ -88,6 +92,7 @@ describe("STORY-191 AC7 · the run phase: batches, a bucket token per model call
     const out = await runJudging(prepared(pending(5)), { judge, bucket: granted, sleep: async () => {} });
     expect(out.verdicts).toEqual([]);
     expect(out.failedBatches).toBe(1);
+    expect(out.attempted, "the call was made and billed").toBe(5);
   });
 
   it("'unjudged' from the model is kept as unjudged (stored, so it is not asked again) and never turned into about_brand", async () => {

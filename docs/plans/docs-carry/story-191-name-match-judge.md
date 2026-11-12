@@ -15,3 +15,7 @@ What was built (owner decision 99c, 2026-11-12):
 For the owner: the cap value; whether judging should have its own engine bucket rather than sharing `gemini`'s; retention of verdict rows after their `mention_facts` partition is dropped (they hold ids and a label, no text; not yet swept).
 
 Reference text to correct: `references/security-and-tenancy.md` ISO-06 census line (95 / 70 / 25; `name_match_verdicts`, migration 0197).
+
+Fix round (owner decision 99l): the monthly cap is now **reserved atomically**. Migration **0202** adds tenant table `name_match_judge_usage` (`workspace_id`, UTC `month`, `matches_sent`; RLS forced, policy in the migration, not portal-readable, subject inventory `exempt`; census 96 / 71 / 25). `prepare` takes its matches from the month's row under a row lock before any model call; `commit` gives back only what was never sent, so the meter counts matches **attempted** (a failed billed batch counts) and concurrent jobs of one workspace cannot overshoot. A job that dies between prepare and commit keeps its reservation (the meter errs high). The cap is no longer counted from stored verdicts.
+
+Recorded follow-ups, not fixed: the publish guard is lifted by configuration (a bound model) rather than by evidence about judged quality; the score can differ between a caller that passes a judge and the rollup; the Wikimedia per-host rate is per process, not per fleet; `name_match_verdicts` retention after the `mention_facts` partition is dropped.

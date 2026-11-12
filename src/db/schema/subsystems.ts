@@ -71,6 +71,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "semantic_nodes",
     "patches",
     "name_match_verdicts",
+    "name_match_judge_usage",
   ],
   tools: [
     "tool_runs",

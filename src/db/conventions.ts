@@ -391,6 +391,8 @@ export const POLICY_IN_OWN_MIGRATION: readonly string[] = [
   "prompt_generations",
   // 0197_name_match_verdicts.up.sql — STORY-191 (owner decision 99c); tenant-scoped, NOT portal-readable.
   "name_match_verdicts",
+  // 0202_name_match_judge_usage.up.sql — STORY-191 fix round (owner decision 99l); tenant-scoped, NOT portal-readable.
+  "name_match_judge_usage",
 ];
 
 // STORY-011 — which runtime roles receive which generated policy. Every

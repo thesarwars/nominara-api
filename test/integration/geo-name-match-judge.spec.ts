@@ -226,6 +226,8 @@ describe("STORY-191 · the name-match judging job", () => {
     expect(await verdicts()).toHaveLength(0);
   });
 
+  const usage = async (ws = workspaceId) => Number((await db.query("SELECT COALESCE(sum(matches_sent), 0)::int AS n FROM name_match_judge_usage WHERE workspace_id = $1", [ws])).rows[0].n);
+
   it("AC7 · the per-workspace monthly cap: a workspace at its cap is not judged and costs no model call, while another workspace is unaffected", async () => {
     await matchesIn(6, "Notion is a concept.", "Notion");
     const other = await seedWorkspace("Notion");
@@ -234,17 +236,59 @@ describe("STORY-191 · the name-match judging job", () => {
     await deliver({ judge: j1, monthlyCap: 4 });
     expect(j1.shown).toHaveLength(4);
     expect(await verdicts()).toHaveLength(4);
+    expect(await usage()).toBe(4);
     const j2 = new FixtureJudge();
     await deliver({ judge: j2, monthlyCap: 4 });
     expect(j2.calls, "the cap is spent").toBe(0);
     const j3 = new FixtureJudge();
     await deliver({ judge: j3, monthlyCap: 4 }, other.ws, other.project);
     expect(j3.shown).toHaveLength(4);
-    // Last month's verdicts do not count against this month's cap.
-    await db.query("UPDATE name_match_verdicts SET judged_at = now() - interval '40 days' WHERE workspace_id = $1", [workspaceId]);
+    // Last month's meter does not count against this month's cap.
+    await db.query("UPDATE name_match_judge_usage SET month = (month - interval '1 month')::date WHERE workspace_id = $1", [workspaceId]);
     const j4 = new FixtureJudge();
     await deliver({ judge: j4, monthlyCap: 4 });
     expect(j4.shown).toHaveLength(2);
+  });
+
+  it("FIX ROUND (major) · N concurrent jobs across a workspace's projects with the cap at N-1 NEVER overshoot: the budget is reserved atomically before any model call", async () => {
+    const N = 8;
+    const projects = [projectId];
+    for (let i = 1; i < N; i++) projects.push((await db.query<{ id: string }>(
+      `INSERT INTO projects (id,workspace_id,name,slug,root_url,root_domain) VALUES (gen_random_uuid(),$1,'Notion',$2,'https://notion.so','notion.so') RETURNING id`,
+      [workspaceId, `p-${randomUUID().slice(0, 8)}`],
+    )).rows[0]!.id);
+    for (const p of projects) await matchesIn(1, "Notion is a concept.", "Notion", workspaceId, p);
+    const judges = projects.map(() => new FixtureJudge());
+    await Promise.all(projects.map((p, i) => deliver({ judge: judges[i]!, monthlyCap: N - 1 }, workspaceId, p)));
+    const sent = judges.reduce((n, j) => n + j.shown.length, 0);
+    expect(sent).toBe(N - 1);
+    expect(await usage()).toBe(N - 1);
+    expect(await verdicts()).toHaveLength(N - 1);
+  }, 60_000);
+
+  it("FIX ROUND (major) · a billed batch that FAILS is counted: the model was called, so the meter moves although no verdict is stored, and the cap then holds", async () => {
+    await matchesIn(5, "Notion is a concept.", "Notion");
+    const failing = new FixtureJudge(VERSION, () => "not_about_brand", async () => {
+      throw new Error("provider 500");
+    });
+    await deliver({ judge: failing, monthlyCap: 5 });
+    expect(failing.calls).toBe(1);
+    expect(await verdicts()).toHaveLength(0);
+    expect(await usage(), "the 5 matches sent are metered").toBe(5);
+    const next = new FixtureJudge();
+    await deliver({ judge: next, monthlyCap: 5 });
+    expect(next.calls, "the cap is spent by the failed attempt").toBe(0);
+  });
+
+  it("FIX ROUND · what a job reserved but never sent (a closed bucket) is given back, so a later job can use it", async () => {
+    await matchesIn(3, "Notion is a concept.", "Notion");
+    const closed = new FixtureJudge();
+    await deliver({ judge: closed, bucket: { tryAcquire: async () => ({ granted: false, retryAfterMs: 1 }) }, monthlyCap: 10 });
+    expect(closed.calls).toBe(0);
+    expect(await usage()).toBe(0);
+    const later = new FixtureJudge();
+    await deliver({ judge: later, monthlyCap: 3 });
+    expect(later.shown).toHaveLength(3);
   });
 
   it("AC7 · the engine bucket is asked for a token before every model call, and a closed bucket means no model call at all", async () => {

@@ -300,6 +300,7 @@ export const SUBJECT_INVENTORY: Readonly<Record<string, InventoryEntry>> = Objec
   share_token_views: exportOf("share_token_views"),
   share_tokens: exportOf("share_tokens"),
   source_domains: exempt(WORKSPACE_CONFIG),
+  name_match_judge_usage: exempt("Per-workspace monthly count of matches sent to the name-match model: a number, no text, no person."),
   name_match_verdicts: exempt("Model verdict on a brand-name match: ids, a judge version and a label, no answer text and no person."),
   prompt_generations: exempt("Background prompt-generation pass: the request and the result hold brand vocabulary and prompt text, no person."),
   sso_configurations: exportOf("sso_configurations"),

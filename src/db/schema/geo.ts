@@ -116,6 +116,13 @@ export const geoAnalyses = pgTable("geo_analyses", {
   computedAt: timestamp("computed_at", { withTimezone: true }).notNull().default(sql`now()`),
 }, (table) => [primaryKey({ columns: [table.projectId, table.analysis, table.windowStart, table.windowDays, table.scoringVersion] })]);
 
+export const nameMatchJudgeUsage = pgTable("name_match_judge_usage", {
+  workspaceId: uuid("workspace_id").notNull(),
+  month: date("month", { mode: "string" }).notNull(),
+  matchesSent: integer("matches_sent").notNull().default(sql`0`),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+}, (table) => [primaryKey({ columns: [table.workspaceId, table.month] })]);
+
 export const nameMatchVerdicts = pgTable("name_match_verdicts", {
   id: uuid("id").primaryKey(),
   workspaceId: uuid("workspace_id").notNull(),
