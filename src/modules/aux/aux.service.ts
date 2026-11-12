@@ -17,7 +17,7 @@ import type {
 import { AUX_CATEGORIES } from "../../../contracts/aux/index.js";
 import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, patchRiskFlagSchema } from "../../../contracts/aux/index.js";
 import type { AuxPatch } from "../../../contracts/aux/index.js";
-import { guidanceFor } from "../../lib/aux/patches/guidance.js";
+import { guidanceForFinding } from "../../lib/aux/patches/guidance.js";
 import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
 import { failManualAudit } from "../../lib/aux/fail-manual-audit.js";
 import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, PriceChangedError, UnauthenticatedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
@@ -863,7 +863,7 @@ function toFinding(row: FindingRow, patch: AuxPatch | null): AuxFinding {
     rule_version: row.rule_version,
     task_id: row.task_id,
     patch,
-    // A rule with no patch carries structured guidance and an alignment link instead (STORY-053 AC9).
-    guidance: patch === null ? guidanceFor(row.rule_code, { projectId: row.project_id, url: row.url }) : null,
+    // A finding with no patch carries structured guidance and an alignment link instead (STORY-053 AC9); never neither (STORY-194 AC2).
+    guidance: guidanceForFinding(row.rule_code, { projectId: row.project_id, url: row.url, title: row.title, rationale: row.consequence ?? null, hasPatch: patch !== null }),
   };
 }

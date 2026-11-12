@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { GUIDANCE_ONLY_RULES, NON_FIXABLE_RULES, PATCHABLE_RULES, guidanceFor } from "./guidance.js";
+import { auxGuidanceSchema } from "../../../../contracts/aux/patch.schema.js";
+import { GUIDANCE_ONLY_RULES, NON_FIXABLE_RULES, PATCHABLE_RULES, guidanceFor, guidanceForFinding } from "./guidance.js";
 
 // STORY-053 AC9 — the non-fixable rules produce structured guidance and an alignment link, not an empty patch.
 // The reference names twelve in aux-and-geo-analysis.md section 5 rule 4; the section 2 catalog marks fourteen with no auto-fix
@@ -50,5 +51,37 @@ describe("STORY-053 scenario 10 · a non-fixable rule's finding carries guidance
 
   it("an unknown rule has none", () => {
     expect(guidanceFor("AUX-R-999", { projectId: "p1", url: null })).toBeNull();
+  });
+});
+
+// STORY-194 AC2 / decision 98b - every finding read serves a patch or guidance, never neither.
+describe("STORY-194 AC2 · a finding is served a patch or guidance, across the whole rule catalog", () => {
+  const ctx = { projectId: "p1", url: "https://acme.com/x" };
+  const base = { title: "A title", rationale: "Engines cannot quote this page cleanly." };
+
+  it.each(ALL)("%s without a patch is served schema-valid guidance (the catalog rationale is the fallback)", (code) => {
+    const g = guidanceForFinding(code, { ...ctx, ...base, hasPatch: false });
+    expect(g).not.toBeNull();
+    expect(auxGuidanceSchema.safeParse(g).success).toBe(true);
+  });
+
+  it("a fixable rule whose patch is missing or gate-refused falls back to the rationale plus the alignment link", () => {
+    const g = guidanceForFinding("AUX-R-001", { ...ctx, ...base, hasPatch: false })!;
+    expect(g.summary).toBe(base.rationale);
+    expect(g.alignment_link).toEqual({ path: "/geo/alignment", target_url: "https://acme.com/x" });
+  });
+
+  it("a rule with no guidance text and no catalog row falls back to the title, never null", () => {
+    const g = guidanceForFinding("AUX-R-999", { ...ctx, title: "Unknown rule", rationale: null, hasPatch: false })!;
+    expect(g.summary).toBe("Unknown rule");
+    expect(auxGuidanceSchema.safeParse(g).success).toBe(true);
+  });
+
+  it.each(ALL)("%s with a patch carries no guidance (patch XOR guidance)", (code) => {
+    expect(guidanceForFinding(code, { ...ctx, ...base, hasPatch: true })).toBeNull();
+  });
+
+  it("a rule with curated text keeps its curated guidance, not the fallback", () => {
+    expect(guidanceForFinding("AUX-R-021", { ...ctx, ...base, hasPatch: false })).toEqual(guidanceFor("AUX-R-021", ctx));
   });
 });
