@@ -198,12 +198,15 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
   // ---- 3. coverage --------------------------------------------------------------------------------------------------
   const coverage = await tx.query<{ coverage: number | null }>(
     `UPDATE geo_alignments g
-        SET coverage_ratio = c.ratio, updated_at = now()
+        SET coverage_ratio = c.ratio, updated_at = now(),
+            -- Decision 99f: a LIVE analysis re-judges the shared nodes on the page, so the draft no longer decides them. The marker goes (the draft
+            -- TEXT stays); a pending recompute is left to run, since it will measure the draft again.
+            draft_state = CASE WHEN $4::boolean OR g.draft_state = 'pending' THEN g.draft_state ELSE NULL END
        FROM (SELECT (count(*) FILTER (WHERE present_in_content))::real / NULLIF(count(*), 0) AS ratio
                FROM semantic_nodes WHERE workspace_id = app.current_workspace() AND project_id = $2 AND prompt_cluster_id IS NOT DISTINCT FROM $3 AND collapsed_into_id IS NULL) c
       WHERE g.id = $1 AND g.workspace_id = app.current_workspace()
       RETURNING g.coverage_ratio AS coverage`,
-    [sessionId, ...scope],
+    [sessionId, ...scope, draft],
   );
 
   // ---- 4. projected gain --------------------------------------------------------------------------------------------

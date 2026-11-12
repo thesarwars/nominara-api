@@ -1115,6 +1115,50 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect((await gapOf()).map((g) => g.url)).toEqual(["https://rival.com/pick"]);
   });
 
+  it("STORY-057 AC3 review · the passage is found with the parser's matcher: 'HP' is not inside 'shape', and 'Box' is not inside 'inbox'", async () => {
+    await db.query(`UPDATE competitors SET name = 'HP' WHERE id = $1`, [rivalId]);
+    await elementLoss(
+      "google_aio",
+      [element("ai_overview_element", "A good shape for your inbox", ["https://rival.com/wrong"]), element("ai_overview_element", "HP laptops lead", ["https://rival.com/right"])],
+      ["https://rival.com/wrong", "https://rival.com/right"],
+      "HP",
+    );
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/right", "passage"]]);
+  });
+
+  it("STORY-057 AC3 review · only a lookalike substring in the text: no passage is located, so the gap stays answer-scoped", async () => {
+    await db.query(`UPDATE competitors SET name = 'HP' WHERE id = $1`, [rivalId]);
+    await elementLoss("google_aio", [element("ai_overview_element", "A good shape", ["https://rival.com/wrong"])], ["https://rival.com/wrong"], "HP");
+    expect((await gapOf()).map((g) => g.scope)).toEqual(["answer"]);
+  });
+
+  it("STORY-057 AC3 review · a label that is a prefix of another rival's name: 'Zoho CRM' belongs to the longer rival, not to 'Zoho'", async () => {
+    await db.query(`UPDATE competitors SET name = 'Zoho' WHERE id = $1`, [rivalId]);
+    await db.query(
+      `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source) VALUES ($1,$2,$3,'Zoho CRM','zohocrm.com',ARRAY[]::text[],'user')`,
+      [randomUUID(), workspaceId, projectId],
+    );
+    await elementLoss(
+      "google_aio",
+      [element("ai_overview_element", "Zoho CRM is great", ["https://rival.com/crm"]), element("ai_overview_element", "Zoho itself is cheap", ["https://rival.com/zoho"])],
+      ["https://rival.com/crm", "https://rival.com/zoho"],
+      "Zoho",
+    );
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/zoho", "passage"]]);
+  });
+
+  it("STORY-057 AC3 review · an alias of the competitor names the passage", async () => {
+    await db.query(`UPDATE competitors SET aliases = ARRAY['RVL'] WHERE id = $1`, [rivalId]);
+    await elementLoss("google_aio", [element("ai_overview_element", "RVL is the pick", ["https://rival.com/alias"]), element("ai_overview_element", "other", ["https://rival.com/x"])], ["https://rival.com/alias", "https://rival.com/x"]);
+    expect((await gapOf()).map((g) => [g.url, g.scope])).toEqual([["https://rival.com/alias", "passage"]]);
+  });
+
+  it("STORY-057 AC3 review · a negative alias suppresses the match, as it does in the parser", async () => {
+    await db.query(`UPDATE projects SET negative_aliases = ARRAY['rival territory'] WHERE id = $1`, [projectId]);
+    await elementLoss("google_aio", [element("ai_overview_element", "Deep in rival territory", ["https://rival.com/x"])], ["https://rival.com/x"]);
+    expect((await gapOf()).map((g) => g.scope)).toEqual(["answer"]);
+  });
+
   it("STORY-057 AC3 · SerpApi fixture (recorded AI Mode answer): the gap shrinks from the answer's citations to the passage naming the competitor", async () => {
     // The recorded answer through the SerpApi mapper, stored the way the adapter stores an element (kind, links, description).
     const elements: { kind: string; description: string; links: { url: string }[] }[] = mapSerpAnswer(aiModePriced as never).elements.map((e) => ({
@@ -1128,7 +1172,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     expect(soundcore.length).toBeGreaterThan(0);
     expect(everyUrl.length).toBeGreaterThan(soundcore.length); // the answer cites more than this passage does
 
-    await db.query(`UPDATE competitors SET root_domain = 'google.com' WHERE id = $1`, [rivalId]);
+    await db.query(`UPDATE competitors SET root_domain = 'google.com', name = 'Soundcore Life Q30' WHERE id = $1`, [rivalId]);
     await engine("google_ai_mode", "licensed_serp");
     await capture({ at: `${D1}T10:00:00Z`, present: true, position: 1, engine: "google_ai_mode" });
     const after = await capture({
@@ -1178,6 +1222,18 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await alignment({ draft_state: "ready", updated: "2026-10-02T00:00:00Z", target: "https://acme.com/other" });
     await lossWithConcepts(["https://rival.com/rbac"]);
     expect(await conceptGap()).toEqual([]);
+  });
+
+  it("decision 99f · draft -> live re-analysis -> judged: the draft keeps the gap out, and the live analysis (which clears the session's draft marker and touches it) lets it be claimed", async () => {
+    await inCluster(clusterId);
+    await node("role based access", { ratio: 0.6, evidence: "https://rival.com/rbac", rank: 1 });
+    await alignment({ draft_state: "ready" });
+    await lossWithConcepts(["https://rival.com/rbac"]);
+    expect(await conceptGap()).toEqual([]);
+    await db.query(`UPDATE geo_alignments SET draft_state = NULL, updated_at = now() WHERE project_id = $1`, [projectId]);
+    await db.query(`UPDATE displacement_events SET concept_gap = '[]'::jsonb`);
+    await run(D2);
+    expect((await conceptGap()).map((c) => c.concept)).toEqual(["role based access"]);
   });
 
   it("decision 99f · a live analysis AFTER the draft re-judges the nodes on the page: judged again, and the gap is claimed", async () => {

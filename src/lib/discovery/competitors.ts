@@ -1,4 +1,5 @@
 import type { ProposedCompetitor } from "../../../contracts/projects/index.js";
+import { parse } from "tldts";
 import { toRegistrableDomain } from "../net/registrable-domain.js";
 import { extractComparisonPageSignals, type ComparisonLink } from "./html-signals.js";
 
@@ -42,7 +43,9 @@ const PLACEHOLDERS = new Set([
   "the competition", "everyone", "anyone", "others like us",
 ]);
 
-const CALL_TO_ACTION_RE = /^(?:see|view|browse|explore|find|read|learn|check|discover|all|our|more|your)\b/i;
+// WHOLE call-to-action phrases only: what is left of "See alternatives" or "View all alternatives" once "alternatives" is cut. A real rival
+// that starts with one of these words ("Discover Financial", "Checkout.com", "All Saints") is a name, not a phrase.
+const CALL_TO_ACTION_RE = /^(?:(?:see|view|browse|explore|find|read|learn|check out|discover)(?:\s+(?:all|more|our|the|other|these|top|best))*|all|our|more|your)$/i;
 
 const norm = (s: string): string => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
 
@@ -147,7 +150,7 @@ export function selectComparisonPages(links: readonly ComparisonLink[], rootUrl:
     }
     if (url.protocol !== "https:" && url.protocol !== "http:") continue;
     if (!PATH_WORD_RE.test(url.pathname) && !TEXT_WORD_RE.test(link.text)) continue;
-    if (!isSameSite(url.toString(), rootDomain)) {
+    if (!isSameSite(url.toString(), rootUrl, rootDomain)) {
       offSite += 1;
       continue;
     }
@@ -158,10 +161,17 @@ export function selectComparisonPages(links: readonly ComparisonLink[], rootUrl:
   return { urls, offSite };
 }
 
-/** True when `url` is on the registrable domain `rootDomain`. An unparsable host is not on the site. */
-export function isSameSite(url: string, rootDomain: string): boolean {
+/**
+ * True when `url` is on the project's own site: the registrable domain `rootDomain` AND, on a shared host (github.io, vercel.app,
+ * myshopify.com: private suffixes in the public suffix list), the same tenant of it. `acme.github.io` never follows `other.github.io`.
+ * An unparsable host is not on the site.
+ */
+export function isSameSite(url: string, rootUrl: string, rootDomain: string): boolean {
   try {
-    return toRegistrableDomain(url) === rootDomain.toLowerCase();
+    if (toRegistrableDomain(url) !== rootDomain.toLowerCase()) return false;
+    const mine = parse(rootUrl, { allowPrivateDomains: true }).domain;
+    const theirs = parse(url, { allowPrivateDomains: true }).domain;
+    return mine !== null && mine !== undefined && mine === theirs;
   } catch {
     return false;
   }

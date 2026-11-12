@@ -138,8 +138,11 @@ export function restoresSlot(kind: DetectedKind, before: CaptureSnapshot, later:
 
 /** One element of a structured answer (STORY-029), reduced to what passage scoping reads: its words and the citation URLs it references. */
 export interface PassageElement {
-  /** The element's text; the same text the parser matches a mention against. */
-  readonly description: string | undefined;
+  /**
+   * The entity labels the parser's matcher (`matchEntities`: word boundaries, aliases, negative aliases) found in this element's text.
+   * Matching is the caller's, never this file's: a substring test here would read "HP" into "shape".
+   */
+  readonly mentions: readonly string[];
   /** The element's OWN references, in the terms of the capture's stored citation URLs (the caller resolves them). */
   readonly citedUrls: readonly string[];
 }
@@ -159,11 +162,7 @@ export function scopeCitationsToPassage(
   citations: readonly SnapshotCitation[],
   elements: readonly PassageElement[] | undefined,
 ): { readonly citations: readonly SnapshotCitation[]; readonly scope: CitationScope } {
-  const label = entityLabel.trim().toLowerCase();
-  const passages =
-    elements === undefined || label === ""
-      ? []
-      : elements.filter((element) => element.description !== undefined && element.description.toLowerCase().includes(label));
+  const passages = elements === undefined ? [] : elements.filter((element) => element.mentions.includes(entityLabel));
   if (passages.length === 0) return { citations, scope: "answer" };
   const cited = new Set(passages.flatMap((passage) => passage.citedUrls));
   return { citations: citations.filter((citation) => cited.has(citation.url)), scope: "passage" };

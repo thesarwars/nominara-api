@@ -45015,7 +45015,11 @@
                         "passage_scoped_engines": {
                           "type": "array",
                           "items": {
-                            "type": "string"
+                            "type": "string",
+                            "enum": [
+                              "google_aio",
+                              "google_ai_mode"
+                            ]
                           }
                         },
                         "concept_gap": {

@@ -22,6 +22,9 @@ import {
 import { deriveConceptGap, type ConceptCandidate } from "../analytics/concept-gap.js";
 import { isLowConfidence, suppressRecommendations } from "../geo/corpus/weights.js";
 import { answerElementSchema } from "../engines/contract.js";
+import { buildMatcher, matchEntities } from "../parser/entity-matcher.js";
+import { normalize } from "../parser/normalize.js";
+import { loadParseContext } from "../parser/parse-capture.js";
 import { classifyDomain, normalizeCitationUrl } from "../parser/citation-url.js";
 import { displacementImpactForEvent, type FunnelStage } from "../scoring/displacement-impact.js";
 import { lockNodeScopesShared } from "../geo/alignment/scope-lock.js";
@@ -75,6 +78,12 @@ const RECOVERY_TITLE: Readonly<Record<DetectedDisplacement["kind"], string>> = {
   recommendation_lost: "Displacement recovered: recommendation restored",
   render_downgraded: "Displacement recovered: render form restored",
 };
+
+interface EntityMatching {
+  readonly automaton: ReturnType<typeof buildMatcher>;
+  readonly aliases: Parameters<typeof matchEntities>[0]["aliases"];
+  readonly negativeAliases: readonly string[];
+}
 
 interface CaptureRow {
   id: string;
@@ -194,6 +203,15 @@ async function refreshProjectDisplacementsInner(
     (await tx.query<{ w: number | null }>(`SELECT max(weight)::float8 AS w FROM project_engines WHERE project_id = $1 AND enabled`, [projectId])).rows[0]?.w ?? 0,
   );
 
+  // The parser's own alias set (brand, every competitor and their aliases, negative aliases), loaded once and only if an event needs it.
+  let matching: Promise<EntityMatching> | undefined;
+  const matcher = (): Promise<EntityMatching> =>
+    (matching ??= loadParseContext(tx, projectId).then(({ context }) => ({
+      automaton: buildMatcher(context.aliases),
+      aliases: context.aliases,
+      negativeAliases: context.negativeAliases,
+    })));
+
   let persisted = 0;
   for (const after of captures) {
     const beforeRow = (
@@ -220,7 +238,7 @@ async function refreshProjectDisplacementsInner(
     const context = await cellContext(tx, projectId, after, maxEngineWeight);
     const afterCitations = await loadCitationSlots(tx, after.id);
     // STORY-057 AC3 - read once per after-capture, from the DB copy of the stored raw capture (no object-store read inside this transaction).
-    const passageElements = await loadPassageElements(tx, after);
+    const passageElements = await loadPassageElements(tx, after, matcher());
     const conceptNodes = await loadConceptNodes(tx, workspaceId, projectId, after.prompt_id);
     for (const event of detected) {
       const gap = await citationGap(tx, workspaceId, event, afterCitations, passageElements);
@@ -443,7 +461,7 @@ async function loadCitationSlots(tx: ClientBase, resultId: string): Promise<Cita
  * dropped: a passage cites only what the capture recorded as a resolved source. A stored element that is not a valid AnswerElement is
  * skipped (never a failed rollup, never a guess at its meaning).
  */
-async function loadPassageElements(tx: ClientBase, capture: CaptureRow): Promise<PassageElement[] | undefined> {
+async function loadPassageElements(tx: ClientBase, capture: CaptureRow, matching: Promise<EntityMatching>): Promise<PassageElement[] | undefined> {
   const stored = (
     await tx.query<{ elements: unknown }>(
       `SELECT payload->'structured_elements' AS elements FROM answer_captures WHERE id = $1 AND captured_at = $2::timestamptz`,
@@ -451,6 +469,7 @@ async function loadPassageElements(tx: ClientBase, capture: CaptureRow): Promise
     )
   ).rows[0]?.elements;
   if (!Array.isArray(stored) || stored.length === 0) return undefined;
+  const found = await matching;
 
   const keyToUrl = new Map<string, string>();
   const slots = await tx.query<{ normalized_url: string; raw_url: string }>(
@@ -470,7 +489,12 @@ async function loadPassageElements(tx: ClientBase, capture: CaptureRow): Promise
     const parsed = answerElementSchema.safeParse(raw);
     if (!parsed.success) continue;
     const citedUrls = [...new Set(parsed.data.links.map((l) => resolve(l.url)).filter((u): u is string => u !== undefined))];
-    elements.push({ description: parsed.data.description, citedUrls });
+    // WHO IS NAMED is the parser's matcher's call, so "HP" is not in "shape", "Zoho" is not "Zoho CRM", and aliases and negative aliases apply.
+    const text = normalize(parsed.data.description ?? "");
+    const mentions = text === "" ? [] : matchEntities({ text, aliases: found.aliases, negativeAliases: found.negativeAliases }, found.automaton)
+      .filter((m) => m.entityType !== "other")
+      .map((m) => m.entityLabel);
+    elements.push({ mentions: [...new Set(mentions)], citedUrls });
   }
   return elements.length === 0 ? undefined : elements;
 }

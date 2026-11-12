@@ -47,6 +47,7 @@ function serving(routes: Record<string, Route>, now: () => number = () => Date.n
 
 describe("STORY-190 · which links are comparison pages", () => {
   const sel = (links: { href: string; text: string }[]) => selectComparisonPages(links, "https://hubspot.com", "hubspot.com");
+  const selOn = (rootUrl: string, rootDomain: string, links: { href: string; text: string }[]) => selectComparisonPages(links, rootUrl, rootDomain);
 
   it("AC1/decision 99g - a path word (/compare, /vs, /alternatives) or the link text marks a comparison page", () => {
     const out = sel([
@@ -72,6 +73,19 @@ describe("STORY-190 · which links are comparison pages", () => {
     ]);
     expect(out.urls).toEqual(["https://www.hubspot.com/compare/x"]);
     expect(out.offSite).toBe(2);
+  });
+
+  it("review - a project on a shared host (github.io, vercel.app, myshopify.com) never follows another tenant's site on that host", () => {
+    for (const [root, mine, theirs] of [
+      ["https://acme.github.io", "https://acme.github.io/vs/x", "https://other.github.io/vs/x"],
+      ["https://acme.vercel.app", "https://acme.vercel.app/compare", "https://other.vercel.app/compare"],
+      ["https://acme.myshopify.com", "https://www.acme.myshopify.com/compare", "https://other.myshopify.com/compare"],
+    ] as const) {
+      const rootDomain = new URL(root).hostname.split(".").slice(-2).join("."); // what a public-suffix-only reading stores: the shared host
+      const out = selOn(root, rootDomain, [{ href: mine, text: "" }, { href: theirs, text: "" }]);
+      expect(out.urls).toEqual([mine]);
+      expect(out.offSite).toBe(1);
+    }
   });
 
   it("AC1 - the same page linked twice (or with a fragment) is selected once", () => {
@@ -160,6 +174,38 @@ describe("STORY-190 · discover() opens comparison pages through the guarded fet
     const init = deps.fetch.mock.calls[1]![1] as { followRedirect: (u: string) => boolean };
     expect(init.followRedirect("https://hubspot.com/x")).toBe(true);
     expect(init.followRedirect("https://elsewhere.example/x")).toBe(false);
+  });
+
+  it("review - 'Discover Financial' and 'Checkout.com' are real rivals, not calls to action; 'See alternatives' still names nobody", () => {
+    const out = proposeCompetitors({
+      brandNames: BRANDS,
+      links: [{ href: "/a", text: "Discover Financial alternatives" }, { href: "/b", text: "Checkout.com alternatives" }, { href: "/c", text: "All Saints vs HubSpot" }, { href: "/d", text: "See alternatives" }, { href: "/e", text: "View all alternatives" }, { href: "/f", text: "Find more alternatives" }],
+    });
+    expect(out.map((c) => c.name).sort()).toEqual(["All Saints", "Checkout.com", "Discover Financial"]);
+  });
+
+  it("review - a fetch that loses the budget race and answers LATE is discarded: its page proposes nothing and nothing throws", async () => {
+    vi.useFakeTimers();
+    try {
+      const late = `<h1>HubSpot vs Latecomer</h1>`;
+      const deps = serving({ "https://hubspot.com": HOME(`<a href="/compare">Compare</a>`), "https://hubspot.com/compare": late });
+      const real = deps.fetch.getMockImplementation()! as (url: string, init?: unknown) => Promise<unknown>;
+      deps.fetch.mockImplementation(async (url: string, init?: unknown) => {
+        if (!url.endsWith("/compare")) return real(url, init);
+        await new Promise((r) => setTimeout(r, DISCOVERY_BUDGET_MS + 5_000)); // answers after the budget has closed
+        return real(url, init);
+      });
+      const seen: { skippedBudget: number; fetched: number }[] = [];
+      Object.assign(deps, { onComparisonPages: (s: { skippedBudget: number; fetched: number }) => seen.push(s) });
+      const pending = discover(BASE, deps);
+      await vi.advanceTimersByTimeAsync(DISCOVERY_BUDGET_MS + 1);
+      const result = await pending;
+      await vi.advanceTimersByTimeAsync(10_000); // the late answer lands now
+      expect(result.competitors_proposed).toEqual([]);
+      expect(seen).toEqual([expect.objectContaining({ skippedBudget: 1, fetched: 0 })]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("AC4 - supplied competitors: nothing proposed and no comparison page is fetched", async () => {

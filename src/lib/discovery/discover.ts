@@ -326,12 +326,12 @@ async function fetchComparisonPages(
           selection.urls.map(async (url) => {
             try {
               const response = await withinBudget(
-                deps.fetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootDomain) }),
+                deps.fetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootUrl, input.rootDomain) }),
                 budgetMs,
               );
               if (response.status >= 300 && response.status < 400) {
                 stats.redirectedOff += 1; // a redirect the same-site veto stopped
-              } else if (!isSameSite(response.finalUrl, input.rootDomain)) {
+              } else if (!isSameSite(response.finalUrl, input.rootUrl, input.rootDomain)) {
                 stats.redirectedOff += 1;
               } else if (response.status >= 400 || !looksLikeHtml(response.headers["content-type"])) {
                 stats.failed += 1; // a login wall, an error, or not a page
