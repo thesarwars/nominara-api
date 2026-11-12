@@ -17,6 +17,7 @@ import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
 import { createCreditHousekeepingHandler } from "./handlers/credit-housekeeping.handler.js";
 import { createCreditReconcileHandler } from "./handlers/credit-reconcile.handler.js";
 import { createReportCleanupHandler } from "./handlers/report-cleanup.handler.js";
+import { createBillingStripeDriftHandler } from "./handlers/billing-stripe-drift.handler.js";
 import { createRetentionPurgeHandler } from "./handlers/retention-purge.handler.js";
 import { createCreditVerifyHandler } from "./handlers/credit-verify.handler.js";
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
@@ -162,6 +163,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
   "billing.downgrade_notice": (context) => createBillingDowngradeNoticeHandler(context),
   "billing.cancel_on_deletion": (context) => createBillingCancelOnDeletionHandler(context),
+  "billing.stripe_drift": (context) => createBillingStripeDriftHandler(context),
   "notify.dispatch": (context) => createNotifyDispatchHandler(context),
   "report.build": (context) => createReportBuildHandler(context),
   "report.cleanup": (context) => createReportCleanupHandler(context),

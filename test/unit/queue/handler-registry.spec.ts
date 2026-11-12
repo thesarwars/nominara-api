@@ -67,6 +67,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "billing.cancel_on_deletion",
       "billing.customer_email",
       "billing.downgrade_notice",
+      "billing.stripe_drift",
       "capture.execute",
       "capture.parse",
       "capture.plan",
@@ -161,6 +162,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "rollup.category_benchmark",
       // STORY-045 / decision 95(a) - prompt.generate, declared after rollup.category_benchmark in topology.ts.
       "prompt.generate",
+      // STORY-075 AC11 - billing.stripe_drift, declared after prompt.generate in topology.ts.
+      "billing.stripe_drift",
     ]);
   });
 

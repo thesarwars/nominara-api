@@ -111,6 +111,10 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // ENABLED: the handler is a no-op unless `RETENTION_PURGE_ENABLED=true`. See `handlers/retention-purge.handler.ts`.
   { queue: "retention.purge", cron: "40 3 * * *", statedAs: "STORY-077 R4 / STORY-013, data-model.md §7: retention purge nightly (handler gated by RETENTION_PURGE_ENABLED, default off)" },
 
+  // ⚠ NOT FROM §4 - STORY-075 AC11, owner decision 2026-10-28 section 100(e): the nightly Stripe-versus-local drift check (alert only, never writes).
+  // THE HOUR IS A CHOICE: 03:45 UTC, after the retention purge (03:40) in the same quiet window, :45 and not :00 for the reason §6.1 gives `capture.plan` :05.
+  { queue: "billing.stripe_drift", cron: "45 3 * * *", statedAs: "STORY-075 AC11 / decision 2026-10-28 section 100(e): nightly Stripe-versus-local subscription drift check, alert only" },
+
   // ⚠ NOT FROM §4 — STORY-013 AC6 / AC14 / AC16: the nightly orphan scan, purge-failure check and vector-recall check
   // (`handlers/maintenance-integrity.handler.ts`). The references say "nightly" and give no hour. THE HOUR IS A CHOICE, NOT A
   // TRANSCRIPTION: 03:10 UTC, ahead of the 03:20 partition tick and the 03:40 retention purge so the read-only scans see the estate

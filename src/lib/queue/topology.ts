@@ -562,6 +562,19 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "promptgen:{generation}",
     tenantScoped: true,
   },
+  // STORY-075 AC11 / owner decision 2026-10-28 section 100(e): the nightly Stripe-versus-local drift check. ALERT ONLY, it never writes
+  // (`lib/billing/stripe-drift.ts`). Stripe calls may not be made on a request path (KAD-06), so it is a cron job; not tenant-scoped (the tick
+  // names no workspace; discovery is cross-tenant on the owner connection). Idempotent: it reads and counts.
+  {
+    name: "billing.stripe_drift",
+    producer: "cron daily (STORY-075 AC11, decision 2026-10-28 section 100(e); not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "stripedrift:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",
