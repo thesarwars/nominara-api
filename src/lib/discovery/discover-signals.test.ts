@@ -102,7 +102,8 @@ describe("STORY-043 · AC15 latency objective", () => {
   it("scenario 18 (sub-measure only) — discover()'s own run of a slow 4 s root fetch is reported as 4 s; the objective itself is judged from submission in the crawl.discover handler test", async () => {
     let t = 0;
     const deps: DiscoverDeps = {
-      fetch: vi.fn(async () => { t += 4000; return { status: 200, headers: {}, body: Buffer.from(COMPARISONS), finalUrl: "https://hubspot.com/" }; }),
+      // Only the root fetch is slow: the comparison pages (STORY-190) this document links to are answered at once.
+      fetch: vi.fn(async (url: string) => { if (url === BASE.rootUrl) t += 4000; return { status: 200, headers: {}, body: Buffer.from(COMPARISONS), finalUrl: "https://hubspot.com/" }; }),
       now: () => t,
     };
     const result = await discover(BASE, deps);

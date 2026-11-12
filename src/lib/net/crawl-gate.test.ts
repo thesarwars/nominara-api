@@ -174,3 +174,18 @@ describe("crawl gate - decision 70(d)", () => {
     await expect(h.gate("https://a.example/x")).rejects.toMatchObject({ reason: "too_many_redirects" });
   });
 });
+
+describe("crawl gate - robots exemption option (owner decision 99j)", () => {
+  it("a request the `robotsExempt` predicate accepts skips robots.txt; every other request is still gated; the default gate has no exemption", async () => {
+    const calls: string[] = [];
+    const inner = async (url: string): Promise<GuardedResponse> => {
+      calls.push(url);
+      return { status: 200, headers: {}, body: Buffer.from(url.endsWith("/robots.txt") ? "User-agent: *\nDisallow: /" : "ok"), finalUrl: url };
+    };
+    const gate = createCrawlGate({ fetch: inner, sleep: async () => {}, robotsExempt: (u) => u.pathname === "/open" });
+    await expect(gate("https://a.example/open")).resolves.toMatchObject({ status: 200 });
+    await expect(gate("https://a.example/closed")).rejects.toBeInstanceOf(CrawlRefusal);
+    const plain = createCrawlGate({ fetch: inner, sleep: async () => {} });
+    await expect(plain("https://a.example/open")).rejects.toBeInstanceOf(CrawlRefusal);
+  });
+});

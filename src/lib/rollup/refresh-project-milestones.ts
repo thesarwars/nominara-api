@@ -169,27 +169,18 @@ async function pinEngineModelChanges(tx: ClientBase, workspaceId: string, projec
 }
 
 async function pinPromptSetChange(tx: ClientBase, workspaceId: string, projectId: string, metricDate: string, timezone: string): Promise<number> {
-  // `before` is the set that existed when the day began; a prompt counts as
-  // REMOVED that day when it was deleted, or archived (the archive is the
-  // status change, stamped by `updated_at`), during it.
+  // `before` is the set that existed when the day began; a prompt counts as REMOVED that day when it was deleted, or archived, during
+  // it. The archive time is `tracked_prompts.status_changed_at` (migration 0199, owner decision 99(e)), stamped by a trigger on every
+  // status change, so a later edit of the archived row (which bumps `updated_at`) cannot move the day it left the set. A row with no
+  // recorded change (NULL: written before 0199) falls back to `updated_at`, as the rollup always did.
   //
-  // ⚠ KNOWN LIMITS, open for an owner decision (STORY-066 review round 1; put to the owner in
-  // plans-7day/followups-2026-10-26-s066.md, items 1 and 2):
-  //   1. `tracked_prompts` has no status-change timestamp, so `updated_at`
-  //      stands in for the archive time. `touch_updated_at` bumps it on ANY
-  //      later update of an archived row, so such an update moves the
-  //      prompt's "removed" day, and a re-roll of that later day can pin a
-  //      spurious change (and a re-roll of an earlier day counts the prompt
-  //      in `before`). The fix is a schema change (a status-change timestamp
-  //      or record), which the story does not name.
-  //   2. `paused` (a downgrade or retention pause) is not counted as a
-  //      removal, and paused prompts stay in `before`. Whether the "prompt
-  //      set" of §13 is the measured (active) set is not settled.
+  // A PAUSED prompt (a downgrade or retention pause) is NOT removed: only `archived` and a deletion leave the set, so a paused prompt is
+  // in `before` and never in `removed` (decision 99(e); `scoring-models.md` section 13).
   const counts = await tx.query<{ before: number; added: number; removed: number; last_change: Date | null }>(
     `WITH d AS (SELECT ${DAY_BOUNDS}),
      p AS (
        SELECT t.created_at, t.deleted_at,
-              CASE WHEN t.status = 'archived' AND t.deleted_at IS NULL THEN t.updated_at END AS archived_at
+              CASE WHEN t.status = 'archived' AND t.deleted_at IS NULL THEN COALESCE(t.status_changed_at, t.updated_at) END AS archived_at
          FROM tracked_prompts t
         WHERE t.project_id = $1
      )

@@ -38,6 +38,13 @@ export const displacedByEntrySchema = z
  * does not (STORY-057 AC1/AC2). `brand_present` comes from the verified
  * `project_source_index`; `null` = never verified, never assumed.
  */
+/**
+ * STORY-057 AC3 - the engines whose captures carry per-element references (`structured_elements[].links`): the two licensed Google
+ * surfaces (STORY-029). On these the citation gap can be scoped to the passage that recommends the competitor; on every other engine
+ * it is answer-scoped. Served on each displacement so the interface can say where the diagnosis is sharper.
+ */
+export const PASSAGE_SCOPED_ENGINES = ["google_aio", "google_ai_mode"] as const;
+
 export const citationGapEntrySchema = z
   .object({
     url: z.string().min(1),
@@ -45,6 +52,13 @@ export const citationGapEntrySchema = z
     source_class: displacementSourceClassSchema,
     held_by: z.array(z.string().min(1)).min(1),
     brand_present: z.boolean().nullable(),
+    /**
+     * STORY-057 AC3 / decision 99i - the PASSAGE VIEW, display only (the gap itself, the impact score and the concept gap are whole-answer).
+     * `passage` = cited in the passage that names the displacing entity (engines in PASSAGE_SCOPED_ENGINES); `outside_passage` = a passage was
+     * located and this source is cited elsewhere in the answer; `answer` = no passage could be located. Absent on rows stored before this
+     * field: read as `answer`.
+     */
+    scope: z.enum(["passage", "outside_passage", "answer"]).optional(),
   })
   .strict();
 

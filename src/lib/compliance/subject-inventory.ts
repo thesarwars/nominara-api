@@ -108,7 +108,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   geo_alignments: {
     columns:
       "id workspace_id project_id task_id target_url prompt_cluster_id engine_keys embedding_model embedding_dims centroid_source_count centroid_domains live_content_md draft_content_md baseline_alignment current_alignment target_band_low target_band_high percentile_vs_corpus coverage_ratio recommendations status created_by created_at updated_at",
-    omit: "centroid analysis_state analysis_reason draft_state draft_recompute_due_at",
+    omit: "centroid analysis_state analysis_reason draft_state draft_recompute_due_at page_structure",
   },
   geo_analyses: {
     columns:
@@ -212,7 +212,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
   },
   tracked_prompts: {
     columns:
-      "id workspace_id project_id generation_batch_id generation_source text intent_archetype funnel_stage generator_meta cluster_id is_priority stability_score superseded_by last_captured_at status created_at updated_at deleted_at first_activated_at activation_credits paused_by_downgrade_at embedding_model",
+      "id workspace_id project_id generation_batch_id generation_source text intent_archetype funnel_stage generator_meta cluster_id is_priority stability_score superseded_by last_captured_at status created_at updated_at deleted_at first_activated_at activation_credits paused_by_downgrade_at embedding_model status_changed_at",
     omit: "text_hash embedding",
   },
   workspace_invitations: {
@@ -300,6 +300,8 @@ export const SUBJECT_INVENTORY: Readonly<Record<string, InventoryEntry>> = Objec
   share_token_views: exportOf("share_token_views"),
   share_tokens: exportOf("share_tokens"),
   source_domains: exempt(WORKSPACE_CONFIG),
+  name_match_judge_usage: exempt("Per-workspace monthly count of matches sent to the name-match model: a number, no text, no person."),
+  name_match_verdicts: exempt("Model verdict on a brand-name match: ids, a judge version and a label, no answer text and no person."),
   prompt_generations: exempt("Background prompt-generation pass: the request and the result hold brand vocabulary and prompt text, no person."),
   sso_configurations: exportOf("sso_configurations"),
   stripe_subscription_syncs: exempt("Billing sync log keyed by workspace; references no person."),

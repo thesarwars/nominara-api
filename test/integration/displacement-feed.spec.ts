@@ -192,6 +192,7 @@ describe("NEW-C-5 · displacement feed, dismiss and restore", () => {
     expect(item!.citation_gap.map((g) => g.domain)).toEqual(["seed.com", "closed.com", "unknown.com"]);
     expect(Object.keys(item!.citation_gap[0]!).sort()).toEqual(["brand_present", "domain", "held_by", "source_class", "url"]);
     expect(item!.recovery_task_count).toBe(2);
+    expect(item!.passage_scoped_engines).toEqual(["google_aio", "google_ai_mode"]); // STORY-057 AC3: the engines whose gap is passage-scoped, served with every row
   });
 
   it("NEW-C-5 AC1 — a seedable domain of ANOTHER workspace does not count", async () => {

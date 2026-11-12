@@ -27,6 +27,11 @@ export interface RefreshProjectGeoOptions {
   /** The window ends on this day (UTC, inclusive). Defaults to now. */
   asOf?: Date;
   windowDays?: 7 | 30 | 90;
+  /**
+   * STORY-191 - the name-match judge in force (`judgeInForce(env)`): the heuristic's identity when no model is bound, else the model's version. Defaults to
+   * the HEURISTIC, so a caller that does not say publishes nothing (owner decision 17): the guard is on the default path.
+   */
+  judge?: string;
 }
 
 /** Recompute A3 and A6 for one project; a recompute of the same window replaces each row. Returns A3's. */
@@ -78,7 +83,7 @@ export async function refreshProjectGeo(
   const entity = await writeGeoAnalysis(
     tx,
     projectId,
-    buildEntity(await loadEntityInput(tx, projectId, windowStart, windowDays)).write,
+    buildEntity(await loadEntityInput(tx, projectId, windowStart, windowDays, options.judge)).write,
   );
   incrementCounter("nominara_geo_entity_recompute_total", { sufficient: String(entity.sufficient) });
   logger.log({

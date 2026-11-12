@@ -43,6 +43,14 @@ export interface CrawlGateOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly robotsTtlMs?: number;
   readonly failureTtlMs?: number;
+  /**
+   * Owner decision 99(j): a NARROW, documented exemption from the robots check. A request this accepts is sent without reading the host's robots.txt (the
+   * SSRF guard underneath and the per-host budget still apply, and `exemptCrawlDelaySeconds` can make that budget stricter). Judged on every redirect hop.
+   * The shared `crawlGatedFetch` has none; a caller builds its own gate with an enumerated predicate (src/lib/geo/entity-probe/wikimedia-gate.ts).
+   */
+  readonly robotsExempt?: (url: URL) => boolean;
+  /** The minimum spacing, in seconds, between requests to a host while exempt requests are made to it. */
+  readonly exemptCrawlDelaySeconds?: number;
 }
 
 interface HostState {
@@ -110,7 +118,10 @@ export function createCrawlGate(options: CrawlGateOptions = {}): FetchLike {
   async function gateOne(url: URL, init: GuardedFetchInit): Promise<GuardedResponse> {
     const state = stateFor(url.host.toLowerCase());
     const isRobotsFile = url.pathname === "/robots.txt";
-    if (!isRobotsFile) {
+    if (!isRobotsFile && options.robotsExempt?.(url) === true) {
+      if (options.exemptCrawlDelaySeconds !== undefined) state.budget.setCrawlDelay(options.exemptCrawlDelaySeconds);
+      await state.budget.acquire("page");
+    } else if (!isRobotsFile) {
       const robots = await robotsFor(url.origin, state);
       if (robots === "unavailable") throw refuse("robots_unavailable");
       if (robots !== null && !isAllowed(robots, CRAWL_AGENT, `${url.pathname}${url.search}`)) throw refuse("robots_disallowed");

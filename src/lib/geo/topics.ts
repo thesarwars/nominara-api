@@ -85,6 +85,70 @@ export function achievability(current: number | null, target: number | null): nu
 const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 const round = (n: number): number => Math.round(n * 1e6) / 1e6;
 
+type TrackedAuthority = { entity: TopicEntity; sov: number; presence: number; authority: number };
+
+/** One topic's authority for every tracked entity, its owner and the brand's, and the gap. Pure; shared by the analysis and the stored columns. */
+function scoreTopic(t: TopicInput, tracked: readonly TopicEntity[]) {
+  const authorities: TrackedAuthority[] = tracked.map((e) => {
+    const cells: Cell[] = t.cells.map((c) => {
+      const denominator = c.entities.reduce((s, x) => s + x.prominence, 0);
+      const mine = c.entities.filter((x) => x.key === e.key).reduce((m, x) => Math.max(m, x.prominence), 0);
+      return { status: "answered", engineWeight: c.engineWeight, sov: denominator > 0 ? mine / denominator : 0, brandPresent: mine > 0 };
+    });
+    const sov = shareOfVoice(cells) ?? 0;
+    const presence = presenceRate(cells) ?? 0;
+    return { entity: e, sov, presence, authority: sov * presence };
+  });
+  // argmax; ties go to the brand, then to the label, so input order never decides.
+  const ranked = [...authorities].sort(
+    (a, b) => b.authority - a.authority || (a.entity.type === "brand" ? -1 : 0) - (b.entity.type === "brand" ? -1 : 0) || byText(a.entity.label, b.entity.label),
+  );
+  const owner = ranked[0]!;
+  const mine = authorities.find((a) => a.entity.type === "brand")!;
+  const ach = achievability(t.currentAlignment, t.targetAlignment);
+  const gap = ach === null ? null : t.commercialIntent * Math.max(0, owner.authority - mine.authority) * ach;
+  return { t, authorities, ranked, owner, mine, ach, gap };
+}
+
+/** STORY-188 - what the rollup stores on `topic_clusters` for one cluster. Null where the figure cannot be measured. */
+export interface TopicPerformanceColumns {
+  clusterId: string;
+  /** The brand's 1-based place among the tracked entities by authority; null when no one has authority in the topic. */
+  authorityRank: number | null;
+  /** The tracked entity key that owns the topic (`brand`, or a competitor id); null when no one has authority. */
+  leaderKey: string | null;
+  gapPriority: number | null;
+  achievability: number | null;
+}
+
+/**
+ * STORY-188 - the denormalised per-cluster columns, from the SAME A5 code as the persisted `topics` analysis (no second formula).
+ *
+ * The authority columns share that analysis's sufficiency rule: under `TOPIC_MIN_ANSWERS` parsed answers across `TOPIC_MIN_TOPICS` topics
+ * they are null, as is a topic with no answer in the window. `achievability` needs only the alignment, so it is reported whenever an
+ * alignment was measured; it is null (not 0) when none was.
+ */
+export function topicPerformanceColumns(input: TopicsGeoInput): TopicPerformanceColumns[] {
+  const live = input.topics.filter((t) => t.cells.length > 0);
+  const answers = live.reduce((n, t) => n + t.cells.length, 0);
+  const sufficient = answers >= TOPIC_MIN_ANSWERS && live.length >= TOPIC_MIN_TOPICS;
+  const tracked = input.entities.filter((e) => e.type === "brand" || e.type === "competitor");
+  if (sufficient && !tracked.some((e) => e.type === "brand")) throw new RangeError("topical authority needs the brand among the tracked entities");
+  return input.topics.map((t) => {
+    const ach = achievability(t.currentAlignment, t.targetAlignment);
+    if (!sufficient || t.cells.length === 0) return { clusterId: t.clusterId, authorityRank: null, leaderKey: null, gapPriority: null, achievability: ach };
+    const scored = scoreTopic(t, tracked);
+    const anyone = scored.owner.authority > 0;
+    return {
+      clusterId: t.clusterId,
+      authorityRank: anyone ? scored.ranked.findIndex((a) => a.entity.type === "brand") + 1 : null,
+      leaderKey: anyone ? scored.owner.entity.key : null,
+      gapPriority: scored.gap,
+      achievability: ach,
+    };
+  });
+}
+
 /** Pure: the persisted row and the read detail from one aggregate, so they cannot disagree. */
 export function buildTopics(input: TopicsGeoInput): { write: GeoAnalysisWrite; detail: GeoTopicsDetail | null } {
   const base = { analysis: "topics" as const, window_start: input.windowStart, window_days: input.windowDays, score: null, score_label: null };
@@ -110,27 +174,7 @@ export function buildTopics(input: TopicsGeoInput): { write: GeoAnalysisWrite; d
   const brand = tracked.find((e) => e.type === "brand");
   if (brand === undefined) throw new RangeError("topical authority needs the brand among the tracked entities");
 
-  const rows = live.map((t) => {
-    const authorities = tracked.map((e) => {
-      const cells: Cell[] = t.cells.map((c) => {
-        const denominator = c.entities.reduce((s, x) => s + x.prominence, 0);
-        const mine = c.entities.filter((x) => x.key === e.key).reduce((m, x) => Math.max(m, x.prominence), 0);
-        return { status: "answered", engineWeight: c.engineWeight, sov: denominator > 0 ? mine / denominator : 0, brandPresent: mine > 0 };
-      });
-      const sov = shareOfVoice(cells) ?? 0;
-      const presence = presenceRate(cells) ?? 0;
-      return { entity: e, sov, presence, authority: sov * presence };
-    });
-    // argmax; ties go to the brand, then to the label, so input order never decides.
-    const ranked = [...authorities].sort(
-      (a, b) => b.authority - a.authority || (a.entity.type === "brand" ? -1 : 0) - (b.entity.type === "brand" ? -1 : 0) || byText(a.entity.label, b.entity.label),
-    );
-    const owner = ranked[0]!;
-    const mine = authorities.find((a) => a.entity.type === "brand")!;
-    const ach = achievability(t.currentAlignment, t.targetAlignment);
-    const gap = ach === null ? null : t.commercialIntent * Math.max(0, owner.authority - mine.authority) * ach;
-    return { t, authorities, owner, mine, ach, gap };
-  });
+  const rows = live.map((t) => scoreTopic(t, tracked));
 
   // Top decile of gap_priority over the topics that have one; at least one topic.
   const withGap = rows.filter((r) => r.gap !== null).sort((a, b) => b.gap! - a.gap! || byText(a.t.label, b.t.label) || byText(a.t.clusterId, b.t.clusterId));

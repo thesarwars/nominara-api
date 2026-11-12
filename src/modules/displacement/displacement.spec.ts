@@ -91,11 +91,23 @@ describe("NEW-C-5 · contract (AC1)", () => {
     task_id: null,
     recovery_task_count: 0,
     data_source: "live",
+    passage_scoped_engines: ["google_aio", "google_ai_mode"],
   };
 
   it("AC1 — a complete item parses, and an unknown key is refused (.strict())", () => {
     expect(displacementItemSchema.safeParse(item).success).toBe(true);
     expect(displacementItemSchema.safeParse({ ...item, extra: 1 }).success).toBe(false);
+  });
+
+  it("STORY-057 AC3 - the item names the engines whose citation gap can be passage-scoped; a gap entry's scope is passage or answer, and optional on rows stored before it", () => {
+    expect(displacementItemSchema.safeParse({ ...item, passage_scoped_engines: [] }).success).toBe(true);
+    expect(displacementItemSchema.safeParse({ ...item, passage_scoped_engines: undefined }).success).toBe(false);
+    expect(displacementItemSchema.safeParse({ ...item, passage_scoped_engines: ["gemini"] }).success).toBe(false); // an enum over PASSAGE_SCOPED_ENGINES, not any string
+    const entry = { url: "https://r.example/a", domain: "r.example", source_class: "vendor_owned", held_by: ["Rival"], brand_present: null };
+    expect(displacementItemSchema.safeParse({ ...item, citation_gap: [{ ...entry, scope: "passage" }] }).success).toBe(true);
+    expect(displacementItemSchema.safeParse({ ...item, citation_gap: [entry] }).success).toBe(true);
+    expect(displacementItemSchema.safeParse({ ...item, citation_gap: [{ ...entry, scope: "outside_passage" }] }).success).toBe(true);
+    expect(displacementItemSchema.safeParse({ ...item, citation_gap: [{ ...entry, scope: "paragraph" }] }).success).toBe(false);
   });
 
   it("AC1 — a row without before_result_id or after_result_id cannot be expressed", () => {

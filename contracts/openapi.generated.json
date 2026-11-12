@@ -43908,6 +43908,9 @@
                               },
                               "basis": {
                                 "type": "string"
+                              },
+                              "basis_url": {
+                                "type": "string"
                               }
                             },
                             "required": [
@@ -44313,6 +44316,9 @@
                                 "maximum": 1
                               },
                               "basis": {
+                                "type": "string"
+                              },
+                              "basis_url": {
                                 "type": "string"
                               }
                             },
@@ -44987,6 +44993,14 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "scope": {
+                                "type": "string",
+                                "enum": [
+                                  "passage",
+                                  "outside_passage",
+                                  "answer"
+                                ]
                               }
                             },
                             "required": [
@@ -44997,6 +45011,16 @@
                               "brand_present"
                             ],
                             "additionalProperties": false
+                          }
+                        },
+                        "passage_scoped_engines": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "google_aio",
+                              "google_ai_mode"
+                            ]
                           }
                         },
                         "concept_gap": {
@@ -45097,6 +45121,7 @@
                         "after_position_class",
                         "takers",
                         "citation_gap",
+                        "passage_scoped_engines",
                         "concept_gap",
                         "impact_score",
                         "recovered_at",

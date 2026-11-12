@@ -77,6 +77,10 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0190_platform_metrics_aggregate",
       // STORY-045 (owner decision 95a) - the tenth post-0006 tenant table (prompt_generations); its policy ships in migration 0193.
       "0193_prompt_generations",
+      // STORY-191 (owner decision 99c) - the eleventh post-0006 tenant table (name_match_verdicts); its policy ships in migration 0197.
+      "0197_name_match_verdicts",
+      // STORY-191 fix round (owner decision 99l) - the twelfth post-0006 tenant table (name_match_judge_usage); its policy ships in migration 0202.
+      "0202_name_match_judge_usage",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

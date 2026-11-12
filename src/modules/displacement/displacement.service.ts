@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import {
   citationGapSchema,
+  PASSAGE_SCOPED_ENGINES,
   conceptGapSchema,
   displacedBySchema,
   type DisplacementDismissalResponse,
@@ -158,6 +159,7 @@ export class DisplacementService {
           after_position_class: row.after_position_class,
           takers: p.takers,
           citation_gap: p.citationGap,
+          passage_scoped_engines: [...PASSAGE_SCOPED_ENGINES],
           concept_gap: p.conceptGap,
           impact_score: row.impact_score,
           recovered_at: row.recovered_at?.toISOString() ?? null,

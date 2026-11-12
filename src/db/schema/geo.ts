@@ -95,6 +95,7 @@ export const geoAlignments = pgTable("geo_alignments", {
   analysisReason: text("analysis_reason"),
   draftState: text("draft_state"),
   draftRecomputeDueAt: timestamp("draft_recompute_due_at", { withTimezone: true }),
+  pageStructure: jsonb("page_structure"),
 });
 
 export const geoAnalyses = pgTable("geo_analyses", {
@@ -114,6 +115,25 @@ export const geoAnalyses = pgTable("geo_analyses", {
   scoringVersion: text("scoring_version").notNull().default(sql`'v1'::text`),
   computedAt: timestamp("computed_at", { withTimezone: true }).notNull().default(sql`now()`),
 }, (table) => [primaryKey({ columns: [table.projectId, table.analysis, table.windowStart, table.windowDays, table.scoringVersion] })]);
+
+export const nameMatchJudgeUsage = pgTable("name_match_judge_usage", {
+  workspaceId: uuid("workspace_id").notNull(),
+  month: date("month", { mode: "string" }).notNull(),
+  matchesSent: integer("matches_sent").notNull().default(sql`0`),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+}, (table) => [primaryKey({ columns: [table.workspaceId, table.month] })]);
+
+export const nameMatchVerdicts = pgTable("name_match_verdicts", {
+  id: uuid("id").primaryKey(),
+  workspaceId: uuid("workspace_id").notNull(),
+  projectId: uuid("project_id").notNull(),
+  mentionFactId: uuid("mention_fact_id").notNull(),
+  capturedAt: timestamp("captured_at", { withTimezone: true }).notNull(),
+  judgeVersion: text("judge_version").notNull(),
+  judgeModel: text("judge_model").notNull(),
+  verdict: text("verdict").notNull(),
+  judgedAt: timestamp("judged_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
 
 export const patches = pgTable("patches", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),

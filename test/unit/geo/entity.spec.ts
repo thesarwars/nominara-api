@@ -10,7 +10,9 @@ import {
   ENTITY_MIN_CATEGORY_PASSAGES,
   ENTITY_MIN_NAME_MATCHES,
   ENTITY_NODE_TASK_RULE,
+  HEURISTIC_JUDGE,
   insideUrlOrDomain,
+  isAmbiguousNameMatch,
   judgeNameMatch,
   mentionContext,
   spanOfMention,
@@ -49,6 +51,8 @@ const input = (over: Partial<EntityInput> = {}): EntityInput => ({
   windowStart: "2026-09-08",
   windowDays: 30,
   rootDomain: "acme.com",
+  // A MODEL judge (STORY-191): the figure is publishable. The guard tests below use HEURISTIC_JUDGE.
+  judge: "fixture-model:name-match-v1",
   nodes: KNOWN,
   nameMatches: 100,
   unjudged: 0,
@@ -221,6 +225,44 @@ describe("STORY-060 · A2 entity readiness (pure)", () => {
     expect(detail!.disambiguation.level).toBe("low");
   });
 
+  // STORY-060 E7 / owner decision 99(b): the profile probe checks Wikidata and Wikipedia ONLY, so the missing-node finding (and with it the alert and the
+  // task) must not wait for all seven nodes: a CHECKED, absent, high-weight node is a missing node whatever the other nodes' state.
+  it("E7 · a CHECKED absent high-weight node raises its finding and task rule while the other five nodes are unchecked and the score stays withheld", () => {
+    const { write, detail } = buildEntity(input({ nodes: [absent("wikidata"), absent("wikipedia")] }));
+    expect(write.score).toBeNull();
+    expect(detail!.authority).toMatchObject({ score: null });
+    const missing = write.findings.filter((f) => f.id.startsWith("entity-node-missing"));
+    // wikidata weighs 0.22 (>= 0.18): a finding with the task rule. wikipedia weighs 0.14: none.
+    expect(missing.map((f) => f.id)).toEqual(["entity-node-missing-wikidata"]);
+    expect(missing[0]).toMatchObject({ task_rule_code: ENTITY_NODE_TASK_RULE, severity: "medium", metric: { name: "node_weight", value: 0.22, target: 0.18 } });
+    expect(missing[0]!.evidence.length).toBeGreaterThan(0);
+    expect(detail!.nodes.filter((n) => n.status === "unchecked")).toHaveLength(5);
+    expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
+  });
+
+  it("E7 · a checked, absent, high-weight node is a measured fact: with risk UNMEASURED and no co-occurrence, the missing-node finding is still written (the analysis is not 'insufficient')", () => {
+    const { write, detail } = buildEntity(input({ nodes: [absent("wikidata"), absent("wikipedia")], nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } }));
+    expect(write.sufficient).toBe(true);
+    expect(write.score).toBeNull();
+    expect(write.findings.map((f) => f.id)).toContain("entity-node-missing-wikidata");
+    expect(detail!.disambiguation.level).toBe("unmeasured");
+    expect(geoAnalysisWriteSchema.safeParse(write).success).toBe(true);
+    // ...and with NO node checked, or only present or low-weight nodes, and nothing else measurable it stays insufficient, as before.
+    expect(buildEntity(input({ nodes: [node("wikidata"), absent("wikipedia")], nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } })).write.sufficient).toBe(false);
+    expect(buildEntity(input({ nodes: [], nameMatches: 0, notAboutBrand: 0, cooccurrence: { terms: [], categoryPassages: 0, entities: [] } })).write.sufficient).toBe(false);
+  });
+
+  it("E7 · an UNCHECKED node is never a missing one, and a present high-weight node raises nothing", () => {
+    expect(buildEntity(input({ nodes: [absent("wikipedia")] })).write.findings.some((f) => f.id.startsWith("entity-node-missing"))).toBe(false);
+    expect(buildEntity(input({ nodes: [node("wikidata"), absent("wikipedia")] })).write.findings.some((f) => f.id.startsWith("entity-node-missing"))).toBe(false);
+  });
+
+  it("E7 · the finding does not depend on the judge: the heuristic guard withholds the score, never the missing-node finding", () => {
+    const { write } = buildEntity(input({ nodes: [absent("wikidata")], judge: HEURISTIC_JUDGE }));
+    expect(write.score).toBeNull();
+    expect(write.findings.map((f) => f.id)).toContain("entity-node-missing-wikidata");
+  });
+
   it("co-occurrence: the brand's rate against each competitor's, over the passages that carry a category term", () => {
     const { detail } = buildEntity(input());
     expect(detail!.cooccurrence).toMatchObject({ sufficient: true, reason: null, terms: ["crm"], category_passages: 40 });
@@ -365,5 +407,80 @@ describe("STORY-060 · cased spellings", () => {
   it("a cased alias is accepted as spelled, in capitals and capitalised, never lowercase", () => {
     expect(casedVariants("HubSpot")).toEqual(["HubSpot", "HUBSPOT", "Hubspot"]);
     expect(casedVariants("Notion")).toEqual(["Notion", "NOTION"]);
+  });
+});
+
+// STORY-191 - the owner-decision-17 publish guard, and the matches only a model is asked about.
+
+const ALL_SEVEN_PRESENT: EntityNodeRecord[] = (["wikidata", "wikipedia", "g2", "crunchbase", "linkedin", "github", "category_directory"] as const).map((n) => node(n));
+
+describe("STORY-191 AC8 · the publish guard: no Entity Authority score while the judge in force is the v1 heuristic", () => {
+  it("every node checked, every node complete and linked, risk LOW: the score is still null, suppressed, with a stated reason", () => {
+    const { write, detail } = buildEntity(input({ nodes: ALL_SEVEN_PRESENT, judge: HEURISTIC_JUDGE, nameMatches: 100, notAboutBrand: 1 }));
+    expect(write.score).toBeNull();
+    expect(detail!.authority.score).toBeNull();
+    expect(detail!.authority.suppressed).toBe(true);
+    expect(detail!.authority.reason).toMatch(/v1 case heuristic/iu);
+    // The risk and the node facts are still reported, separately.
+    expect(detail!.disambiguation).toMatchObject({ level: "low", risk: 0.01 });
+    expect(detail!.nodes.every((n) => n.status === "complete")).toBe(true);
+    // No "ready" verdict is issued for a figure that is not published.
+    expect(write.findings.map((f) => f.id)).not.toContain("entity-ready");
+  });
+
+  it("the same input under a MODEL judge publishes (the guard is lifted by binding the judge, and only by that)", () => {
+    const { write, detail } = buildEntity(input({ nodes: ALL_SEVEN_PRESENT, judge: "gemini-2.5-flash:name-match-v1", nameMatches: 100, notAboutBrand: 1 }));
+    expect(write.score).toBe(100);
+    expect(detail!.authority).toEqual({ score: 100, suppressed: false, reason: null });
+    expect(write.findings.map((f) => f.id)).not.toContain("entity-nodes-unchecked");
+  });
+
+  it("no input shape publishes by omission: an empty or unknown judge identity is not the heuristic, but the heuristic identity is the ONLY one the guard names", () => {
+    expect(HEURISTIC_JUDGE).toBe("heuristic-v1");
+    expect(buildEntity(input({ nodes: ALL_SEVEN_PRESENT, judge: "heuristic-v1" })).write.score).toBeNull();
+  });
+});
+
+describe("STORY-191 AC4 · isAmbiguousNameMatch names exactly the matches the v1 heuristic gets wrong or cannot judge", () => {
+  const at = (raw: string, span: string, alias = "Notion") => {
+    const start = raw.indexOf(span);
+    return { alias, span, before: raw.slice(Math.max(0, start - 64), start), after: raw.slice(start + span.length, start + span.length + 16) };
+  };
+
+  it("a capitalised common word at the start of a sentence is ambiguous (the heuristic passes it as the brand)", () => {
+    for (const raw of ["Notion is a concept in philosophy.", "It was late. Notion was not on anyone's mind.", "Stop!\nNotion was a thing", "Why? Notion"]) {
+      const m = at(raw, "Notion");
+      expect(judgeNameMatch(m), raw).toBe("about_brand");
+      expect(isAmbiguousNameMatch(m), raw).toBe(true);
+    }
+  });
+
+  it("a capitalised word inside markup or a heading is ambiguous", () => {
+    for (const raw of ["## Notion", "- **Notion** helps teams", "| Tool | Notion |", "use `Notion` here", "1. Notion"]) {
+      expect(isAmbiguousNameMatch(at(raw, "Notion")), raw).toBe(true);
+    }
+  });
+
+  it("a lowercase-only brand such as monday is ambiguous in every casing (unjudged under v1)", () => {
+    for (const span of ["monday", "Monday", "MONDAY"]) {
+      const m = at(`See you on ${span} then.`, span, "monday");
+      expect(judgeNameMatch(m)).toBe("unjudged");
+      expect(isAmbiguousNameMatch(m)).toBe(true);
+    }
+  });
+
+  it("the matches the heuristic settles firmly are NOT sent to a model", () => {
+    // mid-sentence capitalised use, a URL or domain, the lowercase common word of a cased brand, a misread offset
+    expect(isAmbiguousNameMatch(at("We use Notion daily.", "Notion"))).toBe(false);
+    expect(isAmbiguousNameMatch(at("Open notion.so now", "notion"))).toBe(false);
+    expect(isAmbiguousNameMatch(at("Visit https://www.notion.so/x", "notion"))).toBe(false);
+    expect(isAmbiguousNameMatch(at("That is a notion we like.", "notion"))).toBe(false);
+    expect(isAmbiguousNameMatch({ alias: "Notion", span: "otion " })).toBe(false);
+    expect(isAmbiguousNameMatch({ alias: "Notion", span: "" })).toBe(false);
+  });
+
+  it("judgeNameMatch itself is unchanged: it is still the fallback verdict", () => {
+    expect(judgeNameMatch(at("Notion is a concept.", "Notion"))).toBe("about_brand");
+    expect(judgeNameMatch(at("That is a notion we like.", "notion"))).toBe("not_about_brand");
   });
 });

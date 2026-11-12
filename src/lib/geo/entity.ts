@@ -18,15 +18,15 @@ import { incrementCounter } from "../telemetry/metrics.js";
 // withheld outright when the brand's name collides with common words (`high` disambiguation risk): a figure computed
 // over false positives is worse than none. The risk itself is reported next to the score and never folded into it.
 //
-// TWO GATES, NOT ONE. Only the SCORE (and sameAs coverage and the node-based findings) waits for all seven nodes to be
-// checked. Disambiguation risk and category co-occurrence read `mention_facts` and `corpus_passages`, need no profile
-// data, and are computed and persisted whether or not any node was ever checked: a brand whose name collides with a
-// common word gets its alias-tuning task today, not after a profile probe exists.
+// THREE GATES, NOT ONE. The SCORE and the sameAs coverage figure wait for all seven nodes to be checked, and (owner decision 17, STORY-191) for a MODEL
+// name-match judge: while the judge in force is the v1 heuristic no score is published at all. A missing-node finding waits only for THAT node to be
+// checked (owner decision 99b: the profile probe checks Wikidata and Wikipedia only). Disambiguation risk and category co-occurrence read
+// `mention_facts` and `corpus_passages`, need no profile data, and are computed and persisted whether or not any node was ever checked: a brand whose
+// name collides with a common word gets its alias-tuning task today, not after a profile probe exists.
 //
-// WHAT THIS FILE DOES NOT DO: probe Wikidata, Wikipedia, Crunchbase, LinkedIn, GitHub, G2/Capterra or a category
-// directory. That is network I/O and belongs to a job behind a port, outside any transaction (ADR-0003); the sources
-// and their access terms are an owner decision. `writeEntityNodes` is the one place a check result becomes an
-// `entity_nodes` row, so that job has a single, tested write path to call.
+// WHAT THIS FILE DOES NOT DO: probe Wikidata, Wikipedia, Crunchbase, LinkedIn, GitHub, G2/Capterra or a category directory. That is network I/O and
+// belongs to a job behind a port, outside any transaction (ADR-0003): src/lib/geo/entity-probe probes Wikidata and Wikipedia (STORY-060 E1/E3); the
+// other five are not probed. `writeEntityNodes` is the one place a check result becomes an `entity_nodes` row, so that job has a single, tested write path.
 
 /** The stored `entity_nodes.node` vocabulary. */
 export type StoredEntityNode = "wikidata" | "wikipedia" | "g2" | "capterra" | "crunchbase" | "linkedin" | "github" | "category_directory";
@@ -86,6 +86,11 @@ export interface EntityInput {
   windowStart: string;
   windowDays: 7 | 30 | 90;
   rootDomain: string;
+  /**
+   * The name-match judge in force for this analysis (STORY-191): `HEURISTIC_JUDGE` (the v1 case heuristic) or a model judge's version string.
+   * REQUIRED, with no default, so no caller can publish by omission: owner decision 17 keeps the authority score null while it is the heuristic.
+   */
+  judge: string;
   nodes: EntityNodeRecord[];
   /** Brand-name matches in the window (mention rows). */
   nameMatches: number;
@@ -95,6 +100,9 @@ export interface EntityInput {
   notAboutBrand: number;
   cooccurrence: { terms: string[]; categoryPassages: number; entities: { name: string; isBrand: boolean; passages: number }[] };
 }
+
+/** The identity of the v1 case heuristic (`judgeNameMatch`). Owner decision 17: no authority score is published while this is the judge in force. */
+export const HEURISTIC_JUDGE = "heuristic-v1";
 
 const round3 = (x: number): number => Math.round(x * 1_000) / 1_000;
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
@@ -166,8 +174,10 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
       ? "Authoritative profiles have not been checked for this project yet; the Entity Authority score needs all seven nodes checked."
       : `These authoritative nodes have not been checked yet: ${unchecked.map((n) => n.node).join(", ")}. The score needs all seven.`;
 
-  // Nothing at all is measurable: say so, publish nothing else.
-  if (!allChecked && level === "unmeasured" && !coSufficient) {
+  // Nothing at all is measurable: say so, publish nothing else. The one exception is a CHECKED, ABSENT, high-weight node (owner decision 99b): that is a
+  // measured fact with a finding to raise, and it must be able to fire while risk and co-occurrence are still unmeasured.
+  const missingHighWeight = nodes.some((n) => n.checked && !n.present && ENTITY_NODE_WEIGHTS[n.node] >= ENTITY_ALERT_MIN_WEIGHT);
+  if (!allChecked && level === "unmeasured" && !coSufficient && !missingHighWeight) {
     return {
       write: {
         ...base,
@@ -192,15 +202,22 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
 
   // Unmeasured risk withholds too: a score we cannot show is free of false positives is not a score we can trust.
   const unmeasuredRisk = level === "unmeasured";
-  const suppressed = highRisk || unmeasuredRisk;
+  // OWNER DECISION 17 - THE PUBLISH GUARD. While the judge in force is the v1 case heuristic (sentence-initial and markup-wrapped capitalised uses pass as
+  // "about the brand", so the risk is biased low) no Entity Authority score is published, whatever the nodes and the measured risk say. STORY-191 lifts
+  // this by binding a model judge: the guard fires on the judge's identity alone and nothing else may bypass it.
+  const heuristicJudge = input.judge === HEURISTIC_JUDGE;
+  const suppressed = highRisk || unmeasuredRisk || heuristicJudge;
+  const heuristicReason = "Disambiguation risk was judged by the v1 case heuristic, which undercounts false positives, so the Entity Authority score is withheld until a model judge is bound (owner decision 17).";
   const unmeasuredReason = `Disambiguation risk cannot be measured yet (${String(judged)} judged brand-name matches of the ${String(ENTITY_MIN_NAME_MATCHES)} it needs), so the Entity Authority score cannot be shown to be free of false positives and is withheld.`;
   const reason = highRisk
     ? `Disambiguation risk is high (${pct(riskRaw!)} of ${String(judged)} judged name matches are not about this brand), so the Entity Authority score would be computed over false positives and is withheld. Tune the brand's aliases first.${allChecked ? "" : ` ${notCheckedReason}`}`
     : unmeasuredRisk
       ? `${unmeasuredReason}${allChecked ? "" : ` ${notCheckedReason}`}`
-      : allChecked
-        ? null
-        : notCheckedReason;
+      : heuristicJudge
+        ? `${heuristicReason}${allChecked ? "" : ` ${notCheckedReason}`}`
+        : allChecked
+          ? null
+          : notCheckedReason;
   const score = suppressed ? null : authority;
 
   const detailNodes = nodes.map((n) => {
@@ -266,8 +283,9 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
     });
   }
 
-  // Node-based findings need every node checked: an unchecked node is not an absent one.
-  for (const n of allChecked ? nodes : []) {
+  // A missing-node finding needs THAT node checked, not all seven (owner decision 99(b): the profile probe checks Wikidata and Wikipedia only, and the
+  // alert and task for a missing high-weight node must still fire): an unchecked node is not an absent one, a checked absent one is.
+  for (const n of nodes.filter((node) => node.checked)) {
     if (n.present || ENTITY_NODE_WEIGHTS[n.node] < ENTITY_ALERT_MIN_WEIGHT) continue;
     findings.push({
       id: `entity-node-missing-${n.node}`,
@@ -311,7 +329,7 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
   // The detail rides on the first finding, so a row with none would drop it: a brand with nothing to act on gets an explicit no-action verdict.
   if (findings.length === 0) {
     findings.push(
-      allChecked && !unmeasuredRisk
+      allChecked && !unmeasuredRisk && !heuristicJudge
         ? {
             id: "entity-ready",
             severity: "info",
@@ -326,9 +344,11 @@ export function buildEntity(input: EntityInput): { write: GeoAnalysisWrite; deta
             severity: "info",
             headline: unmeasuredRisk
               ? "Disambiguation risk is not yet measurable; the Entity Authority score waits for enough brand-name matches."
-              : `Disambiguation risk is ${level}; the Entity Authority score waits for the authoritative profiles to be checked.`,
-            detail: unmeasuredRisk ? unmeasuredReason : notCheckedReason,
-            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(judged)} judged brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` }],
+              : !allChecked
+                ? `Disambiguation risk is ${level}; the Entity Authority score waits for the authoritative profiles to be checked.`
+                : `Disambiguation risk is ${level}; the Entity Authority score waits for a model name-match judge.`,
+            detail: unmeasuredRisk ? unmeasuredReason : !allChecked ? notCheckedReason : heuristicReason,
+            evidence: [{ url: home, snippet: unmeasuredRisk ? `${String(judged)} judged brand-name matches; ${String(ENTITY_MIN_NAME_MATCHES)} are needed.` : !allChecked ? `${String(unchecked.length)} of ${String(nodes.length)} scored nodes have not been checked.` : `The judge in force is ${input.judge}.` }],
             metric: unmeasuredRisk ? { name: "name_matches", value: judged, target: ENTITY_MIN_NAME_MATCHES } : { name: "unchecked_nodes", value: unchecked.length },
             no_action: true,
           },
@@ -419,8 +439,8 @@ export async function writeEntityNodes(tx: ClientBase, projectId: string, checks
  * "unjudged" (counted as matches, outside the risk denominator), never guessed to be about the brand; so is a span that is
  * not the alias once folded (a misread offset). The heuristic undercounts false positives (sentence-initial and
  * markup-wrapped capitalised uses pass), so risk is biased low.
- * FOLLOW-UP, not started: a model-assisted judge behind this same signature, run outside the transaction. No job may
- * publish Entity Authority in production until it lands.
+ * STORY-191 binds a model judge for the matches `isAmbiguousNameMatch` names; this heuristic stays the fallback when no model is
+ * configured, and the verdict for every match the model is not asked about.
  */
 export function judgeNameMatch(match: { alias: string; span: string; before?: string; after?: string }): "about_brand" | "not_about_brand" | "unjudged" {
   // A span that is not the alias once folded the way the matcher folds is a misread offset: no evidence either way.
@@ -431,6 +451,32 @@ export function judgeNameMatch(match: { alias: string; span: string; before?: st
   if (insideUrlOrDomain(match.before ?? "", match.after ?? "")) return "about_brand";
   const spanIsLower = match.span !== "" && match.span === match.span.toLowerCase() && match.span !== match.span.toUpperCase();
   return spanIsLower ? "not_about_brand" : "about_brand";
+}
+
+/** A match at the start of a line, optionally behind list, quote, heading, table or emphasis markers: a capitalised word here is capitalised by position. */
+const LINE_START = /(?:^|\n)[ \t]*(?:(?:[#>*_`~|]+|[-+\u2022]|\d+[.)])[ \t]*)*$/u;
+/** After a sentence end (with any closing quote or emphasis mark): the same. */
+const AFTER_SENTENCE_END = /[.!?:]["')\]*_]*\s+$/u;
+/** Wrapped in markup: emphasis, code, link text, a table cell or a heading marker on either side. */
+const MARKUP_BEFORE = /(?:[*_`[~]|\|[ \t]*)$/u;
+const MARKUP_AFTER = /^[*_`\]|~]/u;
+
+/**
+ * STORY-191 - the matches the v1 heuristic cannot settle, and so the only ones a model is asked about (owner decision 99c):
+ *  - the brand has no uppercase letter ("monday"), so case carries no signal (`judgeNameMatch` says `unjudged`);
+ *  - a capitalised span at the start of a sentence or line, or wrapped in markup (heading, emphasis, link text, table cell), where capital letters
+ *    come from position and the heuristic passes a common word as the brand.
+ * NOT ambiguous: a span that does not fold back to the alias (a misread offset, which no model can repair), a span inside a URL or domain (the
+ * brand's own address) and a lowercase span of a capitalised brand (the common word). Those the heuristic settles.
+ */
+export function isAmbiguousNameMatch(match: { alias: string; span: string; before?: string; after?: string }): boolean {
+  if (fold(match.span).folded !== fold(match.alias).folded) return false;
+  if (match.alias === match.alias.toLowerCase()) return true;
+  const before = match.before ?? "";
+  const after = match.after ?? "";
+  if (insideUrlOrDomain(before, after)) return false;
+  if (match.span === match.span.toLowerCase() && match.span !== match.span.toUpperCase()) return false;
+  return LINE_START.test(before) || AFTER_SENTENCE_END.test(before) || MARKUP_BEFORE.test(before) || MARKUP_AFTER.test(after);
 }
 
 /** True when the span is part of a domain token (a TLD follows it), markdown link text, or a URL (a scheme or `www.` precedes it in the same token). */
@@ -475,15 +521,21 @@ export function spanOfMention(rawText: string | null, charStart: number, charEnd
   return text.slice(charStart, charEnd);
 }
 
+export interface ContextWindow {
+  readonly before: number;
+  readonly after: number;
+}
+const HEURISTIC_WINDOW: ContextWindow = { before: 64, after: 16 };
+
 /** The span with a little text each side, for judging; null under the same conditions as `spanOfMention`. */
-export function mentionContext(rawText: string | null, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
-  return rawText === null ? null : contextOfNormalised(normalize(rawText), charStart, charEnd);
+export function mentionContext(rawText: string | null, charStart: number, charEnd: number, window: ContextWindow = HEURISTIC_WINDOW): { span: string; before: string; after: string } | null {
+  return rawText === null ? null : contextOfNormalised(normalize(rawText), charStart, charEnd, window);
 }
 
 /** `mentionContext` over text that is already normalised. */
-function contextOfNormalised(text: string, charStart: number, charEnd: number): { span: string; before: string; after: string } | null {
+export function contextOfNormalised(text: string, charStart: number, charEnd: number, window: ContextWindow = HEURISTIC_WINDOW): { span: string; before: string; after: string } | null {
   if (charStart < 0 || charEnd <= charStart || charEnd > text.length) return null;
-  return { span: text.slice(charStart, charEnd), before: text.slice(Math.max(0, charStart - 64), charStart), after: text.slice(charEnd, charEnd + 16) };
+  return { span: text.slice(charStart, charEnd), before: text.slice(Math.max(0, charStart - window.before), charStart), after: text.slice(charEnd, charEnd + window.after) };
 }
 
 // ------------------------------------------------------------------ loader
@@ -512,7 +564,7 @@ export function categoryTerms(categorySlug: string | null, verticals: readonly s
 }
 
 /** Reads the window's facts. Must run inside the ambient tenant transaction: RLS is the guarantee, `project_id` is for the planner. */
-export async function loadEntityInput(tx: ClientBase, projectId: string, windowStart: string, windowDays: 7 | 30 | 90): Promise<EntityInput> {
+export async function loadEntityInput(tx: ClientBase, projectId: string, windowStart: string, windowDays: 7 | 30 | 90, judge: string = HEURISTIC_JUDGE): Promise<EntityInput> {
   const project = await tx.query<{ root_domain: string; name: string; brand_aliases: string[]; category_slug: string | null; verticals: string[] }>(
     "SELECT root_domain, name, brand_aliases, category_slug, verticals FROM projects WHERE id = $1 AND deleted_at IS NULL",
     [projectId],
@@ -529,17 +581,20 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
   // offsets are UTF-16 indices into the normalised string, which SQL `substr` over the raw payload cannot honour.
   // The text is resolved as the parser resolves it (capture-parse `reusedTextOf`): an L2-reused row carries `{}` and a
   // `source_result_id`, its mentions were matched against the SOURCE row's text, so that is where their offsets point.
-  const captures = await tx.query<{ text: string | null; mentions: [string, number, number][] }>(
+  // STORY-191: each mention also carries the verdict a MODEL judge stored for it under `$5` (null when none). `$5` is the judge in force; the
+  // heuristic's identity matches no stored row, because the heuristic is pure and recomputed, never stored.
+  const captures = await tx.query<{ text: string | null; mentions: [string, number, number, string | null][] }>(
     `SELECT min(COALESCE(NULLIF(ac.payload ->> 'text', ''), NULLIF(src.payload ->> 'text', ''))) AS text,
-            json_agg(json_build_array(mf.matched_alias, mf.char_start, mf.char_end)) AS mentions
+            json_agg(json_build_array(mf.matched_alias, mf.char_start, mf.char_end, v.verdict)) AS mentions
        FROM mention_facts mf
+       LEFT JOIN name_match_verdicts v ON v.mention_fact_id = mf.id AND v.captured_at = mf.captured_at AND v.workspace_id = mf.workspace_id AND v.judge_version = $5
        LEFT JOIN answer_captures ac ON ac.id = mf.result_id AND ac.captured_at = mf.captured_at AND ac.workspace_id = mf.workspace_id AND ac.project_id = mf.project_id
        LEFT JOIN answer_captures src ON src.id = ac.source_result_id AND src.workspace_id = ac.workspace_id AND src.project_id = ac.project_id
       WHERE mf.project_id = $1 AND mf.entity_type = 'brand' AND mf.scoring_version = $4
         AND mf.captured_at >= ($2::date::timestamp AT TIME ZONE 'UTC')
         AND mf.captured_at <  ($2::date::timestamp AT TIME ZONE 'UTC') + make_interval(days => $3)
       GROUP BY mf.result_id, mf.captured_at`,
-    [projectId, windowStart, windowDays, SCORING_VERSION],
+    [projectId, windowStart, windowDays, SCORING_VERSION, judge],
   );
   // The parser may store the folded alias; judge against the cased spelling the project actually holds.
   const cased = casedSpellings([p.name, ...p.brand_aliases]);
@@ -549,11 +604,18 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
   for (const c of captures.rows) {
     // Normalised once per capture, not once per mention.
     const text = c.text === null ? null : normalize(c.text);
-    for (const [alias, start, end] of c.mentions) {
+    for (const [alias, start, end, stored] of c.mentions) {
       nameMatches += 1;
       // A span that cannot be read (answer text no longer held), or that the case heuristic cannot judge, is counted as a match, reported as unjudged, and never as a false positive.
       const ctx = text === null ? null : contextOfNormalised(text, start, end);
-      const verdict = ctx === null ? "unjudged" : judgeNameMatch({ alias: cased.get(fold(alias).folded) ?? alias, ...ctx });
+      const cas = cased.get(fold(alias).folded) ?? alias;
+      let verdict: "about_brand" | "not_about_brand" | "unjudged";
+      if (stored === "about_brand" || stored === "not_about_brand" || stored === "unjudged") verdict = stored;
+      else if (ctx === null) verdict = "unjudged";
+      // With a model judge in force, a match the heuristic cannot settle and the model has not (yet) judged is UNJUDGED - never the heuristic's guess,
+      // which passes a capitalised common word as the brand. It is reported, kept out of the risk denominator, and judged when the job next runs.
+      else if (judge !== HEURISTIC_JUDGE && isAmbiguousNameMatch({ alias: cas, ...ctx })) verdict = "unjudged";
+      else verdict = judgeNameMatch({ alias: cas, ...ctx });
       if (verdict === "unjudged") unjudged += 1;
       else if (verdict === "not_about_brand") notAboutBrand += 1;
     }
@@ -604,6 +666,7 @@ export async function loadEntityInput(tx: ClientBase, projectId: string, windowS
     windowStart,
     windowDays,
     rootDomain: p.root_domain,
+    judge,
     nodes: nodes.rows.map((r) => ({ node: r.node, present: r.present, complete: r.complete, url: r.url, missingFields: r.missing_fields, inBrandSameas: r.in_brand_sameas })),
     nameMatches,
     unjudged,

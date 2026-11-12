@@ -9,7 +9,11 @@ import { datesWithFacts } from "../../rollup/aggregate-day.js";
 import { refreshProjectDisplacements } from "../../rollup/refresh-project-displacements.js";
 import { refreshProjectSourceIndex } from "../../rollup/refresh-project-source-index.js";
 import { refreshProjectMilestones } from "../../rollup/refresh-project-milestones.js";
+import { refreshProjectTopicClusters } from "../../rollup/refresh-project-topic-clusters.js";
 import { rollUpDay } from "../../rollup/roll-up-day.js";
+import { HEURISTIC_JUDGE } from "../../geo/entity.js";
+import { judgeInForce } from "../../geo/name-match-judge/select.js";
+import { entityProbeKey, nameMatchJudgeKey } from "../../../../contracts/analytics/index.js";
 import { afterCommit, currentTenantStore } from "../../../tenancy/tenant-context.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { withProjectQueueLock } from "../locks.js";
@@ -53,12 +57,20 @@ export type EnqueueVerifyPresence = (workspaceId: string, payload: { projectId: 
 /** STORY-063 — enqueues one `task.generate` job for a project and workspace-local day. Injected in tests. */
 export type EnqueueTaskGenerate = (workspaceId: string, payload: { projectId: string; metricDate: string }, idempotencyKey: string) => Promise<unknown>;
 
+/** STORY-191 - enqueues one `geo.analyze` name-match judging job for a project (owner decision 99c). Injected in tests. */
+export type EnqueueNameMatchJudge = (workspaceId: string, payload: { kind: "name_match_judge"; projectId: string; judgeVersion: string; day: string }, idempotencyKey: string) => Promise<unknown>;
+
+/** STORY-060 E1 - enqueues one `geo.analyze` entity-profile probe job for a project (owner decision 99b). Injected in tests. */
+export type EnqueueEntityProbe = (workspaceId: string, payload: { kind: "entity_probe"; projectId: string; day: string }, idempotencyKey: string) => Promise<unknown>;
+
 /** SLO-14: parse to metric visible, p95 at most 15 minutes. */
 export const ROLLUP_FRESHNESS_SLO_SECONDS = 15 * 60;
 
 export interface RollupMetricDailyDeps {
   readonly enqueueVerifyPresence?: EnqueueVerifyPresence;
   readonly enqueueTaskGenerate?: EnqueueTaskGenerate;
+  readonly enqueueNameMatchJudge?: EnqueueNameMatchJudge;
+  readonly enqueueEntityProbe?: EnqueueEntityProbe;
 }
 
 export function createRollupMetricDailyHandler(context: QueueHandlerContext, deps?: RollupMetricDailyDeps): JobProcessor {
@@ -89,6 +101,31 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       );
       return producer.enqueueTenantJob("task.generate", workspaceId, payload, { idempotencyKey });
     });
+
+  const enqueueNameMatchJudge: EnqueueNameMatchJudge =
+    deps?.enqueueNameMatchJudge ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("geo.analyze", workspaceId, payload, { idempotencyKey });
+    });
+
+  const enqueueEntityProbe: EnqueueEntityProbe =
+    deps?.enqueueEntityProbe ??
+    (async (workspaceId, payload, idempotencyKey): Promise<unknown> => {
+      producer ??= new QueueProducer(
+        createQueueWorkerConnection(context.env.QUEUE_REDIS_URL),
+        queueKeyPrefix(context.env.NODE_ENV),
+        signingKeysFromEnv(context.env),
+      );
+      return producer.enqueueTenantJob("geo.analyze", workspaceId, payload, { idempotencyKey });
+    });
+
+  // STORY-191 - the judge in force, from the process's own configuration: the heuristic's identity unless a keyed model judge is bound.
+  const judge = judgeInForce(context.env);
 
   return async (tx: ClientBase, job: Job): Promise<void> => {
     const payload = payloadSchema.parse((job.data as { payload: unknown }).payload);
@@ -137,6 +174,12 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       // date happened to be last rather than the most recent one.
       await denormalizeProject(tx, payload.projectId, timezone);
 
+      // STORY-188 / decision 99(d) — the per-cluster performance columns (visibility_score, authority_rank, leader_entity_id,
+      // gap_priority, achievability, computed_at), AFTER the project rollup, so reads of a cluster serve stored values and never compute.
+      // Same transaction and lock; a dissolved cluster's dangling prompt_cluster_id is nulled in it. It must run BEFORE refreshProjectGoals
+      // (a topic_authority goal reads topic_clusters.visibility_score). Reads only this database: no network call.
+      await refreshProjectTopicClusters(tx, payload.projectId, timezone);
+
       // NEW-C-4 — the Source Citation Index (and source_coverage) is derived
       // from citation_facts; recompute it here, inside the same tenant
       // transaction and lock, so it never serves a stale or seeded index. It
@@ -147,7 +190,7 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
       // sentiment), each over the 7/30/90-day windows, written to geo_analyses
       // so the read endpoints only read. Same transaction and lock; reads only this
       // database (no network call), free and unmetered.
-      await refreshProjectGeoWindows(tx, payload.projectId);
+      await refreshProjectGeoWindows(tx, payload.projectId, { judge });
       // STORY-062 AC12 / SLO #28 — GEO freshness is trigger-to-VISIBLE: from the job's enqueue time to the commit, so queue wait
       // and every other rollup step count. No enqueue time means no figure, never a 0. Only the daily triggers count: a
       // dirty-date backfill or a rebuild is not the daily recompute the objective describes, and would skew its p95.
@@ -217,6 +260,39 @@ export function createRollupMetricDailyHandler(context: QueueHandlerContext, dep
                   project_id: projectId,
                   error: error instanceof Error ? error.name : "unknown",
                 });
+              });
+          });
+        }
+        // STORY-191 (owner decision 99c) - the ambiguous brand-name matches are judged by a model OUTSIDE this transaction (ADR-0003): a `geo.analyze` job queued
+        // once this one has committed, only when a model judge is bound (with none, the v1 heuristic is the judge and there is nothing to ask). One key per
+        // project, judge version and UTC day. A failed enqueue is logged, never thrown: the rollup is durable and the next day's run asks again.
+        if (judge !== HEURISTIC_JUDGE) {
+          const day = new Date().toISOString().slice(0, 10);
+          const request = { kind: "name_match_judge" as const, projectId, judgeVersion: judge, day };
+          afterCommit(() => {
+            void enqueueNameMatchJudge(workspaceId, request, nameMatchJudgeKey(request))
+              .then(() => {
+                incrementCounter("nominara_geo_name_match_judge_requested_total");
+              })
+              .catch((error: unknown) => {
+                incrementCounter("nominara_geo_name_match_judge_request_failed_total");
+                logger.error({ event: "geo.name_match_judge.request_failed", workspace_id: workspaceId, project_id: projectId, error: error instanceof Error ? error.name : "unknown" });
+              });
+          });
+        }
+        // STORY-060 E1/E3 (owner decision 99b) - the Wikidata and Wikipedia profile probe makes network calls, so like the judge it is queued once this transaction
+        // has committed (never awaited inside it, KAD-06). One key per project and UTC day; the job itself skips a project probed within the last week. A failed
+        // enqueue is logged, never thrown. Only when ENTITY_PROFILE_PROBE is `wikimedia`.
+        if (context.env.ENTITY_PROFILE_PROBE === "wikimedia") {
+          const probeRequest = { kind: "entity_probe" as const, projectId, day: new Date().toISOString().slice(0, 10) };
+          afterCommit(() => {
+            void enqueueEntityProbe(workspaceId, probeRequest, entityProbeKey(probeRequest))
+              .then(() => {
+                incrementCounter("nominara_geo_entity_probe_requested_total");
+              })
+              .catch((error: unknown) => {
+                incrementCounter("nominara_geo_entity_probe_request_failed_total");
+                logger.error({ event: "geo.entity_probe.request_failed", workspace_id: workspaceId, project_id: projectId, error: error instanceof Error ? error.name : "unknown" });
               });
           });
         }

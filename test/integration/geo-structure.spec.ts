@@ -284,4 +284,57 @@ describe("STORY-060 · A3 answer structure (persisted, read)", () => {
       withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => refreshProjectGeo(tx, randomUUID(), { asOf: AS_OF })),
     ).rejects.toMatchObject({ code: "not_found" });
   });
+
+  describe("S3 / owner decision 99k · the structure-match gap, per cluster, from the page each alignment session read", () => {
+    const A = randomUUID();
+    const B = randomUUID();
+    const C = randomUUID();
+    const session = (cluster: string | null, structure: unknown, over: { createdAt?: string; ws?: string; project?: string } = {}) =>
+      db.query(
+        `INSERT INTO geo_alignments (workspace_id, project_id, target_url, prompt_cluster_id, engine_keys, embedding_model, page_structure, created_at)
+         VALUES ($1,$2,$3,$4,'{chatgpt}','m',$5::jsonb,COALESCE($6::timestamptz, now()))`,
+        [over.ws ?? workspaceId, over.project ?? projectId, `https://acme.com/${randomUUID().slice(0, 6)}`, cluster, structure === null ? null : JSON.stringify(structure), over.createdAt ?? null],
+      );
+    const prose = { tables: 0, lists: { ordered: 0, unordered: 3, definition: 0 } };
+    const withTable = { tables: 1, lists: { ordered: 0, unordered: 0, definition: 0 } };
+    async function tableDominant(...clusters: string[]): Promise<void> {
+      for (const [i, c] of clusters.entries()) {
+        const prompt = await promptInCluster(`Topic ${String(i)}`, c);
+        await many(30, { form: "comparison_table", brand: "recommendation", prompt });
+      }
+    }
+    const gapIds = async () => (((await rows())[0].findings as { id: string }[]) ?? []).map((f) => f.id).filter((id) => id.startsWith("structure-gap-")).sort();
+
+    it("a table on cluster A's page does not cover B's prose-only page: a gap for B alone; C, whose page nobody read, is not assessed", async () => {
+      await tableDominant(A, B, C);
+      await session(A, withTable);
+      await session(B, prose);
+      await refresh();
+      expect(await gapIds()).toEqual([`structure-gap-${B}`]);
+      const detail = geoStructureDetailSchema.parse((await rows())[0].findings[0].structure);
+      expect(detail.template).toMatch(/Topic/u);
+    });
+
+    it("the LATEST session per cluster is the page that counts; a NULL or unparseable summary is not assessed and never throws", async () => {
+      await tableDominant(A, B);
+      await session(A, prose, { createdAt: "2026-01-01T00:00:00Z" });
+      await session(A, withTable, { createdAt: "2026-02-01T00:00:00Z" });
+      await session(B, null);
+      await session(B, { tables: "many" });
+      await refresh();
+      expect(await gapIds()).toEqual([]);
+      await db.query("TRUNCATE geo_analyses");
+      await session(A, prose, { createdAt: "2026-03-01T00:00:00Z" });
+      await refresh();
+      expect(await gapIds()).toEqual([`structure-gap-${A}`]);
+    });
+
+    it("another project's session is never read, even for the same cluster id", async () => {
+      await tableDominant(A);
+      const other = await makeProject(workspaceId, false);
+      await session(A, prose, { project: other });
+      await refresh();
+      expect(await gapIds()).toEqual([]);
+    });
+  });
 });

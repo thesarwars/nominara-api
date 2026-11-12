@@ -4,12 +4,14 @@ import {
   type DiscoveryResponse,
   type ProposedCompetitor,
 } from "../../../contracts/projects/index.js";
-import { guardedFetch } from "../net/guarded-fetch.js";
+import { GuardedFetchRefusal, guardedFetch } from "../net/guarded-fetch.js";
 import { buildClassificationText, type CategoryClassification } from "../categories/classify.js";
 import { CONFIDENCE, extractFromHtml, extractPageTitle } from "./extract.js";
 import { proposeNegativeAliases } from "./common-words.js";
-import { proposeCompetitors } from "./competitors.js";
-import { extractHtmlSignals } from "./html-signals.js";
+import { isSameSite, proposeCompetitors, selectComparisonPages } from "./competitors.js";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
+import { incrementCounter } from "../telemetry/metrics.js";
+import { extractHtmlSignals, type ComparisonLink } from "./html-signals.js";
 
 // STORY-043 — the discovery pass. api-specification.md §4.5.
 //
@@ -39,6 +41,19 @@ const FIELD_FOR_SUPPLIED: Record<string, string> = {
   negative_aliases: "negative_aliases",
 };
 
+/** STORY-190 - what happened to the comparison pages a pass tried to open. Counts only: never a URL, a name or page text. */
+export interface ComparisonPageStats {
+  readonly selected: number;
+  readonly fetched: number;
+  /** Links to another registrable domain: never followed. */
+  readonly offSite: number;
+  /** Answered, but the redirect went off the registrable domain (or was vetoed): the body is discarded. */
+  readonly redirectedOff: number;
+  readonly refused: number;
+  readonly failed: number;
+  readonly skippedBudget: number;
+}
+
 export interface DiscoverInput {
   readonly rootUrl: string;
   readonly rootDomain: string;
@@ -61,6 +76,8 @@ export interface DiscoverDeps {
    * so the project's discovery reads can show them before the pass ends. The caller owns where they go; it must not throw, and if it does
    * the pass carries on regardless: the final payload is what the handler commits, and this is progress only.
    */
+  /** STORY-190 - told once, with counts, when comparison pages were considered. Must not throw; a throw is ignored. */
+  readonly onComparisonPages?: (stats: ComparisonPageStats) => void;
   readonly onFields?: (fields: Readonly<Record<string, DiscoveredField>>) => Promise<void>;
 }
 
@@ -80,10 +97,12 @@ export const DISCOVERY_BUDGET_MS = DISCOVERY_LATENCY_OBJECTIVE.p95Ms;
  * Rejects after `ms`, clearing its timer when the race is settled either way. It does not abort `work`: the fetch behind it is
  * `guardedFetch`, which destroys its own request at TOTAL_TIMEOUT_MS (20 s, shorter than this budget), so an abandoned fetch is bounded.
  */
+const BUDGET_EXCEEDED = "discovery: budget exceeded";
+
 async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const budget = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("discovery: budget exceeded")), ms);
+    timer = setTimeout(() => reject(new Error(BUDGET_EXCEEDED)), ms);
   });
   try {
     return await Promise.race([work, budget]);
@@ -210,15 +229,15 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
 
       // AC11 — read against every name the brand is known by, supplied or discovered, so a supplied name does not blind it.
       if (!skip.has("competitors")) {
-        competitors = proposeCompetitors({
-          brandNames: [
-            ...(input.knownBrandNames ?? []),
-            ...(extracted.brandName ? [extracted.brandName.value] : []),
-            ...(signals.logoAlt ? [signals.logoAlt] : []),
-            ...(domainStem(input.rootDomain) ? [domainStem(input.rootDomain)!] : []),
-          ],
-          links: signals.comparisonLinks,
-        });
+        const brandNames = [
+          ...(input.knownBrandNames ?? []),
+          ...(extracted.brandName ? [extracted.brandName.value] : []),
+          ...(signals.logoAlt ? [signals.logoAlt] : []),
+          ...(domainStem(input.rootDomain) ? [domainStem(input.rootDomain)!] : []),
+        ];
+        // STORY-190 - up to 3 same-site comparison pages, in this run phase (no transaction held), inside what is left of the budget.
+        const pages = await fetchComparisonPages(signals.comparisonLinks, input, deps, DISCOVERY_BUDGET_MS - (deps.now() - startedAt));
+        competitors = proposeCompetitors({ brandNames, links: signals.comparisonLinks, pages });
       }
     }
   } catch {
@@ -281,6 +300,75 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
       .filter(([, field]) => field.confidence < LOW_CONFIDENCE_THRESHOLD)
       .map(([name]) => name),
   };
+}
+
+/**
+ * STORY-190 - opens the comparison pages the home page links to, through the guarded fetcher (`deps.fetch`), at most 3, same registrable
+ * domain only. Concurrent, all inside ONE shared budget: a page that does not answer in what is left is skipped, and nothing here throws.
+ * No transaction is open (the caller is the run phase); public pages only (a plain GET, no credentials, no forms); counts and ids only.
+ */
+async function fetchComparisonPages(
+  links: readonly ComparisonLink[],
+  input: DiscoverInput,
+  deps: DiscoverDeps,
+  budgetMs: number,
+): Promise<{ url: string; html: string }[]> {
+  const selection = selectComparisonPages(links, input.rootUrl, input.rootDomain);
+  if (selection.urls.length === 0 && selection.offSite === 0) return [];
+  return trace.getTracer("nominara.discovery").startActiveSpan("discovery.comparison_pages", async (span) => {
+    const stats = { fetched: 0, redirectedOff: 0, refused: 0, failed: 0, skippedBudget: 0 };
+    const pages: { url: string; html: string }[] = [];
+    try {
+      if (budgetMs <= 0) {
+        stats.skippedBudget = selection.urls.length;
+      } else {
+        await Promise.all(
+          selection.urls.map(async (url) => {
+            try {
+              const response = await withinBudget(
+                deps.fetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootUrl, input.rootDomain) }),
+                budgetMs,
+              );
+              if (response.status >= 300 && response.status < 400) {
+                stats.redirectedOff += 1; // a redirect the same-site veto stopped
+              } else if (!isSameSite(response.finalUrl, input.rootUrl, input.rootDomain)) {
+                stats.redirectedOff += 1;
+              } else if (response.status >= 400 || !looksLikeHtml(response.headers["content-type"])) {
+                stats.failed += 1; // a login wall, an error, or not a page
+              } else {
+                stats.fetched += 1;
+                pages.push({ url: response.finalUrl, html: response.body.toString("utf8") });
+              }
+            } catch (error) {
+              if (error instanceof GuardedFetchRefusal) stats.refused += 1;
+              else if (error instanceof Error && error.message === BUDGET_EXCEEDED) stats.skippedBudget += 1;
+              else stats.failed += 1;
+            }
+          }),
+        );
+      }
+    } catch {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+    } finally {
+      span.setAttribute("nominara.discovery.comparison_pages_selected", selection.urls.length);
+      span.setAttribute("nominara.discovery.comparison_pages_fetched", stats.fetched);
+      span.end();
+    }
+    for (const [outcome, count] of Object.entries({ fetched: stats.fetched, off_site: selection.offSite, redirected_off: stats.redirectedOff, refused: stats.refused, failed: stats.failed, skipped_budget: stats.skippedBudget })) {
+      for (let i = 0; i < count; i++) incrementCounter("nominara_discovery_comparison_pages_total", { outcome });
+    }
+    try {
+      deps.onComparisonPages?.({ selected: selection.urls.length, offSite: selection.offSite, ...stats });
+    } catch {
+      // Reporting only.
+    }
+    return pages;
+  });
+}
+
+function looksLikeHtml(contentType: string | string[] | undefined): boolean {
+  const value = Array.isArray(contentType) ? contentType[0] : contentType;
+  return value === undefined || /html|xml/i.test(value);
 }
 
 /** product-spec.md FR-ONB-02c — "the first 10 prompts are free". */

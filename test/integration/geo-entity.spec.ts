@@ -59,7 +59,7 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
   });
 
   const inTx = <T>(fn: (tx: Client) => Promise<T>) => withTenantContext(db, { workspaceId, actorId: randomUUID() }, (tx) => fn(tx as unknown as Client)) as Promise<T>;
-  const refresh = () => inTx((tx) => refreshProjectGeo(tx, projectId, { asOf: AS_OF }));
+  const refresh = (judge?: string) => inTx((tx) => refreshProjectGeo(tx, projectId, { asOf: AS_OF, ...(judge === undefined ? {} : { judge }) }));
   const read = () => withTenantContext(db, { workspaceId, actorId: randomUUID() }, () => new GeoService(new TasksService(new NoopRealtimePublisher())).analysis(projectId, "entity", { timeframe: "30d" }));
   const row = async () => (await db.query("SELECT * FROM geo_analyses WHERE project_id = $1 AND analysis = 'entity' AND window_days = 30", [projectId])).rows[0];
 
@@ -229,15 +229,29 @@ describe("STORY-060 · A2 entity readiness (persisted, read)", () => {
   it("#1/#3 · checked nodes are persisted and read back with presence, completeness and the link gap; risk is separate", async () => {
     await inTx((tx) => writeEntityNodes(tx, projectId, ALL_PRESENT, SAMEAS));
     await matches(30, "Notion");
-    await refresh();
+    // STORY-191: a published score needs a MODEL judge in force; the heuristic default withholds it (see the guard test below).
+    await refresh("fixture-model:name-match-v1");
     const stored = await row();
     expect(stored.sufficient).toBe(true);
+    expect(stored.score).not.toBeNull();
     const detail = geoEntityDetailSchema.parse((await read()).detail);
     expect(detail.nodes.find((n) => n.node === "wikipedia")).toMatchObject({ status: "thin", link_gap: true });
     expect(detail.nodes.find((n) => n.node === "github")).toMatchObject({ status: "absent", presence: 0 });
     expect(detail.nodes.find((n) => n.node === "linkedin")).toMatchObject({ in_brand_sameas: true, link_gap: false });
     expect(detail.disambiguation).toMatchObject({ level: "low", risk: 0 });
     expect(detail.authority.score).toBe(Number(stored.score));
+  });
+
+  it("STORY-191 AC8 · the publish guard, end to end: every node checked, risk low, and the DEFAULT judge (the v1 heuristic) still persists a NULL score with its reason", async () => {
+    await inTx((tx) => writeEntityNodes(tx, projectId, [...ALL_PRESENT, { node: "github", url: "https://github.com/acme", missingFields: [] }], SAMEAS));
+    await matches(30, "Notion");
+    await refresh();
+    const stored = await row();
+    expect(stored.score).toBeNull();
+    expect(stored.suppression_reason).toMatch(/v1 case heuristic/iu);
+    const detail = geoEntityDetailSchema.parse((await read()).detail);
+    expect(detail.authority).toMatchObject({ score: null, suppressed: true });
+    expect(detail.disambiguation).toMatchObject({ level: "low" });
   });
 
   it("#4 · a high disambiguation risk persists a NULL score and an alias-tuning finding; the read says why", async () => {
