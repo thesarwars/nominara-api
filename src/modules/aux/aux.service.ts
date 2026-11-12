@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase, Pool } from "pg";
-import { z } from "zod";
 import { AUX_CATEGORY_WEIGHTS } from "../../lib/scoring/aux.js";
 import type {
   AuxAudit,
@@ -15,10 +14,9 @@ import type {
   UpdateAuxFindingRequest,
 } from "../../../contracts/aux/index.js";
 import { AUX_CATEGORIES } from "../../../contracts/aux/index.js";
-import { patchJsonldBlockSchema, patchPreconditionSchema, patchReversalSchema, patchRiskFlagSchema } from "../../../contracts/aux/index.js";
 import type { AuxPatch } from "../../../contracts/aux/index.js";
 import { guidanceFor } from "../../lib/aux/patches/guidance.js";
-import { pageMatches, sha256Tag, type LatestAuditFacts } from "../../lib/aux/patches/precondition.js";
+import { EARLIER_PATCHES_MAX, PATCH_SELECT, latestAuditFacts, latestPatches, toPatch, type PatchRow } from "../../lib/aux/patches/read.js";
 import { failManualAudit } from "../../lib/aux/fail-manual-audit.js";
 import { ConflictError, FeatureNotInPlanError, IdempotencyConflictError, NotFoundError, PreconditionUnmetError, PriceChangedError, UnauthenticatedError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { PG_POOL } from "../../db/pg-pool.js";
@@ -110,15 +108,6 @@ const FINDING_SELECT = `
     FROM aux_findings f
     LEFT JOIN aux_rule_catalog c ON c.code = f.rule_code`;
 
-/** STORY-053: how many earlier patches a patch names. Patches are never deleted, so the read is bounded rather than the table. */
-const EARLIER_PATCHES_MAX = 20;
-
-const PATCH_SELECT = `
-  SELECT p.id, p.finding_id, p.project_id, p.rule_code, p.kind, p.target_url, p.content_before_hash, p.content_after, p.unified_diff,
-         p.jsonld_blocks, p.reversal, p.preconditions, p.explanation, p.derivation, p.requires_human_review, p.review_reason,
-         p.risk_flags, p.created_at
-    FROM patches p`;
-
 const manualAuditLogger = new Logger("aux.manual-audit");
 const tracer = trace.getTracer("nominara-api");
 
@@ -180,7 +169,7 @@ export class AuxService {
       [projectId, query.severity ?? null, query.status ?? null, query.rule_code ?? null, query.url ?? null, after?.[0] ?? null, after?.[1] ?? null, query.limit + 1],
     );
     incrementCounter("nominara_aux_finding_reads_total", { filtered: String(query.severity !== undefined || query.status !== undefined || query.rule_code !== undefined || query.url !== undefined) });
-    const patches = await this.latestPatches(projectId, result.rows.slice(0, query.limit).map((r) => r.id));
+    const patches = await latestPatches(currentTenantStore()!.client, projectId, result.rows.slice(0, query.limit).map((r) => r.id), "finding");
     return pageFrom(result.rows, query.limit, "aux.findings", (row) => toFinding(row, patches.get(row.id) ?? null), (row) => [row.severity_rank, row.id]);
   }
 
@@ -246,7 +235,7 @@ export class AuxService {
 
     const read = await client.query<FindingRow>(`${FINDING_SELECT} WHERE f.id = $1`, [findingId]);
     const row = read.rows[0]!;
-    return toFinding(row, (await this.latestPatches(row.project_id, [row.id])).get(row.id) ?? null);
+    return toFinding(row, (await latestPatches(currentTenantStore()!.client, row.project_id, [row.id], "finding")).get(row.id) ?? null);
   }
 
   /**
@@ -348,7 +337,7 @@ export class AuxService {
     if (row === undefined) throw new NotFoundError({ message: "no such patch" });
     const visible = await client.query(`SELECT 1 WHERE ${SCOPE_OK.replace("%P%", "$1::uuid")}`, [row.project_id]);
     if (visible.rows.length === 0) throw new ProjectOutOfScopeException();
-    const audit = await this.latestAuditFacts(row.project_id);
+    const audit = await latestAuditFacts(client, row.project_id);
     const earlier = await client.query<{ id: string }>(
       `SELECT id FROM patches WHERE finding_id = $1 AND (created_at, id) < ($2::timestamptz, $3::uuid)
         ORDER BY created_at DESC, id DESC LIMIT ${EARLIER_PATCHES_MAX}`,
@@ -356,47 +345,6 @@ export class AuxService {
     );
     incrementCounter("nominara_aux_patch_reads_total", { route: "get" });
     return toPatch(row, audit, row.finding_id === null ? [] : earlier.rows.map((r) => r.id));
-  }
-
-  /**
-   * The newest patch of each finding, with the ids of the ones before it. One bounded query for the page (21 rows a finding at most), and
-   * one for the project's latest audit, which is what `page_matches` is judged against.
-   */
-  private async latestPatches(projectId: string, findingIds: readonly string[]): Promise<Map<string, AuxPatch>> {
-    const out = new Map<string, AuxPatch>();
-    if (findingIds.length === 0) return out;
-    const client = currentTenantStore()!.client;
-    const rows = await client.query<PatchRow & { rn: number }>(
-      `SELECT * FROM (
-         SELECT p.*, row_number() OVER (PARTITION BY p.finding_id ORDER BY p.created_at DESC, p.id DESC) AS rn
-           FROM (${PATCH_SELECT} WHERE p.finding_id = ANY($1::uuid[])) p
-       ) ranked WHERE rn <= ${EARLIER_PATCHES_MAX + 1} ORDER BY finding_id, rn`,
-      [findingIds],
-    );
-    if (rows.rows.length === 0) return out;
-    const audit = await this.latestAuditFacts(projectId);
-    const grouped = new Map<string, (PatchRow & { rn: number })[]>();
-    for (const row of rows.rows) grouped.set(row.finding_id!, [...(grouped.get(row.finding_id!) ?? []), row]);
-    for (const [findingId, list] of grouped) {
-      const patch = toPatch(list[0]!, audit, list.slice(1).map((r) => r.id));
-      // A latest patch made against a file that has since changed is not offered on the finding: the audit would have made a new one, so
-      // its absence means today's gate refused or found nothing. It stays readable by id.
-      if (patch.page_matches !== false) out.set(findingId, patch);
-    }
-    incrementCounter("nominara_aux_patch_reads_total", { route: "finding" });
-    return out;
-  }
-
-  /** What the project's most recent finished audit saw of the files a patch is judged against. null = no audit has finished. */
-  private async latestAuditFacts(projectId: string): Promise<LatestAuditFacts | null> {
-    const audit = await currentTenantStore()!.client.query<{ robots_hash: Buffer | null; llms_txt_present: boolean | null }>(
-      `SELECT robots_hash, llms_txt_present FROM aux_audits
-        WHERE project_id = $1 AND status IN ('completed', 'partial')
-        ORDER BY created_at DESC, id DESC LIMIT 1`,
-      [projectId],
-    );
-    const row = audit.rows[0];
-    return row === undefined ? null : { robotsHash: row.robots_hash, llmsTxtPresent: row.llms_txt_present };
   }
 
   /**
@@ -731,54 +679,6 @@ interface FindingRow {
   rule_version: string;
   task_id: string | null;
   severity_rank: number;
-}
-
-interface PatchRow {
-  id: string;
-  finding_id: string | null;
-  project_id: string;
-  rule_code: string | null;
-  kind: AuxPatch["kind"];
-  target_url: string;
-  content_before_hash: Buffer;
-  content_after: string;
-  unified_diff: string | null;
-  jsonld_blocks: AuxPatch["jsonld_blocks"];
-  reversal: AuxPatch["reversal"];
-  preconditions: AuxPatch["preconditions"];
-  explanation: string | null;
-  derivation: string | null;
-  requires_human_review: boolean;
-  review_reason: string | null;
-  risk_flags: string[];
-  created_at: Date;
-}
-
-function toPatch(row: PatchRow, audit: LatestAuditFacts | null, earlier: string[]): AuxPatch {
-  return {
-    patch_id: row.id,
-    finding_id: row.finding_id,
-    project_id: row.project_id,
-    rule_code: row.rule_code,
-    kind: row.kind,
-    target_url: row.target_url,
-    content_before_hash: sha256Tag(row.content_before_hash),
-    content_after: row.content_after,
-    unified_diff: row.unified_diff,
-    jsonld_blocks: row.jsonld_blocks === null ? null : z.array(patchJsonldBlockSchema).parse(row.jsonld_blocks),
-    reversal: row.reversal === null ? null : patchReversalSchema.parse(row.reversal),
-    preconditions: z.array(patchPreconditionSchema).parse(row.preconditions),
-    explanation: row.explanation,
-    derivation: row.derivation,
-    requires_human_review: row.requires_human_review,
-    review_reason: row.review_reason,
-    risk_flags: z.array(patchRiskFlagSchema).parse(row.risk_flags),
-    page_matches: pageMatches({ kind: row.kind, contentBeforeHash: row.content_before_hash, preconditions: row.preconditions }, audit),
-    earlier_patch_ids: earlier,
-    free: true,
-    credits_charged: 0,
-    created_at: row.created_at.toISOString(),
-  };
 }
 
 /** `numeric` arrives as a string; null (not measured) stays null and "0" stays 0. */

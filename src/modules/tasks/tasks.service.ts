@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import type { RealtimeEventPayloads } from "../../../contracts/events/catalog.schema.js";
 import type {
@@ -21,6 +22,7 @@ import { ConflictError, NotFoundError, UnsafeTargetError, ValidationFailedError 
 import { checkSubmittedUrl, isSeedingTask } from "../../lib/sources/verify-submission.js";
 import { ProjectOutOfScopeException } from "../../tenancy/errors.js";
 import {
+  measuredImpactSchema,
   taskBaselineMetricsSchema,
   taskEvidenceRefreshPayloadSchema,
   taskPlaybookPayloadSchema,
@@ -29,13 +31,17 @@ import {
 } from "../../../contracts/tasks/index.js";
 import { GOAL_CONTRIBUTES_SQL } from "../../lib/goals/contribution.js";
 import { refreshProjectTaskCounts } from "../../lib/rollup/refresh-project-task-counts.js";
+import { latestPatches } from "../../lib/aux/patches/read.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
+import type { AuxPatch } from "../../../contracts/aux/index.js";
 import type { ActionItem, ActionItemEffort, ActionItemPrimaryActionKind, ActionItemSource } from "../../../contracts/tasks/index.js";
 import { decodeCursor } from "../../api/pagination/cursor.js";
 import { Page, pageFrom } from "../../api/pagination/page.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import { SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS } from "../../lib/rollup/refresh-project-task-counts.js";
+
+const tracer = trace.getTracer("nominara-api");
 
 /** NEW-E-099b — each portal task list is capped; the portal shows a client's progress, not the whole backlog. */
 export const PORTAL_TASKS_LIMIT = 100;
@@ -230,10 +236,12 @@ export class TasksService {
            t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
            t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
            (t.source_domain_id IS NOT NULL) AS seeding,
+           ${EVIDENCE_SELECT},
            ${REVIEW_SELECT},
            ${SORT_KEYS[query.sort]}
          FROM tasks t
          LEFT JOIN goals g ON g.id = t.goal_id
+         LEFT JOIN milestones m ON m.id = t.milestone_id AND m.workspace_id = app.current_workspace()
          LEFT JOIN task_generation_rules r ON r.code = t.rule_code
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
          LEFT JOIN LATERAL (
@@ -280,7 +288,9 @@ export class TasksService {
       returned: Math.min(result.rows.length, query.limit),
     });
 
-    return pageFrom(result.rows, query.limit, "tasks.tasks", toTask, (row) => [row.k1_key, row.k2_key, row.k3_key, row.k4_key, row.id]);
+    // STORY-194 AC6: the patch of each task's source finding, one bounded read for the page (the AUX finding's reader), after the task query.
+    const patches = await this.patchesFor(client, projectId, result.rows.slice(0, query.limit));
+    return pageFrom(result.rows, query.limit, "tasks.tasks", (row) => toTask(row, patches), (row) => [row.k1_key, row.k2_key, row.k3_key, row.k4_key, row.id]);
   }
 
   /**
@@ -601,8 +611,10 @@ export class TasksService {
               t.rule_code, t.priority, t.impact_score, t.effort_band, t.assignee_id, t.due_at,
               t.dismissed_reason, t.resurface_at, t.completed_at, t.affected_url, t.created_at, t.updated_at,
               (t.source_domain_id IS NOT NULL) AS seeding,
+              ${EVIDENCE_SELECT},
               ${REVIEW_SELECT}
          FROM tasks t
+         LEFT JOIN milestones m ON m.id = t.milestone_id AND m.workspace_id = app.current_workspace()
          LEFT JOIN aux_findings af ON af.id = t.source_finding_id
          LEFT JOIN LATERAL (
            SELECT gap_severity FROM project_source_index
@@ -613,7 +625,26 @@ export class TasksService {
         WHERE t.id = $1`,
       [taskId, SOURCE_INDEX_ENGINE_KEY, SOURCE_INDEX_WINDOW_DAYS],
     );
-    return toTask(row.rows[0] as TaskRow);
+    const found = row.rows[0] as TaskRow;
+    return toTask(found, await this.patchesFor(client, found.project_id, [found]));
+  }
+
+  /** STORY-194 AC6: the latest patch of each row's source finding - one span, one bounded read (none at all when no row has a finding). */
+  private async patchesFor(client: ClientBase, projectId: string, rows: readonly TaskRow[]): Promise<Map<string, AuxPatch>> {
+    const findingIds = findingIdsOf(rows);
+    return tracer.startActiveSpan("tasks.task_rows.patches", async (span) => {
+      try {
+        span.setAttribute("tasks.findings", findingIds.length);
+        const patches = await latestPatches(client, projectId, findingIds, "task");
+        span.setAttribute("tasks.patches_served", patches.size);
+        return patches;
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
   }
 
   /**
@@ -1509,6 +1540,10 @@ interface TaskRow {
   created_at: Date;
   updated_at: Date;
   seeding: boolean;
+  source_geo_analysis: string | null;
+  playbook_slug: string | null;
+  /** `milestones.measured_impact` - free jsonb, validated by `toTask`, never trusted. */
+  measured_impact: unknown;
   review: { url: string; submitted_at: string; reason: TaskVerification["reason"] } | null;
   k1_key: string;
   k2_key: string;
@@ -1516,7 +1551,36 @@ interface TaskRow {
   k4_key: string;
 }
 
-function toTask(row: TaskRow): Task {
+/** STORY-194 AC6: the columns the evidence, the measured impact and the playbook come from (`m` is the task's milestone, joined by the caller). */
+const EVIDENCE_SELECT = "t.source_geo_analysis, t.playbook_slug, m.measured_impact";
+
+const findingIdsOf = (rows: readonly Pick<TaskRow, "source_finding_id">[]): string[] =>
+  rows.flatMap((r) => (r.source_finding_id === null ? [] : [r.source_finding_id]));
+
+/**
+ * STORY-194 AC1 (owner decision 98d): the ONE record an auto task came from, in the order finding, displacement, geo analysis, source
+ * gap. No column is added: these are the `tasks` columns that already hold them. Null when none is set (a manual task).
+ */
+export function evidenceOf(row: Pick<TaskRow, "source_finding_id" | "source_displacement_id" | "source_geo_analysis" | "source_domain_id">): Task["evidence"] {
+  if (row.source_finding_id !== null) return { kind: "finding", id: row.source_finding_id };
+  if (row.source_displacement_id !== null) return { kind: "displacement", id: row.source_displacement_id };
+  if (row.source_geo_analysis !== null) return { kind: "geo_analysis", id: row.source_geo_analysis };
+  if (row.source_domain_id !== null) return { kind: "source_gap", id: row.source_domain_id };
+  return null;
+}
+
+/** STORY-194 AC6: null (never a figure) when there is no measurement, or when the jsonb is not a complete, caveated impact. A 0 delta is a measurement and survives. */
+function measuredImpactOf(row: Pick<TaskRow, "id" | "measured_impact">): Task["measured_impact"] {
+  if (row.measured_impact === null || row.measured_impact === undefined) return null;
+  const parsed = measuredImpactSchema.safeParse(row.measured_impact);
+  if (parsed.success) return parsed.data;
+  incrementCounter("nominara_tasks_measured_impact_invalid_total", {});
+  // The task id only - never the jsonb, which is the engine's measurement.
+  new Logger(TasksService.name).warn({ message: "task measured impact failed validation and was not served", workspace_id: currentTenantStore()?.context.workspaceId, task_id: row.id });
+  return null;
+}
+
+function toTask(row: TaskRow, patches: ReadonlyMap<string, AuxPatch>): Task {
   return {
     id: row.id,
     short_ref: row.short_ref,
@@ -1544,6 +1608,10 @@ function toTask(row: TaskRow): Task {
       row.review === null || row.review === undefined
         ? null
         : { state: row.review.reason === null ? "pending" : "unverified", url: row.review.url, submitted_at: row.review.submitted_at, reason: row.review.reason },
+    evidence: evidenceOf(row),
+    measured_impact: measuredImpactOf(row),
+    patch: row.source_finding_id === null ? null : (patches.get(row.source_finding_id) ?? null),
+    playbook_slug: row.playbook_slug,
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
   };

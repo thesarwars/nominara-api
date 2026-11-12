@@ -58,7 +58,7 @@ describe("STORY-064 · task contract", () => {
       id: "0198f6a0-0000-7000-8000-000000000001", short_ref: "HUB-1", project_id: "0198f6a0-0000-7000-8000-000000000002",
       goal_id: null, title: "t", description: "d", kind: "content", origin: "auto", status: "todo", severity: null,
       source: "content", rule_code: null, priority: 3, impact_score: 10, effort: null, assignee_id: null, due_at: null,
-      dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, seeding: false, review: null, created_at: "x", updated_at: "x",
+      dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, seeding: false, review: null, evidence: null, measured_impact: null, patch: null, playbook_slug: null, created_at: "x", updated_at: "x",
     };
     expect(taskSchema.safeParse(base).success).toBe(true);
     expect(taskSchema.safeParse({ ...base, lane_order: 1 }).success).toBe(false);
@@ -69,7 +69,7 @@ describe("STORY-064 · task contract", () => {
       id: "0198f6a0-0000-7000-8000-000000000001", short_ref: "HUB-1", project_id: "0198f6a0-0000-7000-8000-000000000002",
       goal_id: null, title: "t", description: "d", kind: "content", origin: "auto", status: "done", severity: null,
       source: "content", rule_code: null, priority: 3, impact_score: 10, effort: null, assignee_id: null, due_at: null,
-      dismissed_reason: null, resurface_at: null, completed_at: "x", affected_url: null, seeding: false, review: null, created_at: "x", updated_at: "x",
+      dismissed_reason: null, resurface_at: null, completed_at: "x", affected_url: null, seeding: false, review: null, evidence: null, measured_impact: null, patch: null, playbook_slug: null, created_at: "x", updated_at: "x",
     };
     const body = { task, milestone: { id: "0198f6a0-0000-7000-8000-000000000003", kind: "task_completed", occurred_at: "x" }, verification: null };
     expect(completeTaskResponseSchema.safeParse(body).success).toBe(true);
@@ -83,7 +83,7 @@ describe("STORY-064 · task contract", () => {
       id: "0198f6a0-0000-7000-8000-000000000001", short_ref: "HUB-1", project_id: "0198f6a0-0000-7000-8000-000000000002",
       goal_id: null, title: "t", description: "d", kind: "authority", origin: "auto", status: "in_review", severity: null,
       source: "content", rule_code: null, priority: 3, impact_score: 10, effort: null, assignee_id: null, due_at: null,
-      dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, seeding: true, created_at: "x", updated_at: "x",
+      dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, seeding: true, evidence: null, measured_impact: null, patch: null, playbook_slug: null, created_at: "x", updated_at: "x",
       review: { state: "pending", url: "https://reddit.com/r/x", submitted_at: "x", reason: null },
     };
     const body = { task, milestone: null, verification: null };
@@ -102,7 +102,7 @@ describe("STORY-064 · task contract", () => {
       id: "0198f6a0-0000-7000-8000-000000000001", short_ref: "HUB-1", project_id: "0198f6a0-0000-7000-8000-000000000002",
       goal_id: null, title: "t", description: "d", kind: "authority", origin: "auto", status: "todo", severity: null,
       source: "content", rule_code: null, priority: 3, impact_score: 10, effort: null, assignee_id: null, due_at: null,
-      dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, review: null, created_at: "x", updated_at: "x",
+      dismissed_reason: null, resurface_at: null, completed_at: null, affected_url: null, review: null, evidence: null, measured_impact: null, patch: null, playbook_slug: null, created_at: "x", updated_at: "x",
     };
     expect(taskSchema.safeParse({ ...task, seeding: true }).success).toBe(true);
     expect(taskSchema.safeParse({ ...task, seeding: false }).success).toBe(true);
