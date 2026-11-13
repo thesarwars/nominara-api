@@ -99,6 +99,17 @@ describe("STORY-185 AC3 · GET /v1/billing/retention-export/{id}/download", () =
     expect(h.location).toHaveBeenCalledTimes(1);
   });
 
+  it("MINOR · the presign never outlives the export: it lives min(15 minutes, the time left)", async () => {
+    const h = build([{ ...READY, expires_at: new Date(Date.now() + 100_000) }]);
+    await h.run();
+    const seconds = (h.presignGetStored.mock.calls[0]![2] as { expiresInSeconds: number }).expiresInSeconds;
+    expect(seconds).toBeLessThanOrEqual(100);
+    expect(seconds).toBeGreaterThanOrEqual(98);
+    const far = build([READY]);
+    await far.run();
+    expect((far.presignGetStored.mock.calls[0]![2] as { expiresInSeconds: number }).expiresInSeconds).toBe(RETENTION_EXPORT_URL_SECONDS);
+  });
+
   it("every fetch mints a FRESH presign (nothing cached), and the presign is minted after the request transaction, never inside it", async () => {
     const h = build([READY]);
     await h.service.resolve({ id: ID }, h.location);

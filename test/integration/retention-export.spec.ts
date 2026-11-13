@@ -9,6 +9,7 @@ import { NotFoundError } from "../../src/api/errors/domain-errors.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { attributionPurgeList, rawPurgeList, recordRetentionShortening, rollupPurgeList } from "../../src/lib/billing/retention-shortening.js";
+import { runRetentionExportCleanup } from "../../src/lib/billing/retention-export/cleanup.js";
 import { readExportScope } from "../../src/lib/billing/retention-export/scope.js";
 import { encodeRawObject } from "../../src/lib/capture/raw-object.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
@@ -44,12 +45,18 @@ class MemoryPort implements ObjectStoragePort {
   presigns: string[] = [];
   onGet: (key: string) => Promise<void> = async () => {};
   onPut: (key: string) => Promise<void> = async () => {};
+  /** Simulates a crash AFTER the object is stored and BEFORE anything is recorded. */
+  failAfterPut = false;
+  gets = 0;
+  deletes: string[] = [];
   async put(r: PutObjectRequest): Promise<void> {
     await this.onPut(r.key);
     this.puts += 1;
     this.objects.set(`${r.bucket}/${r.key}`, Buffer.from(r.body as Uint8Array));
+    if (this.failAfterPut) throw new Error("crashed after upload");
   }
   async get(bucket: StorageBucketName, key: string): Promise<Buffer> {
+    this.gets += 1;
     await this.onGet(key);
     const found = this.objects.get(`${bucket}/${key}`);
     if (found === undefined) throw new NotFoundError({ message: "no such object" });
@@ -58,7 +65,10 @@ class MemoryPort implements ObjectStoragePort {
   async head(): Promise<ObjectHead> {
     throw new Error("unused");
   }
-  async delete(): Promise<void> {}
+  async delete(bucket: StorageBucketName, key: string): Promise<void> {
+    this.deletes.push(key);
+    this.objects.delete(`${bucket}/${key}`);
+  }
   async presignGet(bucket: StorageBucketName, key: string, seconds: number): Promise<string> {
     const url = `https://s3.example.test/${bucket}/${key}?sig=${randomUUID()}&exp=${String(seconds)}`;
     this.presigns.push(url);
@@ -189,29 +199,33 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
   }
   async function requestRow(ws: string, requestedBy: string | null, expiresAt = new Date(NOW.getTime() + 14 * DAY)): Promise<string> {
     const id = randomUUID();
+    // The requester is an active owner of the workspace unless a test says otherwise (the delivery email goes only to a current owner or admin).
+    if (requestedBy !== null) await db.query("INSERT INTO workspace_members (workspace_id, user_id, role) SELECT $1, $2, 'owner' WHERE NOT EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)", [ws, requestedBy]);
     await db.query("INSERT INTO retention_exports (id, workspace_id, requested_by, expires_at) VALUES ($1, $2, $3, $4)", [id, ws, requestedBy, expiresAt.toISOString()]);
     return id;
   }
   const row = async (id: string) => (await db.query("SELECT * FROM retention_exports WHERE id = $1", [id])).rows[0]!;
   const planWindow = async (plan: string, key: string): Promise<number> => Number((await db.query<{ v: string }>("SELECT entitlements->$2->>'value' AS v FROM plans WHERE key = $1", [plan, key])).rows[0]!.v);
 
-  async function runJob(ws: string, exportId: string, opts: { attemptsMade?: number; payloadWs?: string } = {}): Promise<void> {
+  async function runJob(ws: string, exportId: string, opts: { attemptsMade?: number; payloadWs?: string; maxBytes?: number } = {}): Promise<void> {
     const context = { pool, env: { NODE_ENV: "test", OAUTH_REDIRECT_BASE_URL: BASE } } as unknown as QueueHandlerContext;
     const process = createJobProcessor(ENTRY, {
       keys: KEYS,
       getClient: () => pool.connect(),
       releaseClient: (client) => (client as unknown as { release(): void }).release(),
-      process: createBillingRetentionExportHandler(context, { sender, store: new TenantObjectStore(port, KEY_ENV), apiBaseUrl: BASE, now: () => new Date() }),
+      process: createBillingRetentionExportHandler(context, { sender, store: new TenantObjectStore(port, KEY_ENV), apiBaseUrl: BASE, now: () => new Date(), ...(opts.maxBytes === undefined ? {} : { maxBytes: opts.maxBytes }) }),
     });
     const payload = { exportId, workspaceId: opts.payloadWs ?? ws, kid: "k1" };
     await process({ data: signQueueJobPayload(payload, KEYS.current.key), attemptsMade: opts.attemptsMade ?? 0, opts: { attempts: 4 } } as unknown as Job);
   }
   const idleInTransaction = async (): Promise<number> => Number((await db.query("SELECT count(*) AS n FROM pg_stat_activity WHERE usename = 'nominara_app' AND state LIKE 'idle in transaction%'")).rows[0].n);
+  const reportKeys = (): string[] => [...port.objects.keys()].filter((k) => k.startsWith("reports/"));
   const storedZip = (): Buffer => {
-    const keys = [...port.objects.keys()].filter((k) => k.startsWith("reports/"));
+    const keys = reportKeys();
     expect(keys, "exactly one stored export").toHaveLength(1);
     return port.objects.get(keys[0]!)!;
   };
+  const cleanup = () => runRetentionExportCleanup(db, pool, new TenantObjectStore(port, KEY_ENV), {});
 
   /** business -> starter: raw 395 -> 90, rollups -> their new window. Two projects with data on both sides of both cutoffs; one capture only inside the window. */
   async function scenario() {
@@ -533,6 +547,155 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
     const s = await scenario();
     await runJob(s.ws, randomUUID());
     expect(port.puts).toBe(0);
+  });
+
+  // -- fix round: superseded exports, orphaned objects, the byte budget, the minors --------------------------------------------------------------
+  describe("fix round (audit)", () => {
+    const enqueued: string[] = [];
+    const queues = { enqueueTenantJob: async (_n: string, _w: string, p: { exportId: string }) => (enqueued.push(p.exportId), {} as never) };
+    const service = () => new RetentionExportService(new TenantObjectStore(port, KEY_ENV), BASE, queues as never);
+    const notice = async (ws: string): Promise<string> => (await db.query<{ text_body: string }>("SELECT text_body FROM downgrade_notices WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT 1", [ws])).rows[0]!.text_body;
+
+    it("MAJOR 1 · a second shortening inside the deferral supersedes the built export: it is not reused, not linked, not called complete; a new build covers the extra data", async () => {
+      const ws = await workspace("business");
+      const requester = await user("o@example.com");
+      const p = await project(ws, "Two-step");
+      await shorten(ws, "business", "starter");
+      const first = (await inTenant(ws, (tx) => readExportScope(tx, ws, new Date())))!;
+      // One capture older than the FIRST cutoff, one that only the second (shorter) window will also purge.
+      await capture(ws, p, new Date(first.raw!.cutoff.getTime() - 5 * DAY), "OLD IN BOTH");
+      await capture(ws, p, new Date(first.raw!.cutoff.getTime() + 10 * DAY), "ONLY THE SECOND PURGES THIS");
+      const oldId = (await inTenant(ws, async () => service().request())).id;
+      await db.query("UPDATE retention_exports SET requested_by = $2 WHERE id = $1", [oldId, requester]);
+      await db.query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')", [ws, requester]);
+      await runJob(ws, oldId);
+      expect((await row(oldId)).status).toBe("ready");
+
+      await shorten(ws, "starter", "free"); // the cutoff moves: 90 -> 30 days before the purge date
+      expect(await notice(ws), "the notice does not link an export the change made incomplete").not.toContain(oldId);
+      expect(await notice(ws)).not.toMatch(/download/i);
+      const view = await inTenant(ws, async () => service().view());
+      expect(view.export).toMatchObject({ id: oldId, status: "superseded", download_url: null });
+
+      const second = await inTenant(ws, async () => service().request());
+      expect(second.id, "a new build is allowed").not.toBe(oldId);
+      expect(second.status).toBe("requested");
+      await db.query("UPDATE retention_exports SET requested_by = $2 WHERE id = $1", [second.id, requester]);
+      port.objects.clear();
+      await runJob(ws, second.id);
+      const cov = retentionExportCoverageSchema.parse((await row(second.id)).coverage);
+      expect(cov.projects[0]!.raw_answers!.count, "both captures are in the new export").toBe(2);
+    });
+
+    it("MAJOR 1 · an unchanged scope is still reused (a ready export is answered as it is) and a legacy row with no stored scope is treated as superseded", async () => {
+      const ws = await workspace("business");
+      await shorten(ws, "business", "starter");
+      const a = await inTenant(ws, async () => service().request());
+      await db.query("UPDATE retention_exports SET status = 'ready', object_key = 'k', coverage = '{}'::jsonb, ready_at = now() WHERE id = $1", [a.id]);
+      const again = await inTenant(ws, async () => service().request());
+      expect(again.id).toBe(a.id);
+      await db.query("UPDATE retention_exports SET scope = NULL WHERE id = $1", [a.id]);
+      const fresh = await inTenant(ws, async () => service().request());
+      expect(fresh.id).not.toBe(a.id);
+    });
+
+    it("MAJOR 2 · the key is deterministic per export: a crash between the upload and the ready commit, then a retry, leaves ONE object, and cleanup deletes it after expiry", async () => {
+      const s = await scenario();
+      const id = await requestRow(s.ws, s.requester);
+      port.failAfterPut = true;
+      await expect(runJob(s.ws, id, { attemptsMade: 0 })).rejects.toThrow("crashed after upload");
+      expect(reportKeys()).toHaveLength(1);
+      expect((await row(id)).status).toBe("building");
+      port.failAfterPut = false;
+      await runJob(s.ws, id, { attemptsMade: 1 });
+      expect(reportKeys(), "the retry overwrote the same key").toHaveLength(1);
+      expect((await row(id)).status).toBe("ready");
+      await db.query("UPDATE retention_exports SET expires_at = now() - interval '1 second' WHERE id = $1", [id]);
+      expect(await cleanup()).toMatchObject({ purged: 1, failed: 0 });
+      expect(reportKeys()).toHaveLength(0);
+    });
+
+    it("MAJOR 2 · a duplicate delivery leaves one object, one ready row and one email", async () => {
+      const s = await scenario();
+      const id = await requestRow(s.ws, s.requester);
+      await Promise.all([runJob(s.ws, id), runJob(s.ws, id)]);
+      expect(reportKeys()).toHaveLength(1);
+      expect((await row(id)).status).toBe("ready");
+      expect(sender.sent).toHaveLength(1);
+    });
+
+    it("MAJOR 2 · a FAILED export's object (the last attempt crashed after the upload) is deleted after its expiry, whatever its status", async () => {
+      const s = await scenario();
+      const id = await requestRow(s.ws, s.requester);
+      port.failAfterPut = true;
+      await expect(runJob(s.ws, id, { attemptsMade: 3 })).rejects.toThrow("crashed after upload");
+      expect((await row(id)).status).toBe("failed");
+      expect(reportKeys(), "the orphan exists").toHaveLength(1);
+      expect(await cleanup(), "not expired yet: untouched").toMatchObject({ purged: 0 });
+      await db.query("UPDATE retention_exports SET expires_at = now() - interval '1 second' WHERE id = $1", [id]);
+      expect(await cleanup()).toMatchObject({ purged: 1, failed: 0 });
+      expect(reportKeys()).toHaveLength(0);
+      expect((await row(id)).object_purged_at).not.toBeNull();
+      // A missing object is tolerated.
+      const other = await requestRow(s.ws, s.requester);
+      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x', expires_at = now() - interval '1 second' WHERE id = $1", [other]);
+      expect(await cleanup()).toMatchObject({ purged: 1, failed: 0 });
+    });
+
+    it("MAJOR 3 · over the byte budget the build fails fast and stably (zip_limit) BEFORE reading everything; at the cap it succeeds, one byte under it fails", async () => {
+      const s = await scenario();
+      const probe = await requestRow(s.ws, s.requester);
+      await runJob(s.ws, probe);
+      const files = unzip(storedZip());
+      const total = [...files].filter(([name]) => name !== "manifest.json").reduce((n, [, data]) => n + data.length, 0);
+      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x' WHERE id = $1", [probe]);
+      port.objects.clear();
+      port.puts = 0;
+      port.gets = 0;
+
+      const tight = await requestRow(s.ws, s.requester);
+      await runJob(s.ws, tight, { maxBytes: 1 });
+      expect(await row(tight)).toMatchObject({ status: "failed", error_code: "zip_limit" });
+      expect(port.puts).toBe(0);
+      expect(port.gets, "stopped at the first object, not after reading all three").toBe(1);
+
+      const under = await requestRow(s.ws, s.requester);
+      await runJob(s.ws, under, { maxBytes: total - 1 });
+      expect((await row(under)).error_code).toBe("zip_limit");
+      const exact = await requestRow(s.ws, s.requester);
+      await runJob(s.ws, exact, { maxBytes: total });
+      expect((await row(exact)).status).toBe("ready");
+    });
+
+    it("MINOR · the ready email goes only if the requester is still an owner or admin; the export itself is still ready", async () => {
+      const s = await scenario();
+      const id = await requestRow(s.ws, s.requester);
+      await db.query("UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2", [s.ws, s.requester]);
+      await runJob(s.ws, id);
+      expect((await row(id)).status).toBe("ready");
+      expect(sender.sent).toHaveLength(0);
+      const removed = await requestRow(s.ws, s.requester);
+      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x' WHERE id = $1", [id]);
+      await db.query("UPDATE workspace_members SET role = 'admin', status = 'removed' WHERE workspace_id = $1 AND user_id = $2", [s.ws, s.requester]);
+      await runJob(s.ws, removed);
+      expect(sender.sent, "a removed member gets nothing").toHaveLength(0);
+      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x' WHERE id = $1", [removed]);
+      await db.query("UPDATE workspace_members SET role = 'admin', status = 'active' WHERE workspace_id = $1 AND user_id = $2", [s.ws, s.requester]);
+      const ok = await requestRow(s.ws, s.requester);
+      await runJob(s.ws, ok);
+      expect(sender.sent, "an admin does").toHaveLength(1);
+    });
+
+    it("MINOR · an expired in-flight row is marked failed before the insert, so a new request starts a new export (the stale row never answers)", async () => {
+      const ws = await workspace("business");
+      await shorten(ws, "business", "starter");
+      const stale = (await inTenant(ws, async () => service().request())).id;
+      await db.query("UPDATE retention_exports SET expires_at = now() - interval '1 second' WHERE id = $1", [stale]);
+      const fresh = await inTenant(ws, async () => service().request());
+      expect(fresh.id).not.toBe(stale);
+      expect(fresh.status).toBe("requested");
+      expect(await row(stale)).toMatchObject({ status: "failed", error_code: "expired" });
+    });
   });
 
   // -- the request side, against the real database ------------------------------------------------------------------------------------------------
