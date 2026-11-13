@@ -11,9 +11,12 @@ import type { RealtimePublisher } from "../../src/lib/cache/realtime-publisher.j
 import { loadManualRunProject, planManualRun } from "../../src/lib/capture/manual-run.js";
 import { readRunProgress } from "../../src/lib/capture/run-progress.js";
 import { BaseCaptureAdapter } from "../../src/lib/engines/base-adapter.js";
-import type { RawCapture } from "../../src/lib/engines/contract.js";
+import type { CaptureInput, RawCapture } from "../../src/lib/engines/contract.js";
 import { createCaptureExecuteHandler } from "../../src/lib/queue/handlers/capture-execute.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
+import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
+import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import * as metrics from "../../src/lib/telemetry/metrics.js";
@@ -340,6 +343,59 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     const progress = await readRunProgress(db, second.runId, NOW);
     expect(progress.skipped).toBe(1);
     expect(progress.cachedByLayer.l1).toBe(1);
+  });
+
+  // STORY-032 AC15 - a MANUAL run's cell reaches the adapter with requestMode "live", through the real plan -> signed payload -> handler path
+  // (the handler's payload schema is strict, so an unknown key would also have failed here).
+  it("STORY-032 AC15 - a manual run's cell is captured with requestMode live", async () => {
+    const seen: (string | undefined)[] = [];
+    vi.spyOn(BaseCaptureAdapter.prototype, "capture").mockImplementationOnce((input) => {
+      seen.push(input.requestMode);
+      return Promise.resolve({ text: "an answer", format: "markdown", truncated: false, responseTokensEst: 3, latencyMs: 5, costUsd: 0 });
+    });
+    await addPrompt("normal");
+    const { jobs } = await planRun();
+    await handler()(db, jobs[0]!);
+    vi.restoreAllMocks();
+    expect(seen).toEqual(["live"]);
+  });
+
+  // STORY-032 AC15 - COMPATIBILITY: a job signed BEFORE requestMode existed has no such key. It must still verify against the real signing
+  // key, pass the strict payload schema, and run with no mode (the adapter's default, queued) - not be rejected or dead-lettered.
+  it("STORY-032 AC15 - an old-shape signed capture.execute job (no requestMode) replays through the real worker path and runs queued", async () => {
+    const seen: CaptureInput[] = [];
+    vi.spyOn(BaseCaptureAdapter.prototype, "capture").mockImplementationOnce((input) => {
+      seen.push(input);
+      return Promise.resolve({ text: "an answer", format: "markdown", truncated: false, responseTokensEst: 3, latencyMs: 5, costUsd: 0 });
+    });
+    await addPrompt("normal");
+    const { runId, jobs } = await planRun();
+    const { requestMode: _planned, ...oldShape } = (jobs[0]!.data as { payload: Record<string, unknown> }).payload;
+    expect(_planned, "the planner now sets it: this job is stripped to the OLD shape").toBe("live");
+    const key = Buffer.from("old-shape-replay-signing-key-32by");
+    const entry = QUEUE_TOPOLOGY.find((e) => e.name === "capture.execute")!;
+    const process = createJobProcessor(entry, {
+      keys: { current: { kid: "test-kid", key } },
+      getClient: () => Promise.resolve(db),
+      releaseClient: () => undefined,
+      process: handler(),
+    });
+    await process({ data: signQueueJobPayload(oldShape as unknown as Parameters<typeof signQueueJobPayload>[0], key) } as unknown as Job);
+    vi.restoreAllMocks();
+    expect(seen).toHaveLength(1);
+    expect("requestMode" in seen[0]!, "no mode on the wire: the adapter defaults to queued").toBe(false);
+    const row = await db.query<{ status: string }>("SELECT status FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(row.rows[0]!.status).toBe("captured");
+  }, 60_000);
+
+  // STORY-032 AC16 - the NFR-SIM-12 async fact rides the L1 entry, so a reuse of an on-demand answer is still an on-demand row.
+  it("STORY-032 AC16 - a seeded answer's async_generated fact is copied onto the L1 row a later run writes", async () => {
+    const { second } = await captureThenReplan("normal", raw({ text: "an on-demand answer", asyncGenerated: true }));
+    const row = await db.query<{ cache_layer: string; async_generated: boolean | null }>(
+      "SELECT cache_layer, async_generated FROM answer_captures WHERE run_id = $1",
+      [second.runId],
+    );
+    expect(row.rows[0]).toMatchObject({ cache_layer: "l1", async_generated: true });
   });
 
   // ---- Audit round 3 - what may enter L1, and how a token-budget failure is recorded ---------------------------------------------

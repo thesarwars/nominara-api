@@ -182,4 +182,6 @@ export const semanticNodes = pgTable("semantic_nodes", {
   computedAt: timestamp("computed_at", { withTimezone: true }).notNull().default(sql`now()`),
   embeddingModel: text("embedding_model"),
   collapsedIntoId: uuid("collapsed_into_id"),
+  embeddingNext: halfvec("embedding_next", { dimensions: 1536 }),
+  embeddingNextModel: text("embedding_next_model"),
 });

@@ -79,6 +79,7 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "db:generate": "writes a migration scaffold",
   "db:migrate": "mutates a database",
   "db:rollback": "mutates a database",
+  "db:reembed": "operator command (STORY-186, decision 104b): enqueues paid re-embed jobs and promotes projects; off by default",
   "db:reset": "mutates a database",
   "db:dev-credentials": "provisions local role passwords",
   "db:rls-generate": "writes generated RLS artifacts; db:rls-check is the gate over them",

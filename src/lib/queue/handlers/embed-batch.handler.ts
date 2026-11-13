@@ -94,6 +94,20 @@ export class EmbedBatchFailedError extends Error {
   }
 }
 
+/**
+ * STORY-186 - a stage job whose target model is not the model THIS worker's provider announces. Staging would write a vector under a model the
+ * operator did not ask for and the project would never complete, so the job is refused, once, loudly (an UnrecoverableError: no retry ladder).
+ */
+export class StageModelMismatchError extends UnrecoverableError {
+  constructor(
+    readonly targetModel: string,
+    readonly workerModel: string,
+  ) {
+    super("embed.batch stage job refused: the worker's embedding model is not the operator's target model");
+    this.name = "StageModelMismatchError";
+  }
+}
+
 export class EmbedBatchPermanentError extends UnrecoverableError {
   readonly spentTokens: number;
   readonly retryable: boolean = false;
@@ -241,6 +255,54 @@ const TABLE_SQL: Readonly<Record<EmbedTable, TableSql>> = {
   },
 };
 
+// STORY-186 (owner decision 104(c)) - a STAGE job. The new vector goes to `embedding_next` / `embedding_next_model`; `embedding` and
+// `embedding_model`, the pair every similarity query reads, are not touched, so the old vector is served until the project is promoted
+// (reembed-promote.ts). Only rows that HAVE a vector under another model are staged: a row with no vector is the backfill's (a direct job),
+// and a row already under the target model needs nothing. Re-staging happens when the staged model is not the target (a second model change).
+const STAGE_SQL: Readonly<Partial<Record<EmbedTable, TableSql>>> = {
+  tracked_prompts: {
+    pending: `SELECT id, text, NULL::text AS hash, false AS is_draft
+                FROM tracked_prompts
+               WHERE deleted_at IS NULL AND workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND $2::text IS NOT NULL
+                 AND embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $2
+                 AND (embedding_next IS NULL OR embedding_next_model IS DISTINCT FROM $2)
+               ORDER BY id`,
+    reuse: undefined,
+    write: `UPDATE tracked_prompts t
+               SET embedding_next = v.vec::halfvec(1536), embedding_next_model = $3
+              FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
+             WHERE t.id = v.id AND t.deleted_at IS NULL AND t.workspace_id = app.current_workspace()
+               AND t.embedding IS NOT NULL AND t.embedding_model IS DISTINCT FROM $3
+               AND (t.embedding_next IS NULL OR t.embedding_next_model IS DISTINCT FROM $3)
+            RETURNING t.id`,
+  },
+  semantic_nodes: {
+    pending: `SELECT id, phrase AS text, NULL::text AS hash, false AS is_draft
+                FROM semantic_nodes
+               WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND $2::text IS NOT NULL
+                 AND embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $2
+                 AND (embedding_next IS NULL OR embedding_next_model IS DISTINCT FROM $2)
+               ORDER BY id`,
+    reuse: undefined,
+    write: `UPDATE semantic_nodes t
+               SET embedding_next = v.vec::halfvec(1536), embedding_next_model = $3
+              FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)
+             WHERE t.id = v.id AND t.workspace_id = app.current_workspace()
+               AND t.embedding IS NOT NULL AND t.embedding_model IS DISTINCT FROM $3
+               AND (t.embedding_next IS NULL OR t.embedding_next_model IS DISTINCT FROM $3)
+            RETURNING t.id`,
+  },
+};
+
+/** The statement set for a job: the stage set when the payload says so (the schema guarantees the table has one), else the direct set. */
+function sqlFor(payload: EmbedBatchPayload): TableSql {
+  if (payload.stage !== true) return TABLE_SQL[payload.table];
+  // FAIL CLOSED: a stage job with no stage statements must never fall through to the in-place write.
+  const staged = STAGE_SQL[payload.table];
+  if (staged === undefined) throw new Error(`embed.batch: no stage statements for ${payload.table}`);
+  return staged;
+}
+
 export function createEmbedBatchHandler(context: QueueHandlerContext, deps: EmbedBatchDeps = {}): JobProcessor {
   const logger = new Logger("embed.batch");
 
@@ -253,7 +315,12 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
   const prepare = async (tx: ClientBase, job: Job): Promise<EmbedPrepared | typeof PHASES_DONE> => {
     const payload = payloadOf(job);
     const { model, dimensions } = providerFor();
-    const sql = TABLE_SQL[payload.table];
+    const sql = sqlFor(payload);
+    if (payload.stage === true && payload.targetModel !== model) {
+      incrementCounter("nominara_embed_stage_model_mismatch_total", { table: payload.table });
+      logger.error({ event: "embed.batch.stage_model_mismatch", workspace_id: payload.workspaceId, table: payload.table, target_model: payload.targetModel ?? null, worker_model: model, requested: payload.ids.length });
+      throw new StageModelMismatchError(payload.targetModel ?? "", model);
+    }
     const ids = [...new Set(payload.ids.map((id) => id.toLowerCase()))].sort();
 
     // L7 FIRST: reuse a stored vector for unchanged content, so the provider never sees it.
@@ -352,7 +419,7 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
       );
       for (const scope of scopes.rows) await lockNodeScope(tx, scope.project_id, scope.prompt_cluster_id);
     }
-    const written = await tx.query(TABLE_SQL[payload.table].write, [
+    const written = await tx.query(sqlFor(payload).write, [
       writeIds,
       prepared.writes.map((write) => fetched.vectors[write.textIndex]!),
       prepared.model,

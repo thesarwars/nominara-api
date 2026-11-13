@@ -73,6 +73,8 @@ export interface CaptureCellInput {
    * refused, in every tenant alike. Absent is "not priority".
    */
   readonly isPriority?: boolean;
+  /** STORY-032 AC15 - the licensed-SERP speed the run's trigger chose, from the signed payload. Absent means the adapter's default (queued). */
+  readonly requestMode?: "queued" | "live";
 }
 
 export type CaptureCellOutcome =
@@ -249,6 +251,7 @@ export async function fetchCell(input: CaptureCellInput, ports: FetchCellPorts =
         locale: input.locale,
         sampleIndex: input.sampleIndex,
         ...(input.personaHint !== null ? { personaHint: input.personaHint } : {}),
+        ...(input.requestMode !== undefined ? { requestMode: input.requestMode } : {}),
         requireCitations: adapter.supportsCitations,
       },
       captureContext(controller.signal, costs),
@@ -529,6 +532,8 @@ export async function seedSharedCache(cache: Cache, input: CaptureCellInput, raw
       excerpt: minimiseExcerpt(raw.text, EXCERPT_CHARS),
       // STORY-079 - the answer's own capture time, so a Tools scan serving it can state its true age.
       capturedAt: now.toISOString(),
+      // STORY-032 AC16 - the NFR-SIM-12 async fact, so an L1 reuse copies it. Absent when the engine reports none (never written as false).
+      ...(typeof raw.asyncGenerated === "boolean" ? { asyncGenerated: raw.asyncGenerated } : {}),
     }),
     { ttlMs: input.ttlSeconds * 1000 },
   );

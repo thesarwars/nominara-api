@@ -337,6 +337,62 @@ describe("STORY-032 · planning a run end to end", () => {
     expect(row.rows[0]!.source_result_id, "an L1 row may never reference another tenant's capture").toBeNull();
   }, 60_000);
 
+  // STORY-032 AC15 - scenario 15: the run's trigger sets the licensed-SERP mode on every live cell it will enqueue.
+  it("STORY-032 AC15 - a manual run's cells carry requestMode live and a scheduled run's carry queued", async () => {
+    await addEngine("google_aio");
+    await addEngine("google_ai_mode");
+    await addPrompt("best crm");
+    const modes = async (trigger: PlanRunContext["trigger"]) => {
+      await db.query("DELETE FROM answer_captures WHERE run_id = $1", [runId]);
+      const plan = await planInTransaction(db, context({ trigger }));
+      return plan.cells.map((cell) => `${cell.engineKey}:${(cell.payload as { requestMode?: string }).requestMode}`).sort();
+    };
+    expect(await modes("manual")).toEqual(["google_ai_mode:live", "google_aio:live", "perplexity:live"]);
+    expect(await modes("scheduled")).toEqual(["google_ai_mode:queued", "google_aio:queued", "perplexity:queued"]);
+  }, 60_000);
+
+  // STORY-032 AC16 - scenario 16, L1 half: through the real probe -> cell -> row path.
+  it("STORY-032 AC16 - an L1-suppressed cell's row carries the entry's async_generated and no_ai_overview_for_query", async () => {
+    await addPrompt("best crm");
+    await cache.set(
+      captureL1Key({ env: "test", engineKey: "perplexity", adapterMajor: adapterMajorOf("1.0.0"), promptText: "best crm", locale: "en-US", personaHint: null, ttlSeconds: TTL_SECONDS, nowMs: NOW_MS }),
+      JSON.stringify({ v: 2, contentHash: "a".repeat(64), payload: { answer: "" }, excerpt: null, asyncGenerated: true, flags: ["no_ai_overview_for_query"] }),
+      { ttlMs: 600_000 },
+    );
+    await planInTransaction(db, context());
+    const row = await db.query<{ flags: string[]; async_generated: boolean | null }>("SELECT flags, async_generated FROM answer_captures WHERE run_id = $1 AND cache_layer = 'l1'", [runId]);
+    expect(row.rows[0]).toEqual({ flags: ["no_ai_overview_for_query"], async_generated: true });
+  }, 60_000);
+
+  // STORY-032 AC16 - scenario 16, L2 half: a near-duplicate prompt reuses a source whose answer was on-demand and a flagged absence.
+  it("STORY-032 AC16 - an L2-suppressed cell's row carries its source's async_generated and no_ai_overview_for_query", async () => {
+    const vector = (mix: number) => {
+      const v = new Array<number>(1536).fill(0);
+      const norm = Math.sqrt(1 + mix * mix);
+      v[0] = 1 / norm;
+      v[1] = mix / norm;
+      return `[${v.join(",")}]`;
+    };
+    const sourcePrompt = await addPrompt("best crm for small business");
+    const targetPrompt = await addPrompt("best crm for small businesses");
+    await db.query("UPDATE tracked_prompts SET embedding = $2::halfvec WHERE id = $1", [sourcePrompt, vector(0)]);
+    await db.query("UPDATE tracked_prompts SET embedding = $2::halfvec WHERE id = $1", [targetPrompt, vector(0.1)]);
+    // The source is a PRIOR run's parsed capture of the source prompt, so only the target cell can be reused.
+    const priorRun = randomUUID();
+    await db.query(`INSERT INTO capture_runs (id, workspace_id, project_id, trigger, engine_keys) VALUES ($1, $2, $3, 'scheduled', ARRAY['perplexity'])`, [priorRun, workspaceId, projectId]);
+    await db.query(
+      `INSERT INTO answer_captures (workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version, normalizer_version,
+                                    content_hash, status, cache_layer, async_generated, flags)
+       VALUES ($1, $2, $3, $4, 'perplexity', now(), 'api', '1.0.0', 'v1', sha256('x'::bytea), 'parsed', 'live', true, ARRAY['no_ai_overview_for_query'])`,
+      [workspaceId, projectId, priorRun, sourcePrompt],
+    );
+    await db.query("UPDATE tracked_prompts SET status = 'paused' WHERE id = $1", [sourcePrompt]);
+    const plan = await planInTransaction(db, context());
+    expect(plan.suppressedByLayer.l2, "the probe must be capable of reusing, or the assertion below is vacuous").toBe(1);
+    const row = await db.query<{ flags: string[]; async_generated: boolean | null }>("SELECT flags, async_generated FROM answer_captures WHERE run_id = $1 AND cache_layer = 'l2'", [runId]);
+    expect(row.rows[0]).toEqual({ flags: ["no_ai_overview_for_query"], async_generated: true });
+  }, 60_000);
+
   // EXACTLY ONE LAYER PER CELL. A cell answered by L1 must not be offered to
   // L2: it would cost a vector query for an answer already in hand, and a
   // double hit would write TWO answer_captures rows for one cell and count
