@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import { randomBytes } from "node:crypto";
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Test } from "@nestjs/testing";
@@ -9,7 +10,6 @@ import { ApiModule } from "../../src/api/api.module.js";
 import { configureApp } from "../../src/api/configure-app.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
-import { cacheKeyNamespace } from "../../src/lib/cache/key-namespace.js";
 import { SessionService } from "../../src/modules/identity/session.service.js";
 import { apiUrl } from "../support/api-url.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
@@ -17,6 +17,7 @@ import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture
 import { walkRoutes } from "../support/discover-contract-routes.js";
 import { getIsolationProvidedContext, getMaintenanceConnection } from "./support/context.js";
 import { discoverTenantTables } from "./support/discovery.js";
+import { judgeReplay, normaliseBody } from "./support/fuzz-judge.js";
 import { classifyCacheKeys } from "./support/live-keys.js";
 import { isRunnableForCurrentTarget } from "./support/target-guard.js";
 
@@ -37,7 +38,7 @@ import { isRunnableForCurrentTarget } from "./support/target-guard.js";
 // And where B's OWN identifier makes the route answer 2xx, a foreign identifier must be exactly 403 or 404 (the specification's "only 403/404").
 const REPLAYS = 500;
 const SEED = 0x5eed08;
-const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu;
+const NAMESPACE = `isofuzz-${randomBytes(4).toString("hex")}`;
 
 function mulberry32(seed: number) {
   let a = seed;
@@ -74,25 +75,6 @@ interface Replayable {
   readonly path: string;
   readonly params: readonly string[];
   readonly table: string | null;
-}
-
-/** The answer with what legitimately differs per request removed: the request id (and trace id), the identifiers the request itself named, timestamps. */
-function normalise(body: string, requestIds: readonly string[]): string {
-  let text = body;
-  try {
-    const volatile = new Set(["request_id", "trace_id"]);
-    const strip = (value: unknown): unknown =>
-      Array.isArray(value)
-        ? value.map(strip)
-        : value !== null && typeof value === "object"
-          ? Object.fromEntries(Object.entries(value).filter(([key]) => !volatile.has(key)).map(([key, inner]) => [key, strip(inner)]))
-          : value;
-    text = JSON.stringify(strip(JSON.parse(body)));
-  } catch {
-    // not JSON: compared as text
-  }
-  for (const id of requestIds) text = text.split(id).join("<requested>");
-  return text.replace(UUID, "<uuid>").replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/gu, "<ts>");
 }
 
 describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 over HTTP: a foreign identifier gets only refusals, indistinguishable from a missing one", () => {
@@ -181,7 +163,9 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     // NODE_ENV=test selects the PER-PROCESS in-memory cache (cache.module.ts), which would leave the live Valkey empty and this assertion vacuous. The
     // composition root is booted as it deploys (`development` selects the Valkey adapter, against OUR throwaway container), and the namespace follows.
     process.env.NODE_ENV = "development";
-    delete process.env.CACHE_KEY_NAMESPACE;
+    // The deployment namespace is a DISTINCTIVE literal, and the live keys are judged against that literal: judged against whatever the code resolves it to, a
+    // regression to the NODE_ENV fallback ("development") would be judged by itself and pass.
+    process.env.CACHE_KEY_NAMESPACE = NAMESPACE;
     process.env.QUEUE_REDIS_URL = queueValkey.connectionString;
 
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule, DiscoveryModule] }).compile();
@@ -238,8 +222,10 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
   });
 
   it(`${String(REPLAYS)} replays of A's and C's identifiers under B's admins' sessions yield only refusals, indistinguishable from an identifier that does not exist`, async () => {
-    // Baseline per route: a RANDOM identifier under B. This is what "does not exist" looks like to B, route by route.
+    // Baseline per route: a RANDOM identifier under B. This is what "does not exist" looks like to B, route by route. For a route with more than one parameter the
+    // MIXED baseline is B's own parent with a random child: the mixed-ownership replay below must look exactly like that.
     const baseline = new Map<string, { status: number; body: string }>();
+    const mixedBaseline = new Map<string, { status: number; body: string }>();
     // The control: B's OWN identifier under B. Where it answers 2xx the route demonstrably resolves ids, so a foreign one must be exactly 403/404.
     const resolves = new Set<string>();
     const rand = mulberry32(SEED);
@@ -247,51 +233,65 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
       const missing = fill(route, () => random());
       const refused = await get(bCookie(), missing.url);
       expect(refused.statusCode, `baseline ${route.path} was throttled or failed`).not.toBe(429);
-      baseline.set(route.path, { status: refused.statusCode, body: normalise(refused.body, missing.used) });
+      baseline.set(route.path, { status: refused.statusCode, body: normaliseBody(refused.body, missing.used) });
       const own = fill(route, (index) => idFor(route, b.workspaceId, index, rand));
       const answered = await get(bCookie(), own.url);
       expect(answered.statusCode, `control ${route.path} was throttled`).not.toBe(429);
       expect(answered.statusCode, `control ${route.path}: B's own identifier`).toBeLessThan(500);
       if (answered.statusCode >= 200 && answered.statusCode < 300) resolves.add(route.path);
+      if (route.params.length > 1) {
+        const parent = idFor(route, b.workspaceId, 0, rand);
+        const mixed = fill(route, (index) => (index === 0 ? parent : random()));
+        const response = await get(bCookie(), mixed.url);
+        expect(response.statusCode, `mixed baseline ${route.path} was throttled`).not.toBe(429);
+        mixedBaseline.set(route.path, { status: response.statusCode, body: normaliseBody(response.body, mixed.used) });
+      }
     }
     // A control that never succeeds would let every refusal below be "the route refuses everything". These are the routes whose own-id read works.
     expect(resolves.size, `routes that answered B's own identifier with 2xx: ${[...resolves].join(", ")}`).toBeGreaterThanOrEqual(10);
 
     const foreignIds = new Set([...pools.get(a.workspaceId)!.values(), ...pools.get(c.workspaceId)!.values()].flat());
+    const resolving = routes.filter((route) => resolves.has(route.path));
+    const multi = routes.filter((route) => route.params.length > 1);
     const failures: string[] = [];
     let refused = 0;
+    let onResolving = 0;
+    let mixedReplays = 0;
+    const resolvingCovered = new Set<string>();
     for (let i = 0; i < REPLAYS; i++) {
-      const route = routes[Math.floor(rand() * routes.length)]!;
+      // Weighted toward the routes that RESOLVE identifiers: a route that refuses everything cannot show a scope check is missing.
+      const route = rand() < 0.75 ? resolving[Math.floor(rand() * resolving.length)]! : routes[Math.floor(rand() * routes.length)]!;
       const victim = rand() < 0.5 ? a.workspaceId : c.workspaceId;
-      const { url, used } = fill(route, (index) => idFor(route, victim, index, rand));
+      // Mixed ownership on a multi-parameter route: B's OWN parent with a foreign child (a handler that scopes the parent and trusts the child).
+      const mixed = multi.includes(route) && rand() < 0.5;
+      const parent = mixed ? idFor(route, b.workspaceId, 0, rand) : "";
+      const { url, used } = fill(route, (index) => (mixed && index === 0 ? parent : idFor(route, victim, index, rand)));
       const response = await get(bCookie(), url);
-      const base = baseline.get(route.path)!;
-      const label = `#${String(i)} GET ${url} -> ${String(response.statusCode)}`;
-      if (response.statusCode >= 500) failures.push(`${label}: a server error`);
-      else if (response.statusCode === 429) failures.push(`${label}: throttled, so the replay proves nothing`);
-      else {
-        if (response.statusCode < 400 && base.status >= 400) failures.push(`${label}: succeeded where a missing id is refused (${String(base.status)})`);
-        if (resolves.has(route.path) && response.statusCode !== 403 && response.statusCode !== 404) failures.push(`${label}: a resolving route must refuse a foreign id with 403 or 404`);
-        const echoed = new Set(used);
-        const leaked = (response.body.match(UUID) ?? []).filter((id) => foreignIds.has(id) && !echoed.has(id));
-        if (leaked.length > 0) failures.push(`${label}: the body carries a foreign identifier (${leaked[0]!})`);
-        if (response.statusCode !== base.status || normalise(response.body, used) !== base.body) failures.push(`${label}: differs from the answer for an identifier that does not exist (${String(base.status)}): got ${normalise(response.body, used).slice(0, 160)} / want ${base.body.slice(0, 160)}`);
-        if (response.statusCode >= 400) refused++;
+      if (resolves.has(route.path)) {
+        onResolving++;
+        resolvingCovered.add(route.path);
       }
+      if (mixed) mixedReplays++;
+      const failuresHere = judgeReplay({
+        label: `#${String(i)} GET ${url} -> ${String(response.statusCode)}${mixed ? " (mixed ownership)" : ""}`,
+        status: response.statusCode,
+        body: response.body,
+        used,
+        baseline: mixed ? mixedBaseline.get(route.path)! : baseline.get(route.path)!,
+        // A mixed replay's own parent resolves; only the child is foreign, so it is held to "same as a missing child" rather than to 403/404 specifically.
+        resolves: !mixed && resolves.has(route.path),
+        foreignIds,
+      });
+      failures.push(...failuresHere);
+      if (failuresHere.length === 0 && response.statusCode >= 400) refused++;
     }
     expect(failures, `seed=${String(SEED)}\n${failures.slice(0, 10).join("\n")}`).toEqual([]);
-    // A floor, so a replay that "passes" because nothing ran (or everything errored upstream) cannot stand.
+    // Floors, so a replay that "passes" because nothing ran, or everything was refused upstream of the scope check, cannot stand.
     expect(refused).toBeGreaterThanOrEqual(Math.floor(REPLAYS * 0.9));
+    expect(onResolving, "replays on routes that resolve identifiers").toBeGreaterThanOrEqual(Math.floor(REPLAYS * 0.7));
+    expect(resolvingCovered.size, "distinct resolving routes replayed").toBeGreaterThanOrEqual(Math.floor(resolving.length * 0.8));
+    if (multi.length > 0) expect(mixedReplays, "mixed-ownership replays on multi-parameter routes").toBeGreaterThanOrEqual(20);
   }, 400_000);
-
-  it("the judge can fail: a route that answers 200 for a foreign id is reported (negative control on the replay judgement)", () => {
-    // The judgement above is inline; this restates its two cheapest branches on a planted response so a refactor that drops them is seen.
-    const planted = { statusCode: 200, body: JSON.stringify({ data: { id: [...pools.get(a.workspaceId)!.values()].flat()[0] } }) };
-    const foreign = new Set([...pools.get(a.workspaceId)!.values()].flat());
-    expect(planted.statusCode < 400).toBe(true);
-    expect((planted.body.match(UUID) ?? []).some((id) => foreign.has(id))).toBe(true);
-    expect(normalise(planted.body, [])).not.toBe(normalise(JSON.stringify({ error: { code: "not_found" } }), []));
-  });
 
   // ISO-13, the live half: what the traffic above actually left in the cache. Every authenticated request above touched rate-limit and session state.
   it("STORY-012 AC8 · ISO-13 live: every key in the cache the traffic wrote is namespaced {env}:{ws}:… (or the global exception), and no key names two tenants", async () => {
@@ -310,7 +310,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
         keys.push(...batch);
       } while (cursor !== "0");
 
-      const report = classifyCacheKeys(keys, { env: cacheKeyNamespace(), tenantIds: [a.workspaceId, b.workspaceId, c.workspaceId] });
+      const report = classifyCacheKeys(keys, { env: NAMESPACE, tenantIds: [a.workspaceId, b.workspaceId, c.workspaceId] });
       expect(report.violations, `un-namespaced or mixed keys among ${String(keys.length)}`).toEqual([]);
       // Non-vacuity: the two tenants that made requests each have tenant keys, and neither has the other's.
       expect(report.tenantKeys.get(a.workspaceId)?.length ?? 0, `tenant A's keys among ${keys.slice(0, 12).join(" | ")}`).toBeGreaterThan(0);
@@ -318,7 +318,9 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
 
       // The judge against THIS keyspace, made to fail: a planted un-namespaced tenant key and a planted two-tenant key are both caught.
       await redis.set(`${a.workspaceId}:planted:x`, "1");
-      await redis.set(`${cacheKeyNamespace()}:${a.workspaceId}:planted:${b.workspaceId}`, "1");
+      // The NODE_ENV fallback namespace: the key a regression of CACHE_KEY_NAMESPACE would write. It must fail against the pinned literal.
+      await redis.set(`development:${a.workspaceId}:planted:y`, "1");
+      await redis.set(`${NAMESPACE}:${a.workspaceId}:planted:${b.workspaceId}`, "1");
       const planted: string[] = [];
       let planting = "0";
       do {
@@ -326,8 +328,8 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
         planting = next;
         planted.push(...batch);
       } while (planting !== "0");
-      const reasons = classifyCacheKeys(planted, { env: cacheKeyNamespace(), tenantIds: [a.workspaceId, b.workspaceId, c.workspaceId] }).violations.map((v) => v.reason).sort();
-      expect(reasons).toEqual(["a tenant key with no deployment namespace", "one key names two tenants"]);
+      const reasons = classifyCacheKeys(planted, { env: NAMESPACE, tenantIds: [a.workspaceId, b.workspaceId, c.workspaceId] }).violations.map((v) => v.reason).sort();
+      expect(reasons).toEqual(["a tenant key with no deployment namespace", "a tenant key with no deployment namespace", "one key names two tenants"]);
     } finally {
       redis.disconnect();
     }
