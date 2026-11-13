@@ -71,13 +71,14 @@ export class ExportDownloadService {
       const row = found.rows[0];
       if (row === undefined) throw new NotFoundError({ message: "no such export" });
       if (!isStoredObjectKey(row.object_key)) throw new DegradedError({ message: "the export file is not available" });
-      // STORY-097 AC4: the file name carries no platform name once the brand is removed (entitlement held NOW and the theme's switch set).
-      const entitlements = await this.resolver.resolveForWorkspace(context.workspaceId);
-      const showBrand = !(row.hide_brand === true && entitlements.entitlements["whitelabel.remove_branding"]?.value === true);
       // No transaction and no pooled connection is held from here on: the presign and the count run once the request's transaction ended.
       const registered = afterTransaction(async () => {
         let after = "error";
         try {
+          // STORY-097 AC4: the file name carries no platform name once the brand is removed (entitlement held NOW and the theme's switch set).
+          // Resolved HERE, after the request transaction ended, so no entitlement read is made while it is open (ADR-0003).
+          const entitlements = await this.resolver.resolveForWorkspace(context.workspaceId);
+          const showBrand = !(row.hide_brand === true && entitlements.entitlements["whitelabel.remove_branding"]?.value === true);
           const url = await bound.presignGetStored("reports", row.object_key, {
             expiresInSeconds: EXPORT_DOWNLOAD_URL_SECONDS,
             downloadFilename: reportFileName(showBrand, row.period_end, row.format),

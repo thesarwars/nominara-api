@@ -212,3 +212,15 @@ describe("STORY-097 AC4 · the download file name", () => {
     expect(nameOf(h)).toBe("nominara-report-2026-10-31.pdf");
   });
 });
+
+describe("STORY-097 (review fix) · the entitlement read happens after the request transaction", () => {
+  it("resolveForWorkspace is not called by the in-transaction lookup, only by the after-transaction work", async () => {
+    const h = build({ rows: [{ object_key: KEY, format: "pdf", period_end: "2026-10-31" }] });
+    const resolver = (h.service as unknown as { resolver: { resolveForWorkspace: ReturnType<typeof vi.fn> } }).resolver;
+    const spy = vi.spyOn(resolver, "resolveForWorkspace");
+    await h.service.resolve({ id: ID }, h.location);
+    expect(spy).not.toHaveBeenCalled();
+    for (const task of h.afterTasks.splice(0)) await task();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
