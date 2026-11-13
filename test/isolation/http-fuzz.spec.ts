@@ -76,10 +76,23 @@ interface Replayable {
   readonly table: string | null;
 }
 
+/** The answer with what legitimately differs per request removed: the request id (and trace id), the identifiers the request itself named, timestamps. */
 function normalise(body: string, requestIds: readonly string[]): string {
-  let out = body;
-  for (const id of requestIds) out = out.split(id).join("<requested>");
-  return out.replace(UUID, "<uuid>").replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/gu, "<ts>");
+  let text = body;
+  try {
+    const volatile = new Set(["request_id", "trace_id"]);
+    const strip = (value: unknown): unknown =>
+      Array.isArray(value)
+        ? value.map(strip)
+        : value !== null && typeof value === "object"
+          ? Object.fromEntries(Object.entries(value).filter(([key]) => !volatile.has(key)).map(([key, inner]) => [key, strip(inner)]))
+          : value;
+    text = JSON.stringify(strip(JSON.parse(body)));
+  } catch {
+    // not JSON: compared as text
+  }
+  for (const id of requestIds) text = text.split(id).join("<requested>");
+  return text.replace(UUID, "<uuid>").replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/gu, "<ts>");
 }
 
 describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 over HTTP: a foreign identifier gets only refusals, indistinguishable from a missing one", () => {
@@ -258,7 +271,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
         const echoed = new Set(used);
         const leaked = (response.body.match(UUID) ?? []).filter((id) => foreignIds.has(id) && !echoed.has(id));
         if (leaked.length > 0) failures.push(`${label}: the body carries a foreign identifier (${leaked[0]!})`);
-        if (response.statusCode !== base.status || normalise(response.body, used) !== base.body) failures.push(`${label}: differs from the answer for an identifier that does not exist (${String(base.status)})`);
+        if (response.statusCode !== base.status || normalise(response.body, used) !== base.body) failures.push(`${label}: differs from the answer for an identifier that does not exist (${String(base.status)}): got ${normalise(response.body, used).slice(0, 160)} / want ${base.body.slice(0, 160)}`);
         if (response.statusCode >= 400) refused++;
       }
     }
@@ -296,7 +309,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
       const report = classifyCacheKeys(keys, { env: cacheKeyNamespace(), tenantIds: [a.workspaceId, b.workspaceId, c.workspaceId] });
       expect(report.violations, `un-namespaced or mixed keys among ${String(keys.length)}`).toEqual([]);
       // Non-vacuity: the two tenants that made requests each have tenant keys, and neither has the other's.
-      expect(report.tenantKeys.get(a.workspaceId)?.length ?? 0, "tenant A's keys").toBeGreaterThan(0);
+      expect(report.tenantKeys.get(a.workspaceId)?.length ?? 0, `tenant A's keys among ${keys.slice(0, 12).join(" | ")}`).toBeGreaterThan(0);
       expect(report.tenantKeys.get(b.workspaceId)?.length ?? 0, "tenant B's keys").toBeGreaterThan(0);
 
       // The judge against THIS keyspace, made to fail: a planted un-namespaced tenant key and a planted two-tenant key are both caught.
