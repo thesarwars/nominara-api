@@ -80,7 +80,7 @@ describe("STORY-066 AC1/AC2 · the published growth-map operation documents its 
       .flatMap((item) => Object.values(item))
       .find((op) => op.operationId === "getProjectGrowthMap");
     const query = new Map((operation?.parameters ?? []).filter((p) => p.in === "query").map((p) => [p.name, p.schema?.enum]));
-    expect(query.get("timeframe")).toEqual(["24h", "7d", "30d", "90d", "180d", "365d"]);
+    expect(query.get("timeframe")).toEqual(["24h", "7d", "30d", "90d", "180d", "365d", "custom"]);  // STORY-090 adds `custom`
     expect(query.get("granularity")).toEqual(["hour", "day", "week"]);
   });
 });
