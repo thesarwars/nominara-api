@@ -13,12 +13,13 @@ import {
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Audit } from "../../api/decorators/audit.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
+import { RequireStepUp } from "../../api/decorators/require-step-up.decorator.js";
 import { RequireStorage } from "../../api/decorators/require-storage.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { RetentionExportService } from "./retention-export.service.js";
 
 // STORY-185 / owner decision 100 - the full-data export offered while a retention-shortening purge is pending. Owner and admin only (billing:read for
-// the view and the download, billing:write for the request). Costs 0 credits and is not the report export: no @Meter, no @Credits, no export:data.
+// the view and the download, billing:write for the request). The request also needs a fresh strong authentication (owner decision 100(j): `@RequireStepUp`, 401 `step_up_required`, as export:data does for owner and admin). Costs 0 credits and is not the report export: no @Meter, no @Credits, no export:data.
 // The request is the ordinary `writes` rate class (60/min) AND structurally limited: one export in flight per workspace, and a ready one is reused,
 // so a loop of requests builds nothing more. Audited (`billing.retention_export.requested`, the response id as the resource).
 @Controller("billing/retention-export")
@@ -36,6 +37,7 @@ export class RetentionExportController {
   @HttpCode(202)
   @RequireStorage()
   @RequirePermission("billing:write")
+  @RequireStepUp()
   @Audit({ action: "billing.retention_export.requested", resourceType: "retention_export", resourceIdFrom: "response" })
   @ApiContract({ operationId: "requestRetentionExport", requestSchema: retentionExportRequestSchema, responseSchema: retentionExportSchema })
   request(@Body(new ZodValidationPipe(retentionExportRequestSchema)) _body: RetentionExportRequest): Promise<RetentionExport> {
