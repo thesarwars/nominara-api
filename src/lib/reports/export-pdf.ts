@@ -180,6 +180,35 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
             const anyLow = section.days.some((day) => isLow(day.blended, day.cells?.blended) || keys.some((key) => isLow(day.byEngine[key] ?? null, day.cells?.byEngine[key])));
             if (anyLow) text("* low confidence: fewer cells than the interface needs to show a trend; indicative only.", 8);
           }
+        } else if (section.kind === "attribution") {
+          heading(`Attribution - AI-referred sessions${section.windowDays === null ? "" : ` (last ${String(section.windowDays)} days)`}`);
+          // The caveat comes first and in bold: it is the section's permanent frame, not a footnote (STORY-116 AC13).
+          text(section.measuredFloorNote, 9, true);
+          pdf.moveDown(0.4);
+          const t = section.totals;
+          if (t === null) text(`${DASH} no attribution window has been computed yet`, 9);
+          else {
+            const n = (v: number | null): string => (v === null ? DASH : String(v));
+            table(
+              [{ label: "Measure", width: 170 }, { label: "Current", width: 80 }, { label: "Prior", width: 80 }],
+              [
+                ["AI-referred sessions", n(t.ai_sessions.current), n(t.ai_sessions.prior)],
+                ["Conversions", n(t.conversions.current), n(t.conversions.prior)],
+                ["Conversion rate", percent(t.conversion_rate), percent(t.conversion_rate_prior)],
+                ...t.by_engine.map((e) => [`  ${e.referrer_class} sessions`, n(e.sessions.current), n(e.sessions.prior)]),
+                ["Unattributed sessions (not in the AI total)", n(t.unattributed.sessions.current), n(t.unattributed.sessions.prior)],
+              ],
+            );
+            text(`Measured from ${t.measured_from ?? DASH} to ${t.measured_to ?? DASH}.`, 8);
+          }
+          pdf.moveDown(0.4);
+          if (section.rows.length === 0) text(`${DASH} no page measured in this window`, 9);
+          else {
+            table(
+              [{ label: "Page", width: 190 }, { label: "Cited", width: 40 }, { label: "Sessions", width: 55 }, { label: "Conv.", width: 40 }, { label: "Rate", width: 40 }, { label: "Pattern", width: 130 }],
+              section.rows.map((r) => [r.url, String(r.citations), String(r.ai_sessions), String(r.conversions), percent(r.conversion_rate), r.pattern]),
+            );
+          }
         } else {
           heading("Competitors");
           if (section.competitors.length === 0) text(`${DASH} no competitor measured in this window`, 9);

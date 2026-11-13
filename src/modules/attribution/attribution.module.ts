@@ -11,6 +11,6 @@ import { AttributionIngestService } from "./attribution-ingest.service.js";
 @Module({
   controllers: [AttributionConfigController, AttributionController, AttributionIngestController],
   providers: [AttributionConfigService, AttributionIngestService, AttributionService],
-  exports: [AttributionConfigService],
+  exports: [AttributionConfigService, AttributionService],
 })
 export class AttributionModule {}

@@ -1,3 +1,4 @@
+import { MEASURED_FLOOR_COPY, type AttributionRow, type AttributionTotals } from "../../../contracts/attribution/index.js";
 import type { DataSource } from "../../../contracts/analytics/index.js";
 import type { ExportPalette } from "../theme/export-palette.js";
 import type { MethodologyFooter, ReportSection, ReportTimeframe } from "../../../contracts/reports/index.js";
@@ -67,6 +68,18 @@ export interface CompetitorSummary {
   engines: EngineSummary[];
 }
 
+/**
+ * STORY-116 (PROVISIONAL, batch 13): the attribution report's figures for the section. Only what the section draws; the caveat is NOT an
+ * input - the builder sets it from the shared constant, so no caller can omit or reword it.
+ */
+export interface AttributionInput {
+  windowDays: 7 | 30 | 90;
+  windowStart: string | null;
+  /** Null until a rollup window has been computed: the section then shows the caveat and no figures, never zeros. */
+  totals: AttributionTotals | null;
+  rows: readonly AttributionRow[];
+}
+
 export interface ExportDocumentInput {
   projectName: string;
   generatedAt: string;
@@ -80,12 +93,23 @@ export interface ExportDocumentInput {
   overview: { blended: MetricSummary; engines: EngineSummary[] };
   growthMap: { engineKeys: string[]; days: GrowthMapDay[] };
   competitors: CompetitorSummary[];
+  /** Absent when the section was not requested (or the caller has none): the section, if requested, renders with no figures. */
+  attribution?: AttributionInput | undefined;
 }
 
 export type DocumentSection =
   | { kind: "overview"; blended: MetricSummary; engines: EngineSummary[] }
   | { kind: "growth_map"; engineKeys: string[]; days: GrowthMapDay[] }
-  | { kind: "competitors"; competitors: CompetitorSummary[] };
+  | { kind: "competitors"; competitors: CompetitorSummary[] }
+  | {
+      kind: "attribution";
+      windowDays: 7 | 30 | 90 | null;
+      windowStart: string | null;
+      totals: AttributionTotals | null;
+      rows: AttributionRow[];
+      /** STORY-116 AC13: always the shared constant, in every format, whatever the figures. */
+      measuredFloorNote: string;
+    };
 
 export interface ExportDocument {
   projectName: string;
@@ -99,8 +123,8 @@ export interface ExportDocument {
   footer: MethodologyFooter;
 }
 
-const CANONICAL_ORDER: readonly ReportSection[] = ["overview", "growth_map", "matrix", "competitors", "sources", "tasks", "aux"];
-const COMPOSABLE: ReadonlySet<ReportSection> = new Set(["overview", "growth_map", "competitors"]);
+const CANONICAL_ORDER: readonly ReportSection[] = ["overview", "growth_map", "matrix", "competitors", "sources", "tasks", "aux", "attribution"];
+const COMPOSABLE: ReadonlySet<ReportSection> = new Set(["overview", "growth_map", "competitors", "attribution"]);
 
 /** The blend beside no engine is not exported: it becomes the absent summary. */
 function withEngines<T extends { blended: MetricSummary; engines: EngineSummary[] }>(entry: T): T {
@@ -124,6 +148,15 @@ export function buildExportDocument(input: ExportDocumentInput): ExportDocument 
       });
     } else if (section === "competitors" && !input.hideCompetitors) {
       sections.push({ kind: "competitors", competitors: input.competitors.map(withEngines) });
+    } else if (section === "attribution") {
+      sections.push({
+        kind: "attribution",
+        windowDays: input.attribution?.windowDays ?? null,
+        windowStart: input.attribution?.windowStart ?? null,
+        totals: input.attribution?.totals ?? null,
+        rows: [...(input.attribution?.rows ?? [])],
+        measuredFloorNote: MEASURED_FLOOR_COPY,
+      });
     }
   }
 

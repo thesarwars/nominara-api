@@ -16,6 +16,7 @@ import { failedKey, pendingKey } from "../../lib/reports/artifact-key.js";
 import { renderCsv } from "../../lib/reports/export-csv.js";
 import {
   buildExportDocument,
+  type AttributionInput,
   type CompetitorSummary,
   type EngineSummary,
   type GrowthMapDay,
@@ -36,6 +37,7 @@ import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { exportDownloadUrl, EXPORT_PUBLIC_BASE_URL } from "./export-download.service.js";
+import { AttributionService } from "../attribution/attribution.service.js";
 import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 
 // NEW-E-100b — POST /v1/projects/{id}/reports/export (STORY-100, NFR-AGY-05).
@@ -150,6 +152,8 @@ export class ExportService {
     private readonly objects: TenantObjectStore,
     /** The API's public origin the download route is addressed on (OAUTH_REDIRECT_BASE_URL). */
     @Inject(EXPORT_PUBLIC_BASE_URL) private readonly publicBaseUrl: string,
+    /** STORY-116: the attribution section reads the report through its owning service (one table, one owner). */
+    private readonly attribution: AttributionService,
   ) {}
 
   /** Post-commit uploads still running, by artifact id. The scheduled path waits on these through `uploaded()`. */
@@ -222,6 +226,13 @@ export class ExportService {
         ? await this.growthMap(tx, projectId, scoringVersion, window.from, window.to)
         : { engineKeys: [] as string[], days: [] as GrowthMapDay[] };
 
+      // PROVISIONAL (batch 13): attribution windows are 7/30/90 days; a 24-hour export reads the shortest, and the section names its window.
+      let attributionInput: AttributionInput | undefined;
+      if (wanted.has("attribution")) {
+        const report = await this.attribution.report(projectId, { timeframe: body.timeframe === "24h" ? "7d" : body.timeframe });
+        attributionInput = { windowDays: report.window_days, windowStart: report.window_start, totals: report.totals, rows: report.rows };
+      }
+
       let competitors: CompetitorSummary[] = [];
       if (wanted.has("competitors") && !body.hide_competitors) {
         const rows = await this.aggregate(tx, projectId, scoringVersion, "competitor", window.from, window.to);
@@ -248,6 +259,7 @@ export class ExportService {
         overview,
         growthMap,
         competitors,
+        attribution: attributionInput,
       });
 
       const file = body.format === "pdf" ? await renderPdf(doc) : Buffer.from(renderCsv(doc), "utf8");

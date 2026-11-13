@@ -50,6 +50,41 @@ function summaryRows(section: string, entity: string, engineKey: string, summary
   );
 }
 
+type AttributionSection = Extract<ExportDocument["sections"][number], { kind: "attribution" }>;
+
+/** STORY-116: the caveat is the section's first row; a null figure is an empty cell (never 0), and the unattributed class is its own line, never summed in. */
+function attributionRows(section: AttributionSection): string[] {
+  const line = (entity: string, engineKey: string, metric: string, value: string): string => row(["attribution", "", entity, engineKey, metric, value, "", "", ""]);
+  const out = [line("", "", "measured_floor_note", section.measuredFloorNote), line("", "", "window_days", section.windowDays === null ? "" : String(section.windowDays))];
+  const totals = section.totals;
+  if (totals !== null) {
+    out.push(line("", "", "measured_from", totals.measured_from ?? ""), line("", "", "measured_to", totals.measured_to ?? ""));
+    out.push(
+      line("project", "all", "ai_sessions", num(totals.ai_sessions.current)),
+      line("project", "all", "ai_sessions_prior", num(totals.ai_sessions.prior)),
+      line("project", "all", "conversions", num(totals.conversions.current)),
+      line("project", "all", "conversions_prior", num(totals.conversions.prior)),
+      line("project", "all", "conversion_rate", num(totals.conversion_rate)),
+      line("project", "all", "conversion_rate_prior", num(totals.conversion_rate_prior)),
+    );
+    for (const engine of totals.by_engine) {
+      out.push(line("project", engine.referrer_class, "ai_sessions", num(engine.sessions.current)), line("project", engine.referrer_class, "conversions", num(engine.conversions.current)));
+    }
+    out.push(line("project", "unattributed", "sessions", num(totals.unattributed.sessions.current)), line("project", "unattributed", "conversions", num(totals.unattributed.conversions.current)));
+  }
+  for (const r of section.rows) {
+    out.push(
+      line(r.url, "all", "citations", String(r.citations)),
+      line(r.url, "all", "ai_sessions", String(r.ai_sessions)),
+      line(r.url, "all", "conversions", String(r.conversions)),
+      line(r.url, "all", "conversion_rate", num(r.conversion_rate)),
+      line(r.url, "all", "gsc_ai_impressions", r.gsc_ai_impressions === null ? "" : String(r.gsc_ai_impressions)),
+      line(r.url, "all", "pattern", r.pattern),
+    );
+  }
+  return out;
+}
+
 export function renderCsv(doc: ExportDocument): string {
   const footer = doc.footer;
   const meta = (metric: string, value: string): string => row(["methodology", "", "", "", metric, value, "", "", ""]);
@@ -84,6 +119,8 @@ export function renderCsv(doc: ExportDocument): string {
         lines.push(figure("all", day.blended, day.cells?.blended));
         for (const key of section.engineKeys) lines.push(figure(key, day.byEngine[key] ?? null, day.cells?.byEngine[key]));
       }
+    } else if (section.kind === "attribution") {
+      lines.push(...attributionRows(section));
     } else {
       for (const competitor of section.competitors) {
         lines.push(...summaryRows("competitors", competitor.name, "all", competitor.blended));
