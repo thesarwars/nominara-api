@@ -294,10 +294,10 @@ export class ScheduledReportsService implements OnModuleDestroy {
     const recorded = await this.record(client, workspaceId, report, deliveryId, "sending", null, 0, artifacts[0] ?? null);
     // STORY-100 AC10: the agency's display name and Reply-To, read from the theme row in THIS transaction (the send itself
     // holds none) and carried to the post-commit send.
-    const sender = await resolveReportSender(client, report.theme_id);
+    const sender = await resolveReportSender(client, report.theme_id, entitlements.entitlements["whitelabel.remove_branding"]?.value === true);
     // STORY-180 AC3: attach or link, decided and (for a link) the token's hash stored, in THIS transaction. The bytes are read
     // after the commit, by the delivery.
-    const mail = await planArtifactMail(client, { ...(this.mailDeps ??= mailDepsFromEnv(this.objects, loadEnv())), uploaded: (ids) => this.exports.uploaded(ids) }, workspaceId, artifacts);
+    const mail = await planArtifactMail(client, { ...(this.mailDeps ??= mailDepsFromEnv(this.objects, loadEnv())), uploaded: (ids) => this.exports.uploaded(ids) }, workspaceId, artifacts, sender.theme?.showBrandLine ?? true);
     // The request's WHOLE tenant context (project scope included) carries to the second transaction.
     const context = currentTenantStore()!.context;
     afterCommit(() => this.startDelivery(context, report, deliveryId, mail, sender));

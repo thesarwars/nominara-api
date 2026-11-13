@@ -5,6 +5,7 @@ import type { ClientBase } from "pg";
 import { z } from "zod";
 import { selectEmailSender } from "../../../modules/identity/email-sender.selector.js";
 import type { EmailSender } from "../../../modules/identity/ports/email-sender.js";
+import { AttributionService } from "../../../modules/attribution/attribution.service.js";
 import { ExportService } from "../../../modules/reports/export.service.js";
 import { MethodologyService } from "../../../modules/reports/methodology.service.js";
 import { InMemoryCacheAdapter } from "../../cache/in-memory-cache.adapter.js";
@@ -78,7 +79,7 @@ export function createReportBuildHandler(context: QueueHandlerContext, deps: Rep
       const config = resolveStorageConfig(context.env);
       // Unconfigured storage fails closed, as in the API: every export refuses with 503 and the period retries then settles failed.
       const objects = new TenantObjectStore(config === null ? unconfiguredStoragePort() : new S3Adapter(config), config?.keyEnv ?? context.env.NODE_ENV);
-      run = { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, context.pool, objects, context.env.OAUTH_REDIRECT_BASE_URL), mail: mailDepsFromEnv(objects, context.env) };
+      run = { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, context.pool, objects, context.env.OAUTH_REDIRECT_BASE_URL, new AttributionService()), mail: mailDepsFromEnv(objects, context.env) };
     }
     return run;
   };

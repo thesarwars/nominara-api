@@ -10,6 +10,7 @@ import { createReportBuildHandler } from "../../src/lib/queue/handlers/report-bu
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { QUEUE_TOPOLOGY } from "../../src/lib/queue/topology.js";
 import { createJobProcessor } from "../../src/lib/queue/worker-factory.js";
+import { AttributionService } from "../../src/modules/attribution/attribution.service.js";
 import { ExportService } from "../../src/modules/reports/export.service.js";
 import { MethodologyService } from "../../src/modules/reports/methodology.service.js";
 import { EntitlementResolver } from "../../src/lib/entitlements/entitlement-resolver.js";
@@ -177,7 +178,7 @@ describe("STORY-100 · scheduled reports on their cadence", () => {
     const resolver = new EntitlementResolver(new InMemoryCacheAdapter(), appPool);
     const usage = new StructuralUsage(appPool);
     const objects = objectStore();
-    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool, objects, "http://localhost:3000"), mail: mailDepsFromEnv(objects, workerEnv() as never) };
+    return { resolver, usage, exports: new ExportService(new MethodologyService(), resolver, usage, appPool, objects, "http://localhost:3000", new AttributionService()), mail: mailDepsFromEnv(objects, workerEnv() as never) };
   }
 
   /** Real services over the app pool, but a build that always throws (a stand-in for a renderer fault). */

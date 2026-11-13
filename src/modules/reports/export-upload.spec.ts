@@ -79,7 +79,7 @@ function build(opts: { putFails?: boolean; recordedRows?: number; recordThrows?:
       if (opts.deleteFails) throw new Error("s3 down");
     }),
   };
-  const service = new ExportService({} as never, {} as never, {} as never, pool as never, {} as never, "https://api.example.test");
+  const service = new ExportService({} as never, {} as never, {} as never, pool as never, {} as never, "https://api.example.test", {} as never);
   return { service, bound, tasks, recorded, release, pool, order, requestTasks, audits, txClient, rereads, unitTx, auditTx, transactionCount: () => transactions };
 }
 

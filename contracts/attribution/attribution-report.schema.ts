@@ -20,9 +20,9 @@ export type AttributionWindowDays = (typeof ATTRIBUTION_WINDOW_DAYS)[number];
 export const SUBSTITUTION_CO_MOVEMENT_COPY =
   "Citations rose while AI-referred sessions fell on this page. The two moved together; this is an observation, and other explanations cannot be ruled out.";
 
-/** NFR-ANL-09 - the label every attribution figure carries: a measured floor, never an estimated total. */
+/** NFR-ANL-09 - the label every attribution figure carries; the spec wording verbatim (ui-ux-guidelines.md section 5, attribution_floor). */
 export const MEASURED_FLOOR_COPY =
-  "Figures are measured counts and a floor: sessions whose referrer was stripped appear as unattributed direct and are not estimated into the AI total.";
+  "A measured floor. Referrer stripping means some AI traffic is unattributable, and this figure is never extrapolated.";
 
 export const attributionQuerySchema = z
   .object({

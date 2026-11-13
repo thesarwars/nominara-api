@@ -16,6 +16,7 @@ import { failedKey, pendingKey } from "../../lib/reports/artifact-key.js";
 import { renderCsv } from "../../lib/reports/export-csv.js";
 import {
   buildExportDocument,
+  type AttributionInput,
   type CompetitorSummary,
   type EngineSummary,
   type GrowthMapDay,
@@ -30,11 +31,13 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { httpReservationJobId } from "../../lib/usage/reservation-job-id.js";
 import { commitTierCap, limitValueFor, readCounter, releaseTierCap, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
+import { reportFileName } from "../../lib/reports/artifact-filename.js";
 import { exportPaletteFrom, type ExportPalette, type StoredThemeValues } from "../../lib/theme/export-palette.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
 import { AuditChainService } from "../audit/audit-chain.service.js";
 import { exportDownloadUrl, EXPORT_PUBLIC_BASE_URL } from "./export-download.service.js";
+import { AttributionService } from "../attribution/attribution.service.js";
 import { MethodologyService, TIMEFRAME_DAYS } from "./methodology.service.js";
 
 // NEW-E-100b — POST /v1/projects/{id}/reports/export (STORY-100, NFR-AGY-05).
@@ -139,6 +142,16 @@ function summaryOf(row: AggregateRow | undefined, dataSource: DataSource | null)
   };
 }
 
+/**
+ * `scheduledReport` (a scheduled run): ONE theme per run, the report's own `theme_id` (the workspace default only when it is null), used for
+ * the file's colours, its brand line and its name; the artifact records the report so the download names it under the same theme.
+ */
+export interface ExportOptions {
+  readonly awaitUpload?: boolean;
+  readonly audit?: RequestAuditActor;
+  readonly scheduledReport?: { readonly id: string; readonly themeId: string | null };
+}
+
 @Injectable()
 export class ExportService {
   constructor(
@@ -149,6 +162,8 @@ export class ExportService {
     private readonly objects: TenantObjectStore,
     /** The API's public origin the download route is addressed on (OAUTH_REDIRECT_BASE_URL). */
     @Inject(EXPORT_PUBLIC_BASE_URL) private readonly publicBaseUrl: string,
+    /** STORY-116: the attribution section reads the report through its owning service (one table, one owner). */
+    private readonly attribution: AttributionService,
   ) {}
 
   /** Post-commit uploads still running, by artifact id. The scheduled path waits on these through `uploaded()`. */
@@ -167,7 +182,7 @@ export class ExportService {
    * `options.awaitUpload` (the HTTP export route only): the request does not answer until the file is stored, and fails if it could not
    * be. Without it (the scheduled path, whose delivery waits through `uploaded()`) the upload runs after commit and nothing holds a response.
    */
-  async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options: { readonly awaitUpload?: boolean; readonly audit?: RequestAuditActor } = {}): Promise<ExportResponse> {
+  async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options: ExportOptions = {}): Promise<ExportResponse> {
     const started = Date.now();
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ExportService requires an active tenant context");
@@ -221,6 +236,13 @@ export class ExportService {
         ? await this.growthMap(tx, projectId, scoringVersion, window.from, window.to)
         : { engineKeys: [] as string[], days: [] as GrowthMapDay[] };
 
+      // PROVISIONAL (batch 13): attribution windows are 7/30/90 days; a 24-hour export reads the shortest, and the section names its window.
+      let attributionInput: AttributionInput | undefined;
+      if (wanted.has("attribution")) {
+        const report = await this.attribution.report(projectId, { timeframe: body.timeframe === "24h" ? "7d" : body.timeframe });
+        attributionInput = { windowDays: report.window_days, windowStart: report.window_start, totals: report.totals, rows: report.rows };
+      }
+
       let competitors: CompetitorSummary[] = [];
       if (wanted.has("competitors") && !body.hide_competitors) {
         const rows = await this.aggregate(tx, projectId, scoringVersion, "competitor", window.from, window.to);
@@ -233,12 +255,13 @@ export class ExportService {
           .filter((c) => c.engines.length > 0 || c.blended.measuredCells > 0);
       }
 
+      const palette = await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true, options.scheduledReport?.themeId ?? null);
       const doc = buildExportDocument({
         projectName: project.rows[0].name,
         generatedAt: new Date().toISOString(),
         timeframe: body.timeframe,
         window: { from: window.from, to: window.to },
-        palette: await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true),
+        palette,
         footer,
         sections: body.sections,
         hideCompetitors: body.hide_competitors,
@@ -246,14 +269,15 @@ export class ExportService {
         overview,
         growthMap,
         competitors,
+        attribution: attributionInput,
       });
 
       const file = body.format === "pdf" ? await renderPdf(doc) : Buffer.from(renderCsv(doc), "utf8");
       await tx.query(
         `INSERT INTO report_artifacts
-           (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at)
-         VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9::jsonb, now() + make_interval(days => $10::int))`,
-        [exportId, workspaceId, [projectId], window.from, window.to, body.format, pendingKey(exportId), file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS],
+           (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at, scheduled_report_id)
+         VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9::jsonb, now() + make_interval(days => $10::int), $11)`,
+        [exportId, workspaceId, [projectId], window.from, window.to, body.format, pendingKey(exportId), file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS, options.scheduledReport?.id ?? null],
       );
 
       this.scheduleUpload(
@@ -289,7 +313,7 @@ export class ExportService {
       return {
         export_id: exportId,
         format: body.format,
-        filename: `nominara-report-${stamp}.${body.format}`,
+        filename: reportFileName(palette.showBrandLine, stamp, body.format),
         download_url: exportDownloadUrl(this.publicBaseUrl, exportId),
         footer,
         pdf,
@@ -561,8 +585,8 @@ export class ExportService {
     from: string,
     to: string,
   ): Promise<{ engineKeys: string[]; days: GrowthMapDay[] }> {
-    const result = await tx.query<{ metric_date: string; engine_key: string; visibility: number | null }>(
-      `SELECT to_char(metric_date, 'YYYY-MM-DD') AS metric_date, engine_key,
+    const result = await tx.query<{ metric_date: string; engine_key: string; visibility: number | null; cells: number | string }>(
+      `SELECT to_char(metric_date, 'YYYY-MM-DD') AS metric_date, engine_key, sum(cells_total)::int AS cells,
               CASE WHEN sum(cells_total) > 0
                    THEN (sum(visibility_score * cells_total) / sum(cells_total))::float8 END AS visibility
          FROM metric_daily
@@ -576,8 +600,15 @@ export class ExportService {
     const byDate = new Map<string, GrowthMapDay>();
     for (const row of result.rows) {
       const day = byDate.get(row.metric_date) ?? { date: row.metric_date, blended: null, byEngine: Object.fromEntries(engineKeys.map((k) => [k, null])) };
-      if (row.engine_key === CROSS_ENGINE_KEY) day.blended = row.visibility;
-      else day.byEngine[row.engine_key] = row.visibility;
+      const cells = day.cells ?? { blended: 0, byEngine: {} };
+      if (row.engine_key === CROSS_ENGINE_KEY) {
+        day.blended = row.visibility;
+        cells.blended = Number(row.cells);
+      } else {
+        day.byEngine[row.engine_key] = row.visibility;
+        cells.byEngine[row.engine_key] = Number(row.cells);
+      }
+      day.cells = cells;
       byDate.set(row.metric_date, day);
     }
     return { engineKeys, days: [...byDate.values()] };
@@ -587,10 +618,14 @@ export class ExportService {
    * The workspace's default theme as a palette (platform default when none is stored). Brand removal is
    * re-checked against the CURRENT entitlements, not trusted from the stored flag.
    */
-  private async palette(tx: ClientBase, brandRemovalGranted: boolean): Promise<ExportPalette> {
+  private async palette(tx: ClientBase, brandRemovalGranted: boolean, themeId: string | null = null): Promise<ExportPalette> {
+    // The same pick as resolveReportSender (the report's own theme, else the default), so a run never mixes two themes.
     const result = await tx.query<StoredThemeValues>(
       `SELECT color_primary, color_accent, color_bg, color_fg, hide_nominara_brand
-         FROM brand_themes ORDER BY is_default DESC, created_at, id LIMIT 1`,
+         FROM brand_themes
+        WHERE ($1::uuid IS NOT NULL AND id = $1::uuid) OR is_default
+        ORDER BY (id = $1::uuid) DESC NULLS LAST, is_default DESC, created_at, id LIMIT 1`,
+      [themeId],
     );
     return exportPaletteFrom(result.rows[0], brandRemovalGranted);
   }

@@ -1,6 +1,7 @@
 import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { notificationDeepLinkSchema, type NotificationDeepLink, type NotificationSeverity } from "../../../contracts/notifications/index.js";
+import { evaluatePermission, type Permission } from "../../tenancy/permission-matrix.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { emailableMembers, SENTIMENT_ALERT_KIND, seesProject } from "./audience.js";
@@ -34,6 +35,16 @@ export interface NotificationInput {
   readonly taskId?: string | null;
   /** Producer facts kept on the row (the alert rule, its scope); never published as such. */
   readonly facts?: Readonly<Record<string, string | number | boolean | null>>;
+  /**
+   * STORY-098 (PROVISIONAL): email NOW although the severity would wait for the digest. For an event the agency wants in its
+   * inbox at once but that is not an alert (a share link's first view). Same outbox, same suppression, same relay.
+   */
+  readonly emailNow?: boolean;
+  /**
+   * With `emailNow`: who is emailed. Only members whose role holds `permission` AND who can see EVERY project in `projectIds` (an empty list is
+   * the whole workspace, so only a member who sees every project). Their digest cadence is ignored: an immediate notice is not a digest.
+   */
+  readonly emailAudience?: { readonly permission: Permission; readonly projectIds: readonly string[] };
 }
 
 export interface WriteOutcome {
@@ -49,6 +60,11 @@ export interface WriterOptions {
   readonly enqueue?: EnqueueNotifyDispatch;
   /** The app's public origin, for the link in an email (`WEBAUTHN_ORIGIN` is the app's origin). */
   readonly appOrigin?: string;
+  /**
+   * For a caller on the API request path, which has no queue producer: the outbox rows are recorded and NO enqueue is attempted
+   * (not even a failing one); the notify sweep's relay sends them at its next tick.
+   */
+  readonly relayOnly?: boolean;
 }
 
 export async function writeNotification(tx: ClientBase, input: NotificationInput, options: WriterOptions = {}): Promise<WriteOutcome> {
@@ -59,7 +75,7 @@ export async function writeNotification(tx: ClientBase, input: NotificationInput
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::text[], $10)
      ON CONFLICT (workspace_id, event_key) WHERE event_key IS NOT NULL DO NOTHING
      RETURNING id`,
-    [input.workspaceId, input.projectId, input.userId, input.kind, input.severity, input.title, input.body, JSON.stringify(payload), channelsFor(input.severity), input.eventKey],
+    [input.workspaceId, input.projectId, input.userId, input.kind, input.severity, input.title, input.body, JSON.stringify(payload), input.emailNow === true ? ["in_app", "email"] : channelsFor(input.severity), input.eventKey],
   );
   const id = inserted.rows[0]?.id;
   if (id === undefined) {
@@ -67,12 +83,19 @@ export async function writeNotification(tx: ClientBase, input: NotificationInput
     return { id: null, created: false, emailIds: [] };
   }
   incrementCounter("nominara_notifications_written_total", { kind: input.kind, outcome: "created" });
-  if (!emailsImmediately(input.severity)) return { id, created: true, emailIds: [] };
+  if (input.emailNow !== true && !emailsImmediately(input.severity)) return { id, created: true, emailIds: [] };
 
   const rendered = renderImmediateEmail({ title: input.title, body: input.body, deepLink, appOrigin: options.appOrigin });
   const emailIds: string[] = [];
-  for (const member of await emailableMembers(tx, input.workspaceId, input.userId)) {
+  const members = await emailableMembers(tx, input.workspaceId, input.userId);
+  const audience = input.emailAudience;
+  for (const member of members) {
     if (!seesProject(member.visible, input.projectId)) continue;
+    if (audience !== undefined) {
+      if (evaluatePermission(member.role, audience.permission).access === "deny") continue;
+      const sees = audience.projectIds.length === 0 ? member.visible === null : audience.projectIds.every((id) => seesProject(member.visible, id));
+      if (!sees) continue;
+    }
     if (input.kind === SENTIMENT_ALERT_KIND && !member.sentimentAlerts) continue;
     const row = await tx.query<{ id: string }>(
       `INSERT INTO notification_emails (workspace_id, user_id, kind, dedupe_key, notification_id, notification_count, status, subject, text_body)
@@ -87,7 +110,7 @@ export async function writeNotification(tx: ClientBase, input: NotificationInput
   await tx.query("UPDATE notifications SET dispatched_at = now() WHERE id = $1", [id]);
 
   const store = currentTenantStore();
-  if (emailIds.length > 0 && store !== undefined) {
+  if (emailIds.length > 0 && store !== undefined && options.relayOnly !== true) {
     const enqueue = options.enqueue;
     store.afterCommit(() => {
       for (const emailId of emailIds) {

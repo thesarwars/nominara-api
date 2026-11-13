@@ -236,10 +236,37 @@ describe("NEW-E-099b · portal tasks and first-view notification", () => {
     const first = await rows();
     expect(first).toHaveLength(1);
     expect(first[0].user_id).toBeNull();
-    expect(first[0].channels).toEqual(["in_app"]);
+    expect(first[0].channels).toEqual(["in_app", "email"]);
     expect(JSON.stringify(first[0].payload)).toContain(t.id);
     expect((await mint()).statusCode).toBe(200);
     expect(await rows()).toHaveLength(1);
+  });
+
+  it("STORY-098 (review fix) · the portal mint, under the real portal role and RLS, records one notification_emails row per INTENDED recipient: an owner and a manager who sees the token's project; not an admin whose digest is off, a manager scoped elsewhere, an analyst, nor a second mint", async () => {
+    const w = await world();
+    const db = harness.db();
+    const addMember = async (role: string, scope: string[] | null, cadence: string | null = null): Promise<string> => {
+      const user = randomUUID();
+      await db.query("INSERT INTO users (id, email, email_verified_at, status) VALUES ($1,$2,now(),'active')", [user, `${user}@example.test`]);
+      await db.query("INSERT INTO workspace_members (id, workspace_id, user_id, role, project_scope, status, digest_cadence) VALUES ($1,$2,$3,$4,$5,'active',$6)", [randomUUID(), w.ws, user, role, scope, cadence]);
+      return user;
+    };
+    // Owner decision 2026-11-13: a digest set to "off" is an email opt-out, so the opted-out owner is not emailed.
+    const owner = await addMember("owner", null);
+    await addMember("admin", null, "off");
+    const inScope = await addMember("manager", [w.p1]);
+    await addMember("manager", [w.p2]);
+    await addMember("analyst", null);
+    const secret = randomBytes(32).toString("base64url");
+    await token(w, { scope: [w.p1] }, secret);
+    const mint = () => harness.app().inject({ method: "POST", url: apiUrl("/portal/session"), headers: { "content-type": "application/json" }, payload: JSON.stringify({ secret }) });
+    expect((await mint()).statusCode).toBe(200);
+    const emails = async () => (await db.query("SELECT user_id, kind, status FROM notification_emails WHERE workspace_id = $1 ORDER BY user_id", [w.ws])).rows as Array<{ user_id: string; kind: string; status: string }>;
+    const rows = await emails();
+    expect(rows.map((r) => r.user_id).sort()).toEqual([owner, inScope].sort());
+    for (const r of rows) expect(r).toMatchObject({ kind: "immediate", status: "pending" });
+    expect((await mint()).statusCode).toBe(200);
+    expect(await emails()).toHaveLength(2);
   });
 
   it("FR-AGY-01o · two parallel first mints produce exactly one notification", async () => {
