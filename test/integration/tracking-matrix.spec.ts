@@ -89,6 +89,8 @@ describe("STORY-034 · the prompt × engine matrix", () => {
     rank?: number;
     sov?: number;
     sentiment?: string;
+    /** STORY-091: `answer_captures.flags` (the parse stage stamps `engine_refused_to_answer` / `empty_answer`). */
+    flags?: string[];
   }
 
   async function addCapture(
@@ -96,15 +98,16 @@ describe("STORY-034 · the prompt × engine matrix", () => {
     engineKey: string,
     status: string,
     options: CaptureOptions = {},
-  ): Promise<void> {
-    await db.query(
+  ): Promise<{ id: string; capturedAt: Date }> {
+    const inserted = await db.query<{ id: string; captured_at: Date }>(
       `INSERT INTO answer_captures (workspace_id, project_id, run_id, prompt_id, engine_key, captured_at,
                                     capture_mode, adapter_version, normalizer_version, content_hash,
                                     status, error_code, cache_layer,
-                                    brand_present, brand_rank_position, sov, sentiment_label)
+                                    brand_present, brand_rank_position, sov, sentiment_label, flags)
        VALUES ($1, $2, $3, $4, $5, now() - make_interval(days => $6::int, hours => $10::int),
                'api', '1.0.0', 'v1', sha256(random()::text::bytea), $7, $8, $9,
-               $11, $12, $13, $14)`,
+               $11, $12, $13, $14, $15::text[])
+       RETURNING id, captured_at`,
       [
         workspaceId,
         projectId,
@@ -120,7 +123,20 @@ describe("STORY-034 · the prompt × engine matrix", () => {
         options.rank ?? null,
         options.sov ?? null,
         options.sentiment ?? null,
+        options.flags ?? [],
       ],
+    );
+    return { id: inserted.rows[0]!.id, capturedAt: inserted.rows[0]!.captured_at };
+  }
+
+  /** One `mention_facts` row for a capture (STORY-091: the brand's position in the answer is read from its first occurrence). */
+  async function addMention(capture: { id: string; capturedAt: Date }, promptId: string, engineKey: string, mention: { type: "brand" | "competitor" | "other"; occurrence: number; charStart: number; positionClass: string }): Promise<void> {
+    await db.query(
+      `INSERT INTO mention_facts
+         (workspace_id, project_id, result_id, prompt_id, engine_key, captured_at, entity_type, entity_label, matched_alias, occurrence_index,
+          char_start, char_end, first_token_index, prominence, sentiment_label, sentiment_score, sentiment_confidence, sentiment_method, render_score, position_class)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'X','X',$8,$9,$9 + 1,0,0.5,'positive',0.5,0.9,'lexicon',0.4,$10)`,
+      [workspaceId, projectId, capture.id, promptId, engineKey, capture.capturedAt, mention.type, mention.occurrence, mention.charStart, mention.positionClass],
     );
   }
 
@@ -281,6 +297,43 @@ describe("STORY-034 · the prompt × engine matrix", () => {
       sov: null,
       sentiment_label: null,
     });
+  });
+
+  // STORY-091 (the drawer's "position class" and "tell a refusal from another absence") - two facts the cell did not carry.
+  it("STORY-091 · a parsed cell names the brand's position in the answer, read from its FIRST occurrence; a competitor's or another capture's mention is not it", async () => {
+    const promptId = await addPrompt("crm");
+    const capture = await addCapture(promptId, "chatgpt", "parsed", { brandPresent: true, sov: 0.5 });
+    await addMention(capture, promptId, "chatgpt", { type: "brand", occurrence: 1, charStart: 400, positionClass: "caveat" });
+    await addMention(capture, promptId, "chatgpt", { type: "brand", occurrence: 0, charStart: 20, positionClass: "recommendation" });
+    await addMention(capture, promptId, "chatgpt", { type: "competitor", occurrence: 0, charStart: 5, positionClass: "ranked" });
+    const other = await addCapture(promptId, "perplexity", "parsed", { brandPresent: true });
+    await addMention(other, promptId, "perplexity", { type: "brand", occurrence: 0, charStart: 9, positionClass: "also_consider" });
+
+    const cells = (await matrix()).prompts[0]!.cells;
+    expect(cells.find((c) => c.engine_key === "chatgpt")!.position_class).toBe("recommendation");
+    expect(cells.find((c) => c.engine_key === "perplexity")!.position_class).toBe("also_consider");
+  });
+
+  it("STORY-091 · position_class is null (never a default class) where nothing places the brand: pending, failed, parsed-and-absent, and a brand-less answer", async () => {
+    const promptId = await addPrompt("crm");
+    await addCapture(promptId, "chatgpt", "parsed", { brandPresent: false, sov: 0 });
+    expect((await matrix()).prompts[0]!.cells.map((c) => [c.engine_key, c.position_class])).toEqual([["chatgpt", null], ["perplexity", null]]);
+    const failed = await addPrompt("crm two");
+    await addCapture(failed, "perplexity", "failed", { errorCode: "timeout" });
+    const cells = (await matrix()).prompts.find((p) => p.prompt_id === failed)!.cells;
+    expect(cells.map((c) => c.position_class)).toEqual([null, null]);
+  });
+
+  it("STORY-091 · a cell carries the flags the parse stamped, so a refusal reads differently from another absence; no capture is null, and none stamped is []", async () => {
+    const promptId = await addPrompt("crm");
+    await addCapture(promptId, "chatgpt", "parsed", { brandPresent: false, sov: 0, flags: ["engine_refused_to_answer"] });
+    await addCapture(promptId, "perplexity", "parsed", { brandPresent: false, sov: 0 });
+    const other = await addPrompt("crm two");
+    const cells = (await matrix()).prompts;
+    const first = cells.find((p) => p.prompt_id === promptId)!.cells;
+    expect(first.find((c) => c.engine_key === "chatgpt")!.flags).toEqual(["engine_refused_to_answer"]);
+    expect(first.find((c) => c.engine_key === "perplexity")!.flags).toEqual([]);
+    expect(cells.find((p) => p.prompt_id === other)!.cells.map((c) => c.flags)).toEqual([null, null]);
   });
 
   it("AC3 — a cached cell reports its TRUE age, and a live one reports none", async () => {

@@ -1,4 +1,6 @@
 import { Inject, Injectable, Logger, Optional, ServiceUnavailableException, type OnModuleDestroy } from "@nestjs/common";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { HealthCheckService, HealthIndicatorService, type HealthCheckResult } from "@nestjs/terminus";
 import type { Queue } from "bullmq";
 import type { Redis } from "ioredis";
@@ -10,14 +12,18 @@ import type {
   QueueDepth,
   ReadinessResponse,
 } from "../../../contracts/common/health.schema.js";
-import { ENGINE_CATALOG_STATUSES, type EngineStatusEntry, type EngineStatusResponse } from "../../../contracts/engines/index.js";
+import { ENGINE_CATALOG_STATUSES, projectEngineState, type EngineStatusEntry, type EngineStatusResponse, type ProjectEngineHealthEntry, type ProjectEngineHealthQuery } from "../../../contracts/engines/index.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { appliedMigrationNames, listMigrationFiles } from "../../db/migrate-runner.js";
+import { assertNotMigrationOwner } from "../../db/roles.js";
 import { ACTIVE_ENGINE_KEYS } from "../../lib/engines/registry.js";
 import { EngineBreakerRegistry } from "../../lib/engines/engine-breaker-registry.js";
 import { CircuitBreaker } from "../../lib/resilience/circuit-breaker.js";
 import { buildQueue } from "../../lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { EngineHealthService, PER_ENGINE_STATUS_WINDOW_MS } from "./engine-health.service.js";
 
 // STORY-022 — HealthModule (system-architecture.md §5): "Liveness,
@@ -58,6 +64,9 @@ export const CACHE_CONNECTION_TOKEN = Symbol("HEALTH_CACHE_CONNECTION");
 // is observability inside a probe an orchestrator polls, so being late is a
 // worse answer than being empty.
 const QUEUE_DEPTH_READ_TIMEOUT_MS = 2_000;
+
+/** The cursor's list name: another list's cursor is a 400 here (STORY-117 AC6). */
+const PROJECT_ENGINE_HEALTH_LIST = "project_engine_health";
 
 @Injectable()
 export class HealthService implements OnModuleDestroy {
@@ -111,6 +120,52 @@ export class HealthService implements OnModuleDestroy {
       }),
     );
     return { engines, generated_at: new Date(nowMs).toISOString() };
+  }
+
+  /**
+   * STORY-090 - `GET /v1/projects/{id}/engine-health`: the engines ENABLED for the project (the entitled view the matrix and scorecards read), each with the
+   * state `GET /engines/status` implies (`projectEngineState`) and when its breaker episode began. The project's own set is read in the request's tenant
+   * transaction (RLS scopes it; a project of another workspace is a 404); the engine/breaker half is the global read above, taken AFTER that read so no
+   * Valkey call happens while the transaction is doing database work. Never a partial list: an engine the status read could not report fails the request.
+   */
+  async projectEngineHealth(projectId: string, query: ProjectEngineHealthQuery): Promise<Page<ProjectEngineHealthEntry>> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("projectEngineHealth requires an active tenant context");
+    const found = await store.client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL", [projectId]);
+    if (found.rowCount === 0) throw new NotFoundError({ message: "no such project" });
+    // The entitled set WITHOUT the view's `status = 'active'` filter (project_entitled_engines drops an engine the moment the ladder marks it `degraded`, which is
+    // exactly when the pip must name it): the plan floor and the project's override are the view's own tests, `degraded` engines stay listed. PROVISIONAL.
+    const enabled = await store.client.query<{ engine_key: string }>(
+      `SELECT e.key AS engine_key
+         FROM projects p
+         JOIN workspaces w         ON w.id = p.workspace_id
+         JOIN plans workspace_plan ON workspace_plan.key = w.plan_key
+         JOIN engines e            ON e.status IN ('active', 'degraded')
+         JOIN plans engine_plan    ON engine_plan.key = e.min_plan_key AND engine_plan.sort_order <= workspace_plan.sort_order
+         LEFT JOIN project_engines ov ON ov.project_id = p.id AND ov.engine_key = e.key
+        WHERE p.id = $1 AND p.deleted_at IS NULL AND COALESCE(ov.enabled, true)`,
+      [projectId],
+    );
+    const keys = new Set(enabled.rows.map((row) => row.engine_key));
+    const status = await this.engineStatus();
+    incrementCounter("nominara_health_project_engine_health_reads_total");
+    const reported = new Map(status.engines.map((engine) => [engine.engine_key, engine]));
+    // An enabled engine with no dispatching adapter (registry `disabled`) cannot capture, so it is `unavailable` with no episode start: never silently left out.
+    // Keyset on `engine_key` (unique per project): the page after the cursor's key, one row over the limit so `has_more` needs no count.
+    const after = query.cursor === undefined ? undefined : String(decodeCursor(query.cursor, PROJECT_ENGINE_HEALTH_LIST, 1)[0]);
+    const rows = [...keys].sort().filter((key) => after === undefined || key > after).slice(0, query.limit + 1);
+    return pageFrom(
+      rows,
+      query.limit,
+      PROJECT_ENGINE_HEALTH_LIST,
+      (key): ProjectEngineHealthEntry => {
+        const engine = reported.get(key);
+        return engine === undefined
+          ? { engine_key: key, state: "unavailable", since: null }
+          : { engine_key: key, state: projectEngineState(engine), since: engine.unavailable_since };
+      },
+      (key) => [key],
+    );
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -311,6 +366,16 @@ export class HealthService implements OnModuleDestroy {
   private async checkMigrationState(state: MigrationState): Promise<void> {
     const client = await this.pool.connect();
     try {
+      // STORY-010 AC10: the migration owner is never used by a running service. Asserted on the very connection readiness checks out, so a service
+      // that came up as (or switched to) the owner is `not_ready` and takes no traffic. Throws MigrationOwnerConnectionError; the postgres indicator
+      // turns any throw here into `down`. Role names only in the log, never a connection string.
+      try {
+        await assertNotMigrationOwner(client);
+      } catch (error) {
+        incrementCounter("nominara_health_role_check_failures_total");
+        this.logger.error(`readiness: ${(error as Error).message}`);
+        throw error;
+      }
       const files = await listMigrationFiles(this.migrationsDir);
       const expectedNames = files.map((f) => f.name);
       state.expected = expectedNames.length > 0 ? expectedNames[expectedNames.length - 1]! : null;

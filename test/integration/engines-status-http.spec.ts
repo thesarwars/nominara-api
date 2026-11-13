@@ -1,8 +1,9 @@
+import { encodeCursor } from "../../src/api/pagination/cursor.js";
 import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 import { Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { engineStatusResponseSchema, type EngineStatusResponse } from "../../contracts/engines/index.js";
+import { engineStatusResponseSchema, projectEngineHealthResponseSchema, type EngineStatusResponse, type ProjectEngineHealthResponse } from "../../contracts/engines/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME } from "../../src/lib/auth/cookies.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -57,13 +58,13 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
     await pool.end();
   });
 
-  async function viewer(): Promise<{ accessToken: string; csrfToken: string }> {
+  async function viewer(): Promise<{ accessToken: string; csrfToken: string; workspaceId: string }> {
     const ownerId = (await harness.db().query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`o-${randomUUID()}@example.com`])).rows[0]!.id;
     const ws = await workspaces.create(ownerId, { name: `W ${randomUUID()}` }, meta);
     const userId = (await harness.db().query<{ id: string }>("INSERT INTO users (email) VALUES ($1) RETURNING id", [`v-${randomUUID()}@example.com`])).rows[0]!.id;
     await harness.db().query("INSERT INTO workspace_members (workspace_id, user_id, role, status) VALUES ($1,$2,'viewer','active')", [ws.id, userId]);
     const tokens = await sessions.createSession(userId);
-    return workspaces.switchTo(userId, tokens.sid, ws.id, meta);
+    return { ...(await workspaces.switchTo(userId, tokens.sid, ws.id, meta)), workspaceId: ws.id };
   }
 
   it("a viewer sees every active engine with its catalog status, live breaker state, episode start and trailing counters", async () => {
@@ -91,6 +92,77 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
 
     const chatgpt = body.engines.find((e) => e.engine_key === "chatgpt")!;
     expect(chatgpt).toMatchObject({ status: "active", circuit_state: "closed", unavailable_since: null, attempts: 0, p50_latency_ms: null });
+  });
+
+  // STORY-090 AC7/AC8 - GET /v1/projects/{id}/engine-health: the project's own enabled engines, each with a derived state and since.
+  async function project(workspaceId: string): Promise<string> {
+    const id = randomUUID();
+    await harness.db().query("INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'P',$3,'https://e.test','e.test')", [id, workspaceId, `p-${id.slice(0, 8)}`]);
+    return id;
+  }
+  const health = (actor: { accessToken: string; csrfToken: string }, projectId: string, query = "") =>
+    harness.app().inject({ method: "GET", url: apiUrl(`/projects/${projectId}/engine-health${query}`), cookies: { [ACCESS_COOKIE_NAME]: actor.accessToken, [CSRF_COOKIE_NAME]: actor.csrfToken } });
+
+  it("STORY-090 · a project's engine health lists exactly its enabled engines, with the state the breaker and the catalog imply and when the episode began", async () => {
+    const actor = await viewer();
+    const projectId = await project(actor.workspaceId);
+    const enabled = (await harness.db().query<{ engine_key: string }>("SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true ORDER BY engine_key", [projectId])).rows.map((r) => r.engine_key);
+    expect(enabled.length, "the plan entitles at least one engine, or this test proves nothing").toBeGreaterThan(0);
+    // Dispatching engines only can have a breaker episode or a ladder-degraded catalog state; a registry-disabled one has no adapter and reads `unavailable`.
+    const dispatching = enabled.filter((key) => (ACTIVE_ENGINE_KEYS as readonly string[]).includes(key));
+    expect(dispatching.length, "need a dispatching engine to open a breaker on").toBeGreaterThan(0);
+    const open = dispatching[0]!;
+    const degraded = dispatching[1];
+    if (degraded !== undefined) await harness.db().query("UPDATE engines SET status = 'degraded' WHERE key = $1", [degraded]);
+    const before = Date.now();
+    await new EngineBreakerRegistry(redis).for(open as never).recordOutcome("quota_exhausted");
+
+    const response = await health(actor, projectId);
+    expect(response.statusCode, response.body).toBe(200);
+    const body = dataOf<ProjectEngineHealthResponse>(response);
+    expect(projectEngineHealthResponseSchema.safeParse(body).success).toBe(true);
+    expect(response.json().pagination).toEqual({ cursor_next: null, has_more: false, limit: 50 });
+    // A ladder-degraded engine leaves project_entitled_engines (it is `active`-only) but must stay listed: that is when the pip names it.
+    expect(body.map((e) => e.engine_key).sort()).toEqual([...enabled].sort());
+    const byKey = new Map(body.map((e) => [e.engine_key, e]));
+    expect(byKey.get(open)!.state).toBe("unavailable");
+    expect(Date.parse(byKey.get(open)!.since!)).toBeGreaterThanOrEqual(before - 1_000);
+    if (degraded !== undefined) expect(byKey.get(degraded)).toMatchObject({ state: "degraded", since: null });
+    for (const entry of body.filter((e) => e.engine_key !== open && e.engine_key !== degraded)) {
+      expect(entry).toMatchObject({ state: dispatching.includes(entry.engine_key) ? "healthy" : "unavailable", since: null });
+    }
+  });
+
+  it("STORY-090 · the engine list pages by engine key: limit 1 walks every enabled engine once, in order, and a foreign list's cursor is a 400", async () => {
+    const actor = await viewer();
+    const projectId = await project(actor.workspaceId);
+    const all = dataOf<ProjectEngineHealthResponse>(await health(actor, projectId)).map((e) => e.engine_key);
+    expect(all.length, "two engines at least, or there is no second page").toBeGreaterThan(1);
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page <= all.length; page += 1) {
+      const response = await health(actor, projectId, `?limit=1${cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`}`);
+      expect(response.statusCode, response.body).toBe(200);
+      const { data, pagination } = response.json() as { data: ProjectEngineHealthResponse; pagination: { cursor_next: string | null; has_more: boolean } };
+      expect(data).toHaveLength(1);
+      walked.push(data[0]!.engine_key);
+      expect(pagination.has_more).toBe(pagination.cursor_next !== null);
+      cursor = pagination.cursor_next;
+      if (cursor === null) break;
+    }
+    expect(walked).toEqual(all);
+    // A well-formed current-version cursor, issued for another list: refused for the list name alone.
+    const foreignCursor = encodeCursor("goals", ["a"]);
+    expect((await health(actor, projectId, `?cursor=${foreignCursor}`)).statusCode).toBe(400);
+  });
+
+  it("STORY-090 · another workspace's project is a 404, an unknown id is a 404, and no session is a 401", async () => {
+    const mine = await viewer();
+    const theirs = await viewer();
+    const foreign = await project(theirs.workspaceId);
+    expect((await health(mine, foreign)).statusCode).toBe(404);
+    expect((await health(mine, randomUUID())).statusCode).toBe(404);
+    expect((await harness.app().inject({ method: "GET", url: apiUrl(`/projects/${foreign}/engine-health`) })).statusCode).toBe(401);
   });
 
   it("refuses an anonymous caller", async () => {

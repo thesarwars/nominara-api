@@ -6,6 +6,7 @@ import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.j
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { UrlGuard } from "../../src/lib/net/url-guard.service.js";
+import { DID_NOT_CHECK, NOT_TRACKED_NOTE } from "../../src/lib/tools/presentation.js";
 import { QueueProducer } from "../../src/lib/queue/queue-producer.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
 import { ToolsService, type StartToolRunInput } from "../../src/modules/tools/tools.service.js";
@@ -643,6 +644,48 @@ describe("STORY-078 · shared tool core", () => {
         expect((body.presentation as { did_not_check: string }).did_not_check.length).toBeGreaterThan(10);
         expect((body.presentation as { not_tracked_note: string }).not_tracked_note).toMatch(/^Not tracked/);
       }
+    }
+  });
+
+  // STORY-095 AC9 - "disclaimer copy is rendered from the stored snapshot's notes": a stored result carries its own caveats forever.
+  it("STORY-095 AC9 - a run stores its presentation notes in result_json at write time, for a result stored at finish and for one stored at start", async () => {
+    const a = await owner("starter");
+    const run = await start(a, scan({ credits: 0 }));
+    await inTenant(a, () => tools().finishRun(run.id, { enginesSucceeded: ["perplexity", "chatgpt"], enginesFailed: [], result: { answer: "kept" } }));
+    const stored = async (id: string) => (await harness.db().query<{ n: unknown }>("SELECT result_json->'presentation_notes' AS n FROM tool_runs WHERE id = $1", [id])).rows[0]!.n;
+    expect(await stored(run.id)).toEqual({ not_tracked_note: NOT_TRACKED_NOTE, did_not_check: DID_NOT_CHECK.visibility_scan });
+    // Schema Builder stores its result at START (its shape constraint requires one): the notes land there too, and survive the finish.
+    const builder = await start(a, { toolKey: "schema_builder", resultJson: { jsonld: { "@type": "Organization" } }, engineKeys: [], credits: 0 });
+    expect(await stored(builder.id)).toEqual({ not_tracked_note: NOT_TRACKED_NOTE, did_not_check: DID_NOT_CHECK.schema_builder });
+    await inTenant(a, () => tools().finishRun(builder.id, { enginesSucceeded: [], enginesFailed: [] }));
+    expect(await stored(builder.id)).toEqual({ not_tracked_note: NOT_TRACKED_NOTE, did_not_check: DID_NOT_CHECK.schema_builder });
+  });
+
+  it("STORY-095 AC9 - a re-opened run serves the notes it was stored with, not today's wording, and the stored key never leaks into `result`", async () => {
+    const a = await owner("starter");
+    const run = await start(a, scan({ credits: 0 }));
+    await inTenant(a, () => tools().finishRun(run.id, { enginesSucceeded: ["perplexity", "chatgpt"], enginesFailed: [], result: { answer: "kept" } }));
+    // A year-old run: the wording it was stored under differs from this build's.
+    await harness.db().query(
+      "UPDATE tool_runs SET result_json = jsonb_set(result_json, '{presentation_notes}', $2::jsonb) WHERE id = $1",
+      [run.id, JSON.stringify({ not_tracked_note: "Not tracked — written under last year's rules.", did_not_check: "Last year's scope line." })],
+    );
+    for (const body of [data<Record<string, unknown>>(await getRun(a, run.id)), data<Array<Record<string, unknown>>>(await list(a)).find((r) => r.id === run.id)!]) {
+      expect(body.presentation).toMatchObject({ not_tracked_note: "Not tracked — written under last year's rules.", did_not_check: "Last year's scope line." });
+    }
+    const detail = data<{ result: Record<string, unknown> }>(await getRun(a, run.id));
+    expect(detail.result).toEqual({ answer: "kept" });
+  });
+
+  it("STORY-095 AC9 - a run stored before this change, or with no stored result, still reads its composed notes (never blank)", async () => {
+    const a = await owner("starter");
+    const legacy = await start(a, scan({ credits: 0 }));
+    await inTenant(a, () => tools().finishRun(legacy.id, { enginesSucceeded: ["perplexity", "chatgpt"], enginesFailed: [], result: { answer: "old" } }));
+    await harness.db().query("UPDATE tool_runs SET result_json = result_json - 'presentation_notes' WHERE id = $1", [legacy.id]);
+    const empty = await finished(a);
+    expect((await harness.db().query("SELECT result_json FROM tool_runs WHERE id = $1", [empty.id])).rows[0]!.result_json, "no result stored: nothing to stamp").toBeNull();
+    for (const id of [legacy.id, empty.id]) {
+      expect(data<{ presentation: { not_tracked_note: string; did_not_check: string } }>(await getRun(a, id)).presentation).toMatchObject({ not_tracked_note: NOT_TRACKED_NOTE, did_not_check: DID_NOT_CHECK.visibility_scan });
     }
   });
 

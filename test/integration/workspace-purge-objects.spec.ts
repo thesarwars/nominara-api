@@ -45,10 +45,10 @@ async function versions(bucket: string, prefix: string): Promise<string[]> {
 describe("STORY-182 · purge deletes object prefixes in a versioned bucket", () => {
   it("[STORY-182 AC4] after the purge no version of any object under the workspace's three prefixes remains, and another workspace is untouched", async () => {
     await put("raw", `inttest/${WS_A}/2026/10/a.json.gz`, 3);
-    await put("raw", `crawl/inttest/${WS_A}/audit1/dom.gz`, 2);
+    await put("raw", `inttest/${WS_A}/crawl/audit1/dom.gz`, 2);
     await put("reports", `inttest/${WS_A}/r1.pdf`, 2);
     await put("raw", `inttest/${WS_B}/2026/10/b.json.gz`, 2);
-    await put("raw", `crawl/inttest/${WS_B}/audit1/dom.gz`);
+    await put("raw", `inttest/${WS_B}/crawl/audit1/dom.gz`);
     await put("reports", `inttest/${WS_B}/r2.pdf`);
     // A delete marker (a plain delete on a versioned bucket) is a recoverable copy too.
     await adapter.delete("raw", `inttest/${WS_A}/2026/10/a.json.gz`);
@@ -57,10 +57,11 @@ describe("STORY-182 · purge deletes object prefixes in a versioned bucket", () 
     expect(removed).toBeGreaterThanOrEqual(8);
 
     expect(await versions("nominara-raw", `inttest/${WS_A}/`)).toEqual([]);
-    expect(await versions("nominara-raw", `crawl/inttest/${WS_A}/`)).toEqual([]);
+    expect(await versions("nominara-raw", `inttest/${WS_A}/crawl/`)).toEqual([]);
     expect(await versions("nominara-reports", `inttest/${WS_A}/`)).toEqual([]);
-    expect(await versions("nominara-raw", `inttest/${WS_B}/`)).toHaveLength(2);
-    expect(await versions("nominara-raw", `crawl/inttest/${WS_B}/`)).toHaveLength(1);
+    // B's raw prefix holds its two raw versions AND its crawl object (crawl lives inside it since decision 106(e)).
+    expect(await versions("nominara-raw", `inttest/${WS_B}/`)).toHaveLength(3);
+    expect(await versions("nominara-raw", `inttest/${WS_B}/crawl/`)).toHaveLength(1);
     expect(await versions("nominara-reports", `inttest/${WS_B}/`)).toHaveLength(1);
   });
 

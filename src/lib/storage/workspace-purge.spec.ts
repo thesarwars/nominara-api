@@ -30,7 +30,7 @@ describe("STORY-182 · deleteWorkspaceObjectsEverywhere", () => {
     expect(p.calls).toEqual([
       ["reports", `prod/${WS}/`],
       ["raw", `prod/${WS}/`],
-      ["raw", `crawl/prod/${WS}/`],
+      ["raw", `prod/${WS}/crawl/`],
     ]);
     expect(removed).toBe(3);
   });
@@ -46,7 +46,7 @@ describe("STORY-182 · deleteWorkspaceObjectsEverywhere", () => {
   it("[STORY-182 AC3] a failure on one prefix does not stop the others, and is then raised (a re-run finishes the job)", async () => {
     const p = port("prod/");
     await expect(deleteWorkspaceObjectsEverywhere(p, "prod", WS)).rejects.toThrow("s3 down");
-    expect(p.calls.map(([, prefix]) => prefix)).toEqual([`prod/${WS}/`, `prod/${WS}/`, `crawl/prod/${WS}/`]);
+    expect(p.calls.map(([, prefix]) => prefix)).toEqual([`prod/${WS}/`, `prod/${WS}/`, `prod/${WS}/crawl/`]);
   });
 
   it("[STORY-182 AC3] with nothing left to delete the wrapper reports zero and succeeds", async () => {
@@ -74,7 +74,7 @@ describe("STORY-182 (decision 69(b)) · deleteProjectRawObjects", () => {
   it("a key outside the workspace's own raw prefix is never deleted (another workspace, another environment, a traversal), the valid keys are, and the call then fails", async () => {
     const p = port();
     const good = `prod/${WS}/2026/10/a.json.gz`;
-    const bad = [`prod/${OTHER}/2026/10/x.json.gz`, `staging/${WS}/2026/10/x.json.gz`, `prod/${WS}/../${OTHER}/x.json.gz`, `crawl/prod/${WS}/x`];
+    const bad = [`prod/${OTHER}/2026/10/x.json.gz`, `staging/${WS}/2026/10/x.json.gz`, `prod/${WS}/../${OTHER}/x.json.gz`, `crawl/prod/${WS}/x`, `prod/${WS}/crawl/x`];
     await expect(deleteProjectRawObjects(p, "prod", WS, [bad[0]!, good, ...bad.slice(1)])).rejects.toThrow();
     expect(p.calls).toEqual([["raw", good]]);
   });

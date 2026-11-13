@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { toolRunDetailSchema, toolRunSchema } from "../../../contracts/tools/index.js";
 import { toolInputHash } from "./input-hash.js";
 import { toolConversionPlan } from "./conversion.js";
-import { toolPresentation, DID_NOT_CHECK, NOT_TRACKED_NOTE } from "./presentation.js";
+import { toolPresentation, DID_NOT_CHECK, NOT_TRACKED_NOTE, stampPresentationNotes, storedNotesOf, withoutStoredNotes } from "./presentation.js";
 import { deriveToolRunOutcome } from "./run-outcome.js";
 import { toolSnapshotExpiresAt } from "./retention-window.js";
 
@@ -143,6 +143,29 @@ describe("STORY-078 · scenario 22 - every envelope carries the not-tracked mark
       expect(p.did_not_check.length).toBeGreaterThan(10);
       expect(p.did_not_check).not.toContain("\n");
     }
+  });
+
+  it("STORY-095 AC9 - a stored note wins over this build's wording; nothing stored reads the composed one", () => {
+    const stored = { not_tracked_note: "Not tracked, as worded last year.", did_not_check: "Last year's scope." };
+    const p = toolPresentation("visibility_scan", headline, undefined, stored);
+    expect(p).toMatchObject(stored);
+    expect(toolPresentation("visibility_scan", headline, undefined, null).did_not_check).toBe(DID_NOT_CHECK.visibility_scan);
+  });
+
+  it("STORY-095 AC9 - stamping adds the tool's notes beside its result, never overwrites a stored pair, and the read strips the key again", () => {
+    const stamped = stampPresentationNotes({ answer: "x" }, "prompt_research");
+    expect(storedNotesOf(stamped)).toEqual({ not_tracked_note: NOT_TRACKED_NOTE, did_not_check: DID_NOT_CHECK.prompt_research });
+    const old = { not_tracked_note: "old", did_not_check: "old scope" };
+    expect(stampPresentationNotes({ answer: "x", presentation_notes: old }, "prompt_research")).toEqual({ answer: "x", presentation_notes: old });
+    expect(withoutStoredNotes(stamped)).toEqual({ answer: "x" });
+    expect(withoutStoredNotes(null)).toBeNull();
+  });
+
+  it("STORY-095 AC9 - the URL variant of Schema Builder is stamped with its own scope line, and a malformed stored key is ignored, not trusted", () => {
+    expect(storedNotesOf(stampPresentationNotes({ source: "url" }, "schema_builder", "url_check"))!.did_not_check).toMatch(/one page fetched/u);
+    expect(storedNotesOf({ presentation_notes: { not_tracked_note: "", did_not_check: "x" } })).toBeNull();
+    expect(storedNotesOf({ presentation_notes: "nope" })).toBeNull();
+    expect(storedNotesOf(null)).toBeNull();
   });
 
   it("scenario 22 - sampled headline figures are flagged as estimates, and only the ones that are present", () => {

@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { assertCustomRangeAllowed } from "./custom-range.js";
 
 // STORY-136 — the analytics reads' window, shared since NEW-C-1 so the
 // competitor panel and the scorecards cut the SAME days: two spellings of one
@@ -31,7 +32,19 @@ export interface ResolvedWindow {
  * §3's delta compares. An unaligned prior window would make the delta a
  * comparison of a month against a fortnight.
  */
-export async function resolveWindow(tx: ClientBase, projectId: string, days: number, knownTimezone?: string): Promise<ResolvedWindow> {
+/**
+ * STORY-090: a custom range, in place of "the trailing N days". The workspace's retention decides whether it may be served (`assertCustomRangeAllowed`:
+ * a 400 naming the boundary, never a clamp); the prior window is the SAME LENGTH immediately before it, as for a preset.
+ */
+export interface CustomWindow {
+  readonly from: string;
+  readonly to: string;
+  readonly workspaceId: string;
+  /** Names the caller in the custom-range counter only. */
+  readonly surface: string;
+}
+
+export async function resolveWindow(tx: ClientBase, projectId: string, days: number, knownTimezone?: string, custom?: CustomWindow): Promise<ResolvedWindow> {
   let timezone: string | undefined = knownTimezone;
   if (knownTimezone === undefined) {
     const settings = await tx.query<{ timezone: string }>(
@@ -48,6 +61,20 @@ export async function resolveWindow(tx: ClientBase, projectId: string, days: num
     if (found.rowCount === 0) timezone = undefined;
   }
   if (timezone === undefined) throw new NotFoundError({ message: "no such project" });
+
+  if (custom !== undefined) {
+    await assertCustomRangeAllowed(tx, custom.workspaceId, timezone, custom, custom.surface);
+    const span = await tx.query<{ from: string; to: string; prior_from: string; prior_to: string }>(
+      `SELECT to_char(f, 'YYYY-MM-DD') AS from,
+              to_char(t, 'YYYY-MM-DD') AS to,
+              to_char(f - (t - f + 1), 'YYYY-MM-DD') AS prior_from,
+              to_char(f - 1, 'YYYY-MM-DD') AS prior_to
+         FROM (SELECT $1::date AS f, $2::date AS t) x`,
+      [custom.from, custom.to],
+    );
+    const row = span.rows[0]!;
+    return { from: row.from, to: row.to, priorFrom: row.prior_from, priorTo: row.prior_to, timezone };
+  }
 
   const bounds = await tx.query<{ from: string; to: string; prior_from: string; prior_to: string }>(
     `SELECT to_char(today - make_interval(days => $1::int - 1), 'YYYY-MM-DD') AS from,

@@ -17,6 +17,7 @@ import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../l
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import type { PortalProjectEngines, PortalProjectFacts } from "../../lib/portal/portal-facts.js";
 import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
+import { customRangeDays } from "../../../contracts/analytics/custom-range.schema.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
 //
@@ -55,7 +56,19 @@ export class ScorecardsService {
     if (store === undefined) throw new Error("ScorecardsService requires an active tenant context");
     const tx = store.client;
 
-    const window = await resolveWindow(tx, projectId, opts.days ?? TIMEFRAME_DAYS[query.timeframe], opts.portal?.workspace.timezone);
+    // STORY-090: `timeframe=custom` serves the days asked for or refuses with a reason (retention-bounded), never a trimmed range. The portal's own
+    // `opts.days` window is a preset and takes precedence.
+    const custom =
+      opts.days === undefined && query.timeframe === "custom" && query.from !== undefined && query.to !== undefined
+        ? { from: query.from, to: query.to, workspaceId: store.context.workspaceId, surface: "scorecards" }
+        : undefined;
+    const window = await resolveWindow(
+      tx,
+      projectId,
+      opts.days ?? (query.timeframe === "custom" ? (custom === undefined ? TIMEFRAME_DAYS["30d"] : customRangeDays(custom.from, custom.to)) : TIMEFRAME_DAYS[query.timeframe]),
+      opts.portal?.workspace.timezone,
+      custom,
+    );
     const requested = parseEngineFilter(query.engines);
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //

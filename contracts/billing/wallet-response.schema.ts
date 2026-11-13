@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { autoTopupConfigSchema } from "./auto-topup.schema.js";
+import { usageMeterSchema } from "./usage.schema.js";
 
 // STORY-096 — `GET /v1/billing/wallet`. `FR-CRD-10`: "Wallet state —
 // available, reserved, expiring-soon, per-project spend, and daily remaining
@@ -70,6 +71,17 @@ export const walletResponseSchema = z
      * period that starts later than the one on file), not when this config changes.
      */
     auto_topup: autoTopupConfigSchema,
+
+    /**
+     * STORY-095 AC12 - the SHARED daily lookup cap (every capture-backed tool draws on the one counter), beside the balance a tool surface
+     * already reads, so "N of M today" renders as a limit of its own, apart from the credit balance. The same figures as
+     * `GET /billing/usage`'s `daily_lookups` and `daily_resets_at`: `used` is today's UTC row of `credit_daily_counters` (0 with none, never
+     * absent), `cap` the plan's CURRENT entitlement (`null` where the plan sets none, which is not 0). Buying credits does not lift it. OPTIONAL in the contract only because
+     * contracts:diff classes a new required response field a MAJOR change (as on `usage.schema.ts`); the server always sends both.
+     */
+    daily_lookups: usageMeterSchema.optional(),
+    /** The next UTC midnight, when the daily counter rolls over. */
+    daily_resets_at: z.iso.datetime().optional(),
   })
   .strict();
 

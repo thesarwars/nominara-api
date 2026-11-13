@@ -43,6 +43,8 @@ interface CellRow {
   brand_rank_position: number | null;
   sov: number | null;
   sentiment_label: string | null;
+  flags: string[] | null;
+  position_class: string | null;
   data_source: "live" | "demo" | null;
 }
 
@@ -74,6 +76,9 @@ export class MatrixService {
               latest.brand_rank_position AS brand_rank_position,
               latest.sov AS sov,
               latest.sentiment_label AS sentiment_label,
+              -- STORY-091: NULL with no capture ("nothing to flag" is not an empty list), the parse's own flags otherwise.
+              CASE WHEN latest.id IS NULL THEN NULL ELSE latest.flags END AS flags,
+              brand_position.position_class AS position_class,
               success.captured_at AS last_success_at,
               -- NEW-A-5 — provenance of THIS cell's answer. Null when there is
               -- no capture or the capture is not a measurement (failed or
@@ -98,7 +103,7 @@ export class MatrixService {
          ) e
          LEFT JOIN LATERAL (
            SELECT c.id, c.status, c.error_code, c.captured_at, c.cache_layer, c.normalizer_version,
-                  c.brand_present, c.brand_rank_position, c.sov, c.sentiment_label
+                  c.brand_present, c.brand_rank_position, c.sov, c.sentiment_label, c.flags
              FROM answer_captures c
             WHERE c.project_id = p.project_id
               AND c.prompt_id = p.id
@@ -107,6 +112,17 @@ export class MatrixService {
             ORDER BY c.captured_at DESC
             LIMIT 1
          ) latest ON true
+         -- STORY-091: where the brand sits in this answer = its FIRST occurrence's position class (the value the result document gives the brand
+         -- entity). No capture, or an answer that does not name the brand, finds no row: NULL, never a default class.
+         LEFT JOIN LATERAL (
+           SELECT m.position_class
+             FROM mention_facts m
+            WHERE m.result_id = latest.id
+              AND m.workspace_id = app.current_workspace()
+              AND m.entity_type = 'brand'
+            ORDER BY m.char_start ASC, m.occurrence_index ASC
+            LIMIT 1
+         ) brand_position ON latest.id IS NOT NULL
          -- NOT WINDOWED. The last success is the thing that makes a failure
          -- readable, and a failure whose last success predates the window is
          -- exactly the case worth surfacing — clamping it to the window would
@@ -192,6 +208,8 @@ export class MatrixService {
       brand_rank_position: row.brand_rank_position,
       sov: row.sov,
       sentiment_label: row.sentiment_label as MatrixCell["sentiment_label"],
+      position_class: row.position_class as MatrixCell["position_class"],
+      flags: row.flags,
       data_source: row.data_source,
       // AC3 — the TRUE capture age of a reused answer. A cached cell
       // stamped with today's date would claim a freshness it does not have.

@@ -78,8 +78,8 @@ describe("object storage against LocalStack", () => {
     await as(WS_A, () => store.put("crawl", "audit1/dom.gz", "dom"));
     const reports = await rawS3.send(new ListObjectsV2Command({ Bucket: "nominara-reports", Prefix: `inttest/${WS_A}/r1` }));
     expect(reports.Contents?.map((o) => o.Key)).toEqual([`inttest/${WS_A}/r1.pdf`]);
-    const crawl = await rawS3.send(new ListObjectsV2Command({ Bucket: "nominara-raw", Prefix: `crawl/inttest/${WS_A}/` }));
-    expect(crawl.Contents?.map((o) => o.Key)).toEqual([`crawl/inttest/${WS_A}/audit1/dom.gz`]);
+    const crawl = await rawS3.send(new ListObjectsV2Command({ Bucket: "nominara-raw", Prefix: `inttest/${WS_A}/crawl/` }));
+    expect(crawl.Contents?.map((o) => o.Key)).toEqual([`inttest/${WS_A}/crawl/audit1/dom.gz`]);
   });
 
   it("OS-I5 · delete removes the object, and deleting an absent object is not an error", async () => {
@@ -166,13 +166,13 @@ describe("object storage against LocalStack", () => {
     expect((await as(WS_A, () => store.getStored("raw", stored))).toString()).toBe("A data");
   });
 
-  it("OS-I13 · every key the store ever wrote lies under {env}/{workspace}/ or crawl/{env}/{workspace}/ (nothing at the bucket root)", async () => {
+  it("OS-I13 · every key the store ever wrote lies under {env}/{workspace}/ (crawl objects under {env}/{workspace}/crawl/; nothing at the bucket root)", async () => {
     for (const bucket of ["nominara-raw", "nominara-reports"]) {
       const listed = await rawS3.send(new ListObjectsV2Command({ Bucket: bucket }));
       const keys = (listed.Contents ?? []).map((o) => o.Key ?? "");
       expect(keys.length).toBeGreaterThan(0);
       for (const key of keys) {
-        expect(key, key).toMatch(new RegExp(`^(crawl/)?inttest/(${WS_A}|${WS_B})/`));
+        expect(key, key).toMatch(new RegExp(`^inttest/(${WS_A}|${WS_B})/`));
       }
     }
   });

@@ -14,7 +14,8 @@ import { classifyCategory, type TextEmbedder } from "../../lib/categories/classi
 import { loadTaxonomy } from "../../lib/categories/taxonomy.js";
 import { classificationTextFromHtml } from "../../lib/discovery/discover.js";
 import { detectPlatform } from "../../lib/discovery/platform.js";
-import { GuardedFetchRefusal, guardedFetch } from "../../lib/net/guarded-fetch.js";
+import { crawlGatedFetch, type FetchLike } from "../../lib/net/crawl-gate.js";
+import { GuardedFetchRefusal } from "../../lib/net/guarded-fetch.js";
 import { UnparsableHostError } from "../../lib/net/registrable-domain.js";
 import { UrlGuard } from "../../lib/net/url-guard.service.js";
 import { NOMINARA_USER_AGENT } from "../../lib/net/user-agent.js";
@@ -42,7 +43,9 @@ import { incrementCounter, observeValue } from "../../lib/telemetry/metrics.js";
 //
 // WHAT IT CANNOT SAY. The verticals are not derived (the taxonomy carries no verticals); the response names them in `not_derived`.
 
-type FetchPage = typeof guardedFetch;
+// Owner decisions 70(d) and 105(c): the fetch identifies as NominaraBot, so it goes through the robots.txt and per-host-budget gate (the SSRF-guarded fetch underneath).
+// The robots.txt read runs inside the same single deadline; a refused page is an `unavailable` answer like any other unreadable site.
+type FetchPage = FetchLike;
 export const FINGERPRINT_FETCH = Symbol("FINGERPRINT_FETCH");
 export const FINGERPRINT_EMBEDDER = Symbol("FINGERPRINT_EMBEDDER");
 
@@ -56,7 +59,7 @@ export class ProjectFingerprintService {
 
   constructor(
     private readonly urls: UrlGuard,
-    @Optional() @Inject(FINGERPRINT_FETCH) private readonly fetchPage: FetchPage = guardedFetch,
+    @Optional() @Inject(FINGERPRINT_FETCH) private readonly fetchPage: FetchPage = crawlGatedFetch,
     @Optional() @Inject(PG_POOL) private readonly pool?: Pool,
     @Optional() @Inject(FINGERPRINT_EMBEDDER) private embedder?: TextEmbedder,
   ) {}

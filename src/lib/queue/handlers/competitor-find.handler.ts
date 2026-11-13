@@ -24,7 +24,8 @@ import { CaptureFailureError } from "../../engines/failure-taxonomy.js";
 import { EngineRefusalError, resolveEngine } from "../../engines/registry.js";
 import { recordEngineSpend } from "../../engines/record-spend.js";
 import type { SpendMeter } from "../../engines/spend-meter.js";
-import { GuardedFetchRefusal, guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
+import { CrawlRefusal, crawlGatedFetch } from "../../net/crawl-gate.js";
+import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
 import { toRegistrableDomain } from "../../net/registrable-domain.js";
 import { NOMINARA_USER_AGENT } from "../../net/user-agent.js";
 import { normalize } from "../../parser/normalize.js";
@@ -43,7 +44,7 @@ import { buildCaptureEngineGate, buildSpendMeter } from "./capture-execute.handl
 //             query, then ONE capture on ONE engine. Entities are detected in the answer and rows are built from the detected spans only.
 //   commit    one short tenant transaction: the result, the headline, and the settlement. Nothing captured, or nothing named, is refunded in full.
 //
-// THERE IS NO SECOND FETCH PATH. This file imports `guardedFetch` and no raw socket module, no global fetch and no HTTP client of its own; competitor-finder.spec.ts asserts it.
+// THERE IS NO SECOND FETCH PATH. This file imports `crawlGatedFetch` (the SSRF-guarded fetch behind the robots gate) and no raw socket module, no global fetch and no HTTP client of its own; competitor-finder.spec.ts asserts it.
 // WHAT IT WRITES: `tool_runs` (through ToolsService.finishRun) and `usage_ledger` cost rows. No capture row, no fact row, no competitor row (FR-TL-11).
 
 const logger = new Logger("lookup.execute.competitor-finder");
@@ -57,7 +58,7 @@ export interface CompetitorFindDeps {
   readonly spendMeter?: SpendMeter;
   readonly engineGate?: CaptureEngineGate;
   readonly resolveAdapter?: (engineKey: string) => CaptureAdapter;
-  /** Test seam for the network. Production is the guarded fetcher. */
+  /** Test seam for the network. Production is the crawl gate (SSRF-guarded fetch behind robots.txt and the per-host budget, owner decisions 70(d) and 106(g)). */
   readonly fetchPage?: (url: string, init: GuardedFetchInit) => Promise<GuardedResponse>;
   readonly now?: () => Date;
 }
@@ -94,7 +95,7 @@ export function createCompetitorFindPhases(context: QueueHandlerContext, deps: C
   const engineGate = (): CaptureEngineGate => (gate ??= buildCaptureEngineGate(context, (message) => logger.warn(message)));
   const now = deps.now ?? ((): Date => new Date());
   const adapterFor = deps.resolveAdapter ?? resolveEngine;
-  const fetchPage = deps.fetchPage ?? ((url: string, init: GuardedFetchInit) => guardedFetch(url, init));
+  const fetchPage = deps.fetchPage ?? crawlGatedFetch;
   let cacheReady: Promise<Cache> | undefined;
   const liveCache = (): Promise<Cache> =>
     (cacheReady ??=
@@ -151,6 +152,8 @@ export function createCompetitorFindPhases(context: QueueHandlerContext, deps: C
     try {
       response = await fetchPage(targetUrl, init);
     } catch (error) {
+      // The gate declined (robots.txt disallows the page, or could not be read): the same refusal the handler's own robots check reports.
+      if (error instanceof CrawlRefusal) throw new FinderFailure("robots_disallowed");
       throw new FinderFailure(error instanceof GuardedFetchRefusal ? "unsafe_target" : "page_unreachable");
     }
     if (response.status < 200 || response.status >= 300) throw new FinderFailure("page_unreachable");

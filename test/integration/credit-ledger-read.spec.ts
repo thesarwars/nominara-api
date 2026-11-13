@@ -149,6 +149,11 @@ describe("STORY-073 · reading the credit ledger", () => {
   // ─────────────────────── the wallet endpoint ───────────────────────
 
   describe("STORY-096 · GET /billing/wallet", () => {
+    /** The next 00:00Z, worked out here rather than through the service's own helper. */
+    const nextUtcMidnight = (): string => {
+      const now = new Date();
+      return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+    };
     const wallet = () =>
       withTenantContext(appClient, { workspaceId, actorId: SYSTEM_ACTOR_ID }, () => new BillingService().wallet());
 
@@ -196,6 +201,8 @@ describe("STORY-073 · reading the credit ledger", () => {
         lifetime_purchased: 1_000,
         lifetime_spent: 600,
         auto_topup: { enabled: false, pack_key: null, threshold: null, max_per_cycle: null, used_this_cycle: 0, trigger_active: true }, // NEW-D-6: off by default
+        daily_lookups: { used: 0, cap: null }, // STORY-095 AC12: nothing looked up today, and growth sets no daily cap (null, not 0)
+        daily_resets_at: nextUtcMidnight(),
       });
     });
 
@@ -263,6 +270,8 @@ describe("STORY-073 · reading the credit ledger", () => {
         lifetime_purchased: 0,
         lifetime_spent: 0,
         auto_topup: { enabled: false, pack_key: null, threshold: null, max_per_cycle: null, used_this_cycle: 0, trigger_active: true }, // NEW-D-6: off by default
+        daily_lookups: { used: 0, cap: null }, // STORY-095 AC12: nothing looked up today, and growth sets no daily cap (null, not 0)
+        daily_resets_at: nextUtcMidnight(),
       });
     });
 

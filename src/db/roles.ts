@@ -1,4 +1,4 @@
-import type { Client } from "pg";
+import type { ClientBase } from "pg";
 import { MIGRATION_OWNER_ROLE, RUNTIME_ROLES } from "./conventions.js";
 
 export interface ConnectedRoleInfo {
@@ -18,9 +18,9 @@ export interface ConnectedRoleInfo {
  * NestJS HealthModule: no HealthModule (or any NestJS app) exists yet in
  * this repo (only src/db/ and src/lib/ids/ do). A future HealthModule should
  * import inspectConnectedRole/assertNotMigrationOwner from here rather than
- * reimplementing the check.
+ * reimplementing the check. (STORY-010 AC10: `HealthService.readiness()` now does, on the pooled connection it already checks out.)
  */
-export async function inspectConnectedRole(client: Client): Promise<ConnectedRoleInfo> {
+export async function inspectConnectedRole(client: Pick<ClientBase, "query">): Promise<ConnectedRoleInfo> {
   const result = await client.query<{ session_user: string; current_user: string }>(
     "SELECT session_user, current_user",
   );
@@ -49,7 +49,7 @@ export class MigrationOwnerConnectionError extends Error {
 }
 
 /** Throws MigrationOwnerConnectionError if `client` is connected as the migration owner. */
-export async function assertNotMigrationOwner(client: Client): Promise<ConnectedRoleInfo> {
+export async function assertNotMigrationOwner(client: Pick<ClientBase, "query">): Promise<ConnectedRoleInfo> {
   const info = await inspectConnectedRole(client);
   if (info.isMigrationOwner) {
     throw new MigrationOwnerConnectionError(info);

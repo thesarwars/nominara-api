@@ -51,8 +51,8 @@ describe("object storage · key building", () => {
     });
   });
 
-  it("OS-K2 · a crawl key sits under crawl/ in the raw bucket, and a report key in the reports bucket", () => {
-    expect(buildObjectLocation("staging", WS_A, "crawl", "audit1/dom.gz")).toEqual({ bucket: "raw", key: `crawl/staging/${WS_A}/audit1/dom.gz` });
+  it("OS-K2 · a crawl key sits under {env}/{ws}/crawl/ in the raw bucket, and a report key in the reports bucket", () => {
+    expect(buildObjectLocation("staging", WS_A, "crawl", "audit1/dom.gz")).toEqual({ bucket: "raw", key: `staging/${WS_A}/crawl/audit1/dom.gz` });
     expect(buildObjectLocation("staging", WS_A, "reports", "r1.pdf")).toEqual({ bucket: "reports", key: `staging/${WS_A}/r1.pdf` });
   });
 
@@ -92,7 +92,8 @@ describe("object storage · key building", () => {
   it.each([
     ["another workspace", `production/${WS_B}/x`],
     ["another environment", `staging/${WS_A}/x`],
-    ["the crawl prefix read as raw", `crawl/production/${WS_A}/x`],
+    ["the OLD crawl layout (crawl/{env}/{ws}/) read as raw", `crawl/production/${WS_A}/x`],
+    ["a crawl object read as raw (the namespaces never overlap)", `production/${WS_A}/crawl/x`],
     ["a bare prefix with no object part", `production/${WS_A}/`],
     ["a sibling workspace id that only shares a prefix", `production/${WS_A}0/x`],
     ["a traversal out of the prefix", `production/${WS_A}/../${WS_B}/x`],

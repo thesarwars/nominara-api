@@ -1,12 +1,15 @@
 import { readFileSync } from "node:fs";
 import type { Job } from "bullmq";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { CaptureAdapter, RawCapture } from "../../engines/contract.js";
 import type { CaptureEngineGate } from "../../engines/capture-engine-gate.js";
 import type { SpendMeter } from "../../engines/spend-meter.js";
+import { CrawlRefusal } from "../../net/crawl-gate.js";
 import { GuardedFetchRefusal, type GuardedResponse } from "../../net/guarded-fetch.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { createCompetitorFindPhases } from "./competitor-find.handler.js";
+
+vi.mock("../../net/crawl-gate.js", async (importOriginal) => ({ ...(await importOriginal<object>()), crawlGatedFetch: vi.fn() }));
 
 // STORY-081 - the worker half, run phase only (no database): the fetch path, the guard, the span-built rows. Scenario numbers are the story's table.
 
@@ -32,7 +35,7 @@ const adapter = (text: string, calls: { n: number; prompt: string }): CaptureAda
     healthProbe: async () => ({ ok: true, latencyMs: 1 }),
   }) as unknown as CaptureAdapter;
 
-function harness(opts: { answer?: string; fetchPage?: (url: string) => Promise<GuardedResponse> }) {
+function harness(opts: { answer?: string; fetchPage?: (url: string) => Promise<GuardedResponse>; defaultFetch?: boolean }) {
   const calls = { n: 0, prompt: "" };
   const fetched: string[] = [];
   const fetchPage = opts.fetchPage ?? (async (url: string) => (url.endsWith("/robots.txt") ? page("User-agent: *\nAllow: /", { headers: { "content-type": "text/plain" } }) : page(HTML)));
@@ -41,11 +44,15 @@ function harness(opts: { answer?: string; fetchPage?: (url: string) => Promise<G
     spendMeter: { isCeilingReached: async () => false } as unknown as SpendMeter,
     engineGate: { admit: async () => ({ kind: "admit" }), record: async () => undefined } as unknown as CaptureEngineGate,
     resolveAdapter: () => adapter(opts.answer ?? PROSE_ONLY, calls),
-    fetchPage: async (url, init) => {
-      fetched.push(url);
-      expect(init.headers?.["user-agent"]).toContain("NominaraBot");
-      return await fetchPage(url);
-    },
+    ...(opts.defaultFetch === true
+      ? {}
+      : {
+          fetchPage: async (url: string, init: { headers?: Record<string, string> }) => {
+            fetched.push(url);
+            expect(init.headers?.["user-agent"]).toContain("NominaraBot");
+            return await fetchPage(url);
+          },
+        }),
   });
   const payload = { tool: "competitor_finder" as const, toolRunId: RUN, targetUrl: "https://acme-invoicing.example/", engine: "gemini", locale: "en-US", startedAt: "2026-11-06T10:00:00.000Z", workspaceId: WORKSPACE };
   const run = async () => await phases.run({ payload }, {} as Job);
@@ -75,6 +82,29 @@ describe("STORY-081 · the Competitor Finder worker", () => {
     expect(source).toMatch(/from "\.\.\/\.\.\/net\/guarded-fetch\.js"/u);
     expect(source).not.toMatch(/node:https?|undici|\bfetch\(|axios|got\(/u);
     expect(source).toMatch(/from "\.\.\/\.\.\/net\/robots\.js"/u);
+  });
+
+  // Owner decisions 70(d) and 106(g): the page fetch identifies as NominaraBot, so it also keeps the per-host budget; the shared crawl gate is the default fetcher.
+  it("decision 70(d) - the DEFAULT fetch is the robots- and budget-gated one", async () => {
+    const { crawlGatedFetch } = await import("../../net/crawl-gate.js");
+    vi.mocked(crawlGatedFetch).mockImplementation(async (url: string) => (url.endsWith("/robots.txt") ? page("User-agent: *\nAllow: /", { headers: { "content-type": "text/plain" } }) : page(HTML)));
+    const out = await harness({ defaultFetch: true }).run();
+    expect(out.failureCode).toBeNull();
+    expect(crawlGatedFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("decision 70(d) - a gate refusal (robots disallowed, or robots.txt unreadable) is robots_disallowed: the page is not captured against", async () => {
+    for (const reason of ["robots_disallowed", "robots_unavailable"] as const) {
+      const h = harness({
+        fetchPage: async (url) => {
+          if (url.endsWith("/robots.txt")) return page("User-agent: *\nAllow: /", { headers: { "content-type": "text/plain" } });
+          throw new CrawlRefusal(reason);
+        },
+      });
+      const out = await h.run();
+      expect(out.failureCode, reason).toBe("robots_disallowed");
+      expect(h.calls.n).toBe(0);
+    }
   });
 
   it("scenario 3 - robots.txt is requested before the page, with the identified user agent", async () => {

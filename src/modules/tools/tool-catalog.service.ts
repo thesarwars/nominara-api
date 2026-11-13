@@ -3,6 +3,8 @@ import type { ToolCatalogResponse } from "../../../contracts/tools/index.js";
 import { grantedValueSql } from "../../lib/entitlements/granted.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { buildToolCatalog, gatedEntitlementKeys, TOOL_GATES, type UnlockPlan } from "../../lib/tools/tool-catalog.js";
+import { nextUtcMidnight } from "../../lib/usage/daily-cap.js";
+import { readDailyMeters } from "../../lib/usage/daily-meters.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { currentTenantStore, type TenantContext } from "../../tenancy/tenant-context.js";
 
@@ -32,6 +34,7 @@ export class ToolCatalogService {
     const disabled = response.tools.filter((t) => !t.enabled).length + response.tools.reduce((n, t) => n + t.modes.filter((m) => !m.enabled).length, 0);
     incrementCounter("nominara_tools_catalog_reads_total", { disabled: disabled > 0 ? "some" : "none" });
     logger.log({ event: "tools.catalog.read", workspace_id: tenant.workspaceId, disabled_count: disabled });
-    return response;
+    // STORY-095 AC12 / decision 106(d): the shared daily lookup meter beside the catalog (workspace:read), from the helper the usage and wallet reads use.
+    return { ...response, daily_lookups: (await readDailyMeters(store.client, tenant.workspaceId)).lookup, daily_resets_at: nextUtcMidnight(new Date()) };
   }
 }

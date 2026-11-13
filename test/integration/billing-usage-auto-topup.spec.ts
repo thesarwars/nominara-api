@@ -295,6 +295,40 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
     expect([next(before), next(after)]).toContain(Date.parse(daily_resets_at));
   });
 
+  // ---- STORY-095 AC12: the SHARED lookup cap on the wallet read the tool surfaces use -------------
+  it("STORY-095 AC12 · GET /billing/wallet serves today's shared lookup count and the cap: 2 of 3, with the reset instant, from credit_daily_counters", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    await dayRow(workspaceId, "lookup", 2, 3);
+    const wallet = await walletOf(owner);
+    expect(wallet.daily_lookups).toEqual({ used: 2, cap: 3 });
+    expect(wallet.daily_resets_at).toMatch(/T00:00:00\.000Z$/u);
+    // The same figures as the usage read: one meter, two reads.
+    const usage = await daily(owner);
+    expect(wallet.daily_lookups).toEqual(usage.daily_lookups);
+    expect(wallet.daily_resets_at).toBe(usage.daily_resets_at);
+  });
+
+  it("STORY-095 AC12 · no use today is 0 of the cap (not absent), a paid plan's cap is null (not 0), and yesterday's row is not today's use", async () => {
+    const free = await newWorkspace("free");
+    await dayRow(free.workspaceId, "lookup", 3, 3, `${today} - 1`);
+    expect((await walletOf(free.owner)).daily_lookups).toEqual({ used: 0, cap: 3 });
+    const paid = await newWorkspace("growth");
+    await dayRow(paid.workspaceId, "lookup", 1, 3);
+    expect((await walletOf(paid.owner)).daily_lookups).toEqual({ used: 1, cap: null });
+    // A wallet read never creates a counter row.
+    expect((await harness.db().query("SELECT 1 FROM credit_daily_counters WHERE workspace_id = $1", [free.workspaceId])).rowCount).toBe(1);
+  });
+
+  it("STORY-095 AC12 · the figure is on the wallet whether or not a wallet row exists, and it is the lookup counter, never the command-parse one", async () => {
+    const { workspaceId, owner } = await newWorkspace("free");
+    await dayRow(workspaceId, "nlp_command", 9, 20);
+    expect((await harness.db().query("SELECT 1 FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rowCount, "no wallet row yet").toBe(0);
+    expect((await walletOf(owner)).daily_lookups).toEqual({ used: 0, cap: 3 });
+    await harness.db().query("INSERT INTO credit_wallets (workspace_id, cycle_start, cycle_end) VALUES ($1, CURRENT_DATE, CURRENT_DATE + 30)", [workspaceId]);
+    await dayRow(workspaceId, "lookup", 1, 3);
+    expect((await walletOf(owner)).daily_lookups).toEqual({ used: 1, cap: 3 });
+  });
+
   it("STORY-096 AC15 · a purchased pack does not move a daily meter (it raises the monthly ceiling only)", async () => {
     const { workspaceId, owner } = await newWorkspace("free");
     await harness.db().query("UPDATE credit_wallets SET purchased_balance = purchased_balance + 5000 WHERE workspace_id = $1", [workspaceId]);

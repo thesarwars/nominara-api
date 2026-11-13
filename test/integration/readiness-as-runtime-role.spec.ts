@@ -2,15 +2,17 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { Logger } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Client } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DbModule } from "../../src/db/db.module.js";
 import {
   MIGRATION_LEDGER_READERS,
   MIGRATION_LEDGER_SCHEMA,
   MIGRATION_LEDGER_TABLE,
+  MIGRATION_OWNER_ROLE,
   RUNTIME_ROLES,
 } from "../../src/db/conventions.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
@@ -205,6 +207,33 @@ describe("STORY-120 · readiness as the runtime role", () => {
       }
     } finally {
       await rm(buildDir, { recursive: true, force: true });
+    }
+  });
+
+  // STORY-010 AC10 / scenario 8 — the readiness probe itself inspects the
+  // role the service is connected as. The migration owner is NOLOGIN, so the
+  // only way a pooled connection executes as it is a role switch on connect
+  // (the superuser here, `options=-c role=`); the probe must say not_ready.
+  it("STORY-010-AC10 — /health/ready fails when the pooled connection executes as the migration owner", async () => {
+    const asOwner = new URL(container.getConnectionUri());
+    asOwner.searchParams.set("options", `-c role=${MIGRATION_OWNER_ROLE}`);
+    process.env.DATABASE_URL_POOLED = asOwner.toString();
+    const errors = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+
+    const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
+    const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    await configureApp(app);
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+
+    try {
+      const response = await app.inject({ method: "GET", url: "/health/ready" });
+      expect(response.statusCode, "a service running as the migration owner must not be routed traffic").toBe(503);
+      expect(response.json<{ status: string }>().status).toBe("not_ready");
+      // Pinned to the ROLE check, not to some other failure: the probe logged the migration-owner refusal.
+      expect(errors.mock.calls.map((c) => String(c[0])).join("\n")).toContain("migration owner");
+    } finally {
+      await app.close();
     }
   });
 

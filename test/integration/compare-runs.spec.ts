@@ -151,7 +151,10 @@ describe("STORY-084 · Compare Runs", () => {
     const body = data<CompareRunsResponse>(res);
     const row = (await harness.db().query("SELECT diff_base_run_id, diff_compare_run_id, tool_key, result_json, credits_charged FROM tool_runs WHERE id = $1", [body.id])).rows[0];
     expect(row).toMatchObject({ diff_base_run_id: x, diff_compare_run_id: y, tool_key: "compare_runs", credits_charged: 0 });
-    expect(row.result_json).toEqual({ schema_version: 1, compared_tool: "visibility_scan", base_run_id: x, compare_run_id: y });
+    // STORY-095 AC9: beside the two ids the row holds only the notes it was written with, never a copy of either payload.
+    const { presentation_notes: notes, ...ownKeys } = row.result_json as Record<string, unknown>;
+    expect(ownKeys).toEqual({ schema_version: 1, compared_tool: "visibility_scan", base_run_id: x, compare_run_id: y });
+    expect(Object.keys(notes as object).sort()).toEqual(["did_not_check", "not_tracked_note"]);
     expect(JSON.stringify(row.result_json)).not.toContain("Acme is a solid");
   });
 

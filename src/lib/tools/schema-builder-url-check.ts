@@ -10,13 +10,14 @@ import { buildAuxDocument } from "../aux/document-model.js";
 import { evaluateDocument } from "../aux/rules/engine.js";
 import { AUX_RULES } from "../aux/rules/index.js";
 import { cl100kTokenizer } from "../aux/tokenizer-cl100k.js";
-import { GuardedFetchRefusal, guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../net/guarded-fetch.js";
+import { CrawlRefusal, crawlGatedFetch } from "../net/crawl-gate.js";
+import { GuardedFetchRefusal, type GuardedFetchInit, type GuardedResponse } from "../net/guarded-fetch.js";
 import { NOMINARA_USER_AGENT } from "../net/user-agent.js";
 import type { ToolCatalogRow } from "./aux-audit-run.js";
 
 // STORY-083 AC5 / owner decision 82 - Schema Builder URL mode, the worker's computing half: ONE page, fetched through the guarded fetcher, judged by the SAME
 // structured-data rules the in-project audit runs (the engine's own `AUX_RULES`, narrowed to the codes the Schema Builder accepts: AUX-R-008..018 without the held
-// AUX-R-013). There is no second rule implementation and no second fetch path: the only way out is `guardedFetch` (imported here, injectable for a test).
+// AUX-R-013). There is no second rule implementation and no second fetch path: the only way out is `crawlGatedFetch` (the SSRF-guarded fetcher behind the robots.txt and per-host-budget gate, owner decisions 70(d) and 105(c); injectable for a test).
 //
 // PURE APART FROM THE FETCH. No database, no clock, no queue. The caller (the `lookup.execute` handler) runs this OUTSIDE any transaction (ADR-0003).
 //
@@ -89,7 +90,7 @@ function positionOf(locator: string, rawHtml: string): { line: number; column: n
 }
 
 export async function checkUrlStructuredData(input: { readonly url: string; readonly catalog: readonly ToolCatalogRow[] }, deps: UrlCheckDeps = {}): Promise<UrlCheckOutcome> {
-  const fetchOne = deps.fetch ?? ((url: string, init?: GuardedFetchInit) => guardedFetch(url, init));
+  const fetchOne = deps.fetch ?? crawlGatedFetch;
   const timeoutMs = deps.timeoutMs ?? SCHEMA_BUILDER_URL_FETCH_TIMEOUT_MS;
 
   let response: GuardedResponse;
@@ -101,7 +102,8 @@ export async function checkUrlStructuredData(input: { readonly url: string; read
     response = await Promise.race([fetchOne(input.url, { headers: { "user-agent": NOMINARA_USER_AGENT, accept: "text/html,application/xhtml+xml" }, truncateAtCap: true }), timeout]);
   } catch (error) {
     // A reason code, never the error's message: for a connect failure it carries the resolved address.
-    return { kind: "unreachable", reason: error instanceof GuardedFetchRefusal ? "refused" : "unreachable" };
+    // A page the site's robots.txt forbids (or whose robots.txt cannot be read) is refused, like an address the SSRF guard refuses: it was not fetched.
+    return { kind: "unreachable", reason: error instanceof GuardedFetchRefusal || error instanceof CrawlRefusal ? "refused" : "unreachable" };
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

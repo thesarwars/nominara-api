@@ -17,7 +17,8 @@ import { hasLedgerHistory, readLifetimeCounters } from "../../lib/credits/replay
 import { cycleHasLapsed, purchasableOptions, readWallet, type WalletState } from "../../lib/credits/wallet.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { DAILY_CAP_ENTITLEMENT, nextUtcMidnight, type DailyCapAction } from "../../lib/usage/daily-cap.js";
+import { nextUtcMidnight } from "../../lib/usage/daily-cap.js";
+import { readDailyMeters } from "../../lib/usage/daily-meters.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { METRIC_SPECS } from "../../lib/usage/metrics.js";
 import { limitValueFor, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
@@ -153,6 +154,8 @@ export class BillingService {
         lifetime_purchased: 0,
         lifetime_spent: 0,
         auto_topup: AUTO_TOPUP_OFF,
+        daily_lookups: (await readDailyMeters(client, workspaceId)).lookup,
+        daily_resets_at: nextUtcMidnight(new Date()),
       };
     }
 
@@ -167,6 +170,8 @@ export class BillingService {
       lifetime_purchased: counters?.purchased ?? 0,
       lifetime_spent: counters?.spent ?? 0,
       auto_topup: (await readAutoTopup(client, workspaceId)) ?? AUTO_TOPUP_OFF,
+      daily_lookups: (await readDailyMeters(client, workspaceId)).lookup,
+      daily_resets_at: nextUtcMidnight(new Date()),
     };
   }
 
@@ -270,32 +275,19 @@ export class BillingService {
     const links = await client.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM share_tokens WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())`,
     );
-    // STORY-096 AC15 - the daily caps. `used` is today's (UTC) row of credit_daily_counters, 0 with no row; the cap is the plan's CURRENT entitlement,
-    // not the row's `limit_count`, which holds the limit the day's last write used (a mid-day upgrade lifts the cap at once). Read-only: no row is created.
-    const todays = await client.query<{ action_code: string; used_count: number }>(
-      `SELECT action_code, used_count FROM credit_daily_counters
-        WHERE workspace_id = $1 AND utc_date = (now() AT TIME ZONE 'UTC')::date`,
-      [workspaceId],
-    );
-    const entitlements = (await resolveEntitlements(client, workspaceId)).entitlements;
-    const dailyMeter = (action: DailyCapAction): { used: number; cap: number | null } => {
-      const value = entitlements[DAILY_CAP_ENTITLEMENT[action]]?.value;
-      return {
-        used: todays.rows.find((r) => r.action_code === action)?.used_count ?? 0,
-        cap: typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null,
-      };
-    };
+    const meters = await readDailyMeters(client, workspaceId);
 
     incrementCounter("nominara_billing_usage_read_total", { outcome: "ok" });
     return {
       period_start: period.start,
       pdf_exports: { used, cap: limit === UNLIMITED_LIMIT ? null : limit },
       share_links_active: links.rows[0]?.n ?? 0,
-      daily_lookups: dailyMeter("lookup"),
-      daily_nlp_parses: dailyMeter("nlp_command"),
+      daily_lookups: meters.lookup,
+      daily_nlp_parses: meters.nlp_command,
       daily_resets_at: nextUtcMidnight(new Date()),
     };
   }
+
 
   /**
    * STORY-096 AC3 (decision 100(h)) - `GET /v1/billing/retention-purge`: the per-project purge list of a pending retention-shortening deferral, built by the

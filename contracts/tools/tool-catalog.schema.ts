@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { usageMeterSchema } from "../billing/usage.schema.js";
 import { toolKeySchema } from "./tool-key.schema.js";
 
 // STORY-078 AC23 - GET /v1/tools: the tool catalog for the caller's plan. FR-TL-11 / FR-DASH-08: "a tool outside the plan renders disabled, naming the plan that
@@ -36,7 +37,20 @@ export const toolCatalogEntrySchema = z
   })
   .strict();
 
-export const toolCatalogResponseSchema = z.object({ tools: z.array(toolCatalogEntrySchema) }).strict();
+export const toolCatalogResponseSchema = z
+  .object({
+    tools: z.array(toolCatalogEntrySchema),
+    /**
+     * STORY-095 AC12 (owner decision 106(d)) - the SHARED daily lookup cap every capture-backed tool draws on, readable at `workspace:read` beside the catalog:
+     * `used` is today's UTC row of `credit_daily_counters` (0 with none, never absent), `cap` the plan's CURRENT entitlement (`null` where the plan sets none,
+     * which is not 0). The same figures as `GET /billing/usage` and `GET /billing/wallet`. OPTIONAL in the contract only because contracts:diff classes a new
+     * required response field a MAJOR change; the server always sends both.
+     */
+    daily_lookups: usageMeterSchema.optional(),
+    /** The next UTC midnight, when the daily counter rolls over. */
+    daily_resets_at: z.iso.datetime().optional(),
+  })
+  .strict();
 
 export type ToolCatalogMode = z.infer<typeof toolCatalogModeSchema>;
 export type ToolCatalogEntry = z.infer<typeof toolCatalogEntrySchema>;

@@ -14,7 +14,7 @@ export const OBJECT_STORAGE = Symbol("OBJECT_STORAGE");
 /** Logical buckets (system-architecture.md section 3): raw captures and crawl snapshots share `raw`; reports have their own. */
 export type StorageBucketName = "raw" | "reports";
 
-/** Where in a bucket a workspace's object lives. `crawl` is a prefix inside the raw bucket (section 8: `nominara-raw/crawl/`). */
+/** Where in a bucket a workspace's object lives. `crawl` is a prefix inside the workspace's raw prefix (`{env}/{ws}/crawl/`, owner decision 106(e)). */
 export type StorageNamespace = "raw" | "crawl" | "reports";
 
 export interface PutObjectRequest {

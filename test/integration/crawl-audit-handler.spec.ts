@@ -794,7 +794,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       expect((await audits()).at(-1)).toMatchObject({ scope: "key_pages", pages_crawled: 3 });
     });
 
-    it("REVIEW · the tenant object store resolves the workspace from the tenant context at call time: every key lands under crawl/{env}/{workspace_id}/", async () => {
+    it("REVIEW · the tenant object store resolves the workspace from the tenant context at call time: every key lands under {env}/{workspace_id}/crawl/", async () => {
       await verifyDomain();
       const puts: string[] = [];
       const port = { put: async (r: { key: string }) => { puts.push(r.key); } } as unknown as ObjectStoragePort;
@@ -804,7 +804,7 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
       });
       await asTenant(workspaceId, (tx) => createCrawlAuditHandler({ pool: {} as never, env: {} as never }, deps)(tx, job()));
       expect(puts.length).toBeGreaterThan(0);
-      for (const key of puts) expect(key.startsWith(`crawl/test/${workspaceId}/`)).toBe(true);
+      for (const key of puts) expect(key.startsWith(`test/${workspaceId}/crawl/`)).toBe(true);
       expect(puts.some((k) => k.endsWith("/manifest.json"))).toBe(true);
     });
 

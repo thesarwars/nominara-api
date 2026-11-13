@@ -532,8 +532,8 @@ export const envSchema = z
     STORAGE_KMS_KEY_ID: requiredString.optional(),
     // The `{env}` segment of every object key (system-architecture.md section 6). Like CACHE_KEY_NAMESPACE it exists
     // because NODE_ENV cannot name a deployment (staging); a lowercase slug, defaulting to NODE_ENV.
-    // `crawl` is reserved: the crawl namespace is `crawl/{env}/{ws}/…`, so an env named crawl would make a raw key
-    // `crawl/{ws}/…` indistinguishable in shape from a crawl key.
+    // `crawl` stays reserved (it was the leading segment of the old crawl layout, `crawl/{env}/{ws}/…`, and the reservation keeps
+    // a leftover old-layout key unambiguous); the crawl namespace is now `{env}/{ws}/crawl/…`.
     STORAGE_KEY_ENV: z
       .string()
       .regex(/^[a-z0-9][a-z0-9-]{0,31}$/, { message: "must be a lowercase slug of at most 32 characters" })
