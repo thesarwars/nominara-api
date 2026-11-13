@@ -665,7 +665,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const csv = await exportReport(a, p, body({ format: "csv", sections: ["attribution"] }));
     expect(csv.statusCode, csv.body).toBe(201);
     const rows = (await fileOf(exportResponseSchema.parse(data(csv)))).toString("utf8");
-    expect(rows).toContain(`attribution,,,,measured_floor_note,${MEASURED_FLOOR_COPY}`);
+    expect(rows).toContain(`attribution,,,,measured_floor_note,"${MEASURED_FLOOR_COPY}"`); // the spec wording carries a comma, so CSV quotes it
     expect(rows).toContain("methodology,,,,note,");
     expect(rows).not.toContain("unavailable,");
     const pdf = await exportReport(a, p, body({ sections: ["attribution"] }));

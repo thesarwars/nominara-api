@@ -242,7 +242,7 @@ describe("NEW-E-099b · portal tasks and first-view notification", () => {
     expect(await rows()).toHaveLength(1);
   });
 
-  it("STORY-098 (review fix) · the portal mint, under the real portal role and RLS, records one notification_emails row per INTENDED recipient: an owner and a manager who sees the token's project; not a manager scoped elsewhere, an analyst, nor a second mint", async () => {
+  it("STORY-098 (review fix) · the portal mint, under the real portal role and RLS, records one notification_emails row per INTENDED recipient: an owner and a manager who sees the token's project; not an admin whose digest is off, a manager scoped elsewhere, an analyst, nor a second mint", async () => {
     const w = await world();
     const db = harness.db();
     const addMember = async (role: string, scope: string[] | null, cadence: string | null = null): Promise<string> => {
@@ -251,7 +251,9 @@ describe("NEW-E-099b · portal tasks and first-view notification", () => {
       await db.query("INSERT INTO workspace_members (id, workspace_id, user_id, role, project_scope, status, digest_cadence) VALUES ($1,$2,$3,$4,$5,'active',$6)", [randomUUID(), w.ws, user, role, scope, cadence]);
       return user;
     };
-    const owner = await addMember("owner", null, "off"); // digest off: still emailed, an immediate notice is not a digest
+    // Owner decision 2026-11-13: a digest set to "off" is an email opt-out, so the opted-out owner is not emailed.
+    const owner = await addMember("owner", null);
+    await addMember("admin", null, "off");
     const inScope = await addMember("manager", [w.p1]);
     await addMember("manager", [w.p2]);
     await addMember("analyst", null);
