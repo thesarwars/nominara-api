@@ -356,6 +356,12 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "A Stripe call may never be made on a request path (KAD-06), so the deletion request enqueues one signed tenant job after commit; the worker reads the live " +
       "subscription. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed.",
   },
+  "billing.stripe_drift": {
+    workerGroup: "rollup",
+    because:
+      "STORY-075 AC11 / owner decision 2026-10-28 section 100(e): a nightly provider-vs-local drift check that alerts and never writes. It fetches every Stripe " +
+      "subscription, and a Stripe call may never be made on a request path (KAD-06), so it is a cron job. §4's table allocates it no queue.",
+  },
   "credit.housekeeping": {
     workerGroup: "rollup",
     because:
@@ -484,6 +490,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
     expect(systemScoped).toEqual([
       "audit.verify",
+      "billing.stripe_drift",
       "credit.housekeeping",
       "credit.reconcile",
       "credit.verify",

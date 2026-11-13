@@ -49,6 +49,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "credit.verify",
     // STORY-176 / decision 93 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "rollup.category_benchmark",
+    // STORY-075 AC11 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "billing.stripe_drift",
   ],
   // STORY-185 / decision 100(c) - billing.retention_export is not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
   report: ["report.build", "billing.retention_export"],
