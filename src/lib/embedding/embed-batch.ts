@@ -22,8 +22,15 @@ export const embedBatchPayloadSchema = z
     kid: z.string(),
     table: z.enum(EMBED_TABLES),
     ids: z.array(z.string().uuid()).min(1).max(EMBED_JOB_MAX_IDS),
+    // STORY-186 - a re-embed job: write the vector to `embedding_next` beside the served one instead of replacing it (migration 0211).
+    // Only the two tables whose vector is replaced in place carry a staging column.
+    stage: z.literal(true).optional(),
   })
-  .strict();
+  .strict()
+  .refine((payload) => payload.stage !== true || payload.table === "tracked_prompts" || payload.table === "semantic_nodes", {
+    message: "stage is only defined for tracked_prompts and semantic_nodes",
+    path: ["stage"],
+  });
 
 export type EmbedBatchPayload = z.infer<typeof embedBatchPayloadSchema>;
 
@@ -46,7 +53,8 @@ export function splitIdsIntoJobs(ids: readonly string[]): string[][] {
  * de-duplicated and SORTED before hashing. Without that, the same 96 rows in another order would be a second key and a second
  * spend, and replay-safety would be a coin flip.
  */
-export function embedBatchKey(table: EmbedTable, ids: readonly string[]): string {
+export function embedBatchKey(table: EmbedTable, ids: readonly string[], stage = false): string {
   const canonical = [...new Set(ids.map((id) => id.toLowerCase()))].sort();
-  return `emb:${createHash("sha256").update([table, ...canonical].join("\n")).digest("hex")}`;
+  // A stage job for the same rows is a different job from a direct one (it writes elsewhere), so it keys differently. A direct key is unchanged.
+  return `emb:${createHash("sha256").update([stage ? `${table}:stage` : table, ...canonical].join("\n")).digest("hex")}`;
 }
