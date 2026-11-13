@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "compared": [
+    "rule_code",
+    "severity"
+  ],
+  "cases": [
+    {
+      "id": "complete-organization",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Organization\",\n  \"name\": \"Acme\",\n  \"url\": \"https://acme.example\",\n  \"logo\": \"https://acme.example/logo.png\",\n  \"sameAs\": [\n    \"https://x.example/acme\"\n  ],\n  \"description\": \"Widgets.\"\n}\n</script>",
+      "findings": []
+    },
+    {
+      "id": "complete-product",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"offers\": {\n    \"@type\": \"Offer\",\n    \"price\": \"37\",\n    \"priceCurrency\": \"USD\"\n  },\n  \"featureList\": [\n    \"Pipelines\",\n    \"Reports\"\n  ]\n}\n</script>",
+      "findings": []
+    },
+    {
+      "id": "malformed-trailing-comma",
+      "paste": "<script type=\"application/ld+json\">\n{\"@context\": \"https://schema.org\", \"@type\": \"Product\", \"name\": \"x\",}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-008",
+          "severity": "critical"
+        },
+        {
+          "rule_code": "AUX-R-010",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "malformed-truncated",
+      "paste": "<script type=\"application/ld+json\">\n{\"@context\": \"https://schema.org\", \"@type\": \"Product\", \n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-008",
+          "severity": "critical"
+        },
+        {
+          "rule_code": "AUX-R-010",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "missing-context",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@type\": \"Organization\",\n  \"name\": \"Acme\",\n  \"url\": \"https://acme.example\",\n  \"logo\": \"l\",\n  \"sameAs\": [\n    \"s\"\n  ],\n  \"description\": \"d\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-009",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "missing-type-in-graph",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@graph\": [\n    {\n      \"@type\": \"Organization\",\n      \"name\": \"Acme\",\n      \"url\": \"https://acme.example\",\n      \"logo\": \"l\",\n      \"sameAs\": [\n        \"s\"\n      ],\n      \"description\": \"d\"\n    },\n    {\n      \"name\": \"Untyped\"\n    }\n  ]\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-009",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "no-primary-entity",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"BreadcrumbList\",\n  \"itemListElement\": []\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-010",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "organization-missing-profiles",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Organization\",\n  \"name\": \"Acme\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-011",
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "id": "product-without-price",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"offers\": {\n    \"@type\": \"Offer\"\n  },\n  \"featureList\": [\n    \"Pipelines\",\n    \"Reports\"\n  ]\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-012",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "product-without-offers",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"featureList\": [\n    \"Pipelines\"\n  ]\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-012",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "product-without-currency",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"offers\": {\n    \"@type\": \"Offer\",\n    \"price\": \"37\"\n  },\n  \"featureList\": [\n    \"Pipelines\",\n    \"Reports\"\n  ]\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-012",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "product-without-feature-list",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"offers\": {\n    \"@type\": \"Offer\",\n    \"price\": \"37\",\n    \"priceCurrency\": \"USD\"\n  }\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-014",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "rating-without-review-count",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"offers\": {\n    \"@type\": \"Offer\",\n    \"price\": \"37\",\n    \"priceCurrency\": \"USD\"\n  },\n  \"featureList\": [\n    \"Pipelines\",\n    \"Reports\"\n  ],\n  \"aggregateRating\": {\n    \"@type\": \"AggregateRating\",\n    \"ratingValue\": \"4.8\"\n  }\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-015",
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "id": "rating-with-review-count",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Product\",\n  \"name\": \"Acme CRM\",\n  \"offers\": {\n    \"@type\": \"Offer\",\n    \"price\": \"37\",\n    \"priceCurrency\": \"USD\"\n  },\n  \"featureList\": [\n    \"Pipelines\",\n    \"Reports\"\n  ],\n  \"aggregateRating\": {\n    \"@type\": \"AggregateRating\",\n    \"ratingValue\": \"4.8\",\n    \"reviewCount\": \"120\"\n  }\n}\n</script>",
+      "findings": []
+    },
+    {
+      "id": "unrecognised-type",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Widgetz\",\n  \"name\": \"Acme\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-010",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "invalid-type-name",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"not a type!\",\n  \"name\": \"Acme\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-010",
+          "severity": "high"
+        },
+        {
+          "rule_code": "AUX-R-016",
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "id": "non-schema-context",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://example.com/vocab\",\n  \"@type\": \"Organization\",\n  \"name\": \"Acme\",\n  \"url\": \"https://acme.example\",\n  \"logo\": \"https://acme.example/logo.png\",\n  \"sameAs\": [\n    \"https://x.example/acme\"\n  ],\n  \"description\": \"Widgets.\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-016",
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "id": "two-organizations-two-names",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Organization\",\n  \"name\": \"Acme\",\n  \"url\": \"https://acme.example\",\n  \"logo\": \"https://acme.example/logo.png\",\n  \"sameAs\": [\n    \"https://x.example/acme\"\n  ],\n  \"description\": \"Widgets.\"\n}\n</script>\n<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Organization\",\n  \"name\": \"Acme Corp\",\n  \"url\": \"https://acme.example\",\n  \"logo\": \"https://acme.example/logo.png\",\n  \"sameAs\": [\n    \"https://x.example/acme\"\n  ],\n  \"description\": \"Widgets.\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-018",
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "id": "software-application-bare",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"SoftwareApplication\",\n  \"name\": \"Acme CRM\"\n}\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-012",
+          "severity": "high"
+        },
+        {
+          "rule_code": "AUX-R-014",
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "id": "two-blocks-one-broken",
+      "paste": "<script type=\"application/ld+json\">\n{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"Organization\",\n  \"name\": \"Acme\",\n  \"url\": \"https://acme.example\",\n  \"logo\": \"https://acme.example/logo.png\",\n  \"sameAs\": [\n    \"https://x.example/acme\"\n  ],\n  \"description\": \"Widgets.\"\n}\n</script>\n<script type=\"application/ld+json\">\n{\"@context\": \"https://schema.org\",\n</script>",
+      "findings": [
+        {
+          "rule_code": "AUX-R-008",
+          "severity": "critical"
+        }
+      ]
+    }
+  ]
+}
