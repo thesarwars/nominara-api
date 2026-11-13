@@ -563,8 +563,8 @@ export class ExportService {
     from: string,
     to: string,
   ): Promise<{ engineKeys: string[]; days: GrowthMapDay[] }> {
-    const result = await tx.query<{ metric_date: string; engine_key: string; visibility: number | null }>(
-      `SELECT to_char(metric_date, 'YYYY-MM-DD') AS metric_date, engine_key,
+    const result = await tx.query<{ metric_date: string; engine_key: string; visibility: number | null; cells: number | string }>(
+      `SELECT to_char(metric_date, 'YYYY-MM-DD') AS metric_date, engine_key, sum(cells_total)::int AS cells,
               CASE WHEN sum(cells_total) > 0
                    THEN (sum(visibility_score * cells_total) / sum(cells_total))::float8 END AS visibility
          FROM metric_daily
@@ -578,8 +578,15 @@ export class ExportService {
     const byDate = new Map<string, GrowthMapDay>();
     for (const row of result.rows) {
       const day = byDate.get(row.metric_date) ?? { date: row.metric_date, blended: null, byEngine: Object.fromEntries(engineKeys.map((k) => [k, null])) };
-      if (row.engine_key === CROSS_ENGINE_KEY) day.blended = row.visibility;
-      else day.byEngine[row.engine_key] = row.visibility;
+      const cells = day.cells ?? { blended: 0, byEngine: {} };
+      if (row.engine_key === CROSS_ENGINE_KEY) {
+        day.blended = row.visibility;
+        cells.blended = Number(row.cells);
+      } else {
+        day.byEngine[row.engine_key] = row.visibility;
+        cells.byEngine[row.engine_key] = Number(row.cells);
+      }
+      day.cells = cells;
       byDate.set(row.metric_date, day);
     }
     return { engineKeys, days: [...byDate.values()] };

@@ -1,3 +1,4 @@
+import { confidenceFor } from "../scoring/index.js";
 import type { ExportDocument, MetricSummary } from "./export-document.js";
 
 // NEW-E-100b — the CSV rendering of an ExportDocument.
@@ -63,6 +64,9 @@ export function renderCsv(doc: ExportDocument): string {
     meta("scoring_version", footer.scoring_version),
     meta("weight_overrides", footer.weight_overrides === null ? "" : JSON.stringify(footer.weight_overrides)),
     meta("note", footer.note),
+    // STORY-100 (PROVISIONAL): a partial export says so. Drawn here, never stored, so the footer contract is unchanged.
+    meta("export_status", doc.unavailableSections.length === 0 ? "complete" : "partial"),
+    ...(doc.unavailableSections.length === 0 ? [] : [meta("unavailable_sections", doc.unavailableSections.join(" "))]),
   );
   for (const source of footer.engine_data_sources) {
     lines.push(row(["methodology", "", "", source.engine_key, "engine_data_source", source.data_source ?? "", "", "", ""]));
@@ -75,10 +79,10 @@ export function renderCsv(doc: ExportDocument): string {
       for (const engine of section.engines) lines.push(...summaryRows("overview", "brand", engine.engineKey, engine));
     } else if (section.kind === "growth_map") {
       for (const day of section.days) {
-        lines.push(row(["growth_map", day.date, "brand", "all", "visibility_score", num(day.blended), "", "", ""]));
-        for (const key of section.engineKeys) {
-          lines.push(row(["growth_map", day.date, "brand", key, "visibility_score", num(day.byEngine[key] ?? null), "", "", ""]));
-        }
+        const figure = (engineKey: string, value: number | null, cells: number | undefined): string =>
+          row(["growth_map", day.date, "brand", engineKey, "visibility_score", num(value), value === null || cells === undefined ? "" : confidenceFor(cells), value === null || cells === undefined ? "" : String(cells), ""]);
+        lines.push(figure("all", day.blended, day.cells?.blended));
+        for (const key of section.engineKeys) lines.push(figure(key, day.byEngine[key] ?? null, day.cells?.byEngine[key]));
       }
     } else {
       for (const competitor of section.competitors) {

@@ -54,6 +54,11 @@ export interface GrowthMapDay {
   date: string;
   blended: number | null;
   byEngine: Record<string, number | null>;
+  /**
+   * STORY-100 (PROVISIONAL): the cells behind each figure, so a thin day carries the low-confidence treatment like the interface
+   * does. Absent for a caller that does not know; an absent count yields NO confidence, never an invented one.
+   */
+  cells?: { blended: number; byEngine: Record<string, number> };
 }
 
 export interface CompetitorSummary {

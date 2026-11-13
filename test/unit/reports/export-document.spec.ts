@@ -295,3 +295,59 @@ describe("NEW-E-100b · selection, privacy and rendering hygiene", () => {
     expect((pdfText(pdf).match(/Methodology/g) ?? []).length).toBeGreaterThanOrEqual(pages);
   });
 });
+
+describe("STORY-100 · low-confidence treatment on the growth map (PROVISIONAL, batch 13: n is the day's cells)", () => {
+  const days = [
+    { date: "2026-10-05", blended: 55, byEngine: { chatgpt: 45, gemini: 65 }, cells: { blended: 20, byEngine: { chatgpt: 10, gemini: 10 } } },
+    { date: "2026-10-06", blended: 60, byEngine: { chatgpt: 50, gemini: 70 }, cells: { blended: 260, byEngine: { chatgpt: 130, gemini: 130 } } },
+    { date: "2026-10-07", blended: 62, byEngine: { chatgpt: 52, gemini: null }, cells: { blended: 130, byEngine: { chatgpt: 130 } } },
+  ];
+  const doc = () => buildExportDocument(input({ sections: ["growth_map"], growthMap: { engineKeys: ["chatgpt", "gemini"], days } }));
+
+  it("STORY-100 s6 - a day under 30 cells is labelled low in the CSV with its cell count; a day at or over 120 is high", () => {
+    const csv = renderCsv(doc());
+    expect(csv).toContain("growth_map,2026-10-05,brand,all,visibility_score,55,low,20,");
+    expect(csv).toContain("growth_map,2026-10-05,brand,gemini,visibility_score,65,low,10,");
+    expect(csv).toContain("growth_map,2026-10-06,brand,all,visibility_score,60,high,260,");
+  });
+
+  it("STORY-100 s6 - an absent engine day stays an empty cell with NO confidence and NO count (null is not low, not 0)", () => {
+    const csv = renderCsv(doc());
+    expect(csv).toContain("growth_map,2026-10-07,brand,gemini,visibility_score,,,,");
+  });
+
+  it("STORY-100 s6 - a day with no cell facts (an older caller) carries no confidence rather than an invented one", () => {
+    const csv = renderCsv(buildExportDocument(input({ sections: ["growth_map"] })));
+    expect(csv).toContain("growth_map,2026-10-06,brand,all,visibility_score,60,,,");
+  });
+
+  it("STORY-100 s6 - the PDF marks the low-confidence day's figures with * and prints the legend only when one exists", async () => {
+    const withLow = (await everyFormat(doc())).pdfText;
+    expect(withLow).toContain("55*");
+    expect(withLow).not.toContain("60*");
+    expect(withLow).toMatch(/\* low confidence/);
+    const none = (await everyFormat(buildExportDocument(input({ sections: ["growth_map"] })))).pdfText;
+    expect(none).not.toMatch(/\* low confidence/);
+  });
+});
+
+describe("STORY-100 · the footer states a partial export (PROVISIONAL, batch 13)", () => {
+  it("a requested section this export cannot compose is named in the methodology block of both formats, as a partial status", async () => {
+    const { csv, pdfText: text } = await everyFormat(buildExportDocument(input({ sections: ["overview", "matrix", "tasks"] })));
+    expect(csv).toContain("methodology,,,,export_status,partial,");
+    expect(csv).toContain("methodology,,,,unavailable_sections,matrix tasks,");
+    expect(text).toContain("Export status: partial (not included: matrix, tasks)");
+  });
+
+  it("a complete export says complete, and names nothing missing", async () => {
+    const { csv, pdfText: text } = await everyFormat(buildExportDocument(input()));
+    expect(csv).toContain("methodology,,,,export_status,complete,");
+    expect(csv).not.toContain("unavailable_sections");
+    expect(text).toContain("Export status: complete");
+  });
+
+  it("the stored footer contract is unchanged: the status is drawn by the renderers, not stored", () => {
+    const doc = buildExportDocument(input({ sections: ["matrix"] }));
+    expect(Object.keys(doc.footer).sort()).toEqual(Object.keys(footer).sort());
+  });
+});
