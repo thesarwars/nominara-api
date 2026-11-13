@@ -1,10 +1,12 @@
 import type { Client } from "pg";
+import { refundsFor } from "../support/run-race-fixture.js";
+import { verifyWorkspaceWallet } from "../../src/lib/credits/replay.js";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { finalizeRun } from "../../src/lib/capture/finalize-run.js";
 import { readRunProgress } from "../../src/lib/capture/run-progress.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
-import { addCapture, addPrompt, addRun, addTenant, chargeRun, startRaceDb, truncateAll, type RaceDb, type Tenant } from "../support/run-race-fixture.js";
+import { CHARGE, addCapture, addPrompt, addRun, addTenant, chargeRun, startRaceDb, truncateAll, type RaceDb, type Tenant } from "../support/run-race-fixture.js";
 
 // STORY-089 AC "A long-running command ... lands in the notification centre on completion" (FR-CMD-06, test scenario 17). The command bar's long-running
 // command is a manual deep scan; the run's single finalisation (`finalizeRun`, shared by the last live cell and the stuck-run reaper) writes ONE in-app
@@ -97,5 +99,26 @@ describe("STORY-089 · scenario 17 - a finished manual run lands in the notifica
     await finalise(t, run);
     const [row] = await notes(t);
     expect(JSON.stringify(row)).not.toContain("Secret Co Name");
+  });
+
+  it("scenario 17 - a notification that cannot be written NEVER undoes the run's finalisation or its refund: the run finalises, the wallet settles, nothing is notified", async () => {
+    const t = await addTenant(db);
+    const run = await addRun(db, t, { planned: 2 });
+    await chargeRun(db, t, run);
+    await startedBy(run, t.user);
+    await db.query("UPDATE capture_runs SET failed_cells = 2 WHERE id = $1", [run]);
+    await db.query(`CREATE OR REPLACE FUNCTION public.test_refuse_notification() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'notification refused by test'; END $$`);
+    await db.query("CREATE TRIGGER test_refuse_notification BEFORE INSERT ON notifications FOR EACH ROW EXECUTE FUNCTION public.test_refuse_notification()");
+    try {
+      const out = await finalise(t, run);
+      expect(out).toMatchObject({ status: "failed", refunded: CHARGE });
+    } finally {
+      await db.query("DROP TRIGGER test_refuse_notification ON notifications");
+      await db.query("DROP FUNCTION public.test_refuse_notification()");
+    }
+    expect((await db.query<{ status: string }>("SELECT status FROM capture_runs WHERE id = $1", [run])).rows[0]!.status).toBe("failed");
+    expect(await refundsFor(db, t.ws)).toEqual([CHARGE]);
+    expect(await verifyWorkspaceWallet(db, t.ws)).toBeNull();
+    expect(await notes(t)).toHaveLength(0);
   });
 });

@@ -1,8 +1,12 @@
+import { Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
 import { settleFinishedRunCredits } from "../credits/run-settlement.js";
 import { resolveRunOutcome } from "../engines/run-outcome.js";
 import { writeNotification } from "../notifications/writer.js";
+import { incrementCounter } from "../telemetry/metrics.js";
 import type { RunProgress } from "./run-progress.js";
+
+const logger = new Logger("capture.finalize");
 
 // SCANFIX - the ONE place a run is moved to its terminal status, shared by the last
 // live cell (capture.execute) and the stuck-run reaper. It used to be inline in the
@@ -73,16 +77,26 @@ async function notifyManualRunFinished(tx: ClientBase, workspaceId: string, prog
         : refunded > 0
           ? "No engine returned an answer. The credits were refunded in full."
           : "No engine returned an answer.";
-  await writeNotification(tx, {
-    workspaceId,
-    projectId: progress.projectId,
-    userId: triggeredBy,
-    kind: "run.completed",
-    severity: status === "failed" ? "warning" : "info",
-    title,
-    body,
-    eventKey: `run.completed:${progress.runId}`,
-    deepLink: { path: `/p/${progress.projectId}/overview`, query: { run: progress.runId } },
-    facts: { run_id: progress.runId, status, captured: progress.captured, skipped: progress.skipped, failed: progress.failed },
-  });
+  // A NOTIFICATION IS NEVER ALLOWED TO UNDO THE RUN. The status and the settlement above commit with this transaction, so a failure here (the insert, or the deep-link parse)
+  // must not abort it: the write runs inside a SAVEPOINT, and on any error only the savepoint is rolled back. The failure is logged (ids only) and counted, never swallowed silently.
+  await tx.query("SAVEPOINT run_completed_notify");
+  try {
+    await writeNotification(tx, {
+      workspaceId,
+      projectId: progress.projectId,
+      userId: triggeredBy,
+      kind: "run.completed",
+      severity: status === "failed" ? "warning" : "info",
+      title,
+      body,
+      eventKey: `run.completed:${progress.runId}`,
+      deepLink: { path: `/p/${progress.projectId}/overview`, query: { run: progress.runId } },
+      facts: { run_id: progress.runId, status, captured: progress.captured, skipped: progress.skipped, failed: progress.failed },
+    });
+    await tx.query("RELEASE SAVEPOINT run_completed_notify");
+  } catch (error) {
+    await tx.query("ROLLBACK TO SAVEPOINT run_completed_notify");
+    incrementCounter("nominara_capture_run_notify_failures_total", { trigger: "manual" });
+    logger.warn({ event: "run.completed.notify_failed", workspace_id: workspaceId, run_id: progress.runId, project_id: progress.projectId, error_name: error instanceof Error ? error.name : "unknown" });
+  }
 }
