@@ -79,6 +79,26 @@ export interface L1Envelope {
    * Optional and additive (the envelope version is unchanged by it): an entry written before this field existed reads as before, with no time.
    */
   readonly capturedAt?: string;
+  /**
+   * STORY-032 AC16 - the source capture's `async_generated` (NFR-SIM-12), carried so a reuse does not dilute the on-demand share (NFR-SIM-13).
+   * Optional and additive (the envelope version is unchanged): absent is "no such fact", which is a different thing from `false`.
+   */
+  readonly asyncGenerated?: boolean;
+  /**
+   * STORY-032 AC16 - the NFR-SIM-12 flag of the source, when it had one. Today `isSeedable` withholds every flagged answer, so a
+   * written entry never has it; the field exists so that if that policy ever admits a flagged absence its flag is not lost in the copy.
+   */
+  readonly flags?: readonly NfrSim12Flag[];
+}
+
+/** The capture flags that are NFR-SIM-12 facts about an answer and so travel with a reuse. The other flags are not copied. */
+export type NfrSim12Flag = "no_ai_overview_for_query";
+export const NFR_SIM_12_FLAGS: readonly NfrSim12Flag[] = ["no_ai_overview_for_query"];
+
+/** Only the NFR-SIM-12 flags of an arbitrary list, in order and without duplicates; anything else is dropped. */
+export function nfrSim12FlagsOf(flags: unknown): NfrSim12Flag[] {
+  if (!Array.isArray(flags)) return [];
+  return NFR_SIM_12_FLAGS.filter((known) => flags.includes(known));
 }
 
 export interface L1Hit {
@@ -91,6 +111,10 @@ export interface L1Hit {
   readonly excerpt: string | null;
   /** STORY-079 - when the shared answer was captured, or null for an entry written without a time. */
   readonly capturedAt: string | null;
+  /** STORY-032 AC16 - the source's `async_generated`, or null when the entry carries none. */
+  readonly asyncGenerated: boolean | null;
+  /** STORY-032 AC16 - the NFR-SIM-12 flags of the source (empty when none). */
+  readonly flags: readonly NfrSim12Flag[];
 }
 
 /**
@@ -119,7 +143,18 @@ export function parseL1Envelope(raw: string): L1Envelope | undefined {
   if (excerpt !== null && typeof excerpt !== "string") return undefined;
   // A time that is not a time is dropped, never trusted: the entry stays a readable hit for the scheduled path.
   const capturedAt = typeof candidate.capturedAt === "string" && !Number.isNaN(Date.parse(candidate.capturedAt)) ? candidate.capturedAt : undefined;
-  return { v: L1_ENVELOPE_VERSION, contentHash: candidate.contentHash, payload: candidate.payload, excerpt: excerpt ?? null, ...(capturedAt !== undefined ? { capturedAt } : {}) };
+  // A non-boolean is dropped, never coerced: `false` is a fact and "absent" is another.
+  const asyncGenerated = typeof candidate.asyncGenerated === "boolean" ? candidate.asyncGenerated : undefined;
+  const flags = nfrSim12FlagsOf(candidate.flags);
+  return {
+    v: L1_ENVELOPE_VERSION,
+    contentHash: candidate.contentHash,
+    payload: candidate.payload,
+    excerpt: excerpt ?? null,
+    ...(capturedAt !== undefined ? { capturedAt } : {}),
+    ...(asyncGenerated !== undefined ? { asyncGenerated } : {}),
+    ...(flags.length > 0 ? { flags } : {}),
+  };
 }
 
 export interface L1ProbeContext {
@@ -223,6 +258,8 @@ export async function probeExactHash(
         payload: envelope.payload,
         excerpt: envelope.excerpt,
         capturedAt: envelope.capturedAt ?? null,
+        asyncGenerated: envelope.asyncGenerated ?? null,
+        flags: envelope.flags ?? [],
       });
     }
   });

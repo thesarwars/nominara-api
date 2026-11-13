@@ -342,6 +342,31 @@ describe("STORY-034 · capture.execute moves a cell", () => {
     expect(progress.cachedByLayer.l1).toBe(1);
   });
 
+  // STORY-032 AC15 - a MANUAL run's cell reaches the adapter with requestMode "live", through the real plan -> signed payload -> handler path
+  // (the handler's payload schema is strict, so an unknown key would also have failed here).
+  it("STORY-032 AC15 - a manual run's cell is captured with requestMode live", async () => {
+    const seen: (string | undefined)[] = [];
+    vi.spyOn(BaseCaptureAdapter.prototype, "capture").mockImplementationOnce((input) => {
+      seen.push(input.requestMode);
+      return Promise.resolve({ text: "an answer", format: "markdown", truncated: false, responseTokensEst: 3, latencyMs: 5, costUsd: 0 });
+    });
+    await addPrompt("normal");
+    const { jobs } = await planRun();
+    await handler()(db, jobs[0]!);
+    vi.restoreAllMocks();
+    expect(seen).toEqual(["live"]);
+  });
+
+  // STORY-032 AC16 - the NFR-SIM-12 async fact rides the L1 entry, so a reuse of an on-demand answer is still an on-demand row.
+  it("STORY-032 AC16 - a seeded answer's async_generated fact is copied onto the L1 row a later run writes", async () => {
+    const { second } = await captureThenReplan("normal", raw({ text: "an on-demand answer", asyncGenerated: true }));
+    const row = await db.query<{ cache_layer: string; async_generated: boolean | null }>(
+      "SELECT cache_layer, async_generated FROM answer_captures WHERE run_id = $1",
+      [second.runId],
+    );
+    expect(row.rows[0]).toMatchObject({ cache_layer: "l1", async_generated: true });
+  });
+
   // ---- Audit round 3 - what may enter L1, and how a token-budget failure is recorded ---------------------------------------------
   // `recordSuppressedCells` writes an L1 row with truncated = false and no flags, so an L1 copy of a truncated empty (brand_present
   // false) or of a refusal (flag lost) would be wrong in the OTHER tenant. Such an answer must never be seeded. Driven through the real

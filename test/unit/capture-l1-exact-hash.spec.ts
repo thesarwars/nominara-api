@@ -232,6 +232,30 @@ describe("STORY-032 AC4 · the L1 exact-hash probe", () => {
     expect(junk?.capturedAt).toBeUndefined();
   });
 
+  it("STORY-032 AC16 - an envelope may carry async_generated and the NFR-SIM-12 flag; a hit exposes them, and null/none when absent", async () => {
+    const { cache } = countingCache();
+    const facts = candidate({ promptId: "p-facts", promptText: "facts question" });
+    const bare = candidate({ promptId: "p-bare", promptText: "bare question" });
+    for (const [c, extra] of [[facts, { asyncGenerated: true, flags: ["no_ai_overview_for_query", "engine_refused_to_answer", 7] }], [bare, {}]] as const) {
+      await cache.set(
+        captureL1Key({ env: CONTEXT.env, engineKey: c.engineKey, adapterMajor: adapterMajorOf(c.adapterVersion), promptText: c.promptText, locale: CONTEXT.locale, personaHint: CONTEXT.personaHint, ttlSeconds: c.ttlSeconds, nowMs: CONTEXT.nowMs }),
+        JSON.stringify({ v: 2, contentHash: HASH_A, payload: { answer: "x" }, excerpt: "x", ...extra }),
+        { ttlMs: 60_000 },
+      );
+    }
+    const hits = await probeExactHash(cache, CONTEXT, [facts, bare]);
+    const byPrompt = new Map([...hits.values()].map((h) => [h.promptId, h]));
+    expect(byPrompt.get("p-facts")?.asyncGenerated).toBe(true);
+    // Only the NFR-SIM-12 flag survives; a different flag, or a non-string, is dropped rather than trusted.
+    expect(byPrompt.get("p-facts")?.flags).toEqual(["no_ai_overview_for_query"]);
+    expect(byPrompt.get("p-bare")?.asyncGenerated).toBeNull();
+    expect(byPrompt.get("p-bare")?.flags).toEqual([]);
+    // false is a fact and survives as false; a non-boolean is dropped to null.
+    const typed = parseL1Envelope(JSON.stringify({ v: 2, contentHash: HASH_A, payload: {}, excerpt: null, asyncGenerated: false }));
+    expect(typed?.asyncGenerated).toBe(false);
+    expect(parseL1Envelope(JSON.stringify({ v: 2, contentHash: HASH_A, payload: {}, excerpt: null, asyncGenerated: "yes" }))?.asyncGenerated).toBeUndefined();
+  });
+
   it("STORY-079 - a probe hit exposes the capture time when the entry has one, and null when it does not", async () => {
     const { cache } = countingCache();
     const withTime = candidate({ promptId: "p-time", promptText: "timed question" });

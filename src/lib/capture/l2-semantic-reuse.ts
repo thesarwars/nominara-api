@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import { hasFactsStatusSql } from "../rollup/aggregate-day.js";
+import { nfrSim12FlagsOf, type NfrSim12Flag } from "./l1-exact-hash.js";
 
 // STORY-032 — tracking-engine.md §6's L2 near-duplicate probe.
 //
@@ -51,6 +52,10 @@ export interface L2Hit {
    * suppressed an L2 cell. The probe is already reading this row.
    */
   readonly sourceContentHash: Buffer;
+  /** STORY-032 AC16 - the source's `async_generated` (NFR-SIM-12), null when it reported none. Read by the probe for the same reason as the hash. */
+  readonly sourceAsyncGenerated: boolean | null;
+  /** STORY-032 AC16 - the source's NFR-SIM-12 flags (empty when none). */
+  readonly sourceFlags: readonly NfrSim12Flag[];
   readonly cosine: number;
 }
 
@@ -126,6 +131,8 @@ export async function probeSemanticReuse(
     sample_index: number;
     source_result_id: string;
     source_content_hash: Buffer;
+    source_async_generated: boolean | null;
+    source_flags: string[];
     cosine: number;
   }>(
     `
@@ -137,7 +144,7 @@ export async function probeSemanticReuse(
       SELECT * FROM jsonb_to_recordset($2::jsonb)
         AS c(prompt_id uuid, engine_key text, sample_index int, ttl_seconds int)
     )
-    SELECT c.prompt_id, c.engine_key, c.sample_index, s.source_result_id, s.source_content_hash, s.cosine
+    SELECT c.prompt_id, c.engine_key, c.sample_index, s.source_result_id, s.source_content_hash, s.source_async_generated, s.source_flags, s.cosine
       FROM candidate c
       -- BOTH SIDES OF THE COMPARISON ARE PROJECT-SCOPED. The source filters
       -- below were here from the start; the TARGET had none, so a cell whose
@@ -153,6 +160,8 @@ export async function probeSemanticReuse(
       JOIN LATERAL (
         SELECT ac.id AS source_result_id,
                ac.content_hash AS source_content_hash,
+               ac.async_generated AS source_async_generated,
+               ac.flags AS source_flags,
                1 - (source_prompt.embedding <=> target.embedding) AS cosine
           FROM answer_captures ac
           JOIN tracked_prompts source_prompt ON source_prompt.id = ac.prompt_id
@@ -209,6 +218,8 @@ export async function probeSemanticReuse(
       sampleIndex: row.sample_index,
       sourceResultId: row.source_result_id,
       sourceContentHash: row.source_content_hash,
+      sourceAsyncGenerated: row.source_async_generated,
+      sourceFlags: nfrSim12FlagsOf(row.source_flags),
       cosine: Number(row.cosine),
     });
   }

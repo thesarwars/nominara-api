@@ -142,6 +142,22 @@ describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
     return { target, source };
   }
 
+  // STORY-032 AC16 - the probe carries the source's NFR-SIM-12 facts out with the hit (no extra query: it is already reading the row).
+  it("STORY-032 AC16 - a hit carries its source's async_generated and no_ai_overview_for_query flag; a source with neither carries null and none", async () => {
+    const { target, source } = await nearDuplicatePair();
+    const sourceId = await addSourceCapture(source);
+    await db.query("UPDATE answer_captures SET async_generated = true, flags = ARRAY['no_ai_overview_for_query', 'empty_answer'] WHERE id = $1", [sourceId]);
+    const hit = (await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).get(cellKey(candidate(target)))!;
+    expect(hit.sourceAsyncGenerated).toBe(true);
+    // ONLY the NFR-SIM-12 flag is carried; `empty_answer` is not one of the two facts the criterion names.
+    expect(hit.sourceFlags).toEqual(["no_ai_overview_for_query"]);
+
+    await db.query("UPDATE answer_captures SET async_generated = NULL, flags = '{}' WHERE id = $1", [sourceId]);
+    const bare = (await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).get(cellKey(candidate(target)))!;
+    expect(bare.sourceAsyncGenerated).toBeNull();
+    expect(bare.sourceFlags).toEqual([]);
+  }, 30_000);
+
   // The guard on every refusal below: if the probe admitted NOTHING, every
   // "must not reuse" test would pass for the wrong reason.
   it("admits a genuine near-duplicate", async () => {

@@ -55,6 +55,8 @@ const payloadSchema = z
     ttlSeconds: z.number().int().positive(),
     locale: z.string().min(1),
     personaHint: z.string().nullable(),
+    // STORY-032 AC15 - optional so a job signed before this field existed still verifies and runs (as queued, the adapter default).
+    requestMode: z.enum(["queued", "live"]).optional(),
   })
   .strict();
 
@@ -293,6 +295,7 @@ export function createCaptureExecuteHandler(context: QueueHandlerContext, deps?:
       locale: payload.locale,
       personaHint: payload.personaHint,
       normalizerVersion: NORMALIZER_VERSION,
+      ...(payload.requestMode !== undefined ? { requestMode: payload.requestMode } : {}),
     };
     // IDEMPOTENT PER CELL, BEFORE ANY VENDOR CALL: a cell an earlier delivery settled is replayed, not captured again.
     const settled = await settledCell(tx, cellInput);
