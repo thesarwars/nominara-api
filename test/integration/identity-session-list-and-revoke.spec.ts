@@ -225,6 +225,24 @@ describe("STORY-096 AC4/AC7 · own session list and single-session revoke", () =
     expect(row.rows[0].revoked_reason).toBe("user_revoked");
   });
 
+  it("STORY-096 AC7 · revoking the CURRENT session clears the auth cookies, as logout does; revoking another session clears none", async () => {
+    const uid = await user("clear@example.com");
+    const current = await signIn(uid);
+    const other = await signIn(uid);
+
+    const keep = await revokeOne(current, other.sid);
+    expect(keep.statusCode).toBe(200);
+    expect(keep.cookies.map((c) => c.name)).toEqual([]);
+
+    const own = await revokeOne(current, current.sid);
+    expect(own.statusCode).toBe(200);
+    const cleared = own.cookies.filter((c) => c.value === "" || (c.expires !== undefined && c.expires.getTime() < Date.now()));
+    expect(cleared.map((c) => c.name).sort()).toEqual([ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_NAME].sort());
+    // Same cookies, same attributes as logout.
+    const logoutRes = await app.inject({ method: "POST", url: apiUrl("/auth/logout"), ...mutating(await signIn(uid)) });
+    expect(logoutRes.cookies.map((c) => c.name).sort()).toEqual(cleared.map((c) => c.name).sort());
+  });
+
   it("STORY-096 AC7 · a repeat revoke of my own already-ended session is idempotent and does not rewrite its reason", async () => {
     const uid = await user("idem@example.com");
     const current = await signIn(uid);

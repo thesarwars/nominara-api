@@ -227,10 +227,13 @@ export class IdentityController {
   @Delete("me/sessions/:id")
   @SkipTenantContext()
   @ApiContract({ operationId: "revokeSession", paramsSchema: sessionIdParamsSchema, voidResponse: true })
-  revokeSession(
+  async revokeSession(
     @Req() req: AuthenticatedRequest,
     @Param(new ZodValidationPipe(sessionIdParamsSchema)) params: SessionIdParams,
+    @Res({ passthrough: true }) reply: FastifyReply,
   ): Promise<void> {
-    return this.service.revokeSession(req.auth!.sub, params.id, req.session, req.auth!.sid);
+    await this.service.revokeSession(req.auth!.sub, params.id, req.session, req.auth!.sid);
+    // Ending the CURRENT session is a sign-out: clear the cookies exactly as logout does (decision 100g).
+    if (params.id === req.auth!.sid) clearAuthCookies(reply);
   }
 }
