@@ -441,6 +441,10 @@ export const envSchema = z
     // Which embedding provider this process runs. `auto` (default) = OPENAI_API_KEY ? OpenAI : stand-in (refusing in production). `openrouter`
     // = the free nvidia/nemotron-3.5-embed-1b:free at 1536 dimensions, DEVELOPMENT ONLY. Having an OPENROUTER_API_KEY never selects it by itself.
     EMBEDDING_PROVIDER: z.enum(["auto", "stand-in", "openrouter", "openai"]).default("auto"),
+    // STORY-186 (owner decision 104(b)) - the operator re-embed command (`pnpm db:reembed`) refuses to run unless this is "true". Off by default;
+    // nothing else reads it and nothing starts a re-embed automatically (no deploy trigger, no schedule). ANY string loads (a stray value must never stop the API
+    // booting); only `assertReembedEnabled` decides, and only the literal "true" enables it.
+    EMBED_REEMBED_ENABLED: z.string().optional(),
     // STORY-067 - the two verification horizons after a task completes. UNSET = the documented defaults (+48 h, +14 d).
     TASK_VERIFICATION_SHORT_HOURS: z.coerce.number().int().positive().optional(),
     TASK_VERIFICATION_LONG_DAYS: z.coerce.number().int().positive().optional(),

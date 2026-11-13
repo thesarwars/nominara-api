@@ -8,6 +8,8 @@ import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { projectQueueLockKey } from "../../src/lib/queue/locks.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
+import { runReembed } from "../../src/lib/embedding/reembed.js";
+import type { EmbeddingBatchResult, EmbeddingProvider } from "../../src/modules/prompts/ports/embedding-provider.js";
 import { createEmbedBatchHandler } from "../../src/lib/queue/handlers/embed-batch.handler.js";
 import { createTopicClusterHandler } from "../../src/lib/queue/handlers/topic-cluster.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
@@ -920,6 +922,62 @@ describe("STORY-047 - topic.cluster", () => {
     expect(rows.every((r) => r.embedding_model === STAND_IN_EMBEDDING_MODEL)).toBe(true);
     expect(await orphans()).toBe(0);
   });
+
+  // ---- STORY-186 / STORY-047 constraint: a GRADUAL re-embed must not cost a user their cluster rename ---------------------------------
+
+  /** A provider for a NEW model whose geometry differs (other axes) but whose groups are just as tight: text -> the vector it was scripted to. */
+  class ScriptedProvider implements EmbeddingProvider {
+    readonly model = "new-model-1536";
+    readonly dimensions = 1536;
+    constructor(private readonly byText: ReadonlyMap<string, number[]>) {}
+    embed(texts: readonly string[]): Promise<EmbeddingBatchResult> {
+      return Promise.resolve({ vectors: texts.map((t) => this.byText.get(t)!), model: this.model, totalTokens: texts.length });
+    }
+  }
+
+  it("STORY-186 - stage in two halves, cluster mid-way (the old model keeps serving and nothing moves), promote, cluster again: the renamed cluster keeps its id, label and user source", async () => {
+    const groups = await seedGroups(2, 6);
+    await run();
+    const target = (await clusters()).find((c) => c.label === "Pricing comparison")!;
+    await renameToUser(target.id, "Our vendor pricing");
+    const before = await assignments();
+
+    // The new model's vectors: the same groups on different axes.
+    const scripted = new Map<string, number[]>();
+    for (let g = 0; g < 2; g += 1) {
+      for (let i = 0; i < 6; i += 1) {
+        const v = new Array<number>(1536).fill(0);
+        v[500 + g] = 1;
+        v[700 + g * 20 + i] = 0.3;
+        scripted.set(TOPICS[g]!(i), v);
+      }
+    }
+    const embedContext = { pool: undefined, env: { NODE_ENV: "test" } } as unknown as QueueHandlerContext;
+    const embed = createEmbedBatchHandler(embedContext, { provider: new ScriptedProvider(scripted) });
+    const embedEntry = QUEUE_TOPOLOGY.find((e) => e.name === "embed.batch")!;
+    const process = createJobProcessor(embedEntry, { keys: KEYS, getClient: () => pool.connect(), releaseClient: (c) => (c as PoolClient).release(), process: embed });
+    const stage = (ids: string[]) => process({ data: signQueueJobPayload({ workspaceId, kid: "k1", table: "tracked_prompts", ids, stage: true, targetModel: "new-model-1536" }, KEYS.current.key) } as unknown as Job);
+    const all = groups.flat();
+    const noEnqueue = () => Promise.resolve();
+
+    await stage(all.slice(0, 5));
+    expect((await runReembed({ client: db, model: "new-model-1536", enqueue: noEnqueue, logger: console })).cutovers, "an incomplete project is not promoted").toEqual([]);
+    await run();
+    let rows = await clusters();
+    expect(rows.every((c) => c.embedding_model === MODEL), "mid-way: still served and clustered under the old model").toBe(true);
+    expect(rows.find((c) => c.id === target.id)).toMatchObject({ label: "Our vendor pricing", label_source: "user" });
+
+    await stage(all.slice(5));
+    const summary = await runReembed({ client: db, model: "new-model-1536", enqueue: noEnqueue, logger: console });
+    expect(summary.cutovers).toHaveLength(1);
+    await run();
+    rows = await clusters();
+    expect(rows.every((c) => c.embedding_model === "new-model-1536")).toBe(true);
+    expect(rows.find((c) => c.id === target.id), "the same cluster row, its user label intact").toMatchObject({ label: "Our vendor pricing", label_source: "user", prompt_count: 6 });
+    expect(rows).toHaveLength(2);
+    expect(await assignments(), "every prompt is still in the cluster it was in").toEqual(before);
+    expect(await orphans()).toBe(0);
+  }, 120_000);
 
   void createHash;
 });

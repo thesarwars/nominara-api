@@ -142,6 +142,38 @@ describe("STORY-032 · L2 semantic reuse — the six admission rules", () => {
     return { target, source };
   }
 
+  // STORY-032 AC16 - the probe carries the source's NFR-SIM-12 facts out with the hit (no extra query: it is already reading the row).
+  it("STORY-032 AC16 - a hit carries its source's async_generated and no_ai_overview_for_query flag; a source with neither carries null and none", async () => {
+    const { target, source } = await nearDuplicatePair();
+    const sourceId = await addSourceCapture(source);
+    await db.query("UPDATE answer_captures SET async_generated = true, flags = ARRAY['no_ai_overview_for_query', 'empty_answer'] WHERE id = $1", [sourceId]);
+    const hit = (await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).get(cellKey(candidate(target)))!;
+    expect(hit.sourceAsyncGenerated).toBe(true);
+    // ONLY the NFR-SIM-12 flag is carried; `empty_answer` is not one of the two facts the criterion names.
+    expect(hit.sourceFlags).toEqual(["no_ai_overview_for_query"]);
+
+    await db.query("UPDATE answer_captures SET async_generated = NULL, flags = '{}' WHERE id = $1", [sourceId]);
+    const bare = (await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).get(cellKey(candidate(target)))!;
+    expect(bare.sourceAsyncGenerated).toBeNull();
+    expect(bare.sourceFlags).toEqual([]);
+  }, 30_000);
+
+  // STORY-186 AC2 / EC-23 - the L2 probe never compares two embedding models: cosine across vector spaces is silently wrong, and during a
+  // re-embed a project's prompts are briefly under two models. The refusal fails open (no suppression, a live capture), never a wrong reuse.
+  it("STORY-186 AC2 - refuses a near-duplicate whose vector is under a different embedding_model, and admits it under the same one", async () => {
+    const { target, source } = await nearDuplicatePair();
+    await addSourceCapture(source);
+    await db.query("UPDATE tracked_prompts SET embedding_model = 'model-a' WHERE id = ANY($1::uuid[])", [[target, source]]);
+    expect((await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).size, "same model: must admit, or the refusal below proves nothing").toBe(1);
+
+    await db.query("UPDATE tracked_prompts SET embedding_model = 'model-b' WHERE id = $1", [source]);
+    expect((await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).size, "two models: no comparison").toBe(0);
+
+    // A vector with no recorded model is not comparable to one with a model either.
+    await db.query("UPDATE tracked_prompts SET embedding_model = NULL WHERE id = $1", [source]);
+    expect((await probeSemanticReuse(db, { workspaceId, projectId }, [candidate(target)])).size).toBe(0);
+  }, 30_000);
+
   // The guard on every refusal below: if the probe admitted NOTHING, every
   // "must not reuse" test would pass for the wrong reason.
   it("admits a genuine near-duplicate", async () => {

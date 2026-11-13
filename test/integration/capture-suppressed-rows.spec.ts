@@ -192,6 +192,51 @@ describe("STORY-032 · suppressed cells produce rows without advancing the live 
     ).toBe(true);
   }, 30_000);
 
+  // STORY-032 AC16 - a reused absence is still a flagged absence, and the on-demand share (NFR-SIM-13) is not diluted by reuse.
+  it("STORY-032 AC16 - an L1 row carries the no_ai_overview_for_query flag and async_generated of its source", async () => {
+    const promptId = await addPrompt("l1 facts");
+    await recordSuppressedCells(db, context, [
+      {
+        layer: "l1", promptId, engineKey: "google_aio", sampleIndex: 0, contentHash: Buffer.alloc(32, 7), payload: { answer: "" }, excerpt: null,
+        adapterVersion: "0.1.0", asyncGenerated: true, flags: ["no_ai_overview_for_query"],
+      },
+    ]);
+    const row = await db.query<{ flags: string[]; async_generated: boolean | null }>("SELECT flags, async_generated FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(row.rows[0]).toEqual({ flags: ["no_ai_overview_for_query"], async_generated: true });
+  }, 30_000);
+
+  it("STORY-032 AC16 - an L2 row carries both facts of its source", async () => {
+    const promptId = await addPrompt("l2 facts");
+    const sourceHash = Buffer.alloc(32, 3);
+    const sourceId = await addSourceCapture(promptId, sourceHash);
+    await recordSuppressedCells(db, context, [
+      {
+        layer: "l2", promptId, engineKey: "google_aio", sampleIndex: 0, sourceResultId: sourceId, sourceContentHash: sourceHash, adapterVersion: "0.1.0",
+        asyncGenerated: true, flags: ["no_ai_overview_for_query"],
+      },
+    ]);
+    const row = await db.query<{ flags: string[]; async_generated: boolean | null }>("SELECT flags, async_generated FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(row.rows[0]).toEqual({ flags: ["no_ai_overview_for_query"], async_generated: true });
+  }, 30_000);
+
+  it("STORY-032 AC16 - null stays null: a source with no async fact (AI Mode, API engines) is NOT turned into false, and no facts means no flags", async () => {
+    const promptId = await addPrompt("null path");
+    await recordSuppressedCells(db, context, [
+      { layer: "l1", promptId, engineKey: "google_ai_mode", sampleIndex: 0, contentHash: Buffer.alloc(32, 7), payload: { answer: "x" }, excerpt: "x", adapterVersion: "0.1.0" },
+    ]);
+    const row = await db.query<{ flags: string[]; async_generated: boolean | null }>("SELECT flags, async_generated FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(row.rows[0]).toEqual({ flags: [], async_generated: null });
+  }, 30_000);
+
+  it("STORY-032 AC16 - false stays false (an inline overview is a fact, not an absence of one)", async () => {
+    const promptId = await addPrompt("false path");
+    await recordSuppressedCells(db, context, [
+      { layer: "l1", promptId, engineKey: "google_aio", sampleIndex: 0, contentHash: Buffer.alloc(32, 7), payload: { answer: "x" }, excerpt: "x", adapterVersion: "0.1.0", asyncGenerated: false },
+    ]);
+    const row = await db.query<{ async_generated: boolean | null }>("SELECT async_generated FROM answer_captures WHERE run_id = $1", [runId]);
+    expect(row.rows[0]!.async_generated).toBe(false);
+  }, 30_000);
+
   // THE COUNT DISCIPLINE. captured_cells belongs to the workers, as real
   // captures land. Pre-seeding it with suppressions reports work that never
   // happened and makes the suppression rate compute against itself.

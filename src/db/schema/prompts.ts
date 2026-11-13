@@ -85,4 +85,6 @@ export const trackedPrompts = pgTable("tracked_prompts", {
   pausedByDowngradeAt: timestamp("paused_by_downgrade_at", { withTimezone: true }),
   embeddingModel: text("embedding_model"),
   statusChangedAt: timestamp("status_changed_at", { withTimezone: true }),
+  embeddingNext: halfvec("embedding_next", { dimensions: 1536 }),
+  embeddingNextModel: text("embedding_next_model"),
 });

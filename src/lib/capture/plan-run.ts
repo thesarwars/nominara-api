@@ -44,6 +44,19 @@ import { cohortsFor, measureCohort, type SuppressionMeasurement } from "./suppre
 // A caller therefore cannot dispatch a run whose plan is not durable — not
 // because it would be wrong to, but because it has nothing to pass.
 
+/**
+ * STORY-032 AC15 (from STORY-029 AC9) - the licensed-SERP request speed a run's trigger chooses (tracking-engine.md section 3, "Two capture
+ * speeds"). A manual run has a person watching, so it is `live`; a scheduled run executes inside a jittered window, so `queued`.
+ *
+ * `live` is the dearer path, so it is opt-in per trigger: every trigger other than `manual` is queued, and a trigger added later
+ * defaults to the cheap speed until a story says otherwise. PROVISIONAL for `verification`, `drift_sample` and `conversion_backfill`
+ * (platform-initiated, nobody watching) and for the free retry (a person clicks it, but it plans as `scheduled`).
+ * The adapter never picks a mode itself, and API engines ignore this field.
+ */
+export function requestModeForTrigger(trigger: RunTrigger): "live" | "queued" {
+  return trigger === "manual" ? "live" : "queued";
+}
+
 export interface PlanRunContext {
   readonly workspaceId: string;
   readonly projectId: string;
@@ -266,6 +279,8 @@ async function writePlan(
               payload: hit.payload,
               excerpt: hit.excerpt,
               adapterVersion: cell.adapterVersion,
+              asyncGenerated: hit.asyncGenerated,
+              flags: hit.flags,
             },
           ];
     }),
@@ -282,6 +297,8 @@ async function writePlan(
               sourceResultId: hit.sourceResultId,
               sourceContentHash: hit.sourceContentHash,
               adapterVersion: cell.adapterVersion,
+              asyncGenerated: hit.sourceAsyncGenerated,
+              flags: hit.sourceFlags,
             },
           ];
     }),
@@ -356,6 +373,7 @@ async function writePlan(
         ttlSeconds: cell.ttlSeconds,
         locale: context.locale,
         personaHint: context.personaHint,
+        requestMode: requestModeForTrigger(context.trigger),
       },
     })),
     rematch,
