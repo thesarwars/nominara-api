@@ -10,14 +10,18 @@ import type {
   QueueDepth,
   ReadinessResponse,
 } from "../../../contracts/common/health.schema.js";
-import { ENGINE_CATALOG_STATUSES, type EngineStatusEntry, type EngineStatusResponse } from "../../../contracts/engines/index.js";
+import { ENGINE_CATALOG_STATUSES, projectEngineState, type EngineStatusEntry, type EngineStatusResponse, type ProjectEngineHealthResponse } from "../../../contracts/engines/index.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { appliedMigrationNames, listMigrationFiles } from "../../db/migrate-runner.js";
+import { assertNotMigrationOwner } from "../../db/roles.js";
 import { ACTIVE_ENGINE_KEYS } from "../../lib/engines/registry.js";
 import { EngineBreakerRegistry } from "../../lib/engines/engine-breaker-registry.js";
 import { CircuitBreaker } from "../../lib/resilience/circuit-breaker.js";
 import { buildQueue } from "../../lib/queue/queue-factory.js";
 import { QUEUE_TOPOLOGY } from "../../lib/queue/topology.js";
+import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { EngineHealthService, PER_ENGINE_STATUS_WINDOW_MS } from "./engine-health.service.js";
 
 // STORY-022 — HealthModule (system-architecture.md §5): "Liveness,
@@ -111,6 +115,31 @@ export class HealthService implements OnModuleDestroy {
       }),
     );
     return { engines, generated_at: new Date(nowMs).toISOString() };
+  }
+
+  /**
+   * STORY-090 - `GET /v1/projects/{id}/engine-health`: the engines ENABLED for the project (the entitled view the matrix and scorecards read), each with the
+   * state `GET /engines/status` implies (`projectEngineState`) and when its breaker episode began. The project's own set is read in the request's tenant
+   * transaction (RLS scopes it; a project of another workspace is a 404); the engine/breaker half is the global read above, taken AFTER that read so no
+   * Valkey call happens while the transaction is doing database work. Never a partial list: an engine the status read could not report fails the request.
+   */
+  async projectEngineHealth(projectId: string): Promise<ProjectEngineHealthResponse> {
+    const store = currentTenantStore();
+    if (store === undefined) throw new Error("projectEngineHealth requires an active tenant context");
+    const enabled = await store.client.query<{ engine_key: string }>(
+      `SELECT pe.engine_key
+         FROM projects p
+         LEFT JOIN project_entitled_engines pe ON pe.project_id = p.id AND pe.enabled = true
+        WHERE p.id = $1 AND p.deleted_at IS NULL`,
+      [projectId],
+    );
+    if (enabled.rows.length === 0) throw new NotFoundError({ message: "no such project" });
+    const keys = new Set(enabled.rows.flatMap((row) => (row.engine_key === null ? [] : [row.engine_key])));
+    const status = await this.engineStatus();
+    incrementCounter("nominara_health_project_engine_health_reads_total");
+    return status.engines
+      .filter((engine) => keys.has(engine.engine_key))
+      .map((engine) => ({ engine_key: engine.engine_key, state: projectEngineState(engine), since: engine.unavailable_since }));
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -327,6 +356,16 @@ export class HealthService implements OnModuleDestroy {
       // to that packaging cannot silently turn readiness into a rubber
       // stamp. Asserted by readiness-as-runtime-role.spec.ts.
       state.matches = expectedNames.length > 0 && expectedNames.every((name) => appliedSet.has(name));
+      // STORY-010 AC10: the migration owner is never used by a running service. Asserted (after the comparison, so the body still reports it) on the very connection readiness checks out, so a service
+      // that came up as (or switched to) the owner is `not_ready` and takes no traffic. Throws MigrationOwnerConnectionError; the postgres indicator
+      // turns any throw here into `down`. Role names only in the log, never a connection string.
+      try {
+        await assertNotMigrationOwner(client);
+      } catch (error) {
+        incrementCounter("nominara_health_role_check_failures_total");
+        this.logger.error(`readiness: ${(error as Error).message}`);
+        throw error;
+      }
     } finally {
       client.release();
     }
