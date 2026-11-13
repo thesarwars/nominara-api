@@ -103,7 +103,7 @@ import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } f
 // `commit` claims the audit row with `INSERT ... ON CONFLICT (id) DO NOTHING`, then locks it and writes nothing when another
 // delivery finished it first, so two deliveries racing through `run` leave one audit and each finding counted once. A job that
 // fails in `run` leaves no row at all (it never inserted one). Every DELIVERY mints its own run id in `prepare` and stores everything
-// under crawl/{env}/{workspace_id}/{audit_id}/{run_id}/, so a duplicate delivery cannot overwrite the winner's stored copies or
+// under {env}/{workspace_id}/crawl/{audit_id}/{run_id}/, so a duplicate delivery cannot overwrite the winner's stored copies or
 // manifest: the winning `commit` records ITS prefix in `dom_object_prefix`, and every other prefix (a losing duplicate, a retry's
 // earlier attempt, a run that outlived a project's deletion) is an orphan with no row pointing at it. There is NO sweep for orphans:
 // the bound is the crawl/ lifecycle rule in system-architecture.md's retention table (nominara-infra, STORY-003, not built), and until
@@ -161,7 +161,7 @@ export interface CrawlAuditDeps {
   readonly timeoutMs?: number;
   /** The rendered fetch. Default: none installed, which records `renderer_unavailable` per page (see renderer.ts). */
   readonly renderer?: Renderer;
-  /** Writes under crawl/{env}/{workspace_id}/ and returns the full key. Default: the tenant object store; unconfigured fails closed. */
+  /** Writes under {env}/{workspace_id}/crawl/ and returns the full key. Default: the tenant object store; unconfigured fails closed. */
   readonly store?: StoreFn;
   /** The object-storage port the DEFAULT store writes through (S3 when absent). Injectable so a test sees the real key and the real tenant binding. */
   readonly storagePort?: ObjectStoragePort;

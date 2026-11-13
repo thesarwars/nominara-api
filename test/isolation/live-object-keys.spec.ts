@@ -80,7 +80,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-14"))("STORY-012 AC8 · ISO-14 
     await localstack?.stop();
   });
 
-  it("every object three tenants wrote sits under {env}/{workspace}/ (or crawl/{env}/{workspace}/), and each tenant's prefix holds exactly what that tenant wrote", async () => {
+  it("every object three tenants wrote sits under {env}/{workspace}/ (crawl objects under {env}/{workspace}/crawl/), and each tenant's prefix holds exactly what that tenant wrote", async () => {
     const objects = await everything();
     expect(objects.length, "the store holds what was written").toBe(tenants.length * 4);
     const report = judge(objects);
@@ -115,10 +115,13 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-14"))("STORY-012 AC8 · ISO-14 
   it("the judge can fail: an object planted outside the namespace (segments reversed, workspace missing) is reported by the same classifier", async () => {
     await adapter.put({ bucket: "raw", key: `${fixture.a.workspaceId}/${ENV}/misplaced.gz`, body: "x" });
     await adapter.put({ bucket: "raw", key: `${ENV}/misplaced-no-workspace.gz`, body: "x" });
+    // The OLD crawl layout (owner decision 106(e)) must fail the live judge.
+    await adapter.put({ bucket: "raw", key: `crawl/${ENV}/${fixture.a.workspaceId}/audit1/old-layout.gz`, body: "x" });
     const report = judge(await everything());
     expect(report.violations.map((v) => v.reason).sort()).toEqual([
       "no workspace id where the prefix puts one",
       "the key does not open with the deployment namespace",
+      "the old crawl layout (crawl/{env}/{workspace}/): crawl objects live under {env}/{workspace}/crawl/",
     ]);
   });
 });

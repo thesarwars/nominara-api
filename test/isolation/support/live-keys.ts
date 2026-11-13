@@ -69,8 +69,8 @@ export interface ObjectKeyReport {
 }
 
 /**
- * ISO-14 over the objects a live store holds: `{env}/{workspace_id}/...` (raw and reports) or `crawl/{env}/{workspace_id}/...` (the crawl namespace, raw
- * bucket only), the workspace being one that exists. Anything else, a key under a prefix that names two workspaces, or a crawl key in the reports bucket, is a violation.
+ * ISO-14 over the objects a live store holds: `{env}/{workspace_id}/...` (raw and reports), the crawl namespace being `{env}/{workspace_id}/crawl/...` (raw
+ * bucket only; owner decision 106(e)), the workspace being one that exists. Anything else, a key under a prefix that names two workspaces, or a crawl key in the reports bucket, is a violation.
  */
 export function classifyObjectKeys(objects: readonly ObjectKeyRef[], opts: { readonly env: string; readonly tenantIds: readonly string[]; readonly reportsBucket: string }): ObjectKeyReport {
   const known = new Set(opts.tenantIds);
@@ -78,19 +78,21 @@ export function classifyObjectKeys(objects: readonly ObjectKeyRef[], opts: { rea
   const violations: KeyViolation[] = [];
   for (const object of objects) {
     const segments = object.key.split("/");
-    const crawl = segments[0] === "crawl";
-    const env = crawl ? segments[1] : segments[0];
-    const workspace = crawl ? segments[2] : segments[1];
+    const env = segments[0];
+    const workspace = segments[1];
     const label = `${object.bucket}/${object.key}`;
-    if (env !== opts.env) {
+    if (env === "crawl") {
+      // The OLD crawl layout (`crawl/{env}/{ws}/`): moved to `{env}/{ws}/crawl/` by owner decision 106(e). Reported by name so a leftover is not mistaken for noise.
+      violations.push({ key: label, reason: "the old crawl layout (crawl/{env}/{workspace}/): crawl objects live under {env}/{workspace}/crawl/" });
+    } else if (env !== opts.env) {
       violations.push({ key: label, reason: "the key does not open with the deployment namespace" });
     } else if (workspace === undefined || !IS_UUID.test(workspace)) {
       violations.push({ key: label, reason: "no workspace id where the prefix puts one" });
     } else if (!known.has(workspace)) {
       violations.push({ key: label, reason: "the prefix names a workspace that belongs to no tenant" });
-    } else if (crawl && object.bucket === opts.reportsBucket) {
+    } else if (segments[2] === "crawl" && object.bucket === opts.reportsBucket) {
       violations.push({ key: label, reason: "a crawl key in the reports bucket" });
-    } else if (segments.slice(crawl ? 3 : 2).some((segment) => known.has(segment) && segment !== workspace) || segments.length < (crawl ? 4 : 3)) {
+    } else if (segments.slice(2).some((segment) => known.has(segment) && segment !== workspace) || segments.length < 3) {
       violations.push({ key: label, reason: "the key names another tenant below its own prefix, or has no object part" });
     } else {
       byWorkspace.set(workspace, [...(byWorkspace.get(workspace) ?? []), object]);

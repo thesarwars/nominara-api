@@ -4,7 +4,7 @@ import type { StorageBucketName, StorageNamespace } from "./storage.port.js";
 //
 // LAYOUT (system-architecture.md sections 6 and 8)
 //   raw      bucket raw      {env}/{workspace_id}/{relative}          e.g. production/<ws>/2026/10/<id>.json.gz
-//   crawl    bucket raw      crawl/{env}/{workspace_id}/{relative}
+//   crawl    bucket raw      {env}/{workspace_id}/crawl/{relative}   (STORY-012, owner decision 106(e): one standard prefix; it moved from crawl/{env}/{workspace_id}/)
 //   reports  bucket reports  {env}/{workspace_id}/{relative}
 // Every key carries the workspace id, and the workspace id is an argument the TENANT layer fills from the tenant
 // context (never from a request), so no caller-supplied string can choose which workspace's prefix it lands in.
@@ -51,13 +51,18 @@ function assertRelative(relative: string): void {
   }
 }
 
+/** The crawl namespace is `{env}/{ws}/crawl/`, INSIDE the raw prefix, so a raw key may not begin with `crawl/`: the two namespaces never overlap. */
+function assertNotCrawlNamespace(namespace: StorageNamespace, relative: string): void {
+  if (namespace !== "crawl" && relative.split("/")[0] === "crawl") throw new StorageKeyError("a key in this namespace may not begin with the crawl segment");
+}
+
 function prefixFor(keyEnv: string, workspaceId: string, namespace: StorageNamespace): string {
   assertEnvAndWorkspace(keyEnv, workspaceId);
-  return namespace === "crawl" ? `crawl/${keyEnv}/${workspaceId}/` : `${keyEnv}/${workspaceId}/`;
+  return namespace === "crawl" ? `${keyEnv}/${workspaceId}/crawl/` : `${keyEnv}/${workspaceId}/`;
 }
 
 /**
- * `{env}/{workspace_id}/` (or `crawl/{env}/{workspace_id}/`): the whole of one workspace's namespace. For the PURGE path only
+ * `{env}/{workspace_id}/` (or `{env}/{workspace_id}/crawl/`, which lies inside it): the whole of one workspace's namespace. For the PURGE path only
  * (workspace-purge.ts); a feature builds object keys through `buildObjectLocation`, which always appends a validated relative part.
  */
 export function workspacePrefix(keyEnv: string, workspaceId: string, namespace: StorageNamespace): string {
@@ -72,6 +77,7 @@ function bucketFor(namespace: StorageNamespace): StorageBucketName {
 export function buildObjectLocation(keyEnv: string, workspaceId: string, namespace: StorageNamespace, relative: string): ObjectLocation {
   const prefix = prefixFor(keyEnv, workspaceId, namespace);
   assertRelative(relative);
+  assertNotCrawlNamespace(namespace, relative);
   return { bucket: bucketFor(namespace), key: `${prefix}${relative}` };
 }
 
@@ -87,6 +93,7 @@ export function relativeKeyFromStored(keyEnv: string, workspaceId: string, names
   const relative = stored.slice(prefix.length);
   try {
     assertRelative(relative);
+    assertNotCrawlNamespace(namespace, relative);
   } catch {
     // Same class as a foreign prefix: a key that merely STARTS with ours but traverses out of it.
     throw new StorageTenancyError("stored object key is outside the current workspace prefix");

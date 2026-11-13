@@ -47,11 +47,11 @@ describe("STORY-012 AC8 · ISO-13 live cache key judge", () => {
 describe("STORY-012 AC8 · ISO-14 live object key judge", () => {
   const judge = (objects: { bucket: string; key: string }[]) => classifyObjectKeys(objects, { env: "inttest", tenantIds: [A, B, C], reportsBucket: "reports" });
 
-  it("accepts {env}/{ws}/… in both buckets and crawl/{env}/{ws}/… in the raw bucket", () => {
+  it("accepts {env}/{ws}/… in both buckets and {env}/{ws}/crawl/… in the raw bucket", () => {
     const report = judge([
       { bucket: "raw", key: `inttest/${A}/2026/10/x.json.gz` },
       { bucket: "reports", key: `inttest/${B}/r.pdf` },
-      { bucket: "raw", key: `crawl/inttest/${A}/audit1/dom.gz` },
+      { bucket: "raw", key: `inttest/${A}/crawl/audit1/dom.gz` },
     ]);
     expect(report.violations).toEqual([]);
     expect(report.byWorkspace.get(A)).toHaveLength(2);
@@ -73,9 +73,18 @@ describe("STORY-012 AC8 · ISO-14 live object key judge", () => {
     ]);
   });
 
+  it("flags the OLD crawl layout crawl/{env}/{ws}/ by name (owner decision 106(e)), and does not accept it as any other shape", () => {
+    const report = judge([{ bucket: "raw", key: `crawl/inttest/${A}/audit1/dom.gz` }, { bucket: "raw", key: `crawl/other/${B}/x` }]);
+    expect(report.violations.map((v) => v.reason)).toEqual([
+      "the old crawl layout (crawl/{env}/{workspace}/): crawl objects live under {env}/{workspace}/crawl/",
+      "the old crawl layout (crawl/{env}/{workspace}/): crawl objects live under {env}/{workspace}/crawl/",
+    ]);
+    expect(report.byWorkspace.size).toBe(0);
+  });
+
   it("flags a crawl key in the reports bucket, another tenant's id below one's own prefix, and a bare prefix with no object part", () => {
     const report = judge([
-      { bucket: "reports", key: `crawl/inttest/${A}/x` },
+      { bucket: "reports", key: `inttest/${A}/crawl/x` },
       { bucket: "raw", key: `inttest/${A}/copy-of/${B}/x` },
       { bucket: "raw", key: `inttest/${A}` },
     ]);

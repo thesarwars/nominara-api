@@ -46,7 +46,7 @@ Idempotency under at-least-once delivery becomes the handler's, because two deli
 - `commit` then claims the audit row with `INSERT ... ON CONFLICT (id) DO NOTHING`, locks it, and writes nothing when another
   delivery finished first. The audit row is no longer inserted before the crawl, so a job that fails in `run` leaves no row at all.
 - **Every delivery stores under its own run id.** `prepare` mints a UUIDv7 run id and every object (page copies and the manifest)
-  is keyed `crawl/{env}/{workspace_id}/{audit_id}/{run_id}/...`. A duplicate delivery therefore cannot overwrite the winner's
+  is keyed `{env}/{workspace_id}/crawl/{audit_id}/{run_id}/...`. A duplicate delivery therefore cannot overwrite the winner's
   stored copies or manifest. The winning `commit` writes ITS prefix to `aux_audits.dom_object_prefix`; a losing prefix is an
   orphan. The tenant prefix is unchanged, so ISO-14 is unaffected. Test: the last-writer-wins store in `crawl-audit-kad06.spec.ts`.
 
@@ -58,8 +58,9 @@ the pattern that class documents; the bound writer works in `run` with no contex
 - A worker slot is still held for the length of the crawl (bounded by `CRAWL_WALL_CLOCK_BUDGET_MS`); a database connection and a
   transaction are not. The test that proves it is `test/integration/crawl-audit-kad06.spec.ts`: no `idle in transaction` backend and
   no checked-out client during any fetch, render or object-store write.
-- **Orphaned objects are unbounded until STORY-003.** There is NO retention sweep by prefix. The real bound is the `crawl/`
-  lifecycle rule in `system-architecture.md`'s retention table (14 d to GLACIER_IR, 90 d hard delete), which belongs to
+- **Orphaned objects are unbounded until STORY-003.** There is NO retention sweep by prefix. The real bound is the crawl
+  lifecycle rule (NOTE, owner decision 106(e): crawl keys are now `{env}/{ws}/crawl/...`, a mid-key segment an S3 prefix filter cannot match, so
+  nominara-infra must key that rule on an object tag or another mechanism, not on a leading `crawl/` prefix) in `system-architecture.md`'s retention table (14 d to GLACIER_IR, 90 d hard delete), which belongs to
   `nominara-infra` (STORY-003) and is not built. Until it lands, orphans accumulate: a job that exhausts its retries, the prefix of
   a duplicate delivery that lost the race (R1), every earlier attempt of a retried audit, and a `run` that outlives a project's or
   a workspace's deletion and writes after a prefix purge. They sit inside the tenant's own prefix, so nothing is exposed; the cost

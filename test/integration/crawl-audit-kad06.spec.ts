@@ -451,7 +451,7 @@ describe("KAD-06 · crawl.audit holds no transaction and no connection across a 
     );
     expect(puts.length).toBeGreaterThanOrEqual(7);
     // every key lies in THIS workspace's prefix, taken from the tenant context and never from the payload
-    for (const request of puts) expect(request.key.startsWith(`crawl/test/${wsA}/`), request.key).toBe(true);
+    for (const request of puts) expect(request.key.startsWith(`test/${wsA}/crawl/`), request.key).toBe(true);
     for (const o of observed.filter((x) => x.what === "port_put")) {
       expect(o.idleInTx).toBe(0);
       expect(o.checkedOut).toBe(0);
