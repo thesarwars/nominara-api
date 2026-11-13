@@ -32,6 +32,8 @@ import {
   promptResearchRunRequestSchema,
   convertToolRunResponseSchema,
   scanStreamCompletedSchema,
+  toolCatalogResponseSchema,
+  type ToolCatalogResponse,
   toolRunConversionPreviewSchema,
   toolRunDetailSchema,
   toolRunIdSchema,
@@ -84,6 +86,7 @@ import { CompetitorFinderService } from "./competitor-finder.service.js";
 import { CompareRunsService } from "./compare-runs.service.js";
 import { SchemaBuilderService } from "./schema-builder.service.js";
 import { SchemaBuilderUrlService } from "./schema-builder-url.service.js";
+import { ToolCatalogService } from "./tool-catalog.service.js";
 import { ToolsService } from "./tools.service.js";
 import { PromptResearchService } from "./prompt-research.service.js";
 import { VisibilityScanService } from "./visibility-scan.service.js";
@@ -106,7 +109,19 @@ export class ToolsController {
     private readonly compare: CompareRunsService,
     private readonly schemaBuilder: SchemaBuilderService,
     private readonly schemaBuilderUrl: SchemaBuilderUrlService,
+    private readonly catalog: ToolCatalogService,
   ) {}
+
+  // STORY-078 AC23 - the catalog for the caller's plan: a tool the plan lacks is a disabled descriptor naming the plan that unlocks it, never a missing entry.
+  @Get()
+  @RequirePermission("workspace:read")
+  @ScopedByQuery()
+  @ApiContract({ operationId: "listTools", responseSchema: toolCatalogResponseSchema })
+  listTools(@Req() request: AuditableRequest): Promise<ToolCatalogResponse> {
+    const tenant = request.tenant;
+    if (tenant === undefined) throw new Error("the tool catalog route has no tenant context: WorkspaceGuard did not run");
+    return this.catalog.catalog(tenant);
+  }
 
   // STORY-079 / NFR-API-11 - the free paired estimate: the flat price, the engines named before the run, and nothing selectable.
   @Get("visibility-scan/estimate")

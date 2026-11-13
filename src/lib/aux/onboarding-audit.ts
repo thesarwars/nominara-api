@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ClientBase } from "pg";
+import { entitlementGranted } from "../entitlements/granted.js";
 
 // OWNER DECISION 34 (plans-7day/decisions-2026-10-28.md), item 1 - the free onboarding audit.
 //
@@ -29,8 +30,7 @@ export const AUX_AUDITS_ENTITLEMENT = "aux.scheduled_audits";
  * site-files-only check (owner decision 47), never the page audit.
  */
 export function auxAuditsIncluded(entitlements: Readonly<Record<string, { readonly value: unknown } | undefined>>): boolean {
-  const value = entitlements[AUX_AUDITS_ENTITLEMENT]?.value;
-  return !(value === false || value === null || value === undefined);
+  return entitlementGranted(entitlements[AUX_AUDITS_ENTITLEMENT]?.value);
 }
 
 /** Namespace for the derived id: changing it changes every project's onboarding audit id. */
