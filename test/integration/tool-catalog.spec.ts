@@ -10,6 +10,7 @@ import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import { toolCatalogResponseSchema, TOOL_KEYS } from "../../contracts/tools/index.js";
+import { entitlementGranted, grantedValueSql } from "../../src/lib/entitlements/granted.js";
 import { apiUrl } from "../support/api-url.js";
 import { useApiHarness } from "../support/api-harness.js";
 import { startValkey, startValkeyFixture, type StartedValkey, type ValkeyFixture } from "../support/valkey-fixture.js";
@@ -81,20 +82,37 @@ describe("STORY-078 · scenario 23 - the tool catalog route", () => {
   const walletRow = async (workspaceId: string) => (await harness.db().query("SELECT included_balance, purchased_balance, reserved FROM credit_wallets WHERE workspace_id = $1", [workspaceId])).rows[0];
   const jobs = async () => (await harness.db().query<{ n: number }>("SELECT count(*)::int AS n FROM tool_runs")).rows[0]!.n;
 
-  it("scenario 23 - a Free workspace sees all six tools, the full audit mode DISABLED and naming the lowest plan that grants it (read from the plans table)", async () => {
+  it("scenario 23 - a Free workspace sees all six tools, the full audit mode DISABLED and naming Starter, the lowest public plan that grants it", async () => {
     const a = await owner("free");
     const res = await catalog(a);
     expect(res.statusCode, res.body).toBe(200);
     const body = toolCatalogResponseSchema.parse((res.json() as { data: unknown }).data);
     expect(body.tools.map((t) => t.tool_key)).toEqual([...TOOL_KEYS]);
-    const lowest = (await harness.db().query<{ key: string; display_name: string }>(
-      `SELECT key, display_name FROM plans WHERE (entitlements -> 'aux.scheduled_audits' -> 'value') NOT IN ('false'::jsonb, 'null'::jsonb) ORDER BY sort_order ASC LIMIT 1`,
-    )).rows[0]!;
     const audit = body.tools.find((t) => t.tool_key === "aux_audit")!;
     expect(audit.enabled).toBe(true);
     expect(audit.modes.find((m) => m.mode === "site_files")).toMatchObject({ enabled: true, credits: 0, unlocked_by_plan: null });
-    expect(audit.modes.find((m) => m.mode === "full")).toMatchObject({ enabled: false, unlocked_by_plan: { key: lowest.key, display_name: lowest.display_name } });
-    expect(lowest.key).not.toBe("free");
+    expect(audit.modes.find((m) => m.mode === "full")).toMatchObject({ enabled: false, unlocked_by_plan: { key: "starter", display_name: "Starter" } });
+  });
+
+  it("scenario 23 - a hidden plan, however low its sort order, is never named as the unlocking plan", async () => {
+    const a = await owner("free");
+    const before = (await harness.db().query<{ is_public: boolean; sort_order: number }>("SELECT is_public, sort_order FROM plans WHERE key = 'starter'")).rows[0]!;
+    try {
+      await harness.db().query("UPDATE plans SET is_public = false, sort_order = -10 WHERE key = 'starter'");
+      const body = toolCatalogResponseSchema.parse((await catalog(a)).json().data);
+      expect(body.tools.find((t) => t.tool_key === "aux_audit")!.modes.find((m) => m.mode === "full")!.unlocked_by_plan).toEqual({ key: "growth", display_name: "Growth" });
+    } finally {
+      await harness.db().query("UPDATE plans SET is_public = $1, sort_order = $2 WHERE key = 'starter'", [before.is_public, before.sort_order]);
+    }
+  });
+
+  it("scenario 23 - the SQL grant predicate and the TypeScript one agree on every value", async () => {
+    const values: unknown[] = [true, false, null, 0, 1, -1, 0.5, 450, "", "none", "none_tools_only", "unlimited", "1_per_project_per_month", {}, [], { value: true }];
+    for (const value of values) {
+      const row = (await harness.db().query<{ granted: boolean }>(`SELECT ${grantedValueSql("$1::jsonb")} AS granted`, [JSON.stringify(value)])).rows[0]!;
+      expect(row.granted, JSON.stringify(value)).toBe(entitlementGranted(value));
+    }
+    expect((await harness.db().query<{ granted: boolean }>(`SELECT ${grantedValueSql("NULL::jsonb")} AS granted`)).rows[0]!.granted).toBe(false);
   });
 
   it("scenario 23 - a paid workspace has the full mode enabled with no unlock plan", async () => {
@@ -108,6 +126,23 @@ describe("STORY-078 · scenario 23 - the tool catalog route", () => {
     const before = { wallet: await walletRow(a.workspaceId), runs: await jobs() };
     expect((await catalog(a)).statusCode).toBe(200);
     expect({ wallet: await walletRow(a.workspaceId), runs: await jobs() }).toEqual(before);
+  });
+
+  it("STORY-089 - the notifications inbox read refuses a member who has been removed, on the very next request", async () => {
+    const a = await owner("growth");
+    const userId = uuidV7();
+    await harness.db().query(`INSERT INTO users (id, email, email_verified_at, status, created_at, updated_at) VALUES ($1,$2,now(),'active',now(),now())`, [userId, `${userId}@example.test`]);
+    await harness.db().query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1,$2,'analyst')", [a.workspaceId, userId]);
+    const version = (await harness.db().query<{ entitlement_version: number }>("SELECT entitlement_version FROM workspaces WHERE id = $1", [a.workspaceId])).rows[0]!.entitlement_version;
+    const tokens = await sessions.createSession(userId);
+    const entered = await sessions.switchWorkspace(tokens.sid, userId, a.workspaceId, "analyst", null, version);
+    const inbox = () => harness.app().inject({ method: "GET", url: apiUrl(`/workspaces/${a.workspaceId}/notifications`), headers: { cookie: cookieOf(entered), [CSRF_HEADER_NAME]: entered.csrfToken } });
+    expect((await inbox()).statusCode).toBe(200);
+    await harness.app().get(MembershipService).removeMember(pool, a.workspaceId, userId);
+    const refused = await inbox();
+    expect(refused.statusCode).toBe(403);
+    // Membership is enforced by the workspace guard on this route: the member's still-valid session is refused 403 the moment the membership row is gone.
+    expect(JSON.stringify(refused.json())).toContain("forbidden");
   });
 
   it("scenario 23 - an unauthenticated caller is refused", async () => {
