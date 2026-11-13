@@ -59,7 +59,8 @@ describe("STORY-182 · purge deletes object prefixes in a versioned bucket", () 
     expect(await versions("nominara-raw", `inttest/${WS_A}/`)).toEqual([]);
     expect(await versions("nominara-raw", `inttest/${WS_A}/crawl/`)).toEqual([]);
     expect(await versions("nominara-reports", `inttest/${WS_A}/`)).toEqual([]);
-    expect(await versions("nominara-raw", `inttest/${WS_B}/`)).toHaveLength(2);
+    // B's raw prefix holds its two raw versions AND its crawl object (crawl lives inside it since decision 106(e)).
+    expect(await versions("nominara-raw", `inttest/${WS_B}/`)).toHaveLength(3);
     expect(await versions("nominara-raw", `inttest/${WS_B}/crawl/`)).toHaveLength(1);
     expect(await versions("nominara-reports", `inttest/${WS_B}/`)).toHaveLength(1);
   });

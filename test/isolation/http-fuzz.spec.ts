@@ -258,12 +258,20 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     let onResolving = 0;
     let mixedReplays = 0;
     const resolvingCovered = new Set<string>();
+    // The main replays, then a dedicated mixed-ownership pass: every multi-parameter route gets MIXED_PER_ROUTE replays of B's own parent with a foreign child,
+    // so the floor below does not depend on how often the weighted draw happens to land on one of the few such routes.
+    const MIXED_PER_ROUTE = 8;
+    const plan: { route: Replayable; forceMixed: boolean }[] = [];
     for (let i = 0; i < REPLAYS; i++) {
-      // Weighted toward the routes that RESOLVE identifiers: a route that refuses everything cannot show a scope check is missing.
       const route = rand() < 0.75 ? resolving[Math.floor(rand() * resolving.length)]! : routes[Math.floor(rand() * routes.length)]!;
+      plan.push({ route, forceMixed: false });
+    }
+    for (const route of multi) for (let k = 0; k < MIXED_PER_ROUTE; k++) plan.push({ route, forceMixed: true });
+    for (const [i, step] of plan.entries()) {
+      const route = step.route;
       const victim = rand() < 0.5 ? a.workspaceId : c.workspaceId;
       // Mixed ownership on a multi-parameter route: B's OWN parent with a foreign child (a handler that scopes the parent and trusts the child).
-      const mixed = multi.includes(route) && rand() < 0.5;
+      const mixed = multi.includes(route) && (step.forceMixed || rand() < 0.5);
       const parent = mixed ? idFor(route, b.workspaceId, 0, rand) : "";
       const { url, used } = fill(route, (index) => (mixed && index === 0 ? parent : idFor(route, victim, index, rand)));
       const response = await get(bCookie(), url);
@@ -287,7 +295,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     }
     expect(failures, `seed=${String(SEED)}\n${failures.slice(0, 10).join("\n")}`).toEqual([]);
     // Floors, so a replay that "passes" because nothing ran, or everything was refused upstream of the scope check, cannot stand.
-    expect(refused).toBeGreaterThanOrEqual(Math.floor(REPLAYS * 0.9));
+    expect(refused).toBeGreaterThanOrEqual(Math.floor(plan.length * 0.9));
     expect(onResolving, "replays on routes that resolve identifiers").toBeGreaterThanOrEqual(Math.floor(REPLAYS * 0.7));
     expect(resolvingCovered.size, "distinct resolving routes replayed").toBeGreaterThanOrEqual(Math.floor(resolving.length * 0.8));
     if (multi.length > 0) expect(mixedReplays, "mixed-ownership replays on multi-parameter routes").toBeGreaterThanOrEqual(20);
