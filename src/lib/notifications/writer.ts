@@ -87,7 +87,7 @@ export async function writeNotification(tx: ClientBase, input: NotificationInput
 
   const rendered = renderImmediateEmail({ title: input.title, body: input.body, deepLink, appOrigin: options.appOrigin });
   const emailIds: string[] = [];
-  const members = await emailableMembers(tx, input.workspaceId, input.userId, { ignoreCadence: input.emailNow === true });
+  const members = await emailableMembers(tx, input.workspaceId, input.userId);
   const audience = input.emailAudience;
   for (const member of members) {
     if (!seesProject(member.visible, input.projectId)) continue;

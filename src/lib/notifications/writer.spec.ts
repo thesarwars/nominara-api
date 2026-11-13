@@ -79,8 +79,9 @@ describe("STORY-098 · writeNotification emailNow / relayOnly", () => {
     it("a token with no project scope needs a member who sees every project", async () => {
       expect(await recipients([member("scoped", "manager", [P1]), member("all", "owner", null)], [])).toEqual(["all"]);
     });
-    it("the digest cadence does not matter: a member whose digest is off still gets the immediate notice", async () => {
-      expect(await recipients([member("off", "owner", null, "off")], [P1])).toEqual(["off"]);
+    // Owner decision 2026-11-13: a digest set to "off" is an email opt-out; the member still gets the in-app row.
+    it("a member whose digest is off gets no email; a member on any other cadence does", async () => {
+      expect(await recipients([member("off", "owner", null, "off"), member("on", "owner", null, "weekly")], [P1])).toEqual(["on"]);
     });
   });
 
