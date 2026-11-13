@@ -39,7 +39,7 @@ describe("STORY-078 · scenario 23 - the tool catalog", () => {
   });
 
   it("scenario 23 - fail closed: only true, a number above 0, or a non-empty string other than none / none_tools_only is granted", () => {
-    for (const value of [true, 1, 450, 0.5, "unlimited", "1_per_project_per_month", "configurable"]) expect(entitlementGranted(value), String(value)).toBe(true);
+    for (const value of [true, 1, 7, 0.5, "unlimited", "1_per_project_per_month", "configurable"]) expect(entitlementGranted(value), String(value)).toBe(true);
     for (const value of [false, null, undefined, 0, -1, "", "none", "none_tools_only", {}, [], { value: true }]) expect(entitlementGranted(value), JSON.stringify(value) ?? "undefined").toBe(false);
   });
 
