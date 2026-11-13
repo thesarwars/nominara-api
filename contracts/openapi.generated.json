@@ -14066,7 +14066,8 @@
                                     "building",
                                     "ready",
                                     "failed",
-                                    "expired"
+                                    "expired",
+                                    "superseded"
                                   ]
                                 },
                                 "requested_at": {
@@ -14630,7 +14631,8 @@
                             "building",
                             "ready",
                             "failed",
-                            "expired"
+                            "expired",
+                            "superseded"
                           ]
                         },
                         "requested_at": {

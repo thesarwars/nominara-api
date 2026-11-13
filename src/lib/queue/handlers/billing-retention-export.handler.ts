@@ -5,13 +5,12 @@ import type { ClientBase, Pool } from "pg";
 import { retentionExportCoverageSchema, retentionExportJobPayloadSchema, type RetentionExportCoverage } from "../../../../contracts/billing/retention-export.schema.js";
 import { selectEmailSender } from "../../../modules/identity/email-sender.selector.js";
 import { EmailSuppressedError, type EmailSender } from "../../../modules/identity/ports/email-sender.js";
-import { uuidV7 } from "../../ids/uuidv7.js";
 import { withExportLock } from "../../../workers/rollup/retention.js";
 import { attributionPurgeList, rawPurgeList, rollupPurgeList } from "../../billing/retention-shortening.js";
 import { buildRetentionExport, type BuildProject } from "../../billing/retention-export/build.js";
 import { retentionExportDownloadUrl, retentionExportRelativeKey } from "../../billing/retention-export/links.js";
 import { retentionExportReadyEmail } from "../../billing/retention-export/ready-email.js";
-import { readExportScope, type ExportScope } from "../../billing/retention-export/scope.js";
+import { readExportScope, scopeSnapshot, type ExportScope } from "../../billing/retention-export/scope.js";
 import { ZipLimitError } from "../../billing/retention-export/zip.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
@@ -78,6 +77,8 @@ export interface RetentionExportDeps {
   /** The API's public origin for the link in the email. Defaults to OAUTH_REDIRECT_BASE_URL. */
   readonly apiBaseUrl?: string;
   readonly now?: () => Date;
+  /** The build's byte budget (tests); defaults to RETENTION_EXPORT_MAX_BYTES. */
+  readonly maxBytes?: number;
 }
 
 async function lockedProject<T>(pool: Pool, projectId: string, fn: () => Promise<T>): Promise<T> {
@@ -105,9 +106,14 @@ export function createBillingRetentionExportHandler(context: QueueHandlerContext
   const now = deps.now ?? ((): Date => new Date());
   const baseUrl = (): string => deps.apiBaseUrl ?? context.env.OAUTH_REDIRECT_BASE_URL;
 
-  const requesterEmail = async (tx: ClientBase, userId: string | null): Promise<string | null> => {
+  /** The requester's address, only while they are still an ACTIVE owner or admin of the workspace: a demoted or removed person gets no mail (the in-app link is theirs to lose too). */
+  const requesterEmail = async (tx: ClientBase, workspaceId: string, userId: string | null): Promise<string | null> => {
     if (userId === null) return null;
-    const r = await tx.query<{ email: string }>("SELECT email::text AS email FROM users WHERE id = $1 AND deleted_at IS NULL", [userId]);
+    const r = await tx.query<{ email: string }>(
+      `SELECT u.email::text AS email FROM users u JOIN workspace_members m ON m.user_id = u.id
+        WHERE u.id = $1 AND u.deleted_at IS NULL AND m.workspace_id = $2 AND m.status = 'active' AND m.role IN ('owner', 'admin')`,
+      [userId, workspaceId],
+    );
     return r.rows[0]?.email ?? null;
   };
 
@@ -127,7 +133,7 @@ export function createBillingRetentionExportHandler(context: QueueHandlerContext
         incrementCounter("nominara_billing_retention_export_jobs_total", { outcome: "already_done" });
         return PHASES_DONE;
       }
-      const to = await requesterEmail(tx, row.requested_by);
+      const to = await requesterEmail(tx, payload.workspaceId, row.requested_by);
       if (row.status === "ready") {
         // Built and committed, never mailed (a retry after the email failed): no rebuild.
         return { kind: "email", exportId: payload.exportId, workspaceId: payload.workspaceId, to, expiresAt: row.expires_at, coverage: retentionExportCoverageSchema.parse(row.coverage) };
@@ -139,7 +145,12 @@ export function createBillingRetentionExportHandler(context: QueueHandlerContext
         logger.warn({ event: "billing.retention_export.deferral_ended", workspace_id: payload.workspaceId });
         return PHASES_DONE;
       }
-      await tx.query("UPDATE retention_exports SET status = 'building', updated_at = now() WHERE id = $1 AND status IN ('requested', 'building')", [payload.exportId]);
+      // The scope this build is FOR is recorded on the row (it may differ from the one at request time): reuse compares against it.
+      await tx.query("UPDATE retention_exports SET status = 'building', scope = $3::jsonb, updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('requested', 'building')", [
+        payload.exportId,
+        payload.workspaceId,
+        JSON.stringify(scopeSnapshot(scope)),
+      ]);
       // The notice's own purge-list builders decide which projects have something to export, so the export names the projects the notice does.
       const lists = [
         ...(scope.raw === null ? [] : await rawPurgeList(tx, payload.workspaceId, scope.raw.cutoff)),
@@ -170,6 +181,7 @@ export function createBillingRetentionExportHandler(context: QueueHandlerContext
                 lockProject: (projectId, fn) => lockedProject(context.pool, projectId, fn),
                 readRaw: (key) => prepared.bound.getStored("raw", key),
                 now: now(),
+                ...(deps.maxBytes === undefined ? {} : { maxBytes: deps.maxBytes }),
               });
             } catch (error) {
               if (error instanceof ZipLimitError) {
@@ -178,7 +190,7 @@ export function createBillingRetentionExportHandler(context: QueueHandlerContext
               }
               throw error;
             }
-            const stored = await prepared.bound.put("reports", retentionExportRelativeKey(prepared.exportId, uuidV7()), built.zip, { contentType: "application/zip" });
+            const stored = await prepared.bound.put("reports", retentionExportRelativeKey(prepared.exportId), built.zip, { contentType: "application/zip" });
             // The row says `ready` only now that the object is stored; the email below is sent only after that commit.
             const won = await tenantStep(async (tx) => {
               const r = await tx.query(
@@ -191,7 +203,13 @@ export function createBillingRetentionExportHandler(context: QueueHandlerContext
             span.setAttributes({ "nominara.retention_export.bytes": built.zip.length, "nominara.retention_export.projects": built.coverage.projects.length, "nominara.retention_export.complete": built.coverage.complete });
             observeValue("nominara_billing_retention_export_zip_bytes", built.zip.length);
             observeValue("nominara_billing_retention_export_build_duration_ms", Date.now() - started);
-            if (!won) return "lost" as const;
+            if (!won) {
+              // Another delivery finished first (the key is the same, so its object is this one: leave it), or the row can no longer become ready
+              // (failed, superseded, expired): then this upload is an orphan, and it goes now. Best effort: the nightly cleanup also covers it.
+              const state = await tenantStep(async (tx) => (await tx.query<{ status: string }>("SELECT status FROM retention_exports WHERE id = $1 AND workspace_id = app.current_workspace()", [prepared.exportId])).rows[0]?.status);
+              if (state !== "ready") await prepared.bound.delete("reports", retentionExportRelativeKey(prepared.exportId)).catch(() => undefined);
+              return "lost" as const;
+            }
             coverage = built.coverage;
           } else {
             coverage = prepared.coverage;

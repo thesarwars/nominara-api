@@ -18,6 +18,9 @@ import { EXPORT_DOWNLOAD_URL_SECONDS } from "../reports/export.schema.js";
 //   <project-slug>-<id8>/metric_daily.csv          rollup days older than the new rollup window
 //   <project-slug>-<id8>/attribution_daily.csv     attribution days older than the new rollup window
 //
+// `superseded`: a ready export built for an EARLIER scope (a second retention shortening moved the cutoffs, so it no longer covers everything the purge will
+// remove). It has no `download_url` and is not complete; `POST` builds a new one.
+//
 // `coverage` states what the zip holds per project, in the units the retention notice uses (raw captures; rollup DAYS; attribution DAYS), so the
 // two can be read against each other. A section is null when that window was not shortened (nothing of that kind is purged).
 // `complete` is false when a raw object a row points at could not be read: those captures are counted in `unreadable` and absent from the file,
@@ -28,7 +31,7 @@ export const RETENTION_EXPORT_MAX_LIFETIME_DAYS = 14;
 /** The presign the download route redirects to, minted fresh on every fetch. The same lifetime as a report download. */
 export const RETENTION_EXPORT_URL_SECONDS = EXPORT_DOWNLOAD_URL_SECONDS;
 
-export const retentionExportStatusSchema = z.enum(["requested", "building", "ready", "failed", "expired"]);
+export const retentionExportStatusSchema = z.enum(["requested", "building", "ready", "failed", "expired", "superseded"]);
 export type RetentionExportStatus = z.infer<typeof retentionExportStatusSchema>;
 
 const sectionBase = {

@@ -10,6 +10,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 import { recordDowngradeNotices, type RecordedNotice } from "./downgrade-notice-outbox.js";
 import { downgradeNoticeContact } from "./downgrade-pause-notice.js";
 import { retentionExportDownloadUrl } from "./retention-export/links.js";
+import { sameScope, scopeFromParts, type ExportScope } from "./retention-export/scope.js";
 
 // STORY-077 slice B · EC-41 · data-model.md §7 "Plan downgrade shortening retention": a 14-day notice names exactly what will be
 // purged and when, and DEFERS THE FIRST PURGE TO DAY 15.
@@ -222,17 +223,19 @@ export async function attributionPurgeList(tx: ClientBase, workspaceId: string, 
 }
 
 /**
- * STORY-185 / 077 R1: the link to a full-data export that ALREADY EXISTS for this workspace (built and not yet expired), or null. The notice
- * mentions an export only through this, so it never promises one that is not there. Read inside the caller's transaction; the origin is read
- * only when there is a link to build.
+ * STORY-185 / 077 R1: the link to a full-data export that ALREADY EXISTS for this workspace (built, not expired) AND was built for the scope this very
+ * change leaves in force, or null. The notice mentions an export only through this, so it never promises one that is not there, and (audit major 1) never
+ * calls an export complete that this change made incomplete: a shortening that moves the cutoffs supersedes every earlier export. `scope` is the scope AFTER
+ * the change (null when the change leaves nothing to export). Read inside the caller's transaction; the origin is read only when there is a link to build.
  */
-async function existingExportLink(tx: ClientBase, workspaceId: string, now: Date): Promise<string | null> {
-  const found = await tx.query<{ id: string }>(
-    "SELECT id FROM retention_exports WHERE workspace_id = $1 AND status = 'ready' AND expires_at > $2 ORDER BY created_at DESC LIMIT 1",
+async function existingExportLink(tx: ClientBase, workspaceId: string, scope: ExportScope | null, now: Date): Promise<string | null> {
+  if (scope === null) return null;
+  const found = await tx.query<{ id: string; scope: unknown }>(
+    "SELECT id, scope FROM retention_exports WHERE workspace_id = $1 AND status = 'ready' AND expires_at > $2 ORDER BY created_at DESC",
     [workspaceId, now.toISOString()],
   );
-  const id = found.rows[0]?.id;
-  return id === undefined ? null : retentionExportDownloadUrl(loadEnv().OAUTH_REDIRECT_BASE_URL, id);
+  const match = found.rows.find((r) => sameScope(r.scope, scope));
+  return match === undefined ? null : retentionExportDownloadUrl(loadEnv().OAUTH_REDIRECT_BASE_URL, match.id);
 }
 
 export interface RetentionShorteningInput {
@@ -292,7 +295,8 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
       };
 
       // The window being replaced is kept until the purge date; a deferral still running keeps the LONGER of its window and this one.
-      const defer = async (): Promise<void> => {
+      // `planned` is what the workspace row holds AFTER this change (the notice's export link is judged against it, and `defer` writes it).
+      const planned = async (): Promise<{ until: Date; raw: number | null; rollups: number | null }> => {
         const current = (
           await tx.query<{ until: Date | null; raw: number | null; rollups: number | null }>(
             "SELECT retention_purge_not_before AS until, retention_deferred_raw_days AS raw, retention_deferred_rollups_days AS rollups FROM workspaces WHERE id = $1",
@@ -301,10 +305,15 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
         ).rows[0];
         const running = current?.until != null && current.until.getTime() >= now.getTime();
         const keep = (replaced: RetentionWindow, stored: number | null | undefined): number | null => (running ? longerRetentionWindow(replaced, stored ?? null) : typeof replaced === "number" ? replaced : null);
+        const until = current?.until != null && current.until.getTime() > purgeNotBefore.getTime() ? current.until : purgeNotBefore;
+        return { until, raw: keep(from.raw, current?.raw), rollups: keep(from.rollups, current?.rollups) };
+      };
+      const defer = async (): Promise<void> => {
+        const after = await planned();
         await tx.query(
           `UPDATE workspaces SET retention_purge_not_before = GREATEST(COALESCE(retention_purge_not_before, $2), $2),
                                  retention_deferred_raw_days = $3, retention_deferred_rollups_days = $4 WHERE id = $1`,
-          [workspaceId, purgeNotBefore.toISOString(), keep(from.raw, current?.raw), keep(from.rollups, current?.rollups)],
+          [workspaceId, purgeNotBefore.toISOString(), after.raw, after.rollups],
         );
       };
 
@@ -325,7 +334,8 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
         return [];
       }
 
-      const exportLink = await existingExportLink(tx, workspaceId, now);
+      const after = await planned();
+      const exportLink = await existingExportLink(tx, workspaceId, scopeFromParts({ until: after.until, deferredRaw: after.raw, deferredRollups: after.rollups, planRaw: to.raw, planRollups: to.rollups }, now), now);
       const email = retentionShorteningEmail(contact, { fromPlanName: from.name, toPlanName: to.name, purgeNotBefore, raw, rollups, attribution, ...(exportLink === null ? {} : { exportLink }) });
       const recorded = await recordDowngradeNotices(tx, workspaceId, input.requestId, [{ kind: RETENTION_NOTICE_KIND, message: email }]);
       if (recorded.length === 0) {

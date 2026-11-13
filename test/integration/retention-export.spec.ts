@@ -136,7 +136,8 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
     await container.stop();
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await db.query("TRUNCATE retention_exports"); // each case starts with no export rows (the cleanup scans every workspace)
     port = new MemoryPort();
     sender = new RecordingSender();
   });
@@ -581,7 +582,7 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
       expect(second.id, "a new build is allowed").not.toBe(oldId);
       expect(second.status).toBe("requested");
       await db.query("UPDATE retention_exports SET requested_by = $2 WHERE id = $1", [second.id, requester]);
-      port.objects.clear();
+      for (const k of reportKeys()) port.objects.delete(k);
       await runJob(ws, second.id);
       const cov = retentionExportCoverageSchema.parse((await row(second.id)).coverage);
       expect(cov.projects[0]!.raw_answers!.count, "both captures are in the new export").toBe(2);
@@ -591,7 +592,7 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
       const ws = await workspace("business");
       await shorten(ws, "business", "starter");
       const a = await inTenant(ws, async () => service().request());
-      await db.query("UPDATE retention_exports SET status = 'ready', object_key = 'k', coverage = '{}'::jsonb, ready_at = now() WHERE id = $1", [a.id]);
+      await db.query("UPDATE retention_exports SET status = 'ready', object_key = 'k', coverage = $2::jsonb, ready_at = now() WHERE id = $1", [a.id, JSON.stringify({ generated_at: new Date().toISOString(), purge_not_before: new Date().toISOString(), complete: true, projects: [] })]);
       const again = await inTenant(ws, async () => service().request());
       expect(again.id).toBe(a.id);
       await db.query("UPDATE retention_exports SET scope = NULL WHERE id = $1", [a.id]);
@@ -648,8 +649,7 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
       await runJob(s.ws, probe);
       const files = unzip(storedZip());
       const total = [...files].filter(([name]) => name !== "manifest.json").reduce((n, [, data]) => n + data.length, 0);
-      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x' WHERE id = $1", [probe]);
-      port.objects.clear();
+      for (const k of reportKeys()) port.objects.delete(k);
       port.puts = 0;
       port.gets = 0;
 
@@ -675,11 +675,9 @@ describe("STORY-185 · the full-data export before a retention purge", () => {
       expect((await row(id)).status).toBe("ready");
       expect(sender.sent).toHaveLength(0);
       const removed = await requestRow(s.ws, s.requester);
-      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x' WHERE id = $1", [id]);
       await db.query("UPDATE workspace_members SET role = 'admin', status = 'removed' WHERE workspace_id = $1 AND user_id = $2", [s.ws, s.requester]);
       await runJob(s.ws, removed);
       expect(sender.sent, "a removed member gets nothing").toHaveLength(0);
-      await db.query("UPDATE retention_exports SET status = 'failed', error_code = 'x' WHERE id = $1", [removed]);
       await db.query("UPDATE workspace_members SET role = 'admin', status = 'active' WHERE workspace_id = $1 AND user_id = $2", [s.ws, s.requester]);
       const ok = await requestRow(s.ws, s.requester);
       await runJob(s.ws, ok);

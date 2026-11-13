@@ -37,6 +37,42 @@ function section(planWindow: RetentionWindow, deferredWindow: number | null, pur
   return { windowDays: planWindow, cutoff: new Date(purgeNotBefore.getTime() - planWindow * DAY_MS) };
 }
 
+export interface ScopeParts {
+  readonly until: Date | null;
+  readonly deferredRaw: number | null;
+  readonly deferredRollups: number | null;
+  readonly planRaw: RetentionWindow;
+  readonly planRollups: RetentionWindow;
+}
+
+/** The scope for these parts, or null when no deferral is pending at `now` (or it would purge nothing more). Pure: shared by the reader and the notice. */
+export function scopeFromParts(parts: ScopeParts, now: Date): ExportScope | null {
+  if (parts.until === null || parts.until.getTime() < now.getTime()) return null;
+  const raw = section(parts.planRaw, parts.deferredRaw, parts.until);
+  const rollups = section(parts.planRollups, parts.deferredRollups, parts.until);
+  if (raw === null && rollups === null) return null;
+  return { purgeNotBefore: parts.until, raw, rollups };
+}
+
+/** What `retention_exports.scope` stores: the purge date and the cutoffs (null when that window is not shortened). */
+export interface ScopeSnapshot {
+  readonly purge_not_before: string;
+  readonly raw_cutoff: string | null;
+  readonly rollups_cutoff: string | null;
+}
+
+export function scopeSnapshot(scope: ExportScope): ScopeSnapshot {
+  return { purge_not_before: scope.purgeNotBefore.toISOString(), raw_cutoff: scope.raw?.cutoff.toISOString() ?? null, rollups_cutoff: scope.rollups?.cutoff.toISOString() ?? null };
+}
+
+/** True only when `stored` is a snapshot of exactly this scope. A null, malformed or older snapshot never matches (superseded). */
+export function sameScope(stored: unknown, scope: ExportScope): boolean {
+  if (typeof stored !== "object" || stored === null) return false;
+  const want = scopeSnapshot(scope);
+  const have = stored as Partial<ScopeSnapshot>;
+  return have.purge_not_before === want.purge_not_before && have.raw_cutoff === want.raw_cutoff && have.rollups_cutoff === want.rollups_cutoff;
+}
+
 /** The scope of the workspace's pending deferral, or null when none is pending (or it would purge nothing more). Reads inside the caller's tenant transaction. */
 export async function readExportScope(tx: ClientBase, workspaceId: string, now: Date): Promise<ExportScope | null> {
   const r = await tx.query<{ until: Date | null; deferred_raw: number | null; deferred_rollups: number | null; raw: unknown; rollups: unknown }>(
@@ -47,9 +83,6 @@ export async function readExportScope(tx: ClientBase, workspaceId: string, now: 
     [workspaceId],
   );
   const row = r.rows[0];
-  if (row === undefined || row.until === null || row.until.getTime() < now.getTime()) return null;
-  const raw = section(row.raw as RetentionWindow, row.deferred_raw, row.until);
-  const rollups = section(row.rollups as RetentionWindow, row.deferred_rollups, row.until);
-  if (raw === null && rollups === null) return null;
-  return { purgeNotBefore: row.until, raw, rollups };
+  if (row === undefined) return null;
+  return scopeFromParts({ until: row.until, deferredRaw: row.deferred_raw, deferredRollups: row.deferred_rollups, planRaw: row.raw as RetentionWindow, planRollups: row.rollups as RetentionWindow }, now);
 }

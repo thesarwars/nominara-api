@@ -4,7 +4,7 @@ import { decodeRawObject, RawObjectCorruptError } from "../../capture/raw-object
 import { csvCell } from "../../reports/export-csv.js";
 import type { TenantStep } from "../../queue/worker-factory.js";
 import type { ExportScope } from "./scope.js";
-import { createZip, type ZipEntry } from "./zip.js";
+import { createZip, ZipLimitError, type ZipEntry } from "./zip.js";
 
 // STORY-185 - the build of the full-data export: the three kinds of data the pending purge removes, per project, into one zip.
 //
@@ -27,6 +27,26 @@ import { createZip, type ZipEntry } from "./zip.js";
 // never an empty answer. Any other failure (a tenancy refusal, the store down) is thrown: the job retries, it does not ship a partial file.
 
 export const CAPTURE_PAGE_SIZE = 200;
+
+/**
+ * The most raw bytes (answers.jsonl plus the two CSVs, before compression) one export may hold. PROVISIONAL, for the owner to confirm (audit major 3): the
+ * archive is built in memory and uploaded whole (the port's `put` takes a whole body), so an unbounded workspace would exhaust the worker long before the
+ * 4 GiB non-ZIP64 limit. Over it the build fails fast and stably with `ZipLimitError` (`zip_limit`) before reading everything. Streaming the archive to a
+ * multipart upload is the follow-up that removes the cap.
+ */
+export const RETENTION_EXPORT_MAX_BYTES = 1024 ** 3;
+
+/** A running total against a cap: `add` throws `ZipLimitError` on the first byte over it. */
+export class ByteBudget {
+  used = 0;
+  constructor(private readonly max: number) {
+    if (!Number.isInteger(max) || max < 0) throw new Error("byte budget must be a non-negative integer");
+  }
+  add(bytes: number): void {
+    this.used += bytes;
+    if (this.used > this.max) throw new ZipLimitError(`the export would hold more than ${String(this.max)} bytes`);
+  }
+}
 const ROLLUP_PAGE_SIZE = 2000;
 
 export interface BuildProject {
@@ -46,6 +66,8 @@ export interface BuildDeps {
   /** Reads the object a capture's `raw_object_key` names. */
   readonly readRaw: (storedKey: string) => Promise<Buffer>;
   readonly now: Date;
+  /** The byte budget; defaults to RETENTION_EXPORT_MAX_BYTES. */
+  readonly maxBytes?: number;
 }
 
 export interface BuiltExport {
@@ -65,16 +87,22 @@ function field(value: unknown): string {
   return csvCell(String(value));
 }
 
+/** Each row is encoded ONCE into a Buffer and counted against the budget as it is read; the file is one concat at the end. */
 class CsvFile {
-  private readonly lines: string[];
-  constructor(header: readonly string[]) {
-    this.lines = [header.join(",")];
+  private readonly chunks: Buffer[] = [];
+  constructor(header: readonly string[], private readonly budget: ByteBudget) {
+    this.push(header.join(","));
+  }
+  private push(line: string): void {
+    const chunk = Buffer.from(`${line}\r\n`, "utf8");
+    this.budget.add(chunk.length);
+    this.chunks.push(chunk);
   }
   add(values: readonly unknown[]): void {
-    this.lines.push(values.map(field).join(","));
+    this.push(values.map(field).join(","));
   }
   toBuffer(): Buffer {
-    return Buffer.from(`${this.lines.join("\r\n")}\r\n`, "utf8");
+    return Buffer.concat(this.chunks);
   }
 }
 
@@ -102,8 +130,8 @@ interface CaptureRow {
   raw_object_key: string;
 }
 
-async function exportRaw(deps: BuildDeps, projectId: string, cutoff: Date): Promise<{ jsonl: Buffer; count: number; unreadable: number; oldest: Date | null; newest: Date | null }> {
-  const out: string[] = [];
+async function exportRaw(deps: BuildDeps, budget: ByteBudget, projectId: string, cutoff: Date): Promise<{ jsonl: Buffer; count: number; unreadable: number; oldest: Date | null; newest: Date | null }> {
+  const out: Buffer[] = [];
   let count = 0;
   let unreadable = 0;
   let oldest = null as Date | null;
@@ -155,8 +183,8 @@ async function exportRaw(deps: BuildDeps, projectId: string, cutoff: Date): Prom
         }
         throw error;
       }
-      out.push(
-        JSON.stringify({
+      const line = Buffer.from(
+        `${JSON.stringify({
           result_id: capture.id,
           captured_at: capture.captured_at.toISOString(),
           engine_key: capture.engine_key,
@@ -167,8 +195,11 @@ async function exportRaw(deps: BuildDeps, projectId: string, cutoff: Date): Prom
           raw,
           mention_facts: page.mentions.get(capture.id) ?? [],
           citation_facts: page.citations.get(capture.id) ?? [],
-        }),
+        })}\n`,
+        "utf8",
       );
+      budget.add(line.length); // counted as each answer is read: a too-large workspace stops here, not after reading everything
+      out.push(line);
       count += 1;
       oldest = oldest === null || capture.captured_at < oldest ? capture.captured_at : oldest;
       newest = newest === null || capture.captured_at > newest ? capture.captured_at : newest;
@@ -177,11 +208,11 @@ async function exportRaw(deps: BuildDeps, projectId: string, cutoff: Date): Prom
     after = { at: last.at_exact, id: last.id };
     if (page.captures.length < CAPTURE_PAGE_SIZE) break;
   }
-  return { jsonl: Buffer.from(out.length === 0 ? "" : `${out.join("\n")}\n`, "utf8"), count, unreadable, oldest, newest };
+  return { jsonl: Buffer.concat(out), count, unreadable, oldest, newest };
 }
 
-async function exportRollups(deps: BuildDeps, projectId: string, cutoff: Date): Promise<{ csv: Buffer; days: number; oldest: string | null; newest: string | null }> {
-  const file = new CsvFile(METRIC_COLUMNS);
+async function exportRollups(deps: BuildDeps, budget: ByteBudget, projectId: string, cutoff: Date): Promise<{ csv: Buffer; days: number; oldest: string | null; newest: string | null }> {
+  const file = new CsvFile(METRIC_COLUMNS, budget);
   const days = new Set<string>();
   let after: string[] | null = null;
   for (;;) {
@@ -211,8 +242,8 @@ async function exportRollups(deps: BuildDeps, projectId: string, cutoff: Date): 
   return { csv: file.toBuffer(), days: days.size, oldest: sorted[0] ?? null, newest: sorted[sorted.length - 1] ?? null };
 }
 
-async function exportAttribution(deps: BuildDeps, projectId: string, cutoff: Date): Promise<{ csv: Buffer; days: number; oldest: string | null; newest: string | null }> {
-  const file = new CsvFile(ATTRIBUTION_COLUMNS);
+async function exportAttribution(deps: BuildDeps, budget: ByteBudget, projectId: string, cutoff: Date): Promise<{ csv: Buffer; days: number; oldest: string | null; newest: string | null }> {
+  const file = new CsvFile(ATTRIBUTION_COLUMNS, budget);
   const days = new Set<string>();
   let after: string[] | null = null;
   for (;;) {
@@ -244,6 +275,7 @@ async function exportAttribution(deps: BuildDeps, projectId: string, cutoff: Dat
 /** Builds the archive and its coverage. Each project's reads run under that project's export lock. */
 export async function buildRetentionExport(deps: BuildDeps): Promise<BuiltExport> {
   const { scope } = deps;
+  const budget = new ByteBudget(deps.maxBytes ?? RETENTION_EXPORT_MAX_BYTES);
   // Zip entry paths are joined, not interpolated: they are archive paths, not object keys, and the ISO-14 scanner reads a template literal that starts with an interpolation and a slash as a key.
   const entries: ZipEntry[] = [];
   const projects: RetentionExportCoverage["projects"] = [];
@@ -251,9 +283,9 @@ export async function buildRetentionExport(deps: BuildDeps): Promise<BuiltExport
   for (const project of deps.projects) {
     const folder = projectFolder(project.name, project.projectId);
     const built = await deps.lockProject(project.projectId, async () => ({
-      raw: scope.raw === null ? null : await exportRaw(deps, project.projectId, scope.raw.cutoff),
-      rollups: scope.rollups === null ? null : await exportRollups(deps, project.projectId, scope.rollups.cutoff),
-      attribution: scope.rollups === null ? null : await exportAttribution(deps, project.projectId, scope.rollups.cutoff),
+      raw: scope.raw === null ? null : await exportRaw(deps, budget, project.projectId, scope.raw.cutoff),
+      rollups: scope.rollups === null ? null : await exportRollups(deps, budget, project.projectId, scope.rollups.cutoff),
+      attribution: scope.rollups === null ? null : await exportAttribution(deps, budget, project.projectId, scope.rollups.cutoff),
     }));
     if (built.raw !== null) entries.push({ name: [folder, "answers.jsonl"].join("/"), data: built.raw.jsonl });
     if (built.rollups !== null) entries.push({ name: [folder, "metric_daily.csv"].join("/"), data: built.rollups.csv });

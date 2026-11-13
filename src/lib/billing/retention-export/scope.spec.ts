@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readExportScope } from "./scope.js";
+import { readExportScope, sameScope, scopeSnapshot } from "./scope.js";
 
 // STORY-185 AC1/AC2 - what the export covers: the purge DATE minus the NEW window, for each window the change shortens.
 
@@ -50,5 +50,20 @@ describe("STORY-185 · readExportScope", () => {
 
   it("a workspace that is not found (or deleted) has no scope", async () => {
     expect(await readExportScope(tx(undefined), "w", NOW)).toBeNull();
+  });
+});
+
+describe("STORY-185 fix round · sameScope (reuse only for the scope an export was built for)", () => {
+  it("equal snapshot matches; a moved purge date or cutoff, a null or malformed snapshot never does", async () => {
+    const scope = (await readExportScope(tx(base), "w", NOW))!;
+    const snap = scopeSnapshot(scope);
+    expect(sameScope(snap, scope)).toBe(true);
+    expect(sameScope({ ...snap, raw_cutoff: new Date(0).toISOString() }, scope)).toBe(false);
+    expect(sameScope({ ...snap, rollups_cutoff: null }, scope)).toBe(false);
+    expect(sameScope({ ...snap, purge_not_before: new Date(0).toISOString() }, scope)).toBe(false);
+    expect(sameScope(null, scope)).toBe(false);
+    expect(sameScope("x", scope)).toBe(false);
+    const second = (await readExportScope(tx({ ...base, raw: 20 }), "w", NOW))!; // a second, shorter window
+    expect(sameScope(snap, second)).toBe(false);
   });
 });

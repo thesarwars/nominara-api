@@ -3,6 +3,7 @@ import type { ClientBase, Pool } from "pg";
 import { SYSTEM_ACTOR_ID } from "../../../tenancy/constants.js";
 import { withTenantContext } from "../../../tenancy/tenant-context.js";
 import { StorageTenancyError } from "../../storage/storage-keys.js";
+import { retentionExportRelativeKey } from "./links.js";
 import type { TenantObjectStore } from "../../storage/tenant-object-store.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 
@@ -13,7 +14,7 @@ import { incrementCounter } from "../../telemetry/metrics.js";
 //     phase 1   ONE short transaction: re-read what is still due (RLS plus `workspace_id = app.current_workspace()`), bind the object store
 //     phase 2   NO transaction, no connection: delete each object (deleting an absent object succeeds, so a rerun and a vanished object are fine)
 //     phase 3   ONE short transaction: stamp `object_purged_at` on exactly the exports whose object is gone
-// "Due" = ready, `expires_at` past (the DATABASE clock), not yet stamped. `object_key` is kept. A storage error leaves the row unstamped: it is retried at
+// "Due" = `expires_at` past (the DATABASE clock), not yet stamped, WHATEVER the status. `object_key` is kept. A storage error leaves the row unstamped: it is retried at
 // the next run and counted as a failure (the job then fails and walks its ladder). A crash between phases 2 and 3 leaves it due: the next run deletes again
 // (harmless) and stamps. A key outside the workspace's prefix is REFUSED (a tenancy event, never a deletion): it is counted and logged, left as evidence,
 // and is not a failure (it cannot succeed on a retry).
@@ -32,7 +33,8 @@ export interface RetentionCleanupResult {
   readonly refused: number;
 }
 
-const DUE = "status = 'ready' AND object_key IS NOT NULL AND object_purged_at IS NULL AND expires_at < now()";
+// ANY status (fix round, audit major 2): a failed, building, requested or superseded export may have an object too (a crash after the upload, a lost race).
+const DUE = "object_purged_at IS NULL AND expires_at < now()";
 
 export async function runRetentionExportCleanup(owner: ClientBase, pool: Pool, store: TenantObjectStore, deps: { readonly batchSize?: number }): Promise<RetentionCleanupResult> {
   const due = await owner.query<{ id: string; workspace_id: string }>(`SELECT id, workspace_id FROM retention_exports WHERE ${DUE} ORDER BY expires_at, id LIMIT $1`, [
@@ -71,7 +73,7 @@ async function inWorkspace<T>(pool: Pool, workspaceId: string, fn: (tx: ClientBa
 async function cleanWorkspace(pool: Pool, store: TenantObjectStore, workspaceId: string, ids: readonly string[]): Promise<{ purged: number; failed: number; refused: number }> {
   const { rows, bound } = await inWorkspace(pool, workspaceId, async (tx) => {
     const bound = store.bind();
-    const found = await tx.query<{ id: string; object_key: string }>(`SELECT id, object_key FROM retention_exports WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND ${DUE}`, [ids]);
+    const found = await tx.query<{ id: string; object_key: string | null }>(`SELECT id, object_key FROM retention_exports WHERE workspace_id = app.current_workspace() AND id = ANY($1::uuid[]) AND ${DUE}`, [ids]);
     return { rows: found.rows, bound };
   });
   if (rows.length === 0) return { purged: 0, failed: 0, refused: 0 };
@@ -82,7 +84,10 @@ async function cleanWorkspace(pool: Pool, store: TenantObjectStore, workspaceId:
   let refused = 0;
   for (const row of rows) {
     try {
-      await bound.deleteStored("reports", row.object_key);
+      // A ready row names its key (checked against the workspace prefix); any other row's object, if there is one, is at the deterministic key of its id.
+      // Deleting an object that is not there succeeds.
+      if (row.object_key === null) await bound.delete("reports", retentionExportRelativeKey(row.id));
+      else await bound.deleteStored("reports", row.object_key);
       gone.push(row.id);
       incrementCounter("nominara_billing_retention_export_cleanup_total", { outcome: "purged" });
     } catch (error) {

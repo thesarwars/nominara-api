@@ -12,7 +12,7 @@ import {
 } from "../../../contracts/billing/retention-export.schema.js";
 import { afterTransaction } from "../../api/after-transaction.js";
 import { DegradedError, NotFoundError, PreconditionUnmetError } from "../../api/errors/domain-errors.js";
-import { readExportScope } from "../../lib/billing/retention-export/scope.js";
+import { readExportScope, sameScope, scopeSnapshot, type ExportScope } from "../../lib/billing/retention-export/scope.js";
 import { retentionExportDownloadUrl, retentionExportFilename } from "../../lib/billing/retention-export/links.js";
 import { QueueProducer } from "../../lib/queue/queue-producer.js";
 import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
@@ -54,9 +54,10 @@ interface Row {
   error_code: string | null;
   object_key: string | null;
   object_purged_at: Date | null;
+  scope: unknown;
 }
 
-const COLUMNS = "id, status, created_at, expires_at, ready_at, coverage, error_code, object_key, object_purged_at";
+const COLUMNS = "id, status, created_at, expires_at, ready_at, coverage, error_code, object_key, object_purged_at, scope";
 
 @Injectable()
 export class RetentionExportService {
@@ -72,7 +73,7 @@ export class RetentionExportService {
       const { client, workspaceId } = this.tenant();
       const scope = await readExportScope(client, workspaceId, new Date());
       const latest = await this.latest(client, workspaceId);
-      return { available: scope !== null, purge_not_before: scope?.purgeNotBefore.toISOString() ?? null, export: latest === undefined ? null : this.render(latest, workspaceId) };
+      return { available: scope !== null, purge_not_before: scope?.purgeNotBefore.toISOString() ?? null, export: latest === undefined ? null : this.render(latest, scope) };
     });
   }
 
@@ -87,26 +88,37 @@ export class RetentionExportService {
         throw new PreconditionUnmetError({ message: "no retention-shortening purge is pending, so there is nothing to export" });
       }
 
+      // An in-flight row whose link date has passed can never finish usefully: fail it NOW, in this transaction, so it cannot hold the one in-flight slot or be answered.
+      await client.query("UPDATE retention_exports SET status = 'failed', error_code = 'expired', updated_at = now() WHERE workspace_id = $1 AND status IN ('requested', 'building') AND expires_at <= now()", [workspaceId]);
+
       const current = await this.latest(client, workspaceId);
-      if (current !== undefined && current.status === "ready" && current.expires_at.getTime() > now.getTime()) {
+      const live = current !== undefined && current.expires_at.getTime() > now.getTime();
+      // REUSE ONLY FOR THE SAME SCOPE (audit major 1): a second shortening inside the deferral moves the cutoffs, and an export built for the earlier ones is
+      // not complete. A row with no stored scope (legacy) never matches.
+      if (current !== undefined && live && current.status === "ready" && sameScope(current.scope, scope)) {
         incrementCounter("nominara_billing_retention_export_requests_total", { outcome: "already_ready" });
-        return this.render(current, workspaceId);
+        return this.render(current, scope);
       }
-      if (current !== undefined && (current.status === "requested" || current.status === "building") && current.expires_at.getTime() > now.getTime()) {
-        incrementCounter("nominara_billing_retention_export_requests_total", { outcome: "in_flight" });
-        this.enqueueAfterCommit(workspaceId, current.id);
-        return this.render(current, workspaceId);
+      if (current !== undefined && live && (current.status === "requested" || current.status === "building")) {
+        if (sameScope(current.scope, scope)) {
+          incrementCounter("nominara_billing_retention_export_requests_total", { outcome: "in_flight" });
+          this.enqueueAfterCommit(workspaceId, current.id);
+          return this.render(current, scope);
+        }
+        // Built for an earlier scope: stop it (its commit is conditional on `building`, so it can no longer become ready) and start over.
+        await client.query("UPDATE retention_exports SET status = 'failed', error_code = 'superseded', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('requested', 'building')", [current.id, workspaceId]);
+        incrementCounter("nominara_billing_retention_export_requests_total", { outcome: "superseded_in_flight" });
       }
 
       const expiresAt = new Date(Math.min(scope.purgeNotBefore.getTime(), now.getTime() + RETENTION_EXPORT_MAX_LIFETIME_DAYS * DAY_MS));
       const id = uuidV7();
       const inserted = await client.query<Row>(
         // requested_by is the user when the actor is one; null otherwise (the foreign key never fails the request).
-        `INSERT INTO retention_exports (id, workspace_id, requested_by, status, expires_at)
-         VALUES ($1, $2, (SELECT id FROM users WHERE id = $3), 'requested', $4)
+        `INSERT INTO retention_exports (id, workspace_id, requested_by, status, expires_at, scope)
+         VALUES ($1, $2, (SELECT id FROM users WHERE id = $3), 'requested', $4, $5::jsonb)
          ON CONFLICT (workspace_id) WHERE status IN ('requested', 'building') DO NOTHING
          RETURNING ${COLUMNS}`,
-        [id, workspaceId, actorId, expiresAt.toISOString()],
+        [id, workspaceId, actorId, expiresAt.toISOString(), JSON.stringify(scopeSnapshot(scope))],
       );
       const row = inserted.rows[0] ?? (await this.latest(client, workspaceId));
       if (row === undefined) throw new Error("retention export row neither inserted nor found");
@@ -118,7 +130,7 @@ export class RetentionExportService {
         logger.log({ message: "retention export requested", workspace_id: workspaceId });
       }
       this.enqueueAfterCommit(workspaceId, row.id);
-      return this.render(row, workspaceId);
+      return this.render(row, scope);
     });
   }
 
@@ -141,10 +153,12 @@ export class RetentionExportService {
       if (row.status !== "ready" || row.object_key === null) throw new DegradedError({ message: "the export file is not available" });
       const key = row.object_key;
       const readyAt = row.ready_at ?? row.created_at;
+      // Never longer than the export itself has left (and never longer than a download's 15 minutes).
+      const lifetime = Math.max(1, Math.min(RETENTION_EXPORT_URL_SECONDS, Math.floor((row.expires_at.getTime() - Date.now()) / 1000)));
       const registered = afterTransaction(async () => {
         let after = "error";
         try {
-          setLocation(await bound.presignGetStored("reports", key, { expiresInSeconds: RETENTION_EXPORT_URL_SECONDS, downloadFilename: retentionExportFilename(readyAt) }));
+          setLocation(await bound.presignGetStored("reports", key, { expiresInSeconds: lifetime, downloadFilename: retentionExportFilename(readyAt) }));
           after = "redirected";
         } finally {
           incrementCounter("nominara_billing_retention_export_downloads_total", { outcome: after });
@@ -171,9 +185,11 @@ export class RetentionExportService {
     return r.rows[0];
   }
 
-  private render(row: Row, _workspaceId: string): RetentionExport {
+  /** `scope` is the CURRENT scope (null when no deferral is pending). A ready, live export built for another scope reads `superseded`. */
+  private render(row: Row, scope: ExportScope | null): RetentionExport {
     const expired = row.expires_at.getTime() <= Date.now();
-    const status: RetentionExportStatus = (expired || row.object_purged_at !== null) && row.status !== "failed" ? "expired" : (row.status as RetentionExportStatus);
+    let status: RetentionExportStatus = (expired || row.object_purged_at !== null) && row.status !== "failed" ? "expired" : (row.status as RetentionExportStatus);
+    if (status === "ready" && scope !== null && !sameScope(row.scope, scope)) status = "superseded";
     return {
       id: row.id,
       status,
