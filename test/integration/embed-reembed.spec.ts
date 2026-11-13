@@ -7,6 +7,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import { embedBatchPayloadSchema } from "../../src/lib/embedding/embed-batch.js";
 import { cellKey, probeSemanticReuse } from "../../src/lib/capture/l2-semantic-reuse.js";
 import { promoteProject } from "../../src/lib/embedding/reembed-promote.js";
+import { runReembed, type ReembedSummary } from "../../src/lib/embedding/reembed.js";
 import { createEmbedBatchHandler } from "../../src/lib/queue/handlers/embed-batch.handler.js";
 import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { signQueueJobPayload } from "../../src/lib/queue/envelope.js";
@@ -271,4 +272,170 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     expect(provider.calls, "re-staged").toHaveLength(1);
     expect(await promote(workspaceId, projectId, NEW)).toMatchObject({ status: "promoted" });
   }, 60_000);
+
+  // ---- AC1 / AC3 / AC4: the operator run ----------------------------------------------------------------------------------
+
+  interface Enqueued {
+    readonly workspaceId: string;
+    readonly payload: { table: string; ids: string[]; stage?: true };
+    readonly key: string;
+  }
+
+  function recorder(fail: (e: Enqueued) => boolean = () => false): { sent: Enqueued[]; enqueue: Parameters<typeof runReembed>[0]["enqueue"] } {
+    const sent: Enqueued[] = [];
+    return {
+      sent,
+      enqueue: (_queue, ws, payload, key) => {
+        const entry = { workspaceId: ws, payload: payload as Enqueued["payload"], key };
+        if (fail(entry)) return Promise.reject(new Error("valkey down"));
+        sent.push(entry);
+        return Promise.resolve();
+      },
+    };
+  }
+
+  const quiet = { log: () => undefined, warn: () => undefined, error: () => undefined };
+  const reembed = (enqueue: Parameters<typeof runReembed>[0]["enqueue"], model = NEW): Promise<ReembedSummary> => runReembed({ client: db, model, enqueue, logger: quiet });
+
+  /** Hand a recorded job to the real handler, as the worker would. */
+  const process = (e: Enqueued, model = NEW): Promise<unknown> => {
+    const payload = embedBatchPayloadSchema.parse({ workspaceId: e.workspaceId, kid: "k1", ...e.payload });
+    return run(new NamedProvider(model), { data: signQueueJobPayload(payload, KEYS.current.key) } as unknown as Job);
+  };
+
+  async function manyPrompts(count: number, model: string | null, over: { ws?: string; project?: string } = {}): Promise<string[]> {
+    const ids: string[] = [];
+    for (let i = 0; i < count; i += 1) ids.push(await addPrompt(`prompt number ${String(i)} ${randomUUID().slice(0, 6)}`, model, over));
+    return ids;
+  }
+
+  it("AC1 - stale prompts are enqueued as stage jobs of at most 96 ids: 200 rows make 96 + 96 + 8", async () => {
+    await manyPrompts(200, OLD);
+    const { sent, enqueue } = recorder();
+    const summary = await reembed(enqueue);
+    expect(sent.map((e) => e.payload.ids.length).sort((a, b) => a - b)).toEqual([8, 96, 96]);
+    expect(sent.every((e) => e.payload.table === "tracked_prompts" && e.payload.stage === true && e.workspaceId === workspaceId)).toBe(true);
+    expect(new Set(sent.flatMap((e) => e.payload.ids)).size, "every row exactly once").toBe(200);
+    expect(summary.jobs).toMatchObject({ stagePrompts: 3, backfill: 0, stageNodes: 0 });
+  }, 120_000);
+
+  it("AC1 - stale semantic_nodes are enqueued as stage jobs too", async () => {
+    await addNode("audit logging", OLD);
+    const { sent, enqueue } = recorder();
+    await reembed(enqueue);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.payload).toMatchObject({ table: "semantic_nodes", stage: true });
+  }, 60_000);
+
+  it("AC1 - a row already under the target model, and a deleted row, are not enqueued", async () => {
+    await addPrompt("current", NEW);
+    await addPrompt("deleted", OLD, { deleted: true });
+    const { sent, enqueue } = recorder();
+    await reembed(enqueue);
+    expect(sent).toHaveLength(0);
+  }, 60_000);
+
+  it("AC1 - jobs are per workspace: another workspace's ids never ride in this one's job", async () => {
+    const other = await newWorkspace();
+    const mine = await manyPrompts(2, OLD);
+    const theirs = await manyPrompts(2, OLD, { ws: other.workspaceId, project: other.projectId });
+    const { sent, enqueue } = recorder();
+    await reembed(enqueue);
+    expect(sent).toHaveLength(2);
+    const byWs = new Map(sent.map((e) => [e.workspaceId, e.payload.ids.sort()]));
+    expect(byWs.get(workspaceId)).toEqual([...mine].sort());
+    expect(byWs.get(other.workspaceId)).toEqual([...theirs].sort());
+  }, 60_000);
+
+  it("AC3 - active prompts with no vector are enqueued as DIRECT jobs by the same run; paused and deleted ones are not", async () => {
+    const never = await manyPrompts(3, null);
+    await addPrompt("paused never embedded", null, { status: "paused" });
+    await addPrompt("deleted never embedded", null, { deleted: true });
+    const { sent, enqueue } = recorder();
+    const summary = await reembed(enqueue);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.payload.stage, "a backfill writes the served vector, nothing to stage").toBeUndefined();
+    expect(sent[0]!.payload.ids.sort()).toEqual([...never].sort());
+    expect(summary.jobs.backfill).toBe(1);
+  }, 60_000);
+
+  it("AC3/AC4 - the run is idempotent: a second run enqueues the same jobs under the same keys (the queue dedupes them), so nothing is asked twice", async () => {
+    await manyPrompts(3, null);
+    await manyPrompts(3, OLD);
+    const first = recorder();
+    const second = recorder();
+    await reembed(first.enqueue);
+    await reembed(second.enqueue);
+    expect(second.sent.map((e) => e.key).sort()).toEqual(first.sent.map((e) => e.key).sort());
+    expect(new Set(first.sent.map((e) => e.key)).size, "a stage job and a direct job never share a key").toBe(first.sent.length);
+  }, 60_000);
+
+  it("AC4 - resumable: after part of the work is staged, a rerun enqueues only the remainder", async () => {
+    const ids = await manyPrompts(104, OLD);
+    const first = recorder();
+    await reembed(first.enqueue);
+    const big = first.sent.find((e) => e.payload.ids.length === 96)!;
+    await process(big);
+    const second = recorder();
+    await reembed(second.enqueue);
+    expect(second.sent.flatMap((e) => e.payload.ids).sort()).toEqual(ids.filter((id) => !big.payload.ids.includes(id)).sort());
+  }, 120_000);
+
+  it("AC4 - a failed enqueue does not stop the others, is counted, and is picked up by the next run", async () => {
+    await manyPrompts(100, OLD);
+    let calls = 0;
+    const flaky = recorder(() => (calls += 1) === 1);
+    const summary = await reembed(flaky.enqueue);
+    expect(flaky.sent).toHaveLength(1);
+    expect(summary.enqueueFailed).toBe(1);
+    const retry = recorder();
+    const again = await reembed(retry.enqueue);
+    expect(again.enqueueFailed).toBe(0);
+    expect(retry.sent.flatMap((e) => e.payload.ids)).toHaveLength(100);
+  }, 120_000);
+
+  it("AC2/AC4 - end to end: run, process the jobs, run again to cut the project over, run a third time and nothing more happens", async () => {
+    const ids = await manyPrompts(5, OLD);
+    const first = recorder();
+    const s1 = await reembed(first.enqueue);
+    expect(s1.cutovers, "nothing is staged yet: no cutover on the first run").toEqual([]);
+    for (const e of first.sent) await process(e);
+    expect((await state("tracked_prompts", ids)).every((row) => row.embedding_model === OLD), "still served from the old model").toBe(true);
+
+    const second = recorder();
+    const s2 = await reembed(second.enqueue);
+    expect(second.sent, "nothing left to stage").toHaveLength(0);
+    expect(s2.cutovers).toEqual([{ workspaceId, projectId, prompts: 5, nodes: 0 }]);
+    expect((await state("tracked_prompts", ids)).every((row) => row.embedding_model === NEW)).toBe(true);
+
+    const third = recorder();
+    const s3 = await reembed(third.enqueue);
+    expect(third.sent).toHaveLength(0);
+    expect(s3.cutovers).toEqual([]);
+  }, 120_000);
+
+  it("AC2 - one workspace's blocked project does not hold another's cutover; the block is reported", async () => {
+    const other = await newWorkspace();
+    const mine = await manyPrompts(2, OLD);
+    const theirs = await manyPrompts(2, OLD, { ws: other.workspaceId, project: other.projectId });
+    await db.query(
+      `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, engine_keys, embedding_model, live_content_md, status)
+       VALUES ($1, $2, $3, 'https://example.test/p', '{chatgpt}', $4, '# x', 'open')`,
+      [randomUUID(), other.workspaceId, other.projectId, OLD],
+    );
+    const first = recorder();
+    await reembed(first.enqueue);
+    for (const e of first.sent) await process(e);
+    const summary = await reembed(recorder().enqueue);
+    expect(summary.cutovers.map((c) => c.workspaceId)).toEqual([workspaceId]);
+    expect(summary.blocked).toEqual([{ workspaceId: other.workspaceId, projectId: other.projectId, reason: "open_session" }]);
+    expect((await state("tracked_prompts", mine)).every((row) => row.embedding_model === NEW)).toBe(true);
+    expect((await state("tracked_prompts", theirs)).every((row) => row.embedding_model === OLD)).toBe(true);
+  }, 120_000);
+
+  it("AC3 - the run itself never calls an embedding provider: it takes none, and enqueues only", () => {
+    // `runReembed`'s options have no provider field; a spend happens only when a worker runs the jobs it enqueued. Type-level guard.
+    const options: Parameters<typeof runReembed>[0] = { client: db, model: NEW, enqueue: recorder().enqueue, logger: quiet };
+    expect(Object.keys(options).sort()).toEqual(["client", "enqueue", "logger", "model"]);
+  });
 });

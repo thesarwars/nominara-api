@@ -449,4 +449,12 @@ describe("Group C item 3 · object storage configuration", () => {
       expect(() => loadEnv({ ...VALID, ...buckets, STORAGE_KEY_ENV: "crawl" })).toThrow(/STORAGE_KEY_ENV/);
     });
   });
+
+  // STORY-186 / owner decision 104(b) - the operator re-embed switch: off by default, and only the literal "true" turns it on.
+  it("STORY-186 - EMBED_REEMBED_ENABLED is optional, accepts only the literal true, and is a known key", () => {
+    expect(loadEnv(VALID).EMBED_REEMBED_ENABLED).toBeUndefined();
+    expect(loadEnv({ ...VALID, EMBED_REEMBED_ENABLED: "true" }).EMBED_REEMBED_ENABLED).toBe("true");
+    expect(() => loadEnv({ ...VALID, EMBED_REEMBED_ENABLED: "1" })).toThrow(EnvValidationError);
+    expect(KNOWN_KEYS).toContain("EMBED_REEMBED_ENABLED");
+  });
 });
