@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Logger } from "@nestjs/common";
 import { Pool } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { autoTopupConfigSchema, usageResponseSchema, walletResponseSchema } from "../../contracts/billing/index.js";
+import { autoTopupConfigSchema, retentionPurgeResponseSchema, usageResponseSchema, walletResponseSchema } from "../../contracts/billing/index.js";
 import { resolvePassword } from "../../src/db/dev-credentials.js";
 import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../src/lib/auth/cookies.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
@@ -380,5 +380,135 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
     expect(dataOf<{ pdf_exports: unknown }>(await get(a.owner, "/billing/usage")).pdf_exports).toEqual({ used: 0, cap: 25 });
     expect((await walletOf(a.owner)).auto_topup.enabled).toBe(false);
     expect((await walletOf(b.owner)).auto_topup.enabled).toBe(true);
+  });
+
+  // ---- STORY-096 AC3 (owner decision 100(h)): GET /billing/retention-purge ----------------------
+  // The per-project purge list of a PENDING retention-shortening deferral: the same sections, cutoffs and counts as the notice email (both come from
+  // the builders in lib/billing/retention-shortening.ts), read at any time from the settings page. billing:read (owner and admin).
+  const DAYMS = 86_400_000;
+  async function deferredWorkspace(plan = "starter") {
+    const w = await newWorkspace(plan);
+    const project = async (name: string, deleted = false) =>
+      (await harness.db().query<{ id: string }>(`INSERT INTO projects (workspace_id, name, slug, root_url, root_domain, deleted_at) VALUES ($1,$2,$3,'https://e.test','e.test',${deleted ? "now()" : "NULL"}) RETURNING id`, [w.workspaceId, name, `p-${randomUUID().slice(0, 8)}`])).rows[0]!.id;
+    const capture = (projectId: string, at: Date) =>
+      harness.db().query(
+        `INSERT INTO answer_captures (workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version, normalizer_version, content_hash, raw_object_key, response_excerpt)
+         VALUES ($1,$2,gen_random_uuid(),gen_random_uuid(),'chatgpt',$3,'api','v1','v1',decode('00','hex'),$4,'x')`,
+        [w.workspaceId, projectId, at.toISOString(), `raw/${randomUUID()}.json`],
+      );
+    const metric = (projectId: string, date: string) =>
+      harness.db().query("INSERT INTO metric_daily (workspace_id, project_id, engine_key, entity_type, entity_id, metric_date) VALUES ($1,$2,'chatgpt','brand',gen_random_uuid(),$3)", [w.workspaceId, projectId, date]);
+    // Starter keeps 90 days raw and 395 rollup days; the replaced plan (Business) kept 395 and 1095. The first purge is 10 days away.
+    const notBefore = new Date(Date.now() + 10 * DAYMS);
+    await harness.db().query("UPDATE workspaces SET retention_purge_not_before = $2, retention_deferred_raw_days = 395, retention_deferred_rollups_days = 1095 WHERE id = $1", [w.workspaceId, notBefore.toISOString()]);
+    return { ...w, project, capture, metric, notBefore };
+  }
+  const purge = async (a: Actor) => {
+    const res = await get(a, "/billing/retention-purge");
+    expect(res.statusCode, res.body).toBe(200);
+    return retentionPurgeResponseSchema.parse(dataOf(res));
+  };
+
+  it("STORY-096 AC3 · with no deferral in force the answer is null everywhere, never an empty list", async () => {
+    const { owner } = await newWorkspace("starter");
+    expect(await purge(owner)).toEqual({ purge_not_before: null, raw: null, rollups: null, attribution: null });
+  });
+
+  it("STORY-096 AC3 · a pending deferral lists, per project, what goes at the first purge: count, oldest, newest, the cutoff and both windows", async () => {
+    const w = await deferredWorkspace();
+    const site = await w.project("Acme Site");
+    const gone = await w.project("Old Blog", true);
+    const rawCutoff = new Date(w.notBefore.getTime() - 90 * DAYMS);
+    await w.capture(site, new Date(rawCutoff.getTime() - 40 * DAYMS));
+    await w.capture(site, new Date(rawCutoff.getTime() - 1 * DAYMS));
+    await w.capture(gone, new Date(rawCutoff.getTime() - 5 * DAYMS));
+    await w.capture(site, new Date(rawCutoff.getTime() + 1 * DAYMS)); // inside the new window: not named
+    const body = await purge(w.owner);
+    expect(body.purge_not_before).toBe(w.notBefore.toISOString());
+    expect(body.raw).toMatchObject({ from_days: 395, to_days: 90, cutoff: rawCutoff.toISOString(), total: 3 });
+    expect(body.raw!.projects.map((p) => [p.name, p.count])).toEqual([["Acme Site", 2], ["Old Blog (deleted project)", 1]]);
+    const siteLine = body.raw!.projects.find((p) => p.name === "Acme Site")!;
+    expect(siteLine.oldest).toBe(new Date(rawCutoff.getTime() - 40 * DAYMS).toISOString());
+    expect(siteLine.newest).toBe(new Date(rawCutoff.getTime() - 1 * DAYMS).toISOString());
+  });
+
+  it("STORY-096 AC3 · rollup DAYS (not rows) and attribution days are listed under the rollup window", async () => {
+    const w = await deferredWorkspace();
+    const site = await w.project("Acme Site");
+    const cutoffDay = new Date(w.notBefore.getTime() - 395 * DAYMS).toISOString().slice(0, 10);
+    const before = (n: number) => new Date(Date.parse(cutoffDay) - n * DAYMS).toISOString().slice(0, 10);
+    await w.metric(site, before(3));
+    await w.metric(site, before(3)); // a second row of the same day is still one day
+    await w.metric(site, before(1));
+    await w.metric(site, cutoffDay); // the cutoff day itself is kept
+    const body = await purge(w.owner);
+    expect(body.rollups).toMatchObject({ from_days: 1095, to_days: 395, total: 2 });
+    expect(body.rollups!.projects).toEqual([{ name: "Acme Site", count: 2, oldest: `${before(3)}T00:00:00.000Z`, newest: `${before(1)}T00:00:00.000Z` }]);
+    expect(body.attribution).toMatchObject({ to_days: 395, total: 0 });
+  });
+
+  it("STORY-096 AC3 · a lapsed deferral reads as none", async () => {
+    const w = await deferredWorkspace();
+    await harness.db().query("UPDATE workspaces SET retention_purge_not_before = now() - interval '1 second' WHERE id = $1", [w.workspaceId]);
+    expect((await purge(w.owner)).purge_not_before).toBeNull();
+  });
+
+  it("STORY-096 AC3 · the list is the same content the notice email carries: a recorded notice and this read agree on each project's count", async () => {
+    const { recordRetentionShortening } = await import("../../src/lib/billing/retention-shortening.js");
+    const { withTenantContext } = await import("../../src/tenancy/tenant-context.js");
+    const w = await newWorkspace("business");
+    await harness.db().query("UPDATE workspaces SET billing_email = 'b@example.com' WHERE id = $1", [w.workspaceId]);
+    const site = (await harness.db().query<{ id: string }>("INSERT INTO projects (workspace_id, name, slug, root_url, root_domain) VALUES ($1,'Acme Site','acme-site','https://e.test','e.test') RETURNING id", [w.workspaceId])).rows[0]!.id;
+    const cutoff = new Date(Date.now() + 15 * DAYMS - 90 * DAYMS);
+    for (const d of [40, 10, 1]) {
+      await harness.db().query(
+        `INSERT INTO answer_captures (workspace_id, project_id, run_id, prompt_id, engine_key, captured_at, capture_mode, adapter_version, normalizer_version, content_hash, raw_object_key)
+         VALUES ($1,$2,gen_random_uuid(),gen_random_uuid(),'chatgpt',$3,'api','v1','v1',decode('00','hex'),$4)`,
+        [w.workspaceId, site, new Date(cutoff.getTime() - d * DAYMS).toISOString(), `raw/${randomUUID()}.json`],
+      );
+    }
+    await harness.db().query("UPDATE workspaces SET plan_key = 'starter' WHERE id = $1", [w.workspaceId]);
+    const client = await pool.connect();
+    try {
+      await withTenantContext(client, { workspaceId: w.workspaceId, actorId: randomUUID() }, (tx) =>
+        recordRetentionShortening(tx, w.workspaceId, { fromPlanKey: "business", toPlanKey: "starter", requestId: "evt_x", actorUa: "operator:test" }),
+      );
+    } finally {
+      client.release();
+    }
+    const email = (await harness.db().query<{ text_body: string }>("SELECT text_body FROM downgrade_notices WHERE workspace_id = $1 AND kind = 'retention_shortened'", [w.workspaceId])).rows[0]!.text_body;
+    const body = await purge(w.owner);
+    expect(email).toContain("Acme Site: 3 captures");
+    expect(body.raw!.projects).toMatchObject([{ name: "Acme Site", count: 3 }]);
+    expect(body.raw!.total).toBe(3);
+  });
+
+  it("STORY-096 AC3 · owner and admin may read it; a manager and a viewer are 403 naming billing:read", async () => {
+    const w = await deferredWorkspace();
+    expect((await get(await actorIn(w.workspaceId, "admin"), "/billing/retention-purge")).statusCode).toBe(200);
+    for (const role of ["manager", "viewer"] as const) {
+      const res = await get(await actorIn(w.workspaceId, role), "/billing/retention-purge");
+      expect(res.statusCode).toBe(403);
+      expect(res.body).toContain("billing:read");
+    }
+  });
+
+  it("STORY-096 AC3 · tenant-isolated: another workspace's projects, counts and dates never appear", async () => {
+    const a = await deferredWorkspace();
+    const b = await deferredWorkspace();
+    const secret = await b.project("Rival Secret Project");
+    await b.capture(secret, new Date(b.notBefore.getTime() - 400 * DAYMS));
+    const res = await get(a.owner, "/billing/retention-purge");
+    expect(res.body).not.toContain("Rival Secret");
+    expect((await purge(a.owner)).raw!.total).toBe(0);
+    expect((await purge(b.owner)).raw!.total).toBe(1);
+  });
+
+  it("STORY-096 AC3 · the read is side-effect free and a no-op on an unshortened plan: a deferral whose replaced window is not longer lists nothing", async () => {
+    const w = await deferredWorkspace();
+    await harness.db().query("UPDATE workspaces SET retention_deferred_raw_days = 90, retention_deferred_rollups_days = 395 WHERE id = $1", [w.workspaceId]);
+    const body = await purge(w.owner);
+    expect(body).toMatchObject({ raw: null, rollups: null, attribution: null });
+    expect(body.purge_not_before).toBe(w.notBefore.toISOString());
   });
 });

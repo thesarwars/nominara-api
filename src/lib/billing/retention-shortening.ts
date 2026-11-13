@@ -205,6 +205,60 @@ async function attributionPurgeList(tx: ClientBase, workspaceId: string, cutoff:
   return r.rows.map((row) => ({ ...projectRef(row), count: Number(row.count), oldest: utcMidnightOf(row.oldest), newest: utcMidnightOf(row.newest) }));
 }
 
+/**
+ * The purge sections for a shortening from `from` to `to`, as of `purgeNotBefore` (a window's cutoff is that date minus the window). ONE builder: the notice
+ * email (recordRetentionShortening) and the in-app read (readPendingRetentionPurge) both come from here, so they cannot disagree about what goes.
+ */
+async function buildPurgeSections(
+  tx: ClientBase,
+  workspaceId: string,
+  purgeNotBefore: Date,
+  from: { readonly raw: RetentionWindow; readonly rollups: RetentionWindow },
+  to: { readonly raw: RetentionWindow; readonly rollups: RetentionWindow },
+): Promise<{ raw: PurgeListSection | null; rollups: PurgeListSection | null; attribution: PurgeListSection | null }> {
+  const cutoffFor = (window: RetentionWindow): Date => new Date(purgeNotBefore.getTime() - (window as number) * DAY_MS);
+  const raw: PurgeListSection | null = windowShortened(from.raw, to.raw)
+    ? { from: from.raw, to: to.raw, cutoff: cutoffFor(to.raw), projects: await rawPurgeList(tx, workspaceId, cutoffFor(to.raw)) }
+    : null;
+  const rollups: PurgeListSection | null = windowShortened(from.rollups, to.rollups)
+    ? { from: from.rollups, to: to.rollups, cutoff: cutoffFor(to.rollups), projects: await rollupPurgeList(tx, workspaceId, cutoffFor(to.rollups)) }
+    : null;
+  const attribution: PurgeListSection | null = rollups === null ? null : { ...rollups, projects: await attributionPurgeList(tx, workspaceId, rollups.cutoff) };
+  return { raw, rollups, attribution };
+}
+
+export interface PendingRetentionPurge {
+  readonly purgeNotBefore: Date;
+  readonly raw: PurgeListSection | null;
+  readonly rollups: PurgeListSection | null;
+  readonly attribution: PurgeListSection | null;
+}
+
+/**
+ * STORY-096 AC3 (decision 100(h)) - what the first purge of a deferral still in force will remove, per project: the notice email's content, readable
+ * any time. Inside the caller's tenant transaction; read-only. `null` when no deferral is in force (the date is strictly past, the boundary
+ * `resolveWorkspaceRetention` uses). The window being replaced is the one the deferral keeps (`retention_deferred_*_days`; a null there is "no limit"),
+ * the new one is the plan's own. A section is null when that window is not shorter.
+ */
+export async function readPendingRetentionPurge(tx: ClientBase, workspaceId: string, now: Date = new Date()): Promise<PendingRetentionPurge | null> {
+  const r = await tx.query<{ until: Date | null; deferred_raw: number | null; deferred_rollups: number | null; raw: unknown; rollups: unknown }>(
+    `SELECT w.retention_purge_not_before AS until, w.retention_deferred_raw_days AS deferred_raw, w.retention_deferred_rollups_days AS deferred_rollups,
+            p.entitlements->'retention.raw_captures_days'->'value' AS raw, p.entitlements->'retention.rollups_days'->'value' AS rollups
+       FROM workspaces w JOIN plans p ON p.key = w.plan_key WHERE w.id = $1`,
+    [workspaceId],
+  );
+  const row = r.rows[0];
+  if (row === undefined || row.until === null || row.until.getTime() < now.getTime()) return null;
+  const sections = await buildPurgeSections(
+    tx,
+    workspaceId,
+    row.until,
+    { raw: row.deferred_raw ?? "unlimited", rollups: row.deferred_rollups ?? "unlimited" },
+    { raw: row.raw as RetentionWindow, rollups: row.rollups as RetentionWindow },
+  );
+  return { purgeNotBefore: row.until, ...sections };
+}
+
 export interface RetentionShorteningInput {
   readonly fromPlanKey: string;
   readonly toPlanKey: string;
@@ -232,14 +286,10 @@ export async function recordRetentionShortening(tx: ClientBase, workspaceId: str
 
       const now = input.now ?? new Date();
       const purgeNotBefore = new Date(now.getTime() + RETENTION_FIRST_PURGE_DAYS * DAY_MS);
-      const cutoffFor = (window: RetentionWindow): Date => new Date(purgeNotBefore.getTime() - (window as number) * DAY_MS);
 
-      const raw: PurgeListSection | null = rawShortened ? { from: from.raw, to: to.raw, cutoff: cutoffFor(to.raw), projects: await rawPurgeList(tx, workspaceId, cutoffFor(to.raw)) } : null;
-      const rollups: PurgeListSection | null = rollupsShortened ? { from: from.rollups, to: to.rollups, cutoff: cutoffFor(to.rollups), projects: await rollupPurgeList(tx, workspaceId, cutoffFor(to.rollups)) } : null;
-      const sum = (s: PurgeListSection | null): number => (s === null ? 0 : s.projects.reduce((n, p) => n + p.count, 0));
+      const { raw, rollups, attribution } = await buildPurgeSections(tx, workspaceId, purgeNotBefore, from, to);
+      const sum = (s: PurgeListSection | null | undefined): number => (s === null || s === undefined ? 0 : s.projects.reduce((n, p) => n + p.count, 0));
       span.setAttributes({ "nominara.retention_notice.raw_captures": sum(raw), "nominara.retention_notice.rollup_days": sum(rollups) });
-
-      const attribution: PurgeListSection | null = rollups === null ? null : { ...rollups, projects: await attributionPurgeList(tx, workspaceId, rollups.cutoff) };
       span.setAttributes({ "nominara.retention_notice.attribution_days": sum(attribution) });
 
       const afterState = { raw_captures: sum(raw), rollup_days: sum(rollups), attribution_days: sum(attribution), purge_not_before: purgeNotBefore.toISOString() };

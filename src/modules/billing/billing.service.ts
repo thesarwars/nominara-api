@@ -1,6 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import type { ClientBase } from "pg";
-import { LEDGER_EXPORT_MAX_ROWS } from "../../../contracts/billing/index.js";
+import { LEDGER_EXPORT_MAX_ROWS, type RetentionPurgeResponse, type RetentionPurgeSection } from "../../../contracts/billing/index.js";
 import type {
   AutoTopupConfig,
   AutoTopupRequest,
@@ -25,6 +25,7 @@ import { limitValueFor, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
 import type { Page } from "../../api/pagination/page.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { isFeatureGranted } from "../../lib/entitlements/classification.js";
+import { readPendingRetentionPurge, type PurgeListSection } from "../../lib/billing/retention-shortening.js";
 import { readLedgerPage, toLedgerCsv } from "./credit-ledger.reader.js";
 
 // STORY-073 AC12 — api-specification.md §3: `GET /billing/wallet/ledger`,
@@ -294,6 +295,33 @@ export class BillingService {
       daily_lookups: dailyMeter("lookup"),
       daily_nlp_parses: dailyMeter("nlp_command"),
       daily_resets_at: nextUtcMidnight(new Date()),
+    };
+  }
+
+  /**
+   * STORY-096 AC3 (decision 100(h)) - `GET /v1/billing/retention-purge`: the per-project purge list of a pending retention-shortening deferral, built by the
+   * SAME builders as the notice email. Read-only, inside the request's tenant transaction (RLS keeps it to the caller's workspace); counts and dates only.
+   */
+  async retentionPurge(): Promise<RetentionPurgeResponse> {
+    const client = this.client();
+    const workspaceId = currentTenantStore()!.context.workspaceId;
+    const pending = await readPendingRetentionPurge(client, workspaceId);
+    const section = (s: PurgeListSection | null): RetentionPurgeSection | null =>
+      s === null
+        ? null
+        : {
+            from_days: typeof s.from === "number" ? s.from : null,
+            to_days: s.to as number,
+            cutoff: s.cutoff.toISOString(),
+            total: s.projects.reduce((n, p) => n + p.count, 0),
+            projects: s.projects.map((p) => ({ name: p.name, count: p.count, oldest: p.oldest.toISOString(), newest: p.newest.toISOString() })),
+          };
+    incrementCounter("nominara_billing_retention_purge_read_total", { outcome: pending === null ? "none" : "pending" });
+    return {
+      purge_not_before: pending === null ? null : pending.purgeNotBefore.toISOString(),
+      raw: section(pending?.raw ?? null),
+      rollups: section(pending?.rollups ?? null),
+      attribution: section(pending?.attribution ?? null),
     };
   }
 
