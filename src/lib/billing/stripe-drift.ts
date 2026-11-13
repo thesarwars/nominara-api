@@ -1,6 +1,6 @@
 import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
-import type { FetchedStripeObject, StripeGateway } from "./stripe/stripe-gateway.js";
+import { StripeUpstreamError, type FetchedStripeObject, type StripeGateway } from "./stripe/stripe-gateway.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
 // STORY-075 AC11 / owner decision 2026-10-28 section 100(e) - the nightly provider-versus-local drift check.
@@ -24,6 +24,8 @@ export type DriftField =
   | "seats_purchased"
   | "projects_purchased"
   | "plan_key"
+  | "trial_ends_at"
+  | "billing_interval"
   | "remote_missing";
 
 export interface LocalStripeSubscription {
@@ -35,6 +37,8 @@ export interface LocalStripeSubscription {
   readonly currentPeriodStart: Date;
   readonly currentPeriodEnd: Date;
   readonly cancelAtPeriodEnd: boolean;
+  readonly trialEndsAt: Date | null;
+  readonly billingInterval: string;
   readonly seatsPurchased: number;
   readonly projectsPurchased: number;
 }
@@ -107,6 +111,12 @@ export function driftFields(local: LocalStripeSubscription, remote: FetchedStrip
     if (kindOf(line) === "extra_seat") seats += quantity;
     if (kindOf(line) === "extra_project") projects += quantity;
   }
+  // The reconciler writes both (`subscription-state.ts`): the trial end straight from `trial_end`, the interval from the plan item's price.
+  if ((local.trialEndsAt?.getTime() ?? null) !== seconds(raw.trial_end)) fields.push("trial_ends_at");
+  const price = planLine?.price;
+  const recurring = isRecord(price) && isRecord(price.recurring) ? price.recurring.interval : undefined;
+  const interval = recurring === "year" ? "annual" : recurring === "month" ? "monthly" : remote.metadata.billing_interval === "annual" ? "annual" : "monthly";
+  if (local.billingInterval !== interval) fields.push("billing_interval");
   if (local.seatsPurchased !== seats) fields.push("seats_purchased");
   if (local.projectsPurchased !== projects) fields.push("projects_purchased");
   return fields;
@@ -129,11 +139,16 @@ export async function runStripeDriftCheck(
     let fields: DriftField[] | null;
     try {
       fields = driftFields(row, await deps.gateway.fetchObject("subscription", row.stripeSubscriptionId));
-    } catch {
-      // One failed fetch (outage, rate limit) must not hide the rest of the estate; it is counted and the next night retries it.
+    } catch (error) {
+      // One failed fetch must not hide the rest of the estate; it is counted and the next night retries it. A Stripe/network failure
+      // (`StripeUpstreamError`) is told apart from a CODE BUG (anything else), which is logged at error level. The error CLASS NAME only:
+      // a message can carry a customer or subscription id.
       errors += 1;
-      incrementCounter("nominara_billing_stripe_drift_errors_total");
-      logger.warn({ event: "stripe_drift_fetch_failed", subscription_id: row.id, workspace_id: row.workspaceId });
+      const reason = error instanceof StripeUpstreamError ? "stripe" : "internal";
+      incrementCounter("nominara_billing_stripe_drift_errors_total", { reason });
+      const line = { event: "stripe_drift_fetch_failed", reason, error_class: error instanceof Error ? error.constructor.name : typeof error, subscription_id: row.id, workspace_id: row.workspaceId };
+      if (reason === "internal") logger.error(line);
+      else logger.warn(line);
       return;
     } finally {
       checked += 1;
@@ -166,7 +181,7 @@ export async function runStripeDriftCheck(
         afterId = page[page.length - 1]?.id ?? null;
         if (page.length < pageSize || afterId === null) break;
       }
-      span.setAttributes({ "nominara.stripe_drift.checked": checked, "nominara.stripe_drift.drifted": drifted, "nominara.stripe_drift.errors": errors });
+      span.setAttributes({ "nominara.stripe_drift.checked": checked, "nominara.stripe_drift.drifted": drifted, "nominara.stripe_drift.errors": errors, "nominara.stripe_drift.skipped": skipped });
     } catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });
       throw error;
@@ -175,7 +190,11 @@ export async function runStripeDriftCheck(
     }
   });
 
-  incrementCounter("nominara_billing_stripe_drift_runs_total");
+  // Errors on at least half of what was checked: the run did not really observe the estate (an outage or a rate limit). Distinct outcome and an
+  // error-level line for an alert to key on. The job does NOT fail: a retry would repeat the Stripe load that is probably the cause.
+  const degraded = checked > 0 && errors * 2 >= checked;
+  incrementCounter("nominara_billing_stripe_drift_runs_total", { outcome: degraded ? "degraded" : "ok" });
+  if (degraded) logger.error({ event: "stripe_drift_degraded", checked, errors });
   logger.log({ event: "stripe_drift_run", checked, drifted, errors, skipped });
   return { checked, drifted, errors, skipped };
 }

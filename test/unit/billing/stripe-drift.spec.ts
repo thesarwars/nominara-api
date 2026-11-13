@@ -21,6 +21,8 @@ function local(n: number, over: Partial<LocalStripeSubscription> = {}): LocalStr
     cancelAtPeriodEnd: false,
     seatsPurchased: 3,
     projectsPurchased: 2,
+    trialEndsAt: null,
+    billingInterval: "monthly",
     ...over,
   };
 }
@@ -138,6 +140,98 @@ describe("STORY-075 AC11 · nightly Stripe drift check", () => {
     expect(text).not.toContain("4900");
     expect(text).not.toContain("past_due");
     expect(text).not.toContain("growth");
+  });
+
+  it("[STORY-075 AC11] the period is read from the items when current_period_* is missing at the top level", async () => {
+    const planItem = { ...item("plan", 1), current_period_start: T0, current_period_end: T1 };
+    const raw = remoteRaw({ current_period_start: undefined, current_period_end: undefined, items: { data: [planItem, item("extra_seat", 2), item("extra_project", 2)] } });
+    put(1, raw);
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual([]);
+    gateway.objects.clear();
+    put(1, { ...raw, items: { data: [{ ...planItem, current_period_end: T1 + 86_400 }, item("extra_seat", 2), item("extra_project", 2)] } });
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual(["current_period_end"]);
+    metrics.length = 0;
+    gateway.objects.clear();
+    put(1, { ...raw, items: { data: [{ ...planItem, current_period_start: T0 + 86_400 }, item("extra_seat", 2), item("extra_project", 2)] } });
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual(["current_period_start"]);
+  });
+
+  it("[STORY-075 AC11] a null cancel_at_period_end is read as false, as the reconciler does", async () => {
+    put(1, remoteRaw({ cancel_at_period_end: null }));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual([]);
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1, { cancelAtPeriodEnd: true })]), gateway });
+    expect(driftMetrics()).toEqual(["cancel_at_period_end"]);
+  });
+
+  it("[STORY-075 AC11] an incomplete remote and a remote with no plan_key are skipped, not reported", async () => {
+    put(1, remoteRaw({ status: "incomplete" }));
+    gateway.putObject("subscription", "sub_2", {}, remoteRaw());
+    const result = await runStripeDriftCheck({ loadPage: pagesOf([local(1), local(2)]), gateway });
+    expect(result).toMatchObject({ checked: 2, drifted: 0, skipped: 2 });
+    expect(driftMetrics()).toEqual([]);
+  });
+
+  it("[STORY-075 AC11] an unrecognised remote status reports status", async () => {
+    put(1, remoteRaw({ status: "some_future_status" }));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual(["status"]);
+  });
+
+  it("[STORY-075 AC11] an ended remote with a paid local row reports plan_key (and status is clean)", async () => {
+    put(1, remoteRaw({ status: "canceled" }));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1, { planKey: "growth", status: "active" })]), gateway });
+    expect(driftMetrics()).toContain("plan_key");
+    expect(driftMetrics()).not.toContain("status");
+  });
+
+  it("[STORY-075 AC11] trial_ends_at and billing_interval are compared, as the reconciler writes both", async () => {
+    put(1, remoteRaw({ trial_end: T1 }));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual(["trial_ends_at"]);
+    metrics.length = 0;
+    gateway.objects.clear();
+    put(1, remoteRaw({ items: { data: [{ ...item("plan", 1), price: { recurring: { interval: "year" }, product: { metadata: { nominara_kind: "plan" } } } }, item("extra_seat", 2), item("extra_project", 2)] } }));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(driftMetrics()).toEqual(["billing_interval"]);
+  });
+
+  it("[STORY-075 AC11] a code bug (TypeError) is kept apart from a Stripe error: distinct reason, class name only, never the message", async () => {
+    vi.spyOn(gateway, "fetchObject").mockRejectedValue(new TypeError("secret detail cus_123"));
+    const result = await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(result.errors).toBe(1);
+    const reasons = metrics.filter((m) => m.metric === "nominara_billing_stripe_drift_errors_total").map((m) => (m as { reason?: string }).reason);
+    expect(reasons).toEqual(["internal"]);
+    const text = JSON.stringify(logs);
+    expect(text).toContain("TypeError");
+    expect(text).not.toContain("secret detail");
+    metrics.length = 0;
+    vi.spyOn(gateway, "fetchObject").mockRejectedValue(new StripeUpstreamError(503));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1)]), gateway });
+    expect(metrics.filter((m) => m.metric === "nominara_billing_stripe_drift_errors_total").map((m) => (m as { reason?: string }).reason)).toEqual(["stripe"]);
+  });
+
+  it("[STORY-075 AC11] errors on at least half the checked rows mark the run degraded (error log, outcome label) and do not throw", async () => {
+    put(2);
+    const real = gateway.fetchObject.bind(gateway);
+    vi.spyOn(gateway, "fetchObject").mockImplementation((kind, id) => (id === "sub_1" ? Promise.reject(new StripeUpstreamError(429)) : real(kind, id)));
+    const errorSpy = vi.spyOn(Logger.prototype, "error");
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1), local(2)]), gateway });
+    expect(metrics.filter((m) => m.metric === "nominara_billing_stripe_drift_runs_total").map((m) => (m as { outcome?: string }).outcome)).toEqual(["degraded"]);
+    expect(JSON.stringify(errorSpy.mock.calls)).toContain("stripe_drift_degraded");
+  });
+
+  it("[STORY-075 AC11] under half errored, or nothing checked, is a normal run", async () => {
+    put(2);
+    put(3);
+    const real = gateway.fetchObject.bind(gateway);
+    vi.spyOn(gateway, "fetchObject").mockImplementation((kind, id) => (id === "sub_1" ? Promise.reject(new StripeUpstreamError(503)) : real(kind, id)));
+    await runStripeDriftCheck({ loadPage: pagesOf([local(1), local(2), local(3)]), gateway });
+    await runStripeDriftCheck({ loadPage: pagesOf([]), gateway });
+    expect(metrics.filter((m) => m.metric === "nominara_billing_stripe_drift_runs_total").map((m) => (m as { outcome?: string }).outcome)).toEqual(["ok", "ok"]);
   });
 
   it("[STORY-075 AC11] the check has no write path: the gateway is only ever asked to fetch", async () => {
