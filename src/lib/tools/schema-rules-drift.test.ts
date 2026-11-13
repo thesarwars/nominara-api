@@ -78,7 +78,7 @@ describe("STORY-083 AC5 (85c) - the browser rule copy's drift check, API half", 
   it("regenerates the corpus when asked", async () => {
     if (process.env.UPDATE_SCHEMA_RULES_CORPUS !== "1") return;
     const cases = await Promise.all(CASES.map(async (c) => ({ id: c.id, paste: c.paste, findings: await engineFindings(c.paste) })));
-    writeFileSync(CORPUS_PATH, `${JSON.stringify({ version: 1, compared: ["rule_code", "severity"], cases }, null, 2)}\n`);
+    writeFileSync(CORPUS_PATH, JSON.stringify({ version: 1, compared: ["rule_code", "severity"], cases }, null, 2) + "\n");
   });
 
   it("AC5 - every paste in the committed corpus yields, in the engine, exactly the findings the corpus records", async () => {
