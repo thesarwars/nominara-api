@@ -5,7 +5,7 @@ import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenLis
 import { EntitlementExceededError, NotFoundError, ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
-import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { writeNotification } from "../../lib/notifications/writer.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { hash as argon2idHash } from "../../lib/crypto/argon2id.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -439,13 +439,25 @@ export class ShareTokensService {
     );
     // FR-AGY-01o — the FIRST view notifies the agency. "First" is decided by the same atomic UPDATE that took the view
     // (the row lock serialises parallel mints, so exactly one of them sees view_count = 1), and the notification commits
-    // or rolls back with it. In-app only (the column default): email is deferred. No visitor address, agent or secret.
+    // or rolls back with it. In-app and an immediate email through the notification outbox (relayed by the notify sweep). No visitor address, agent or secret.
     const taken = updated.rows[0];
     if (taken !== undefined && taken.view_count === 1) {
-      await client.query(
-        `INSERT INTO notifications (id, workspace_id, kind, severity, title, payload)
-         VALUES ($1, $2, 'portal.first_view', 'info', $3, $4::jsonb)`,
-        [uuidV7(), workspaceId, `${taken.label} was opened for the first time`, JSON.stringify({ share_token_id: id })],
+      await writeNotification(
+        client,
+        {
+          workspaceId,
+          projectId: null,
+          userId: null,
+          kind: "portal.first_view",
+          severity: "info",
+          title: `${taken.label} was opened for the first time`,
+          body: null,
+          // One per token for its life: a redelivered or retried mint writes nothing a second time.
+          eventKey: `portal.first_view:${id}`,
+          facts: { share_token_id: id },
+          emailNow: true,
+        },
+        { relayOnly: true },
       );
       incrementCounter("nominara_portal_first_view_notifications_total", {});
       this.logger.log({ message: "portal first view notified", workspace_id: workspaceId, share_token_id: id });
