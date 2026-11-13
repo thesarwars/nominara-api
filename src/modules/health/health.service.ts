@@ -126,15 +126,22 @@ export class HealthService implements OnModuleDestroy {
   async projectEngineHealth(projectId: string): Promise<ProjectEngineHealthResponse> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("projectEngineHealth requires an active tenant context");
+    const found = await store.client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL", [projectId]);
+    if (found.rowCount === 0) throw new NotFoundError({ message: "no such project" });
+    // The entitled set WITHOUT the view's `status = 'active'` filter (project_entitled_engines drops an engine the moment the ladder marks it `degraded`, which is
+    // exactly when the pip must name it): the plan floor and the project's override are the view's own tests, `degraded` engines stay listed. PROVISIONAL.
     const enabled = await store.client.query<{ engine_key: string }>(
-      `SELECT pe.engine_key
+      `SELECT e.key AS engine_key
          FROM projects p
-         LEFT JOIN project_entitled_engines pe ON pe.project_id = p.id AND pe.enabled = true
-        WHERE p.id = $1 AND p.deleted_at IS NULL`,
+         JOIN workspaces w         ON w.id = p.workspace_id
+         JOIN plans workspace_plan ON workspace_plan.key = w.plan_key
+         JOIN engines e            ON e.status IN ('active', 'degraded')
+         JOIN plans engine_plan    ON engine_plan.key = e.min_plan_key AND engine_plan.sort_order <= workspace_plan.sort_order
+         LEFT JOIN project_engines ov ON ov.project_id = p.id AND ov.engine_key = e.key
+        WHERE p.id = $1 AND p.deleted_at IS NULL AND COALESCE(ov.enabled, true)`,
       [projectId],
     );
-    if (enabled.rows.length === 0) throw new NotFoundError({ message: "no such project" });
-    const keys = new Set(enabled.rows.flatMap((row) => (row.engine_key === null ? [] : [row.engine_key])));
+    const keys = new Set(enabled.rows.map((row) => row.engine_key));
     const status = await this.engineStatus();
     incrementCounter("nominara_health_project_engine_health_reads_total");
     const reported = new Map(status.engines.map((engine) => [engine.engine_key, engine]));

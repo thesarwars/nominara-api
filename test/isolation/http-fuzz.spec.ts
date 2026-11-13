@@ -119,7 +119,13 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     return `${ACCESS_COOKIE_NAME}=${entered.accessToken}`;
   }
 
-  const get = (cookie: string, path: string) => app.inject({ method: "GET", url: apiUrl(path), headers: { cookie } });
+  // The workspace-scoped `reads` bucket is shared by every member of a tenant (burst 60, refilling 1,200/min, api-specification §12). The limits stay as they are:
+  // each request waits PACE_MS, which keeps the whole replay under the refill rate, so a 429 means a real defect rather than the suite outrunning the limiter.
+  const PACE_MS = 70;
+  const get = async (cookie: string, path: string) => {
+    await new Promise((resolve) => setTimeout(resolve, PACE_MS));
+    return app.inject({ method: "GET", url: apiUrl(path), headers: { cookie } });
+  };
 
   /** Fills each `:param` of a route from `pick(index)`; the identifiers used are returned so a body that merely echoes one can be told from a leak. */
   function fill(route: Replayable, pick: (index: number) => string): { url: string; used: string[] } {
@@ -259,7 +265,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     expect(failures, `seed=${String(SEED)}\n${failures.slice(0, 10).join("\n")}`).toEqual([]);
     // A floor, so a replay that "passes" because nothing ran (or everything errored upstream) cannot stand.
     expect(refused).toBeGreaterThanOrEqual(Math.floor(REPLAYS * 0.9));
-  }, 280_000);
+  }, 400_000);
 
   it("the judge can fail: a route that answers 200 for a foreign id is reported (negative control on the replay judgement)", () => {
     // The judgement above is inline; this restates its two cheapest branches on a planted response so a refactor that drops them is seen.
@@ -273,7 +279,10 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
   // ISO-13, the live half: what the traffic above actually left in the cache. Every authenticated request above touched rate-limit and session state.
   it("STORY-012 AC8 · ISO-13 live: every key in the cache the traffic wrote is namespaced {env}:{ws}:… (or the global exception), and no key names two tenants", async () => {
     // Tenant A's own admin reads its own workspace, so A has keys of its own to be judged (the replays above ran only as B).
-    for (let i = 0; i < 3; i++) expect((await get(aCookie, `/workspaces/${a.workspaceId}`)).statusCode).toBeLessThan(500);
+    for (let i = 0; i < 3; i++) {
+      const own = await get(aCookie, `/workspaces/${a.workspaceId}`);
+      expect(own.statusCode, `A's own read: ${own.body.slice(0, 200)}`).toBe(200);
+    }
     const redis = new Redis(cacheValkey.url);
     try {
       const keys: string[] = [];

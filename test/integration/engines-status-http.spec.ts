@@ -107,8 +107,12 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
     const projectId = await project(actor.workspaceId);
     const enabled = (await harness.db().query<{ engine_key: string }>("SELECT engine_key FROM project_entitled_engines WHERE project_id = $1 AND enabled = true ORDER BY engine_key", [projectId])).rows.map((r) => r.engine_key);
     expect(enabled.length, "the plan entitles at least one engine, or this test proves nothing").toBeGreaterThan(0);
-    const [open, degraded] = enabled;
-    await harness.db().query("UPDATE engines SET status = 'degraded' WHERE key = $1", [degraded]);
+    // Dispatching engines only can have a breaker episode or a ladder-degraded catalog state; a registry-disabled one has no adapter and reads `unavailable`.
+    const dispatching = enabled.filter((key) => (ACTIVE_ENGINE_KEYS as readonly string[]).includes(key));
+    expect(dispatching.length, "need a dispatching engine to open a breaker on").toBeGreaterThan(0);
+    const open = dispatching[0]!;
+    const degraded = dispatching[1];
+    if (degraded !== undefined) await harness.db().query("UPDATE engines SET status = 'degraded' WHERE key = $1", [degraded]);
     const before = Date.now();
     await new EngineBreakerRegistry(redis).for(open as never).recordOutcome("quota_exhausted");
 
@@ -116,12 +120,15 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
     expect(response.statusCode, response.body).toBe(200);
     const body = dataOf<ProjectEngineHealthResponse>(response);
     expect(projectEngineHealthResponseSchema.safeParse(body).success).toBe(true);
+    // A ladder-degraded engine leaves project_entitled_engines (it is `active`-only) but must stay listed: that is when the pip names it.
     expect(body.map((e) => e.engine_key).sort()).toEqual([...enabled].sort());
     const byKey = new Map(body.map((e) => [e.engine_key, e]));
-    expect(byKey.get(open!)!.state).toBe("unavailable");
-    expect(Date.parse(byKey.get(open!)!.since!)).toBeGreaterThanOrEqual(before - 1_000);
-    if (degraded !== open) expect(byKey.get(degraded!)).toMatchObject({ state: "degraded", since: null });
-    for (const entry of body.filter((e) => e.engine_key !== open && e.engine_key !== degraded)) expect(entry).toMatchObject({ state: "healthy", since: null });
+    expect(byKey.get(open)!.state).toBe("unavailable");
+    expect(Date.parse(byKey.get(open)!.since!)).toBeGreaterThanOrEqual(before - 1_000);
+    if (degraded !== undefined) expect(byKey.get(degraded)).toMatchObject({ state: "degraded", since: null });
+    for (const entry of body.filter((e) => e.engine_key !== open && e.engine_key !== degraded)) {
+      expect(entry).toMatchObject({ state: dispatching.includes(entry.engine_key) ? "healthy" : "unavailable", since: null });
+    }
   });
 
   it("STORY-090 · another workspace's project is a 404, an unknown id is a 404, and no session is a 401", async () => {
