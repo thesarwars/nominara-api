@@ -69,14 +69,7 @@ export async function finalizeRun(tx: ClientBase, workspaceId: string, progress:
 async function notifyManualRunFinished(tx: ClientBase, workspaceId: string, progress: RunProgress, status: FinalRunStatus, triggeredBy: string | null, refunded: number): Promise<void> {
   if (progress.trigger !== "manual" || triggeredBy === null) return;
   const title = status === "completed" ? "Your scan is ready" : status === "partial" ? "Your scan finished with gaps" : "Your scan captured nothing";
-  const body =
-    status === "completed"
-      ? `${String(progress.captured)} answers captured live, ${String(progress.skipped)} already fresh.`
-      : status === "partial"
-        ? `${String(progress.captured)} answers captured live, ${String(progress.skipped)} already fresh, ${String(progress.failed)} could not be captured.`
-        : refunded > 0
-          ? "No engine returned an answer. The credits were refunded in full."
-          : "No engine returned an answer.";
+  const body = runFinishedBody(status, progress, refunded);
   // A NOTIFICATION IS NEVER ALLOWED TO UNDO THE RUN. The status and the settlement above commit with this transaction, so a failure here (the insert, or the deep-link parse)
   // must not abort it: the write runs inside a SAVEPOINT, and on any error only the savepoint is rolled back. The failure is logged (ids only) and counted, never swallowed silently.
   await tx.query("SAVEPOINT run_completed_notify");
@@ -99,4 +92,12 @@ async function notifyManualRunFinished(tx: ClientBase, workspaceId: string, prog
     incrementCounter("nominara_capture_run_notify_failures_total", { trigger: "manual" });
     logger.warn({ event: "run.completed.notify_failed", workspace_id: workspaceId, run_id: progress.runId, project_id: progress.projectId, error_name: error instanceof Error ? error.name : "unknown" });
   }
+}
+
+/** The notification body for a finished manual run: the work done (live versus already fresh, never billing arithmetic) and, when the settlement handed credits back, that it did. PROVISIONAL copy. */
+export function runFinishedBody(status: FinalRunStatus, progress: Pick<RunProgress, "captured" | "skipped" | "failed">, refunded: number): string {
+  const work = `${String(progress.captured)} answers captured live, ${String(progress.skipped)} already fresh`;
+  if (status === "completed") return `${work}.`;
+  if (status === "partial") return `${work}, ${String(progress.failed)} could not be captured.${refunded > 0 ? " Some credits were refunded." : ""}`;
+  return refunded > 0 ? "No engine returned an answer. The credits were refunded in full." : "No engine returned an answer.";
 }
