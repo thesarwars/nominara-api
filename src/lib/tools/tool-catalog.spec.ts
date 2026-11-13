@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { toolCatalogResponseSchema, TOOL_KEYS } from "../../../contracts/tools/index.js";
 import { AUX_AUDITS_ENTITLEMENT } from "../aux/onboarding-audit.js";
+import { entitlementGranted } from "../entitlements/granted.js";
 import { buildToolCatalog, TOOL_GATES, type ToolGates } from "./tool-catalog.js";
 
 // STORY-078 AC23 / scenario 23 - "Read the tool catalog on a plan missing a tool: a disabled descriptor naming the unlocking plan".
@@ -34,6 +35,20 @@ describe("STORY-078 · scenario 23 - the tool catalog", () => {
     const gates: ToolGates = { tools: { visibility_scan: "tools.visibility_scan" }, modes: {} };
     for (const entitlements of [{}, { "tools.visibility_scan": granted(null) }, { "tools.visibility_scan": granted(false) }]) {
       expect(buildToolCatalog({ entitlements, gates, unlockers }).tools.find((t) => t.tool_key === "visibility_scan")!.enabled).toBe(false);
+    }
+  });
+
+  it("scenario 23 - fail closed: only true, a number above 0, or a non-empty string other than none / none_tools_only is granted", () => {
+    for (const value of [true, 1, 450, 0.5, "unlimited", "1_per_project_per_month", "configurable"]) expect(entitlementGranted(value), String(value)).toBe(true);
+    for (const value of [false, null, undefined, 0, -1, "", "none", "none_tools_only", {}, [], { value: true }]) expect(entitlementGranted(value), JSON.stringify(value) ?? "undefined").toBe(false);
+  });
+
+  it("scenario 23 - a gated tool whose entitlement is 0, none or none_tools_only is DISABLED, not enabled", () => {
+    const gates: ToolGates = { tools: { visibility_scan: "tools.visibility_scan" }, modes: {} };
+    for (const value of [0, "none", "none_tools_only"]) {
+      const scan = buildToolCatalog({ entitlements: { "tools.visibility_scan": granted(value) }, gates, unlockers }).tools.find((t) => t.tool_key === "visibility_scan")!;
+      expect(scan.enabled, String(value)).toBe(false);
+      expect(scan.unlocked_by_plan).toEqual(growth);
     }
   });
 

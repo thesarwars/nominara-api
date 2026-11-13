@@ -8,6 +8,7 @@ import {
   type ToolKey,
 } from "../../../contracts/tools/index.js";
 import { AUX_AUDITS_ENTITLEMENT } from "../aux/onboarding-audit.js";
+import { entitlementGranted } from "../entitlements/granted.js";
 
 // STORY-078 AC23 - the tool catalog for a plan, as a pure function of the plan's resolved entitlements.
 //
@@ -16,8 +17,8 @@ import { AUX_AUDITS_ENTITLEMENT } from "../aux/onboarding-audit.js";
 // `requireAuxAudits` enforces on the route, so the catalog and the 403 cannot disagree). When a per-tool key is added to the plans reference, the entry goes in
 // `tools` and the descriptor disables with no other change.
 //
-// A tool the plan lacks is a disabled descriptor naming the lowest plan that grants it, never a missing entry. An entitlement the plan does not state is NOT granted
-// (fail closed), the same reading as `auxAuditsIncluded`.
+// A tool the plan lacks is a disabled descriptor naming the lowest plan that grants it, never a missing entry. Whether a plan grants an entitlement is `entitlementGranted` (fail closed:
+// true, a number above 0, or a non-empty string other than "none" / "none_tools_only"), the one reading `auxAuditsIncluded`, the plan gate and the unlocking-plan SQL share.
 
 export interface ToolGates {
   /** A whole tool gated on a boolean-or-quota entitlement key. */
@@ -38,10 +39,7 @@ export interface UnlockPlan {
 
 type Entitlements = Readonly<Record<string, { readonly value: unknown } | undefined>>;
 
-const granted = (entitlements: Entitlements, key: string): boolean => {
-  const value = entitlements[key]?.value;
-  return !(value === false || value === null || value === undefined);
-};
+const granted = (entitlements: Entitlements, key: string): boolean => entitlementGranted(entitlements[key]?.value);
 
 const PRICING: Readonly<Record<ToolKey, ToolCatalogEntry["pricing"]>> = {
   visibility_scan: { rate: "flat", credits: VISIBILITY_SCAN_CREDITS },

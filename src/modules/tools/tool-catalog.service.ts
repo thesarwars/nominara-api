@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import type { ToolCatalogResponse } from "../../../contracts/tools/index.js";
+import { grantedValueSql } from "../../lib/entitlements/granted.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { buildToolCatalog, gatedEntitlementKeys, TOOL_GATES, type UnlockPlan } from "../../lib/tools/tool-catalog.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -19,9 +20,9 @@ export class ToolCatalogService {
     const resolved = await this.entitlements.resolveForWorkspace(tenant.workspaceId);
     const unlockers = new Map<string, UnlockPlan>();
     for (const key of gatedEntitlementKeys(TOOL_GATES)) {
-      // Fail closed on what counts as granted: false, null and an absent entry all mean no (the same reading `auxAuditsIncluded` has).
+      // The grant predicate is the TypeScript one (`entitlementGranted`) in SQL, fail closed. A hidden plan (`is_public = false`) is never named: the customer cannot buy it.
       const lowest = await store.client.query<{ key: string; display_name: string }>(
-        `SELECT key, display_name FROM plans WHERE (entitlements -> $1 -> 'value') NOT IN ('false'::jsonb, 'null'::jsonb) ORDER BY sort_order ASC LIMIT 1`,
+        `SELECT key, display_name FROM plans WHERE is_public AND ${grantedValueSql("(entitlements -> $1 -> 'value')")} ORDER BY sort_order ASC LIMIT 1`,
         [key],
       );
       const row = lowest.rows[0];
