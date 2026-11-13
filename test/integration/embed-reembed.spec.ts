@@ -565,7 +565,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
   });
 
   it("a worker whose provider is NOT the operator's target model refuses the stage job loudly: unrecoverable, no provider call, nothing staged, a log line and a counter", async () => {
-    const id = await addPrompt("mismatch", OLD);
+    const id = await addPrompt("confidential wording", OLD);
     const provider = new NamedProvider("worker-model");
     const errors = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
     counted.length = 0;
@@ -576,7 +576,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
       expect(counted.filter((c) => c.name === "nominara_embed_stage_model_mismatch_total")).toEqual([{ name: "nominara_embed_stage_model_mismatch_total", labels: { table: "tracked_prompts" } }]);
       const line = errors.mock.calls.map((call) => call[0]).find((entry) => (entry as { event?: string }).event === "embed.batch.stage_model_mismatch") as Record<string, unknown>;
       expect(line).toMatchObject({ workspace_id: workspaceId, target_model: NEW, worker_model: "worker-model" });
-      expect(JSON.stringify(line)).not.toContain("mismatch");
+      expect(JSON.stringify(line)).not.toContain("confidential");
     } finally {
       errors.mockRestore();
     }
