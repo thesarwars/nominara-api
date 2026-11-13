@@ -956,7 +956,7 @@ describe("STORY-047 - topic.cluster", () => {
     const embed = createEmbedBatchHandler(embedContext, { provider: new ScriptedProvider(scripted) });
     const embedEntry = QUEUE_TOPOLOGY.find((e) => e.name === "embed.batch")!;
     const process = createJobProcessor(embedEntry, { keys: KEYS, getClient: () => pool.connect(), releaseClient: (c) => (c as PoolClient).release(), process: embed });
-    const stage = (ids: string[]) => process({ data: signQueueJobPayload({ workspaceId, kid: "k1", table: "tracked_prompts", ids, stage: true }, KEYS.current.key) } as unknown as Job);
+    const stage = (ids: string[]) => process({ data: signQueueJobPayload({ workspaceId, kid: "k1", table: "tracked_prompts", ids, stage: true, targetModel: "new-model-1536" }, KEYS.current.key) } as unknown as Job);
     const all = groups.flat();
     const noEnqueue = () => Promise.resolve();
 

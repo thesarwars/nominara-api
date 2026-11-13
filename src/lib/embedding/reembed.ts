@@ -164,8 +164,8 @@ async function reembedOnce(options: ReembedOptions): Promise<ReembedSummary> {
       if (bufferWorkspace === null || buffer.length === 0) return;
       const workspaceId = bufferWorkspace;
       for (const ids of splitIdsIntoJobs(buffer)) {
-        const key = embedBatchKey(discovery.table, ids, discovery.stage);
-        const payload: Record<string, unknown> = discovery.stage ? { table: discovery.table, ids, stage: true } : { table: discovery.table, ids };
+        const key = embedBatchKey(discovery.table, ids, discovery.stage ? model : undefined);
+        const payload: Record<string, unknown> = discovery.stage ? { table: discovery.table, ids, stage: true, targetModel: model } : { table: discovery.table, ids };
         try {
           await enqueue("embed.batch", workspaceId, payload, key);
           jobs[discovery.name] += 1;

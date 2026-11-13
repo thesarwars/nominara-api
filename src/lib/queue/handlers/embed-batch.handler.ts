@@ -94,6 +94,20 @@ export class EmbedBatchFailedError extends Error {
   }
 }
 
+/**
+ * STORY-186 - a stage job whose target model is not the model THIS worker's provider announces. Staging would write a vector under a model the
+ * operator did not ask for and the project would never complete, so the job is refused, once, loudly (an UnrecoverableError: no retry ladder).
+ */
+export class StageModelMismatchError extends UnrecoverableError {
+  constructor(
+    readonly targetModel: string,
+    readonly workerModel: string,
+  ) {
+    super("embed.batch stage job refused: the worker's embedding model is not the operator's target model");
+    this.name = "StageModelMismatchError";
+  }
+}
+
 export class EmbedBatchPermanentError extends UnrecoverableError {
   readonly spentTokens: number;
   readonly retryable: boolean = false;
@@ -302,6 +316,11 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
     const payload = payloadOf(job);
     const { model, dimensions } = providerFor();
     const sql = sqlFor(payload);
+    if (payload.stage === true && payload.targetModel !== model) {
+      incrementCounter("nominara_embed_stage_model_mismatch_total", { table: payload.table });
+      logger.error({ event: "embed.batch.stage_model_mismatch", workspace_id: payload.workspaceId, table: payload.table, target_model: payload.targetModel ?? null, worker_model: model, requested: payload.ids.length });
+      throw new StageModelMismatchError(payload.targetModel ?? "", model);
+    }
     const ids = [...new Set(payload.ids.map((id) => id.toLowerCase()))].sort();
 
     // L7 FIRST: reuse a stored vector for unchanged content, so the provider never sees it.

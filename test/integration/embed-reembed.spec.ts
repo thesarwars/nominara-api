@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import type { Job } from "bullmq";
+import { Logger } from "@nestjs/common";
+import { UnrecoverableError, type Job } from "bullmq";
 import { Client, Pool, type PoolClient } from "pg";
 import { trace } from "@opentelemetry/api";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
-import { embedBatchPayloadSchema } from "../../src/lib/embedding/embed-batch.js";
+import { embedBatchKey, embedBatchPayloadSchema } from "../../src/lib/embedding/embed-batch.js";
 import { cellKey, probeSemanticReuse } from "../../src/lib/capture/l2-semantic-reuse.js";
 import { promoteProject } from "../../src/lib/embedding/reembed-promote.js";
 import { runReembed, type ReembedSummary } from "../../src/lib/embedding/reembed.js";
@@ -25,10 +26,15 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // The metric calls this spec asserts on (AC5). Everything else passes through to the real module.
 const observed: { name: string; value: number; labels: Record<string, string | number> }[] = [];
+const counted: { name: string; labels: Record<string, string> }[] = [];
 vi.mock("../../src/lib/telemetry/metrics.js", async () => {
   const actual = await vi.importActual<typeof import("../../src/lib/telemetry/metrics.js")>("../../src/lib/telemetry/metrics.js");
   return {
     ...actual,
+    incrementCounter: (name: string, labels: Record<string, string> = {}) => {
+      counted.push({ name, labels });
+      actual.incrementCounter(name, labels);
+    },
     observeValue: (name: string, value: number, labels: Record<string, string | number> = {}) => {
       observed.push({ name, value, labels });
       actual.observeValue(name, value, labels);
@@ -120,8 +126,8 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     return id;
   }
 
-  function stageJob(ids: string[], table: "tracked_prompts" | "semantic_nodes" = "tracked_prompts", ws = workspaceId): Job {
-    const payload = embedBatchPayloadSchema.parse({ workspaceId: ws, kid: "k1", table, ids, stage: true });
+  function stageJob(ids: string[], table: "tracked_prompts" | "semantic_nodes" = "tracked_prompts", ws = workspaceId, targetModel = NEW): Job {
+    const payload = embedBatchPayloadSchema.parse({ workspaceId: ws, kid: "k1", table, ids, stage: true, targetModel });
     return { data: signQueueJobPayload(payload, KEYS.current.key) } as unknown as Job;
   }
 
@@ -280,7 +286,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
 
   it("AC2 - a second model change mid-stage: vectors staged under the first target are re-staged, never promoted as the second", async () => {
     const id = await addPrompt("one", OLD);
-    await run(new NamedProvider("model-mid"), stageJob([id]));
+    await run(new NamedProvider("model-mid"), stageJob([id], "tracked_prompts", workspaceId, "model-mid"));
     expect(await promote(workspaceId, projectId, NEW), "staged under another target").toMatchObject({ status: "blocked" });
     const provider = new NamedProvider(NEW);
     await run(provider, stageJob([id]));
@@ -292,7 +298,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
 
   interface Enqueued {
     readonly workspaceId: string;
-    readonly payload: { table: string; ids: string[]; stage?: true };
+    readonly payload: { table: string; ids: string[]; stage?: true; targetModel?: string };
     readonly key: string;
   }
 
@@ -339,7 +345,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     const { sent, enqueue } = recorder();
     await reembed(enqueue);
     expect(sent).toHaveLength(1);
-    expect(sent[0]!.payload).toMatchObject({ table: "semantic_nodes", stage: true });
+    expect(sent[0]!.payload).toMatchObject({ table: "semantic_nodes", stage: true, targetModel: NEW });
   }, 60_000);
 
   it("AC1 - a row already under the target model, and a deleted row, are not enqueued", async () => {
@@ -545,4 +551,45 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     expect(text).toContain(workspaceId);
     expect(text).not.toContain("prompt number");
   }, 120_000);
+
+  // ---- the target model travels with a stage job (audit fix) -------------------------------------------------------------------
+
+  it("a stage job names its target model, and a direct job may not carry one; the key differs per target model", () => {
+    const id = randomUUID();
+    const base = { workspaceId, kid: "k1", table: "tracked_prompts", ids: [id] };
+    expect(() => embedBatchPayloadSchema.parse({ ...base, stage: true })).toThrow();
+    expect(() => embedBatchPayloadSchema.parse({ ...base, targetModel: NEW })).toThrow();
+    expect(() => embedBatchPayloadSchema.parse({ ...base, stage: true, targetModel: NEW })).not.toThrow();
+    expect(embedBatchKey("tracked_prompts", [id], "model-a")).not.toBe(embedBatchKey("tracked_prompts", [id], "model-b"));
+    expect(embedBatchKey("tracked_prompts", [id], "model-a")).not.toBe(embedBatchKey("tracked_prompts", [id]));
+  });
+
+  it("a worker whose provider is NOT the operator's target model refuses the stage job loudly: unrecoverable, no provider call, nothing staged, a log line and a counter", async () => {
+    const id = await addPrompt("mismatch", OLD);
+    const provider = new NamedProvider("worker-model");
+    const errors = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+    counted.length = 0;
+    try {
+      await expect(run(provider, stageJob([id], "tracked_prompts", workspaceId, NEW))).rejects.toBeInstanceOf(UnrecoverableError);
+      expect(provider.calls, "no provider call, no spend").toHaveLength(0);
+      expect((await state("tracked_prompts", [id]))[0]).toMatchObject({ has_next: false, embedding_next_model: null, embedding_model: OLD });
+      expect(counted.filter((c) => c.name === "nominara_embed_stage_model_mismatch_total")).toEqual([{ name: "nominara_embed_stage_model_mismatch_total", labels: { table: "tracked_prompts" } }]);
+      const line = errors.mock.calls.map((call) => call[0]).find((entry) => (entry as { event?: string }).event === "embed.batch.stage_model_mismatch") as Record<string, unknown>;
+      expect(line).toMatchObject({ workspace_id: workspaceId, target_model: NEW, worker_model: "worker-model" });
+      expect(JSON.stringify(line)).not.toContain("mismatch");
+    } finally {
+      errors.mockRestore();
+    }
+  }, 60_000);
+
+  it("the operator command records its model in every stage job it enqueues, and not in a backfill job", async () => {
+    await manyPrompts(2, OLD);
+    await manyPrompts(2, null);
+    const { sent, enqueue } = recorder();
+    await reembed(enqueue);
+    const stage = sent.find((e) => e.payload.stage === true)!;
+    const backfill = sent.find((e) => e.payload.stage === undefined)!;
+    expect(stage.payload.targetModel).toBe(NEW);
+    expect(backfill.payload.targetModel).toBeUndefined();
+  }, 60_000);
 });

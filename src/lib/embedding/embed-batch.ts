@@ -25,11 +25,18 @@ export const embedBatchPayloadSchema = z
     // STORY-186 - a re-embed job: write the vector to `embedding_next` beside the served one instead of replacing it (migration 0211).
     // Only the two tables whose vector is replaced in place carry a staging column.
     stage: z.literal(true).optional(),
+    // STORY-186 - the model the OPERATOR's run is switching to, recorded on a stage job. The worker stages only when its own provider announces
+    // exactly this model; otherwise it refuses the job loudly (an operator/worker mismatch must be visible, not a project blocked for ever).
+    targetModel: z.string().min(1).optional(),
   })
   .strict()
   .refine((payload) => payload.stage !== true || payload.table === "tracked_prompts" || payload.table === "semantic_nodes", {
     message: "stage is only defined for tracked_prompts and semantic_nodes",
     path: ["stage"],
+  })
+  .refine((payload) => (payload.stage === true) === (payload.targetModel !== undefined), {
+    message: "a stage job names its targetModel, and only a stage job does",
+    path: ["targetModel"],
   });
 
 export type EmbedBatchPayload = z.infer<typeof embedBatchPayloadSchema>;
@@ -53,8 +60,9 @@ export function splitIdsIntoJobs(ids: readonly string[]): string[][] {
  * de-duplicated and SORTED before hashing. Without that, the same 96 rows in another order would be a second key and a second
  * spend, and replay-safety would be a coin flip.
  */
-export function embedBatchKey(table: EmbedTable, ids: readonly string[], stage = false): string {
+export function embedBatchKey(table: EmbedTable, ids: readonly string[], stageTargetModel?: string): string {
   const canonical = [...new Set(ids.map((id) => id.toLowerCase()))].sort();
-  // A stage job for the same rows is a different job from a direct one (it writes elsewhere), so it keys differently. A direct key is unchanged.
-  return `emb:${createHash("sha256").update([stage ? `${table}:stage` : table, ...canonical].join("\n")).digest("hex")}`;
+  // A stage job for the same rows is a different job from a direct one (it writes elsewhere), and from a stage job for another target model, so
+  // it keys differently. A direct key is unchanged.
+  return `emb:${createHash("sha256").update([stageTargetModel === undefined ? table : `${table}:stage:${stageTargetModel}`, ...canonical].join("\n")).digest("hex")}`;
 }
