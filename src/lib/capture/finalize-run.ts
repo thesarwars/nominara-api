@@ -1,6 +1,7 @@
 import type { ClientBase } from "pg";
 import { settleFinishedRunCredits } from "../credits/run-settlement.js";
 import { resolveRunOutcome } from "../engines/run-outcome.js";
+import { writeNotification } from "../notifications/writer.js";
 import type { RunProgress } from "./run-progress.js";
 
 // SCANFIX - the ONE place a run is moved to its terminal status, shared by the last
@@ -36,10 +37,10 @@ export async function finalizeRun(tx: ClientBase, workspaceId: string, progress:
   });
   const status: FinalRunStatus = outcome === "success" ? "completed" : outcome;
 
-  const finalised = await tx.query<{ finished_at: Date }>(
+  const finalised = await tx.query<{ finished_at: Date; triggered_by: string | null }>(
     `UPDATE capture_runs SET status = $2, finished_at = now()
       WHERE id = $1 AND status IN ('queued','running')
-      RETURNING finished_at`,
+      RETURNING finished_at, triggered_by`,
     [progress.runId, status],
   );
   const row = finalised.rows[0];
@@ -50,5 +51,38 @@ export async function finalizeRun(tx: ClientBase, workspaceId: string, progress:
     runId: progress.runId,
     deliveredCells: progress.captured + progress.skipped,
   });
+  await notifyManualRunFinished(tx, workspaceId, progress, status, row.triggered_by, settlement.refunded);
   return { status, finishedAt: row.finished_at, refunded: settlement.refunded };
+}
+
+/**
+ * STORY-089 (FR-CMD-06) - "a long-running command ... appears in the notification centre on completion". The command bar's long-running command is a manual deep scan, so a
+ * finished MANUAL run writes one in-app notification for the member who started it. Written here, in the transaction that finalised the run, so the notification and the
+ * status commit together and the run's single finalisation is the single producer (the event key is a second guard). A scheduled run was nobody's command, and a manual
+ * run with no member behind it (`triggered_by` null) has no one to tell: both write nothing. PROVISIONAL: the story names no notification kind, copy or severity; this is the
+ * most conservative reading (in-app only, never an email, warning only when nothing was captured).
+ */
+async function notifyManualRunFinished(tx: ClientBase, workspaceId: string, progress: RunProgress, status: FinalRunStatus, triggeredBy: string | null, refunded: number): Promise<void> {
+  if (progress.trigger !== "manual" || triggeredBy === null) return;
+  const title = status === "completed" ? "Your scan is ready" : status === "partial" ? "Your scan finished with gaps" : "Your scan captured nothing";
+  const body =
+    status === "completed"
+      ? `${String(progress.captured)} answers captured live, ${String(progress.skipped)} already fresh.`
+      : status === "partial"
+        ? `${String(progress.captured)} answers captured live, ${String(progress.skipped)} already fresh, ${String(progress.failed)} could not be captured.`
+        : refunded > 0
+          ? "No engine returned an answer. The credits were refunded in full."
+          : "No engine returned an answer.";
+  await writeNotification(tx, {
+    workspaceId,
+    projectId: progress.projectId,
+    userId: triggeredBy,
+    kind: "run.completed",
+    severity: status === "failed" ? "warning" : "info",
+    title,
+    body,
+    eventKey: `run.completed:${progress.runId}`,
+    deepLink: { path: `/p/${progress.projectId}/overview`, query: { run: progress.runId } },
+    facts: { run_id: progress.runId, status, captured: progress.captured, skipped: progress.skipped, failed: progress.failed },
+  });
 }
