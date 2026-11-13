@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { auxFindingSeveritySchema } from "../aux/site-file-finding.schema.js";
+import { storedPresentationNotesSchema } from "./tool-run.schema.js";
 
 // STORY-083 - Schema Builder: POST /v1/tools/schema-builder (owner decision 78a).
 //
@@ -71,6 +72,8 @@ export const schemaBuilderStoredResultSchema = z
     entity_type: schemaBuilderEntityTypeSchema.nullable(),
     vocab_version: z.string(),
     findings: z.array(schemaBuilderFindingSchema).max(SCHEMA_BUILDER_MAX_FINDINGS),
+    /** STORY-095 AC9: the notes the run was written with (absent on a run stored before the key existed). */
+    presentation_notes: storedPresentationNotesSchema.optional(),
   })
   .strict();
 

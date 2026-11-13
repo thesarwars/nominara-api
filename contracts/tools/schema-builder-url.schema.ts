@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { SCHEMA_BUILDER_MAX_FINDINGS, schemaBuilderFindingSchema } from "./schema-builder.schema.js";
+import { storedPresentationNotesSchema } from "./tool-run.schema.js";
 
 // STORY-083 AC5 / owner decision 82 - Schema Builder URL mode: `POST /v1/tools/schema-builder/url`. The URL path of CHECK: the worker fetches one page through the
 // guarded fetcher and runs the SAME structured-data rules the in-project audit runs (AUX-R-008..018, minus the held AUX-R-013); there is no second rule
@@ -46,7 +47,7 @@ export const schemaBuilderUrlUnreachableReasonSchema = z.enum(SCHEMA_BUILDER_URL
  * Schema Builder run to carry a result from its first write); it states nothing about the page.
  */
 export const schemaBuilderUrlResultSchema = z.discriminatedUnion("state", [
-  z.object({ schema_version: z.literal(1), source: z.literal("url"), state: z.literal("pending") }).strict(),
+  z.object({ schema_version: z.literal(1), source: z.literal("url"), state: z.literal("pending"), presentation_notes: storedPresentationNotesSchema.optional() }).strict(),
   z
     .object({
       schema_version: z.literal(1),
@@ -63,9 +64,19 @@ export const schemaBuilderUrlResultSchema = z.discriminatedUnion("state", [
       findings: z.array(schemaBuilderFindingSchema).max(SCHEMA_BUILDER_MAX_FINDINGS),
       /** Findings left out to fit the cap; counted, never dropped silently. */
       findings_omitted: z.number().int().nonnegative(),
+      /** STORY-095 AC9: the notes the run was written with. */
+      presentation_notes: storedPresentationNotesSchema.optional(),
     })
     .strict(),
-  z.object({ schema_version: z.literal(1), source: z.literal("url"), state: z.literal("unreachable"), reason: schemaBuilderUrlUnreachableReasonSchema }).strict(),
+  z
+    .object({
+      schema_version: z.literal(1),
+      source: z.literal("url"),
+      state: z.literal("unreachable"),
+      reason: schemaBuilderUrlUnreachableReasonSchema,
+      presentation_notes: storedPresentationNotesSchema.optional(),
+    })
+    .strict(),
 ]);
 export type SchemaBuilderUrlResult = z.infer<typeof schemaBuilderUrlResultSchema>;
 
