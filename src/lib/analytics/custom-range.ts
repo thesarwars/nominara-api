@@ -24,7 +24,7 @@ export function retentionDaysOf(window: RetentionWindow): number | null {
 }
 
 function shiftDays(date: string, days: number): string {
-  return new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY_MS).toISOString().slice(0, 10);
+  return new Date(Date.parse(date + "T00:00:00Z") + days * DAY_MS).toISOString().slice(0, 10);
 }
 
 /** Pure judgement of one range against the workspace-local `today` and the retention window. The first problem in a fixed order: future, retention, length. */

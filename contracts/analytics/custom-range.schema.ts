@@ -22,7 +22,7 @@ const DAY_MS = 86_400_000;
 
 /** Inclusive day count of `from … to` (`YYYY-MM-DD`). Pure calendar arithmetic in UTC, so no DST hour can move it. */
 export function customRangeDays(from: string, to: string): number {
-  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / DAY_MS) + 1;
+  return Math.round((Date.parse(to + "T00:00:00Z") - Date.parse(from + "T00:00:00Z")) / DAY_MS) + 1;
 }
 
 /** `scoring-models.md` §13: granularity auto-selects, `>90d → week`; a custom range is no different. */

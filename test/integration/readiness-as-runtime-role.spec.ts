@@ -2,10 +2,11 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { Logger } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Client } from "pg";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DbModule } from "../../src/db/db.module.js";
 import {
   MIGRATION_LEDGER_READERS,
@@ -217,6 +218,7 @@ describe("STORY-120 · readiness as the runtime role", () => {
     const asOwner = new URL(container.getConnectionUri());
     asOwner.searchParams.set("options", `-c role=${MIGRATION_OWNER_ROLE}`);
     process.env.DATABASE_URL_POOLED = asOwner.toString();
+    const errors = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
 
     const moduleRef = await Test.createTestingModule({ imports: [DbModule, HealthModule] }).compile();
     const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
@@ -227,10 +229,9 @@ describe("STORY-120 · readiness as the runtime role", () => {
     try {
       const response = await app.inject({ method: "GET", url: "/health/ready" });
       expect(response.statusCode, "a service running as the migration owner must not be routed traffic").toBe(503);
-      const body = response.json<{ status: string; migrationVersion: { matches: boolean } }>();
-      expect(body.status).toBe("not_ready");
-      // Pin it to the role check, not to a failed migration read: the ledger is fully applied.
-      expect(body.migrationVersion.matches, "the migration comparison itself still succeeds").toBe(true);
+      expect(response.json<{ status: string }>().status).toBe("not_ready");
+      // Pinned to the ROLE check, not to some other failure: the probe logged the migration-owner refusal.
+      expect(errors.mock.calls.map((c) => String(c[0])).join("\n")).toContain("migration owner");
     } finally {
       await app.close();
     }

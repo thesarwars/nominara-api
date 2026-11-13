@@ -117,8 +117,8 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-14"))("STORY-012 AC8 · ISO-14 
     await adapter.put({ bucket: "raw", key: `${ENV}/misplaced-no-workspace.gz`, body: "x" });
     const report = judge(await everything());
     expect(report.violations.map((v) => v.reason).sort()).toEqual([
-      "the key does not open with the deployment namespace",
       "no workspace id where the prefix puts one",
+      "the key does not open with the deployment namespace",
     ]);
   });
 });

@@ -91,8 +91,12 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
   let app: NestFastifyApplication;
   let superuser: Client;
   let routes: Replayable[] = [];
-  let bCookie = "";
+  // The `reads` class is a per-user token bucket (burst 60, 300/min, api-specification §12), and a throttled replay proves nothing. The limits stay as they are:
+  // the replays are spread over several of tenant B's own admins (the fixture seeds one per fourth member), each a real member with a real session.
+  let bCookies: string[] = [];
   let aCookie = "";
+  let turn = 0;
+  const bCookie = (): string => bCookies[turn++ % bCookies.length]!;
   const originalEnv = { ...process.env };
 
   const pools = new Map<string, Map<string, string[]>>(); // workspace -> table -> ids
@@ -107,11 +111,11 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     return byTable;
   }
 
-  async function sessionCookie(userId: string, workspaceId: string): Promise<string> {
+  async function sessionCookie(userId: string, workspaceId: string, role: string = "owner"): Promise<string> {
     const sessions = app.get(SessionService);
     const tokens = await sessions.createSession(userId);
     const version = (await superuser.query<{ entitlement_version: number }>("SELECT entitlement_version FROM workspaces WHERE id = $1", [workspaceId])).rows[0]!.entitlement_version;
-    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, "owner", null, version);
+    const entered = await sessions.switchWorkspace(tokens.sid, userId, workspaceId, role, null, version);
     return `${ACCESS_COOKIE_NAME}=${entered.accessToken}`;
   }
 
@@ -174,8 +178,10 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
       }));
 
     for (const tenant of [a, b, c]) pools.set(tenant.workspaceId, await harvest(tenant.workspaceId));
-    bCookie = await sessionCookie(b.ownerUserId, b.workspaceId);
-    aCookie = await sessionCookie(a.ownerUserId, a.workspaceId);
+    // Members 4, 8, 12, ... of the fixture carry the `admin` role (ROLE_CYCLE in three-tenant-fixture.ts).
+    const adminIndexes = [4, 8, 12, 16, 20, 24, 28, 32];
+    bCookies = await Promise.all(adminIndexes.map((i) => sessionCookie(b.userIds[i]!, b.workspaceId, "admin")));
+    aCookie = await sessionCookie(a.userIds[4]!, a.workspaceId, "admin");
   }, 240_000);
 
   afterAll(async () => {
@@ -204,10 +210,11 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
   it("the harness is not vacuous: parameterised GET routes were discovered, every tenant has identifiers, and the two sessions are different tenants'", () => {
     expect(routes.length).toBeGreaterThanOrEqual(20);
     for (const tenant of [a, b, c]) expect([...pools.get(tenant.workspaceId)!.values()].flat().length).toBeGreaterThan(20);
-    expect(bCookie).not.toBe(aCookie);
+    expect(new Set([...bCookies, aCookie]).size, "every actor has its own session").toBe(bCookies.length + 1);
+    expect(bCookies.length).toBeGreaterThanOrEqual(8);
   });
 
-  it(`${String(REPLAYS)} replays of A's and C's identifiers under B's session yield only refusals, indistinguishable from an identifier that does not exist`, async () => {
+  it(`${String(REPLAYS)} replays of A's and C's identifiers under B's admins' sessions yield only refusals, indistinguishable from an identifier that does not exist`, async () => {
     // Baseline per route: a RANDOM identifier under B. This is what "does not exist" looks like to B, route by route.
     const baseline = new Map<string, { status: number; body: string }>();
     // The control: B's OWN identifier under B. Where it answers 2xx the route demonstrably resolves ids, so a foreign one must be exactly 403/404.
@@ -215,10 +222,12 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     const rand = mulberry32(SEED);
     for (const route of routes) {
       const missing = fill(route, () => random());
-      const refused = await get(bCookie, missing.url);
+      const refused = await get(bCookie(), missing.url);
+      expect(refused.statusCode, `baseline ${route.path} was throttled or failed`).not.toBe(429);
       baseline.set(route.path, { status: refused.statusCode, body: normalise(refused.body, missing.used) });
       const own = fill(route, (index) => idFor(route, b.workspaceId, index, rand));
-      const answered = await get(bCookie, own.url);
+      const answered = await get(bCookie(), own.url);
+      expect(answered.statusCode, `control ${route.path} was throttled`).not.toBe(429);
       expect(answered.statusCode, `control ${route.path}: B's own identifier`).toBeLessThan(500);
       if (answered.statusCode >= 200 && answered.statusCode < 300) resolves.add(route.path);
     }
@@ -232,7 +241,7 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
       const route = routes[Math.floor(rand() * routes.length)]!;
       const victim = rand() < 0.5 ? a.workspaceId : c.workspaceId;
       const { url, used } = fill(route, (index) => idFor(route, victim, index, rand));
-      const response = await get(bCookie, url);
+      const response = await get(bCookie(), url);
       const base = baseline.get(route.path)!;
       const label = `#${String(i)} GET ${url} -> ${String(response.statusCode)}`;
       if (response.statusCode >= 500) failures.push(`${label}: a server error`);
@@ -263,6 +272,8 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
 
   // ISO-13, the live half: what the traffic above actually left in the cache. Every authenticated request above touched rate-limit and session state.
   it("STORY-012 AC8 · ISO-13 live: every key in the cache the traffic wrote is namespaced {env}:{ws}:… (or the global exception), and no key names two tenants", async () => {
+    // Tenant A's own admin reads its own workspace, so A has keys of its own to be judged (the replays above ran only as B).
+    for (let i = 0; i < 3; i++) expect((await get(aCookie, `/workspaces/${a.workspaceId}`)).statusCode).toBeLessThan(500);
     const redis = new Redis(cacheValkey.url);
     try {
       const keys: string[] = [];

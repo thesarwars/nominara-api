@@ -166,8 +166,10 @@ describe("STORY-083 · Schema Builder save", () => {
     const rowsBefore = await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId]);
     const reopened = await harness.app().inject({ method: "GET", url: apiUrl(`/tools/runs/${body.id}`), headers: { cookie: a.cookie } });
     expect(reopened.statusCode, reopened.body).toBe(200);
+    // STORY-095 AC9: the read returns the tool's own result; the notes it was stored with are the envelope's `presentation`.
+    const { presentation_notes: _notes, ...ownResult } = stored;
     const run = data<{ tool_key: string; credits_charged: number; result: unknown; presentation: { not_tracked: boolean; did_not_check: string } }>(reopened);
-    expect(run).toMatchObject({ tool_key: "schema_builder", credits_charged: 0, result: stored, presentation: { not_tracked: true } });
+    expect(run).toMatchObject({ tool_key: "schema_builder", credits_charged: 0, result: ownResult, presentation: { not_tracked: true, did_not_check: stored.presentation_notes?.did_not_check } });
     expect(await wallet(a.workspaceId)).toEqual(walletBefore);
     expect(await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId])).toBe(rowsBefore);
     const timeline = await harness.app().inject({ method: "GET", url: apiUrl("/tools/runs?tool_key=schema_builder"), headers: { cookie: a.cookie } });

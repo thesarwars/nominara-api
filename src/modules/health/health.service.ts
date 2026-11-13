@@ -137,9 +137,14 @@ export class HealthService implements OnModuleDestroy {
     const keys = new Set(enabled.rows.flatMap((row) => (row.engine_key === null ? [] : [row.engine_key])));
     const status = await this.engineStatus();
     incrementCounter("nominara_health_project_engine_health_reads_total");
-    return status.engines
-      .filter((engine) => keys.has(engine.engine_key))
-      .map((engine) => ({ engine_key: engine.engine_key, state: projectEngineState(engine), since: engine.unavailable_since }));
+    const reported = new Map(status.engines.map((engine) => [engine.engine_key, engine]));
+    // An enabled engine with no dispatching adapter (registry `disabled`) cannot capture, so it is `unavailable` with no episode start: never silently left out.
+    return [...keys].sort().map((key) => {
+      const engine = reported.get(key);
+      return engine === undefined
+        ? { engine_key: key, state: "unavailable" as const, since: null }
+        : { engine_key: key, state: projectEngineState(engine), since: engine.unavailable_since };
+    });
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -340,6 +345,16 @@ export class HealthService implements OnModuleDestroy {
   private async checkMigrationState(state: MigrationState): Promise<void> {
     const client = await this.pool.connect();
     try {
+      // STORY-010 AC10: the migration owner is never used by a running service. Asserted on the very connection readiness checks out, so a service
+      // that came up as (or switched to) the owner is `not_ready` and takes no traffic. Throws MigrationOwnerConnectionError; the postgres indicator
+      // turns any throw here into `down`. Role names only in the log, never a connection string.
+      try {
+        await assertNotMigrationOwner(client);
+      } catch (error) {
+        incrementCounter("nominara_health_role_check_failures_total");
+        this.logger.error(`readiness: ${(error as Error).message}`);
+        throw error;
+      }
       const files = await listMigrationFiles(this.migrationsDir);
       const expectedNames = files.map((f) => f.name);
       state.expected = expectedNames.length > 0 ? expectedNames[expectedNames.length - 1]! : null;
@@ -356,16 +371,6 @@ export class HealthService implements OnModuleDestroy {
       // to that packaging cannot silently turn readiness into a rubber
       // stamp. Asserted by readiness-as-runtime-role.spec.ts.
       state.matches = expectedNames.length > 0 && expectedNames.every((name) => appliedSet.has(name));
-      // STORY-010 AC10: the migration owner is never used by a running service. Asserted (after the comparison, so the body still reports it) on the very connection readiness checks out, so a service
-      // that came up as (or switched to) the owner is `not_ready` and takes no traffic. Throws MigrationOwnerConnectionError; the postgres indicator
-      // turns any throw here into `down`. Role names only in the log, never a connection string.
-      try {
-        await assertNotMigrationOwner(client);
-      } catch (error) {
-        incrementCounter("nominara_health_role_check_failures_total");
-        this.logger.error(`readiness: ${(error as Error).message}`);
-        throw error;
-      }
     } finally {
       client.release();
     }
