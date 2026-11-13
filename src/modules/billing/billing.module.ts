@@ -21,6 +21,7 @@ import { PlanChangeController } from "./plan-change.controller.js";
 import { PlanChangeService } from "./plan-change.service.js";
 import { CreditPacksController } from "./credit-packs.controller.js";
 import { CreditPacksService } from "./credit-packs.service.js";
+import { BillingRetentionPurgeController } from "./billing-retention-purge.controller.js";
 import { BillingUsageController } from "./billing-usage.controller.js";
 import { BillingController } from "./billing.controller.js";
 import { BillingService } from "./billing.service.js";
@@ -35,7 +36,7 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
 // only — no logic here (coding-standards.md §1's module layout).
 @Module({
   imports: [IdentityModule, StorageModule],
-  controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, PlanChangeController, DowngradeKeepController, RetentionExportController, StripeWebhookController],
+  controllers: [BillingController, BillingUsageController, BillingRetentionPurgeController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, PlanChangeController, DowngradeKeepController, RetentionExportController, StripeWebhookController],
   providers: [
     // The short independent writes of checkout, the credit-pack purchase and add-ons run here, never on the
     // main pool their request already holds a connection of (hold-and-wait).

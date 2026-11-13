@@ -20,19 +20,28 @@ export async function rawRetentionCutoff(client: ClientBase, workspaceId: string
 }
 
 /**
- * Throws `RetentionExceededError` for a capture older than the window, or one the retention sweep already expired (its key nulled
- * and `payload.raw_expired` set - the sweep marks rather than deletes the row, so the marker is how "expired" is told from "never
- * had an object"). `surface` names the caller in the counter only.
+ * True for a capture older than the window, or one the retention sweep already expired (its key nulled and `payload.raw_expired` set - the
+ * sweep marks rather than deletes the row, so the marker is how "expired" is told from "never had an object"). The ONE definition: the 507
+ * surfaces and the result document's `raw_expired` flag (owner decision 100(f)) both read it, so they cannot disagree about which side a capture is on.
  */
+export async function isRawExpired(
+  client: ClientBase,
+  workspaceId: string,
+  capture: { readonly capturedAt: Date; readonly rawExpired: unknown },
+): Promise<boolean> {
+  const cutoff = await rawRetentionCutoff(client, workspaceId);
+  const marked = capture.rawExpired === true || capture.rawExpired === "true";
+  return marked || (cutoff !== null && capture.capturedAt < cutoff);
+}
+
+/** Throws `RetentionExceededError` for an expired capture (see `isRawExpired`). `surface` names the caller in the counter only. */
 export async function assertWithinRawRetention(
   client: ClientBase,
   workspaceId: string,
   capture: { readonly capturedAt: Date; readonly rawExpired: unknown },
   surface: string,
 ): Promise<void> {
-  const cutoff = await rawRetentionCutoff(client, workspaceId);
-  const expired = capture.rawExpired === true || capture.rawExpired === "true";
-  if (expired || (cutoff !== null && capture.capturedAt < cutoff)) {
+  if (await isRawExpired(client, workspaceId, capture)) {
     incrementCounter("nominara_tracking_retention_exceeded_total", { surface });
     throw new RetentionExceededError({ message: "this capture is past the workspace's raw-capture retention" });
   }

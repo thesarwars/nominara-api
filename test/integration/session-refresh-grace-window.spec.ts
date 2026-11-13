@@ -1041,6 +1041,7 @@ describe("STORY-170 · refresh-token reuse grace window", () => {
           "last_used_at",
           "revoked_at",
           "revoked_reason",
+          "user_agent", // STORY-096 AC4 (migration 0204): the device's User-Agent for the session list; not grace state
           "user_id",
         ].sort(),
       );

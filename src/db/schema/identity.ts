@@ -74,6 +74,7 @@ export const sessions = pgTable("sessions", {
   lastStrongAuthAt: timestamp("last_strong_auth_at", { withTimezone: true }),
   lastStrongAuthMethod: text("last_strong_auth_method"),
   activeWorkspaceId: uuid("active_workspace_id"),
+  userAgent: text("user_agent"),
 });
 
 export const userCredentials = pgTable("user_credentials", {

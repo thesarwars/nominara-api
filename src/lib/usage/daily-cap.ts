@@ -1,5 +1,15 @@
 import type { ClientBase } from "pg";
-import type { DailyCapAction } from "../../api/decorators/daily-cap.decorator.js";
+/** `credit_daily_counters.action_code`, verbatim. A route cannot invent a fourth family and quietly get its own allowance. */
+export type DailyCapAction = "lookup" | "nlp_command";
+
+/**
+ * The entitlement each family's limit is read from - plans-and-entitlements.md section 2's table. A MAP RATHER THAN A CONVENTION: the two naming
+ * schemes already diverge (`lookup` reads `credits.lookups_per_day_max`).
+ */
+export const DAILY_CAP_ENTITLEMENT: Readonly<Record<DailyCapAction, string>> = Object.freeze({
+  lookup: "credits.lookups_per_day_max",
+  nlp_command: "credits.nlp_parses_per_day_max",
+});
 
 // STORY-071 — the daily counter, `plans-and-entitlements.md` §6 STEP 0.
 //

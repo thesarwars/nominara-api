@@ -25,11 +25,13 @@ import { TenantObjectStore } from "../../src/lib/storage/tenant-object-store.js"
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
 import type { DirtyEntry } from "../../src/lib/rollup/dirty-dates.js";
 import { ReparseService } from "../../src/modules/tracking/reparse.service.js";
+import { NORMALIZER_VERSION } from "../../src/lib/parser/normalize.js";
+import { rawRetentionCutoff } from "../../src/modules/tracking/raw-retention.js";
 import { ResultDocumentService } from "../../src/modules/tracking/result-document.service.js";
 import { ResultsListService } from "../../src/modules/tracking/results-list.service.js";
 import { ProjectOutOfScopeException } from "../../src/tenancy/errors.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
-import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { currentTenantStore, withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-034 - the remaining read/maintenance ACs: AC7 (the cursor list), AC9 (re-parse with a diff, free) and AC10 (retention
 // failure, not an empty result). Run under the shared docker lock.
@@ -381,16 +383,129 @@ describe("STORY-034 · results list, re-parse and retention", () => {
     expect((await list(projectId, { run_id: uuidV7() })).items).toEqual([]); // a run with no captures is "nothing yet", not "expired"
   });
 
-  it("034-AC10d · the result document past retention is 507, and inside it is served", async () => {
+  // Owner decision 100(f) (2026-11-12) replaced the 507 on THIS route only: past the window the document is served with its facts and excerpt, no raw
+  // text, and `raw_expired: true`. /raw, /reparse and the list stay 507 (034-AC9j, 034-AC10a/f/g, 181-AC4c/e).
+  it("034-AC10d · the result document past retention is served WITHOUT its text and says raw_expired, and inside it is served whole with raw_expired false", async () => {
     const old = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
     const recent = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 5 * DAY) });
-    await expect(as(() => new ResultDocumentService().get(old))).rejects.toBeInstanceOf(RetentionExceededError);
-    await expect(as(() => new ResultDocumentService().get(recent))).resolves.toMatchObject({ result_id: recent });
+    const expired = await as(() => new ResultDocumentService().get(old));
+    expect(expired).toMatchObject({ result_id: old, raw_expired: true });
+    expect(expired.raw_response.text).toBe("");
+    expect(expired.raw_response.excerpt).toBe(ANSWER.slice(0, 280));
+    expect(expired.highlight_map).toEqual([]);
+    const fresh = await as(() => new ResultDocumentService().get(recent));
+    expect(fresh).toMatchObject({ result_id: recent, raw_expired: false });
+    expect(fresh.raw_response.text).toContain("HubSpot");
+    expect(fresh.raw_response.excerpt).toBeUndefined();
   });
 
-  it("034-AC10e · a capture the retention sweep already expired (payload.raw_expired) is 507 on the document too", async () => {
+  it("034-AC10d · the boundary: a capture one second inside the window is whole, one second past it is raw_expired (the cutoff the sweep and /raw use)", async () => {
+    const cutoff = (await as(() => rawRetentionCutoff(currentTenantStore()!.client, workspaceId)))!;
+    expect(cutoff).toBeInstanceOf(Date);
+    const inside = await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() + 5_000) });
+    const past = await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() - 5_000) });
+    expect((await as(() => new ResultDocumentService().get(inside))).raw_expired).toBe(false);
+    expect((await as(() => new ResultDocumentService().get(past))).raw_expired).toBe(true);
+  });
+
+  it("034-AC10d · past the window the FACTS are kept: entities and citations still come back, only the text and its offsets go", async () => {
+    const id = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await seedStaleFacts(id);
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.entities.length).toBeGreaterThan(0);
+    expect(doc.metrics.brand_present).toBe(true);
+    expect(doc.highlight_map).toEqual([]);
+    expect(doc.capture.response_chars).toBe(0);
+  });
+
+  it("034-AC10d · an expired document is still tenant-checked: another workspace's capture is 404, never its excerpt", async () => {
+    const id = await seed({ ws: otherWorkspaceId, project: otherProjectId, status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await expect(as(() => new ResultDocumentService().get(id))).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("034-AC10d · a cell that was never captured is still 422 past the window (there is no document to expire)", async () => {
+    const id = await seed({ status: "failed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await expect(as(() => new ResultDocumentService().get(id))).rejects.toBeInstanceOf(PreconditionUnmetError);
+  });
+
+  it("034-AC10e · a capture the retention sweep already expired (payload.raw_expired) is served as raw_expired too, even inside the window", async () => {
     const id = await seed({ status: "parsed", payloadExtra: { raw_expired: true } });
-    await expect(as(() => new ResultDocumentService().get(id))).rejects.toBeInstanceOf(RetentionExceededError);
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.raw_response.text).toBe("");
+  });
+
+  // A reused (L2) row stores no text of its own and reads its SOURCE's. Retention is judged on the source too: otherwise the expired source's text is served
+  // through a reused row that is itself inside the window (audit finding, batch 11 S3).
+  async function reusedOf(sourceId: string, opts: { capturedAt?: Date } = {}): Promise<string> {
+    const id = await seed({ status: "parsed", cacheLayer: "l2", capturedAt: opts.capturedAt ?? new Date(Date.now() - 2 * DAY) });
+    await db.query(`UPDATE answer_captures SET payload = '{"format":"markdown"}'::jsonb, source_result_id = $2, raw_object_key = NULL, response_excerpt = NULL WHERE id = $1`, [id, sourceId]);
+    return id;
+  }
+
+  it("034-AC10d · a reused (L2) result inside the window whose SOURCE is past the cutoff is raw_expired and serves none of the source's text", async () => {
+    const source = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    const reused = await reusedOf(source);
+    const doc = await as(() => new ResultDocumentService().get(reused));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.raw_response.text).toBe("");
+    expect(doc.raw_response.excerpt).toBeNull(); // the reused row's own excerpt: it has none, and the source's is never borrowed
+    expect(JSON.stringify(doc)).not.toContain("HubSpot");
+  });
+
+  it("034-AC10e · a reused (L2) result whose source the sweep marked raw_expired is raw_expired too", async () => {
+    const source = await seed({ status: "parsed", payloadExtra: { raw_expired: true } });
+    const reused = await reusedOf(source);
+    const doc = await as(() => new ResultDocumentService().get(reused));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.raw_response.text).toBe("");
+  });
+
+  it("034-AC10d · control: a reused result over a LIVE source still serves the source's text, raw_expired false", async () => {
+    const source = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 5 * DAY) });
+    const reused = await reusedOf(source);
+    const doc = await as(() => new ResultDocumentService().get(reused));
+    expect(doc.raw_expired).toBe(false);
+    expect(doc.raw_response.text).toContain("HubSpot");
+  });
+
+  it("034-AC10d · the source's expiry is judged by the same boundary: one second inside the cutoff is served, one second past is not", async () => {
+    const cutoff = (await as(() => rawRetentionCutoff(currentTenantStore()!.client, workspaceId)))!;
+    const inside = await reusedOf(await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() + 5_000) }));
+    const past = await reusedOf(await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() - 5_000) }));
+    expect((await as(() => new ResultDocumentService().get(inside))).raw_expired).toBe(false);
+    expect((await as(() => new ResultDocumentService().get(past))).raw_expired).toBe(true);
+  });
+
+  it("034-AC9 · re-parsing a reused result over an expired source reveals nothing: refused, as for any reused row (no text of its own)", async () => {
+    const source = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    const reused = await reusedOf(source);
+    await expect(as(() => reparseService().reparse(reused))).rejects.toBeInstanceOf(PreconditionUnmetError);
+  });
+
+  it("034-AC10d · an expired document carries no offsets at all: no occurrence spans, no evidence spans, and normalized_text_offsets is false", async () => {
+    const id = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await seedStaleFacts(id);
+    await db.query("UPDATE answer_captures SET normalizer_version = $2 WHERE id = $1", [id, NORMALIZER_VERSION]); // a CURRENT normaliser, so offsets are not already withheld as stale
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.entities.length).toBeGreaterThan(0);
+    for (const entity of doc.entities) {
+      expect(entity.occurrences).toEqual([]);
+      expect(entity.sentiment.evidence_char_start).toBeNull();
+      expect(entity.sentiment.evidence_char_end).toBeNull();
+    }
+    expect(doc.raw_response.normalized_text_offsets).toBe(false);
+  });
+
+  it("034-AC10d · inside the window the offsets stay: normalized_text_offsets true and occurrences present", async () => {
+    const id = await seed({ status: "parsed" });
+    await seedStaleFacts(id);
+    await db.query("UPDATE answer_captures SET normalizer_version = $2 WHERE id = $1", [id, NORMALIZER_VERSION]); // a CURRENT normaliser, so offsets are not already withheld as stale
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_response.normalized_text_offsets).toBe(true);
+    expect(doc.entities.some((e) => e.occurrences.length > 0)).toBe(true);
   });
 
   // ---------------------------------------------------------- AC9: re-parse

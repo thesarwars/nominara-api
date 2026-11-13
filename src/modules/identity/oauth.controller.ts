@@ -7,6 +7,7 @@ import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { Public } from "../../api/decorators/public.decorator.js";
 import { SkipTenantContext } from "../../api/decorators/skip-tenant-context.decorator.js";
 import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
+import { SessionService } from "./session.service.js";
 import { OAUTH_BINDING_COOKIE_NAME, ACCESS_COOKIE_NAME, setAuthCookies, setOauthBindingCookie } from "../../lib/auth/cookies.js";
 import {
   oauthCallbackQuerySchema,
@@ -35,7 +36,10 @@ function requestIdOf(req: OauthRequest): string {
 
 @Controller()
 export class OauthController {
-  constructor(private readonly service: OauthService) {}
+  constructor(
+    private readonly service: OauthService,
+    private readonly sessions: SessionService,
+  ) {}
 
   @Post("auth/oauth/:provider/start")
   @Public()
@@ -84,6 +88,7 @@ export class OauthController {
       req.cookies?.[ACCESS_COOKIE_NAME],
       requestIdOf(req),
     );
+    await this.sessions.recordUserAgent(result.tokens.sid, req.headers?.["user-agent"]);
     setAuthCookies(reply, result.tokens);
     return result.body;
   }
