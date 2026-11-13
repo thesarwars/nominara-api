@@ -178,6 +178,10 @@ describe.skipIf(!isRunnableForCurrentTarget("ISO-08"))("STORY-012 AC5 · ISO-08 
     process.env.DATABASE_URL = asApp.toString();
     process.env.DATABASE_URL_POOLED = asApp.toString();
     process.env.VALKEY_CACHE_URL = cacheValkey.url;
+    // NODE_ENV=test selects the PER-PROCESS in-memory cache (cache.module.ts), which would leave the live Valkey empty and this assertion vacuous. The
+    // composition root is booted as it deploys (`development` selects the Valkey adapter, against OUR throwaway container), and the namespace follows.
+    process.env.NODE_ENV = "development";
+    delete process.env.CACHE_KEY_NAMESPACE;
     process.env.QUEUE_REDIS_URL = queueValkey.connectionString;
 
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule, DiscoveryModule] }).compile();
