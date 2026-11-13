@@ -142,6 +142,16 @@ function summaryOf(row: AggregateRow | undefined, dataSource: DataSource | null)
   };
 }
 
+/**
+ * `scheduledReport` (a scheduled run): ONE theme per run, the report's own `theme_id` (the workspace default only when it is null), used for
+ * the file's colours, its brand line and its name; the artifact records the report so the download names it under the same theme.
+ */
+export interface ExportOptions {
+  readonly awaitUpload?: boolean;
+  readonly audit?: RequestAuditActor;
+  readonly scheduledReport?: { readonly id: string; readonly themeId: string | null };
+}
+
 @Injectable()
 export class ExportService {
   constructor(
@@ -172,7 +182,7 @@ export class ExportService {
    * `options.awaitUpload` (the HTTP export route only): the request does not answer until the file is stored, and fails if it could not
    * be. Without it (the scheduled path, whose delivery waits through `uploaded()`) the upload runs after commit and nothing holds a response.
    */
-  async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options: { readonly awaitUpload?: boolean; readonly audit?: RequestAuditActor } = {}): Promise<ExportResponse> {
+  async export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options: ExportOptions = {}): Promise<ExportResponse> {
     const started = Date.now();
     const store = currentTenantStore();
     if (store === undefined) throw new Error("ExportService requires an active tenant context");
@@ -245,7 +255,7 @@ export class ExportService {
           .filter((c) => c.engines.length > 0 || c.blended.measuredCells > 0);
       }
 
-      const palette = await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true);
+      const palette = await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true, options.scheduledReport?.themeId ?? null);
       const doc = buildExportDocument({
         projectName: project.rows[0].name,
         generatedAt: new Date().toISOString(),
@@ -265,9 +275,9 @@ export class ExportService {
       const file = body.format === "pdf" ? await renderPdf(doc) : Buffer.from(renderCsv(doc), "utf8");
       await tx.query(
         `INSERT INTO report_artifacts
-           (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at)
-         VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9::jsonb, now() + make_interval(days => $10::int))`,
-        [exportId, workspaceId, [projectId], window.from, window.to, body.format, pendingKey(exportId), file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS],
+           (id, workspace_id, project_ids, period_start, period_end, format, object_key, bytes, methodology_footer, expires_at, scheduled_report_id)
+         VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8,$9::jsonb, now() + make_interval(days => $10::int), $11)`,
+        [exportId, workspaceId, [projectId], window.from, window.to, body.format, pendingKey(exportId), file.length, JSON.stringify(footer), ARTIFACT_TTL_DAYS, options.scheduledReport?.id ?? null],
       );
 
       this.scheduleUpload(
@@ -608,10 +618,14 @@ export class ExportService {
    * The workspace's default theme as a palette (platform default when none is stored). Brand removal is
    * re-checked against the CURRENT entitlements, not trusted from the stored flag.
    */
-  private async palette(tx: ClientBase, brandRemovalGranted: boolean): Promise<ExportPalette> {
+  private async palette(tx: ClientBase, brandRemovalGranted: boolean, themeId: string | null = null): Promise<ExportPalette> {
+    // The same pick as resolveReportSender (the report's own theme, else the default), so a run never mixes two themes.
     const result = await tx.query<StoredThemeValues>(
       `SELECT color_primary, color_accent, color_bg, color_fg, hide_nominara_brand
-         FROM brand_themes ORDER BY is_default DESC, created_at, id LIMIT 1`,
+         FROM brand_themes
+        WHERE ($1::uuid IS NOT NULL AND id = $1::uuid) OR is_default
+        ORDER BY (id = $1::uuid) DESC NULLS LAST, is_default DESC, created_at, id LIMIT 1`,
+      [themeId],
     );
     return exportPaletteFrom(result.rows[0], brandRemovalGranted);
   }

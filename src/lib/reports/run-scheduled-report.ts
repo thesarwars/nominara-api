@@ -74,7 +74,7 @@ export const SCHEDULED_REPORT_COLUMNS = `id, name, project_ids, cadence, day_of_
 
 /** What the report build needs from the export service (a structural type, so this module stays DI-free). */
 export interface ReportExporter {
-  export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined): Promise<{ export_id: string }>;
+  export(projectId: string, body: ExportRequest, idempotencyKey: string | undefined, options?: { readonly scheduledReport?: { readonly id: string; readonly themeId: string | null } }): Promise<{ export_id: string }>;
   /** STORY-180: resolves when these artifacts' post-commit uploads have finished (immediately for ones this process did not upload). */
   uploaded(ids: readonly string[]): Promise<void>;
 }
@@ -149,6 +149,7 @@ export async function buildReportArtifacts(exporter: ReportExporter, report: Sch
         projectId,
         { format, sections: report.include_sections, timeframe: report.timeframe, hide_competitors: false, hide_costs: false },
         undefined,
+        { scheduledReport: { id: report.id, themeId: report.theme_id } },
       );
       ids.push(out.export_id);
     }

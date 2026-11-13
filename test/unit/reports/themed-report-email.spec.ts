@@ -37,3 +37,18 @@ describe("STORY-097 · the scheduled-report message carries the theme", () => {
     expect(m.subject).toMatch(/nominara/i);
   });
 });
+
+describe("STORY-097 · one theme per run: the export build is given the report's own theme", () => {
+  it("buildReportArtifacts passes the report's theme_id and id to every export (null theme = the default is chosen downstream)", async () => {
+    const { buildReportArtifacts } = await import("../../../src/lib/reports/run-scheduled-report.js");
+    const calls: unknown[][] = [];
+    const exporter = { export: async (...a: unknown[]) => (calls.push(a), { export_id: `e${String(calls.length)}` }), uploaded: async () => undefined };
+    const base = { id: "r1", name: "n", project_ids: ["p1", "p2"], cadence: "monthly", day_of_period: 1, send_hour_local: 8, timeframe: "30d", format: "both", recipients: [], include_sections: ["overview"], next_send_at: null, active: true };
+    await buildReportArtifacts(exporter as never, { ...base, theme_id: "T" } as never);
+    expect(calls).toHaveLength(4);
+    for (const c of calls) expect(c[3]).toEqual({ scheduledReport: { id: "r1", themeId: "T" } });
+    calls.length = 0;
+    await buildReportArtifacts(exporter as never, { ...base, theme_id: null } as never);
+    for (const c of calls) expect(c[3]).toEqual({ scheduledReport: { id: "r1", themeId: null } });
+  });
+});

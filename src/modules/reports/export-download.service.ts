@@ -60,7 +60,9 @@ export class ExportDownloadService {
     try {
       const found = await tx.query<{ object_key: string; format: string; period_end: string; hide_brand: boolean | null }>(
         `SELECT object_key, format, period_end::text AS period_end,
-                (SELECT hide_nominara_brand FROM brand_themes ORDER BY is_default DESC, created_at, id LIMIT 1) AS hide_brand
+                (SELECT t.hide_nominara_brand FROM brand_themes t
+                  WHERE t.id = (SELECT r.theme_id FROM scheduled_reports r WHERE r.id = report_artifacts.scheduled_report_id) OR t.is_default
+                  ORDER BY (t.id = (SELECT r.theme_id FROM scheduled_reports r WHERE r.id = report_artifacts.scheduled_report_id)) DESC NULLS LAST, t.is_default DESC, t.created_at, t.id LIMIT 1) AS hide_brand
            FROM report_artifacts
           WHERE id = $1 AND workspace_id = app.current_workspace() AND expires_at > now()
             AND (cardinality(app.current_scope_projects()) = 0 OR project_ids <@ app.current_scope_projects())`,
