@@ -17,22 +17,11 @@ import { SetMetadata } from "@nestjs/common";
 // a route cannot invent a fourth family and quietly get its own allowance —
 // `@DailyCap('visibility_scan')` is a compile error, not a bypass.
 
-/** `credit_daily_counters.action_code`, verbatim. */
-export type DailyCapAction = "lookup" | "nlp_command";
+// The action union and the entitlement map live in lib/usage/daily-cap.ts (the service layer reads them too); re-exported here for the guard and routes.
+export { DAILY_CAP_ENTITLEMENT, type DailyCapAction } from "../../lib/usage/daily-cap.js";
+import type { DailyCapAction } from "../../lib/usage/daily-cap.js";
 
 export const DAILY_CAP_KEY = "daily-cap";
-
-/**
- * The entitlement each family's limit is read from — §2's table.
- *
- * A MAP RATHER THAN A CONVENTION. Deriving the key from the action code by
- * string manipulation would break silently the day the two naming schemes
- * diverge, and they already have: `lookup` reads `credits.lookups_per_day_max`.
- */
-export const DAILY_CAP_ENTITLEMENT: Readonly<Record<DailyCapAction, string>> = Object.freeze({
-  lookup: "credits.lookups_per_day_max",
-  nlp_command: "credits.nlp_parses_per_day_max",
-});
 
 export const DailyCap = (action: DailyCapAction): MethodDecorator & ClassDecorator =>
   SetMetadata(DAILY_CAP_KEY, action);

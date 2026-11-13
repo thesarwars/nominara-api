@@ -17,8 +17,7 @@ import { hasLedgerHistory, readLifetimeCounters } from "../../lib/credits/replay
 import { cycleHasLapsed, purchasableOptions, readWallet, type WalletState } from "../../lib/credits/wallet.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
-import { DAILY_CAP_ENTITLEMENT, type DailyCapAction } from "../../api/decorators/daily-cap.decorator.js";
-import { nextUtcMidnight } from "../../lib/usage/daily-cap.js";
+import { DAILY_CAP_ENTITLEMENT, nextUtcMidnight, type DailyCapAction } from "../../lib/usage/daily-cap.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { METRIC_SPECS } from "../../lib/usage/metrics.js";
 import { limitValueFor, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
