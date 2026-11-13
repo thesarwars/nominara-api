@@ -7,7 +7,7 @@ import { AUX_AUDITS_ENTITLEMENT, auxAuditsIncluded } from "./onboarding-audit.js
 export async function requireAuxAudits(tx: ClientBase, entitlements: Readonly<Record<string, { readonly value: unknown } | undefined>>): Promise<void> {
   if (auxAuditsIncluded(entitlements)) return;
   const lowest = await tx.query<{ key: string }>(
-    `SELECT key FROM plans WHERE ${grantedValueSql("(entitlements -> $1 -> 'value')")} ORDER BY sort_order ASC LIMIT 1`,
+    `SELECT key FROM plans WHERE is_public AND ${grantedValueSql("(entitlements -> $1 -> 'value')")} ORDER BY sort_order ASC LIMIT 1`,
     [AUX_AUDITS_ENTITLEMENT],
   );
   throw new FeatureNotInPlanError({
