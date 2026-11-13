@@ -55,6 +55,35 @@ describe("STORY-098 · writeNotification emailNow / relayOnly", () => {
     expect(queued.after).toHaveLength(1);
   });
 
+  describe("emailNow audience (first-view, PROVISIONAL)", () => {
+    const P1 = "0198f6a0-0000-7000-8000-0000000000c1";
+    const P2 = "0198f6a0-0000-7000-8000-0000000000c2";
+    const member = (id: string, role: string, scope: string[] | null, cadence: string | null = null) => ({ user_id: id, role, digest_cadence: cadence, project_scope: scope, sentiment_alerts_enabled: null });
+    async function recipients(members: ReturnType<typeof member>[], projectIds: string[]): Promise<string[]> {
+      const h = harness();
+      const base = h.tx.query.getMockImplementation()! as (text: string, params: unknown[]) => Promise<unknown>;
+      (h.tx.query as unknown as { mockImplementation(f: (t: string, p: unknown[]) => Promise<unknown>): void }).mockImplementation(async (text, params) => (/FROM workspace_members/.test(text) ? { rows: members } : base(text, params)));
+      await writeNotification(h.tx as never, input({ emailNow: true, emailAudience: { permission: "share_token:mint", projectIds } }), { relayOnly: true });
+      return h.sql.filter((q) => /INSERT INTO notification_emails/.test(q.text)).map((q) => q.params[1] as string);
+    }
+
+    it("a manager scoped to the token's project is included; a manager scoped elsewhere is excluded", async () => {
+      expect(await recipients([member("in", "manager", [P1]), member("out", "manager", [P2])], [P1])).toEqual(["in"]);
+    });
+    it("a member who cannot manage share tokens (analyst, viewer) is excluded; owner and admin are included", async () => {
+      expect(await recipients([member("a", "analyst", null), member("v", "viewer", [P1]), member("o", "owner", null), member("ad", "admin", null)], [P1])).toEqual(["o", "ad"]);
+    });
+    it("every project of the token must be visible: a manager scoped to only one of two is excluded", async () => {
+      expect(await recipients([member("half", "manager", [P1]), member("both", "manager", [P1, P2])], [P1, P2])).toEqual(["both"]);
+    });
+    it("a token with no project scope needs a member who sees every project", async () => {
+      expect(await recipients([member("scoped", "manager", [P1]), member("all", "owner", null)], [])).toEqual(["all"]);
+    });
+    it("the digest cadence does not matter: a member whose digest is off still gets the immediate notice", async () => {
+      expect(await recipients([member("off", "owner", null, "off")], [P1])).toEqual(["off"]);
+    });
+  });
+
   it("a repeated event key writes nothing (no outbox row)", async () => {
     const h = harness();
     h.tx.query.mockImplementationOnce(async () => ({ rows: [] }));

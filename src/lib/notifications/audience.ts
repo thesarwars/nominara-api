@@ -66,7 +66,7 @@ export interface EmailRecipient {
  * The active members of the workspace (inside the caller's tenant transaction) whose effective cadence is not `off`,
  * whose account is live and whose address is verified. `userId` narrows to one member (a user-addressed notification).
  */
-export async function emailableMembers(tx: ClientBase, workspaceId: string, userId: string | null = null): Promise<EmailRecipient[]> {
+export async function emailableMembers(tx: ClientBase, workspaceId: string, userId: string | null = null, options: { readonly ignoreCadence?: boolean } = {}): Promise<EmailRecipient[]> {
   const rows = await tx.query<{ user_id: string; role: string; digest_cadence: string | null; project_scope: string[] | null; sentiment_alerts_enabled: boolean | null }>(
     `SELECT m.user_id, m.role, m.digest_cadence, m.project_scope, m.sentiment_alerts_enabled
        FROM workspace_members m JOIN users u ON u.id = m.user_id
@@ -77,5 +77,5 @@ export async function emailableMembers(tx: ClientBase, workspaceId: string, user
   );
   return rows.rows
     .map((row) => ({ userId: row.user_id, role: row.role, cadence: effectiveCadence(row.role, row.digest_cadence), visible: visibleProjects(row.role, row.project_scope), sentimentAlerts: row.sentiment_alerts_enabled !== false }))
-    .filter((member) => member.cadence !== "off");
+    .filter((member) => options.ignoreCadence === true || member.cadence !== "off");
 }

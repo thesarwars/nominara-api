@@ -421,7 +421,7 @@ export class ShareTokensService {
    */
   async consumeView(id: string, view: ViewFacts): Promise<string | null> {
     const { client, workspaceId } = this.store();
-    const updated = await client.query<{ view_count: number; label: string }>(
+    const updated = await client.query<{ view_count: number; label: string; scope_project_ids: string[] }>(
       `UPDATE share_tokens
           SET view_count = view_count + 1, last_viewed_at = now(), failed_attempts = 0, locked_until = NULL
         WHERE id = $1
@@ -429,7 +429,7 @@ export class ShareTokensService {
           AND (expires_at IS NULL OR expires_at > now())
           AND (max_views IS NULL OR view_count < max_views)
           AND (locked_until IS NULL OR locked_until <= now())
-        RETURNING view_count, label`,
+        RETURNING view_count, label, scope_project_ids`,
       [id],
     );
     if (updated.rowCount !== 1) return null;
@@ -446,7 +446,8 @@ export class ShareTokensService {
         client,
         {
           workspaceId,
-          projectId: null,
+          // A single-project token files the in-app row under that project, so a scoped member sees it only if they see the project.
+          projectId: taken.scope_project_ids?.length === 1 ? taken.scope_project_ids[0]! : null,
           userId: null,
           kind: "portal.first_view",
           severity: "info",
@@ -456,6 +457,8 @@ export class ShareTokensService {
           eventKey: `portal.first_view:${id}`,
           facts: { share_token_id: id },
           emailNow: true,
+          // PROVISIONAL: only members who may manage share tokens and see every project the token covers.
+          emailAudience: { permission: "share_token:mint", projectIds: taken.scope_project_ids ?? [] },
         },
         { relayOnly: true },
       );
