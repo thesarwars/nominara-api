@@ -153,6 +153,8 @@ export class BillingService {
         lifetime_purchased: 0,
         lifetime_spent: 0,
         auto_topup: AUTO_TOPUP_OFF,
+        daily_lookups: (await this.dailyMeters(client, workspaceId)).lookup,
+        daily_resets_at: nextUtcMidnight(new Date()),
       };
     }
 
@@ -167,6 +169,8 @@ export class BillingService {
       lifetime_purchased: counters?.purchased ?? 0,
       lifetime_spent: counters?.spent ?? 0,
       auto_topup: (await readAutoTopup(client, workspaceId)) ?? AUTO_TOPUP_OFF,
+      daily_lookups: (await this.dailyMeters(client, workspaceId)).lookup,
+      daily_resets_at: nextUtcMidnight(new Date()),
     };
   }
 
@@ -270,31 +274,39 @@ export class BillingService {
     const links = await client.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM share_tokens WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())`,
     );
-    // STORY-096 AC15 - the daily caps. `used` is today's (UTC) row of credit_daily_counters, 0 with no row; the cap is the plan's CURRENT entitlement,
-    // not the row's `limit_count`, which holds the limit the day's last write used (a mid-day upgrade lifts the cap at once). Read-only: no row is created.
-    const todays = await client.query<{ action_code: string; used_count: number }>(
-      `SELECT action_code, used_count FROM credit_daily_counters
-        WHERE workspace_id = $1 AND utc_date = (now() AT TIME ZONE 'UTC')::date`,
-      [workspaceId],
-    );
-    const entitlements = (await resolveEntitlements(client, workspaceId)).entitlements;
-    const dailyMeter = (action: DailyCapAction): { used: number; cap: number | null } => {
-      const value = entitlements[DAILY_CAP_ENTITLEMENT[action]]?.value;
-      return {
-        used: todays.rows.find((r) => r.action_code === action)?.used_count ?? 0,
-        cap: typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null,
-      };
-    };
+    const meters = await this.dailyMeters(client, workspaceId);
 
     incrementCounter("nominara_billing_usage_read_total", { outcome: "ok" });
     return {
       period_start: period.start,
       pdf_exports: { used, cap: limit === UNLIMITED_LIMIT ? null : limit },
       share_links_active: links.rows[0]?.n ?? 0,
-      daily_lookups: dailyMeter("lookup"),
-      daily_nlp_parses: dailyMeter("nlp_command"),
+      daily_lookups: meters.lookup,
+      daily_nlp_parses: meters.nlp_command,
       daily_resets_at: nextUtcMidnight(new Date()),
     };
+  }
+
+  /**
+   * The two customer-visible DAILY meters, for the usage read (STORY-096 AC15) and the wallet read (STORY-095 AC12), so they cannot disagree.
+   * `used` is today's (UTC) row of credit_daily_counters, 0 with no row; the cap is the plan's CURRENT entitlement, not the row's `limit_count`,
+   * which holds the limit the day's last write used (a mid-day upgrade lifts the cap at once). Read-only: no row is created.
+   */
+  private async dailyMeters(client: ClientBase, workspaceId: string): Promise<Record<DailyCapAction, { used: number; cap: number | null }>> {
+    const todays = await client.query<{ action_code: string; used_count: number }>(
+      `SELECT action_code, used_count FROM credit_daily_counters
+        WHERE workspace_id = $1 AND utc_date = (now() AT TIME ZONE 'UTC')::date`,
+      [workspaceId],
+    );
+    const entitlements = (await resolveEntitlements(client, workspaceId)).entitlements;
+    const meter = (action: DailyCapAction): { used: number; cap: number | null } => {
+      const value = entitlements[DAILY_CAP_ENTITLEMENT[action]]?.value;
+      return {
+        used: todays.rows.find((r) => r.action_code === action)?.used_count ?? 0,
+        cap: typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null,
+      };
+    };
+    return { lookup: meter("lookup"), nlp_command: meter("nlp_command") };
   }
 
   /**

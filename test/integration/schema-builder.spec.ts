@@ -161,7 +161,7 @@ describe("STORY-083 · Schema Builder save", () => {
     expect(row).toMatchObject({ tool_key: "schema_builder", credits_charged: 0, status: "completed", target_url: null, brand_name: null, engine_keys: [] });
     const stored = schemaBuilderStoredResultSchema.parse(row.result_json);
     expect(stored.findings.map((f) => f.rule_code)).toEqual(["AUX-R-012", "AUX-R-008"]);
-    expect(Object.keys(row.result_json).sort()).toEqual(["entity_type", "findings", "mode", "schema_version", "vocab_version"]);
+    expect(Object.keys(row.result_json).sort()).toEqual(["entity_type", "findings", "mode", "presentation_notes", "schema_version", "vocab_version"]);
     const walletBefore = await wallet(a.workspaceId);
     const rowsBefore = await count("SELECT count(*)::int AS n FROM tool_runs WHERE workspace_id = $1", [a.workspaceId]);
     const reopened = await harness.app().inject({ method: "GET", url: apiUrl(`/tools/runs/${body.id}`), headers: { cookie: a.cookie } });

@@ -29,7 +29,7 @@ import { countStructural } from "../../lib/entitlements/structural-usage.js";
 import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import { toolConversionPlan } from "../../lib/tools/conversion.js";
 import { toolInputHash } from "../../lib/tools/input-hash.js";
-import { toolPresentation } from "../../lib/tools/presentation.js";
+import { stampPresentationNotes, storedNotesOf, toolPresentation, withoutStoredNotes } from "../../lib/tools/presentation.js";
 import type { ResolvedEntitlementsResponse } from "../../lib/entitlements/resolution.js";
 import { toolSnapshotExpiresAt } from "../../lib/tools/retention-window.js";
 import { deriveToolRunOutcome } from "../../lib/tools/run-outcome.js";
@@ -176,6 +176,11 @@ function expiredNotice(row: RunRow): ToolRun["expired"] {
   };
 }
 
+/** A Schema Builder run made by fetching a URL reads differently from the paste path (STORY-083 AC5). */
+function variantOf(toolKey: ToolKey, result: ToolRunResult | null): "url_check" | undefined {
+  return toolKey === "schema_builder" && result?.["source"] === "url" ? "url_check" : undefined;
+}
+
 function toRun(row: RunRow): ToolRun {
   const headline = headlineOf(row);
   return {
@@ -206,14 +211,14 @@ function toRun(row: RunRow): ToolRun {
     diff_compare_run_id: row.diff_compare_run_id,
     converted_project_id: row.converted_project_id,
     converted_at: row.converted_at === null ? null : iso(row.converted_at),
-    presentation: toolPresentation(row.tool_key, headline, row.tool_key === "schema_builder" && row.result_json?.["source"] === "url" ? "url_check" : undefined),
+    presentation: toolPresentation(row.tool_key, headline, variantOf(row.tool_key, row.result_json), storedNotesOf(row.result_json)),
     expired: expiredNotice(row),
   };
 }
 
 function toDetail(row: RunRow): ToolRunDetail {
   const plan = toolConversionPlan(row);
-  return { ...toRun(row), result: row.result_json, conversion: { state: plan.state, reason: plan.reason, credits: plan.credits, prefill: plan.prefill } };
+  return { ...toRun(row), result: withoutStoredNotes(row.result_json), conversion: { state: plan.state, reason: plan.reason, credits: plan.credits, prefill: plan.prefill } };
 }
 
 /** `%`, `_` and `\` in a search term are text, not wildcards. */
@@ -275,7 +280,8 @@ export class ToolsService {
           [
             id, actorId, input.toolKey, input.brandName ?? null, input.brandUrl ?? null, input.targetUrl ?? null, input.queryText ?? null,
             input.promptTexts === undefined || input.promptTexts === null ? null : [...input.promptTexts], hash, engineKeys, input.locale ?? null,
-            input.resultJson === undefined || input.resultJson === null ? null : JSON.stringify(input.resultJson),
+            // STORY-095 AC9: the notes are written WITH the result, here for a tool that stores its result at the start.
+            input.resultJson === undefined || input.resultJson === null ? null : JSON.stringify(stampPresentationNotes(input.resultJson, input.toolKey, variantOf(input.toolKey, input.resultJson))),
             input.diffBaseRunId ?? null, input.diffCompareRunId ?? null, input.credits, expiresAt,
           ],
         );
@@ -331,7 +337,9 @@ export class ToolsService {
         }
         const h = finish.headline ?? {};
         const pick = <K extends keyof ToolRunHeadline>(key: K): ToolRunHeadline[K] => (h[key] !== undefined ? (h[key] as ToolRunHeadline[K]) : (row[key] as ToolRunHeadline[K]));
-        const result = finish.result === undefined ? row.result_json : finish.result;
+        const unstamped = finish.result === undefined ? row.result_json : finish.result;
+        // STORY-095 AC9: a result is stored WITH the notes this run's tool states. A run with no result stores none (a null stays null).
+        const result = unstamped === null ? null : stampPresentationNotes(unstamped, row.tool_key, variantOf(row.tool_key, unstamped));
         const updated = await client.query<RunRow>(
           `UPDATE tool_runs SET
              status = $2, engines_succeeded = $3, engines_failed = $4, result_json = $5::jsonb,
