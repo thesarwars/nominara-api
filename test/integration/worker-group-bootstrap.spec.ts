@@ -54,7 +54,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     // STORY-073 AC4 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "credit.verify",
   ],
-  report: ["report.build"],
+  // STORY-185 (decision 100(c)) — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+  report: ["report.build", "billing.retention_export"],
   deploy: ["deploy.cms"],
 };
 
