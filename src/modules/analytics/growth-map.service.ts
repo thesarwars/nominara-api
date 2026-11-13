@@ -15,6 +15,8 @@ import {
   type Milestone,
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { customRangeDays, customRangeGranularity } from "../../../contracts/analytics/custom-range.schema.js";
+import { assertCustomRangeAllowed } from "../../lib/analytics/custom-range.js";
 import { MEASURED_IMPACT_CAVEAT } from "../../../contracts/tasks/task-verification.schema.js";
 import { currentTenantStore, type TenantContextStore } from "../../tenancy/tenant-context.js";
 import {
@@ -55,7 +57,7 @@ import { SCORING_VERSION } from "../../lib/scoring/index.js";
 // pruned to one day), `7d/30d/90d → day` and `>90d → week` (from the rollup).
 
 /** The trailing whole days each day- or week-granularity timeframe covers. `24h` is read by the hour and never uses it. */
-const TIMEFRAME_DAYS: Readonly<Record<GrowthMapTimeframe, number>> = Object.freeze({
+const TIMEFRAME_DAYS: Readonly<Record<Exclude<GrowthMapTimeframe, "custom">, number>> = Object.freeze({
   "24h": 1,
   "7d": 7,
   "30d": 30,
@@ -116,8 +118,14 @@ export class GrowthMapService {
     if (store === undefined) throw new Error("GrowthMapService requires an active tenant context");
     const tx = store.client;
 
-    // §13 — auto-selected. The contract already refused a mismatched `granularity`, so it is never consulted here.
-    const granularity: GrowthMapGranularity = opts.days === undefined ? GROWTH_MAP_GRANULARITY[query.timeframe] : "day";
+    // STORY-090: `timeframe=custom` plots the days asked for or refuses with a reason (retention-bounded), never a trimmed range. The portal's own
+    // `opts.days` window is a preset and takes precedence.
+    const custom =
+      opts.days === undefined && query.timeframe === "custom" && query.from !== undefined && query.to !== undefined ? { from: query.from, to: query.to } : undefined;
+
+    // §13 — auto-selected (a custom range by its own length). The contract already refused a mismatched `granularity`, so it is never consulted here.
+    const granularity: GrowthMapGranularity =
+      opts.days !== undefined ? "day" : custom !== undefined ? customRangeGranularity(customRangeDays(custom.from, custom.to)) : GROWTH_MAP_GRANULARITY[query.timeframe as Exclude<GrowthMapTimeframe, "custom">];
 
     const wanted = new Set(
       (query.entities ?? "brand,competitors").split(",").map((entity) => entity.trim()).filter((entity) => entity.length > 0),
@@ -127,7 +135,17 @@ export class GrowthMapService {
     const selected = requested === null ? null : narrowToEntitled(requested, await this.entitledEngines(tx, projectId));
 
     if (granularity === "hour") return this.hourly(tx, store, projectId, wanted, selected, opts.portal);
-    return this.fromRollup(tx, store, projectId, wanted, selected, granularity, opts.days ?? TIMEFRAME_DAYS[query.timeframe], opts.portal);
+    return this.fromRollup(
+      tx,
+      store,
+      projectId,
+      wanted,
+      selected,
+      granularity,
+      opts.days ?? (custom !== undefined ? customRangeDays(custom.from, custom.to) : TIMEFRAME_DAYS[query.timeframe as Exclude<GrowthMapTimeframe, "custom">]),
+      opts.portal,
+      custom,
+    );
   }
 
   /** Day and week granularity: the rollup layer (`metric_daily`), never the captures. */
@@ -140,8 +158,9 @@ export class GrowthMapService {
     granularity: "day" | "week",
     windowDays: number,
     portal: GrowthMapOptions["portal"],
+    custom?: { readonly from: string; readonly to: string },
   ): Promise<GrowthMapResponse> {
-    const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, windowDays, portal?.timezone);
+    const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, windowDays, portal?.timezone, custom === undefined ? undefined : { ...custom, workspaceId: store.context.workspaceId });
     const days = calendarDays(from, to);
     const buckets: readonly WeekBucket[] | null = granularity === "week" ? weekBuckets(days) : null;
     const labels = buckets === null ? days : buckets.map((bucket) => bucket.label);
@@ -452,11 +471,17 @@ export class GrowthMapService {
     projectId: string,
     days: number,
     knownTimezone?: string,
+    custom?: { readonly from: string; readonly to: string; readonly workspaceId: string },
   ): Promise<{ from: string; to: string; timezone: string; brandLabel: string }> {
     // The project's own timezone, for the reason the rollup gives: a project
     // in a distant zone has a different "today" than the server, and a
     // server-local window would put its captures on the wrong day.
     const { timezone, brandLabel } = await this.projectSettings(tx, projectId, knownTimezone);
+    if (custom !== undefined) {
+      // STORY-090: the range as asked, or a 400 naming why (retention, future, length) - never a trimmed one.
+      await assertCustomRangeAllowed(tx, custom.workspaceId, timezone, custom, "growth_map");
+      return { from: custom.from, to: custom.to, timezone, brandLabel };
+    }
     const bounds = await tx.query<{ from: string; to: string }>(
       `SELECT to_char(today - make_interval(days => $1::int - 1), 'YYYY-MM-DD') AS from,
               to_char(today, 'YYYY-MM-DD')                                      AS to
