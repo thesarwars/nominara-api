@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Job } from "bullmq";
 import { Client, Pool, type PoolClient } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { trace } from "@opentelemetry/api";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { embedBatchPayloadSchema } from "../../src/lib/embedding/embed-batch.js";
 import { cellKey, probeSemanticReuse } from "../../src/lib/capture/l2-semantic-reuse.js";
@@ -20,6 +22,19 @@ import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 
 // STORY-186 - re-embed on a model change. Owner decision 104: staged, then promoted per project in one step. The provider is the
 // deterministic stand-in behind the port (scripted to name any model); nothing here touches a network.
+
+// The metric calls this spec asserts on (AC5). Everything else passes through to the real module.
+const observed: { name: string; value: number; labels: Record<string, string | number> }[] = [];
+vi.mock("../../src/lib/telemetry/metrics.js", async () => {
+  const actual = await vi.importActual<typeof import("../../src/lib/telemetry/metrics.js")>("../../src/lib/telemetry/metrics.js");
+  return {
+    ...actual,
+    observeValue: (name: string, value: number, labels: Record<string, string | number> = {}) => {
+      observed.push({ name, value, labels });
+      actual.observeValue(name, value, labels);
+    },
+  };
+});
 
 const KEYS = { current: { kid: "k1", key: Buffer.from("embed-batch-test-signing-key-32by") } };
 const ENTRY = QUEUE_TOPOLOGY.find((entry) => entry.name === "embed.batch")!;
@@ -438,4 +453,96 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     const options: Parameters<typeof runReembed>[0] = { client: db, model: NEW, enqueue: recorder().enqueue, logger: quiet };
     expect(Object.keys(options).sort()).toEqual(["client", "enqueue", "logger", "model"]);
   });
+
+  // ---- AC5: progress is observable and the cutover is audited --------------------------------------------------------------
+
+  const auditRows = async () =>
+    (await db.query<{ workspace_id: string; action: string; resource_type: string; resource_id: string; after_state: Record<string, unknown>; actor_type: string }>(
+      "SELECT workspace_id, action, resource_type, resource_id, after_state, actor_type FROM audit_log WHERE action = 'embedding.cutover' ORDER BY seq")).rows;
+
+  it("AC5 - a cutover writes one audit row: workspace, project, model and counts, no prompt text; a rerun and a blocked project write none", async () => {
+    const other = await newWorkspace();
+    await manyPrompts(3, OLD);
+    await manyPrompts(2, OLD, { ws: other.workspaceId, project: other.projectId });
+    await db.query(
+      `INSERT INTO geo_alignments (id, workspace_id, project_id, target_url, engine_keys, embedding_model, live_content_md, status)
+       VALUES ($1, $2, $3, 'https://example.test/p', '{chatgpt}', $4, '# x', 'open')`,
+      [randomUUID(), other.workspaceId, other.projectId, OLD],
+    );
+    const first = recorder();
+    await reembed(first.enqueue);
+    for (const e of first.sent) await process(e);
+    await reembed(recorder().enqueue);
+    await reembed(recorder().enqueue);
+    const rows = await auditRows();
+    expect(rows, "one cutover, once; the blocked workspace has none").toHaveLength(1);
+    expect(rows[0]).toMatchObject({ workspace_id: workspaceId, resource_type: "project", resource_id: projectId, actor_type: "system" });
+    expect(rows[0]!.after_state).toMatchObject({ model: NEW, prompts: 3, nodes: 0 });
+    expect(JSON.stringify(rows[0]!.after_state)).not.toContain("prompt number");
+  }, 120_000);
+
+  it("AC5 - the audit row commits WITH the cutover: if it cannot be written the project stays on the old model (fail closed)", async () => {
+    const ids = await manyPrompts(2, OLD);
+    const first = recorder();
+    await reembed(first.enqueue);
+    for (const e of first.sent) await process(e);
+    await db.query("CREATE FUNCTION b14_refuse_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit refused'; END $$");
+    await db.query("CREATE TRIGGER b14_refuse_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION b14_refuse_audit()");
+    try {
+      const summary = await reembed(recorder().enqueue);
+      expect(summary.promoteFailed).toBe(1);
+      expect(summary.cutovers).toEqual([]);
+      expect((await state("tracked_prompts", ids)).every((row) => row.embedding_model === OLD && row.has_next), "rolled back whole").toBe(true);
+    } finally {
+      await db.query("DROP TRIGGER b14_refuse_audit ON audit_log");
+      await db.query("DROP FUNCTION b14_refuse_audit()");
+    }
+    expect((await reembed(recorder().enqueue)).cutovers, "and the rerun completes it").toHaveLength(1);
+  }, 120_000);
+
+  it("AC5 - rows pending per model are reported and observed: by table and model, 0 once nothing is pending (0 is a reading, not absence)", async () => {
+    await manyPrompts(3, OLD);
+    await manyPrompts(2, null);
+    await addNode("audit logging", "model-older");
+    observed.length = 0;
+    const before = await reembed(recorder().enqueue);
+    const pendingOf = (summary: ReembedSummary, table: string, model: string) => summary.pending.find((p) => p.table === table && p.model === model)?.rows;
+    expect(pendingOf(before, "tracked_prompts", OLD)).toBe(3);
+    expect(pendingOf(before, "tracked_prompts", "(none)"), "active prompts never embedded").toBe(2);
+    expect(pendingOf(before, "semantic_nodes", "model-older")).toBe(1);
+    const gauge = observed.filter((o) => o.name === "nominara_embed_reembed_pending_rows");
+    expect(gauge.find((o) => o.labels.table === "tracked_prompts" && o.labels.model === OLD)?.value).toBe(3);
+
+    // Drain it: backfill + stage everything, cut over, then the next run reports zero.
+    const run1 = recorder();
+    await reembed(run1.enqueue);
+    for (const e of run1.sent) await process(e);
+    await db.query("UPDATE semantic_nodes SET embedding = NULL, embedding_model = NULL");
+    await reembed(recorder().enqueue);
+    observed.length = 0;
+    const after = await reembed(recorder().enqueue);
+    expect(after.pending).toEqual([]);
+    const zero = observed.filter((o) => o.name === "nominara_embed_reembed_pending_rows");
+    expect(zero.length, "an empty table still reports").toBeGreaterThan(0);
+    expect(zero.every((o) => o.value === 0)).toBe(true);
+  }, 180_000);
+
+  it("AC5 - one span per run carries the counts and no tenant content; the log lines carry ids, never text", async () => {
+    const exporter = new InMemorySpanExporter();
+    trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }));
+    await manyPrompts(2, OLD);
+    const lines: unknown[] = [];
+    const logger = { log: (m: unknown) => lines.push(m), warn: (m: unknown) => lines.push(m), error: (m: unknown) => lines.push(m) };
+    const first = recorder();
+    await runReembed({ client: db, model: NEW, enqueue: first.enqueue, logger });
+    for (const e of first.sent) await process(e);
+    await runReembed({ client: db, model: NEW, enqueue: recorder().enqueue, logger });
+    const spans = exporter.getFinishedSpans().filter((span) => span.name === "embed.reembed.run");
+    expect(spans).toHaveLength(2);
+    expect(spans[0]!.attributes).toMatchObject({ "nominara.embed.model": NEW, "nominara.embed.jobs_enqueued": 1, "nominara.embed.cutovers": 0 });
+    expect(spans[1]!.attributes).toMatchObject({ "nominara.embed.jobs_enqueued": 0, "nominara.embed.cutovers": 1 });
+    const text = JSON.stringify(lines);
+    expect(text).toContain(workspaceId);
+    expect(text).not.toContain("prompt number");
+  }, 120_000);
 });

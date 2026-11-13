@@ -1,8 +1,10 @@
 import type { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase } from "pg";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { withTenantContext } from "../../tenancy/tenant-context.js";
-import { incrementCounter } from "../telemetry/metrics.js";
+import { appendComplianceAudit } from "../compliance/compliance-audit.js";
+import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 import { embedBatchKey, splitIdsIntoJobs, type EmbedTable } from "./embed-batch.js";
 import type { EnqueueEmbedBatch } from "./prompt-embedding-request.js";
 import { promoteProject } from "./reembed-promote.js";
@@ -24,6 +26,11 @@ import { promoteProject } from "./reembed-promote.js";
 // TENANCY. The discovery reads run on the OWNER connection (the reaper pattern) and return ids only, grouped by workspace: a job never mixes
 // two workspaces' ids. Every WRITE (the promote) runs in that workspace's own tenant context. NO I/O INSIDE A TRANSACTION: the discovery runs
 // outside any transaction, the enqueues are made outside any, and the promote transaction holds only SQL.
+
+const tracer = trace.getTracer("nominara.embed-reembed");
+
+/** The label for a row with no vector at all (an active prompt never embedded). Absent is not a model. */
+export const NO_MODEL_LABEL = "(none)";
 
 /** Thrown by the operator command when EMBED_REEMBED_ENABLED is not exactly "true" (owner decision 104(b): off by default). */
 export class ReembedDisabledError extends Error {
@@ -63,6 +70,13 @@ export interface ReembedBlocked {
   readonly reason: "incomplete" | "open_session";
 }
 
+export interface ReembedPending {
+  readonly table: "tracked_prompts" | "semantic_nodes";
+  /** The model the rows are served under now, or NO_MODEL_LABEL. */
+  readonly model: string;
+  readonly rows: number;
+}
+
 export interface ReembedSummary {
   readonly model: string;
   readonly jobs: { readonly backfill: number; readonly stagePrompts: number; readonly stageNodes: number };
@@ -70,6 +84,8 @@ export interface ReembedSummary {
   readonly cutovers: readonly ReembedCutover[];
   readonly blocked: readonly ReembedBlocked[];
   readonly promoteFailed: number;
+  /** AC5 - rows still not under the target model, per table and served model. Empty when nothing is pending. */
+  readonly pending: readonly ReembedPending[];
 }
 
 interface Discovery {
@@ -113,7 +129,29 @@ const DISCOVERIES: readonly Discovery[] = [
   },
 ];
 
-export async function runReembed(options: ReembedOptions): Promise<ReembedSummary> {
+export function runReembed(options: ReembedOptions): Promise<ReembedSummary> {
+  return tracer.startActiveSpan("embed.reembed.run", async (span) => {
+    try {
+      const summary = await reembedOnce(options);
+      span.setAttributes({
+        "nominara.embed.model": summary.model,
+        "nominara.embed.jobs_enqueued": summary.jobs.backfill + summary.jobs.stagePrompts + summary.jobs.stageNodes,
+        "nominara.embed.enqueue_failed": summary.enqueueFailed,
+        "nominara.embed.cutovers": summary.cutovers.length,
+        "nominara.embed.cutovers_blocked": summary.blocked.length,
+        "nominara.embed.rows_pending": summary.pending.reduce((sum, p) => sum + p.rows, 0),
+      });
+      return summary;
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+async function reembedOnce(options: ReembedOptions): Promise<ReembedSummary> {
   const { client, model, enqueue, logger } = options;
   const jobs = { backfill: 0, stagePrompts: 0, stageNodes: 0 };
   let enqueueFailed = 0;
@@ -175,7 +213,22 @@ export async function runReembed(options: ReembedOptions): Promise<ReembedSummar
   let promoteFailed = 0;
   for (const row of staged.rows) {
     try {
-      const outcome = await withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, (tx) => promoteProject(tx, row.project_id, model));
+      // THE AUDIT ROW COMMITS WITH THE CUTOVER (AC5): if it cannot be written the whole promote rolls back and the project stays on the old model.
+      const outcome = await withTenantContext(client, { workspaceId: row.workspace_id, actorId: SYSTEM_ACTOR_ID }, async (tx) => {
+        const promoted = await promoteProject(tx, row.project_id, model);
+        if (promoted.status === "promoted") {
+          await appendComplianceAudit(tx, {
+            workspaceId: row.workspace_id,
+            actorType: "system",
+            actorId: null,
+            action: "embedding.cutover",
+            resourceType: "project",
+            resourceId: row.project_id,
+            afterState: { model, prompts: promoted.prompts, nodes: promoted.nodes },
+          });
+        }
+        return promoted;
+      });
       if (outcome.status === "promoted") {
         cutovers.push({ workspaceId: row.workspace_id, projectId: row.project_id, prompts: outcome.prompts, nodes: outcome.nodes });
         incrementCounter("nominara_embed_reembed_cutover_total");
@@ -191,5 +244,34 @@ export async function runReembed(options: ReembedOptions): Promise<ReembedSummar
     }
   }
 
-  return { model, jobs, enqueueFailed, cutovers, blocked, promoteFailed };
+  const pending = await readPending(client, model);
+  return { model, jobs, enqueueFailed, cutovers, blocked, promoteFailed, pending };
+}
+
+/**
+ * AC5 - the progress reading: live rows not yet under the target model, per table and served model (ids and counts only, owner connection). A
+ * never-embedded active prompt counts under NO_MODEL_LABEL. Every table is reported, so a finished re-embed observes 0 (a reading) rather than
+ * going silent (no reading).
+ */
+async function readPending(client: ClientBase, model: string): Promise<ReembedPending[]> {
+  const found = await client.query<{ tbl: ReembedPending["table"]; model: string; rows: string }>(
+    `SELECT 'tracked_prompts' AS tbl, COALESCE(embedding_model, $2) AS model, count(*) AS rows
+       FROM tracked_prompts
+      WHERE deleted_at IS NULL AND ((embedding IS NULL AND status = 'active') OR (embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1))
+      GROUP BY 2
+     UNION ALL
+     SELECT 'semantic_nodes', COALESCE(embedding_model, $2), count(*)
+       FROM semantic_nodes
+      WHERE embedding IS NOT NULL AND embedding_model IS DISTINCT FROM $1
+      GROUP BY 2
+      ORDER BY 1, 2`,
+    [model, NO_MODEL_LABEL],
+  );
+  const pending = found.rows.map((row) => ({ table: row.tbl, model: row.model, rows: Number(row.rows) }));
+  for (const table of ["tracked_prompts", "semantic_nodes"] as const) {
+    const mine = pending.filter((p) => p.table === table);
+    if (mine.length === 0) observeValue("nominara_embed_reembed_pending_rows", 0, { table, model });
+    for (const p of mine) observeValue("nominara_embed_reembed_pending_rows", p.rows, { table, model: p.model });
+  }
+  return pending;
 }
