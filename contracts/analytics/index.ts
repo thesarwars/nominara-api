@@ -16,3 +16,4 @@ export * from "./geo-alignment-targets.schema.js";
 export * from "./name-match-judge-job.schema.js";
 export * from "./entity-probe-job.schema.js";
 export * from "./geo-page-structure.schema.js";
+export * from "./custom-range.schema.js";

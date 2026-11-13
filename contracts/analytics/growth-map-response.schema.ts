@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { measuredImpactSchema as writtenMeasuredImpactSchema } from "../tasks/task-verification.schema.js";
+import { customRangeDays, customRangeFields, customRangeGranularity, refineCustomRange } from "./custom-range.schema.js";
 import { dataSourceSchema, engineDataSourceSchema } from "./data-source.schema.js";
 
 // STORY-137 — `GET /v1/projects/{id}/growth-map`, `api-specification.md` §7.
@@ -28,11 +29,11 @@ export const engineFilterSchema = z
  * The two longer windows are named `180d` and `365d` (planner recommendation,
  * 2026-10-26); a custom range is STORY-090's.
  */
-export const growthMapTimeframeSchema = z.enum(["24h", "7d", "30d", "90d", "180d", "365d"]);
+export const growthMapTimeframeSchema = z.enum(["24h", "7d", "30d", "90d", "180d", "365d", "custom"]);
 export const growthMapGranularitySchema = z.enum(["hour", "day", "week"]);
 
-/** §13's auto-selection, as data, so the server and a client cannot disagree about it. */
-export const GROWTH_MAP_GRANULARITY: Readonly<Record<z.infer<typeof growthMapTimeframeSchema>, z.infer<typeof growthMapGranularitySchema>>> =
+/** §13's auto-selection, as data, so the server and a client cannot disagree about it. A custom range selects by its own length (`customRangeGranularity`). */
+export const GROWTH_MAP_GRANULARITY: Readonly<Record<Exclude<z.infer<typeof growthMapTimeframeSchema>, "custom">, z.infer<typeof growthMapGranularitySchema>>> =
   Object.freeze({ "24h": "hour", "7d": "day", "30d": "day", "90d": "day", "180d": "week", "365d": "week" });
 
 export const growthMapQuerySchema = z
@@ -53,14 +54,23 @@ export const growthMapQuerySchema = z
      * daily values. A mismatch is a 400, never a silent substitution.
      */
     granularity: growthMapGranularitySchema.optional(),
+    /** STORY-090: with `timeframe=custom`, the workspace-local days plotted (both inclusive) - see custom-range.schema.ts. */
+    ...customRangeFields,
   })
   .strict()
   .superRefine((query, ctx) => {
-    if (query.granularity !== undefined && query.granularity !== GROWTH_MAP_GRANULARITY[query.timeframe]) {
+    refineCustomRange(query, ctx);
+    const selected =
+      query.timeframe !== "custom"
+        ? GROWTH_MAP_GRANULARITY[query.timeframe]
+        : query.from !== undefined && query.to !== undefined
+          ? customRangeGranularity(customRangeDays(query.from, query.to))
+          : undefined;
+    if (query.granularity !== undefined && selected !== undefined && query.granularity !== selected) {
       ctx.addIssue({
         code: "custom",
         path: ["granularity"],
-        message: `timeframe ${query.timeframe} is served at ${GROWTH_MAP_GRANULARITY[query.timeframe]} granularity`,
+        message: `timeframe ${query.timeframe} is served at ${selected} granularity`,
       });
     }
   });

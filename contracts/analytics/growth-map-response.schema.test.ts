@@ -11,6 +11,7 @@ describe("STORY-066 AC1/AC2 · growth-map query", () => {
     for (const timeframe of ["24h", "7d", "30d", "90d", "180d", "365d"]) {
       expect(growthMapQuerySchema.safeParse({ timeframe }).success).toBe(true);
     }
+    // A custom range is STORY-090's: `custom` is a timeframe only with both dates (custom-range.schema.test.ts).
     expect(growthMapQuerySchema.safeParse({ timeframe: "custom" }).success).toBe(false);
   });
 

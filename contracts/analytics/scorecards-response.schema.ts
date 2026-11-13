@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { customRangeFields, refineCustomRange } from "./custom-range.schema.js";
 import { blendDisclosureSchema, dataSourceSchema } from "./data-source.schema.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`, `api-specification.md` §3's
@@ -13,13 +14,19 @@ import { blendDisclosureSchema, dataSourceSchema } from "./data-source.schema.js
 
 export const scorecardTimeframeSchema = z.enum(["7d", "30d", "90d"]).default("30d");
 
+/** STORY-090: the scorecards alone also take `custom` (the rendering-quality read, which shares the presets, does not). */
+export const scorecardsTimeframeSchema = z.enum(["7d", "30d", "90d", "custom"]).default("30d");
+
 export const scorecardsQuerySchema = z
   .object({
-    timeframe: scorecardTimeframeSchema,
+    timeframe: scorecardsTimeframeSchema,
     /** Comma-separated engine keys. A NARROWING of the project's enabled set. */
     engines: z.string().min(1).optional(),
+    /** STORY-090: with `timeframe=custom`, the workspace-local days measured (both inclusive) - see custom-range.schema.ts. */
+    ...customRangeFields,
   })
-  .strict();
+  .strict()
+  .superRefine(refineCustomRange);
 
 /** §3's band — `low` under 30 measured cells, `medium` to 120, `high` above. */
 export const confidenceSchema = z.enum(["low", "medium", "high"]);
@@ -158,7 +165,7 @@ export const scorecardEntrySchema = z
 export const scorecardsResponseSchema = z
   .object({
     project_id: z.string().uuid(),
-    timeframe: z.enum(["7d", "30d", "90d"]),
+    timeframe: z.enum(["7d", "30d", "90d", "custom"]),
     /** The window actually measured, in the PROJECT'S timezone. */
     window: z
       .object({
