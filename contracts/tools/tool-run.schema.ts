@@ -52,6 +52,21 @@ export const toolRunPresentationSchema = z
   })
   .strict();
 
+/**
+ * STORY-095 AC9 - the presentation notes a run is STORED with, in `tool_runs.result_json` under `presentation_notes`, written once at the
+ * run's own write time (`ToolsService.startRun` / `finishRun`). A re-opened run serves these, not whatever wording this build composes, so a
+ * stored result carries its own caveats forever. The key lives beside the tool's own result and is removed from the `result` a read returns.
+ * A run stored with no result (a failed or empty run) holds no notes, and a run stored before this key existed reads the composed ones.
+ */
+export const PRESENTATION_NOTES_KEY = "presentation_notes";
+export const storedPresentationNotesSchema = z
+  .object({
+    not_tracked_note: z.string().min(1),
+    did_not_check: z.string().min(1),
+  })
+  .strict();
+export type StoredPresentationNotes = z.infer<typeof storedPresentationNotesSchema>;
+
 /** FR-TL-06 - what an expired run says about itself: what was removed, and when. Absent (`null`) on a run that has not expired. */
 export const toolRunExpiredSchema = z
   .object({
