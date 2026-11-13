@@ -161,7 +161,9 @@
           "lifetime_granted",
           "lifetime_purchased",
           "lifetime_spent",
-          "auto_topup"
+          "auto_topup",
+          "daily_lookups",
+          "daily_resets_at"
         ]
       }
     },

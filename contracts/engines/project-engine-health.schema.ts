@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationRequestSchema } from "../common/pagination.schema.js";
 import { engineStatusEntrySchema } from "./engine-status.schema.js";
 
 // STORY-090 AC7/AC8 - `GET /v1/projects/{id}/engine-health` (`tracking:read`): per-project engine health for the live status pip and the filter bar's engine
@@ -20,6 +21,10 @@ export const projectEngineHealthEntrySchema = z
     since: z.iso.datetime().nullable(),
   })
   .strict();
+
+/** Every list takes the cursor envelope (owner decision 2026-10-09 pm #3), short ones included: `cursor`/`limit`, keyed on `engine_key`. */
+export const projectEngineHealthQuerySchema = paginationRequestSchema;
+export type ProjectEngineHealthQuery = z.infer<typeof projectEngineHealthQuerySchema>;
 
 export const projectEngineHealthResponseSchema = z.array(projectEngineHealthEntrySchema);
 

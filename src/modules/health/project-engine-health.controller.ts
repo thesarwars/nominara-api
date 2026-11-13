@@ -1,5 +1,7 @@
-import { Controller, Get, Param } from "@nestjs/common";
-import { projectEngineHealthResponseSchema, type ProjectEngineHealthResponse } from "../../../contracts/engines/index.js";
+import { Controller, Get, Param, Query } from "@nestjs/common";
+import { projectEngineHealthQuerySchema, projectEngineHealthResponseSchema, type ProjectEngineHealthEntry, type ProjectEngineHealthQuery } from "../../../contracts/engines/index.js";
+import type { Page } from "../../api/pagination/page.js";
+import { ZodValidationPipe } from "../../api/pipes/zod-validation.pipe.js";
 import { ApiContract } from "../../api/decorators/api-contract.decorator.js";
 import { ProjectParam } from "../../api/decorators/project-param.decorator.js";
 import { RequirePermission } from "../../api/decorators/require-permission.decorator.js";
@@ -14,8 +16,11 @@ export class ProjectEngineHealthController {
   @Get()
   @RequirePermission("tracking:read")
   @ProjectParam("id")
-  @ApiContract({ operationId: "getProjectEngineHealth", responseSchema: projectEngineHealthResponseSchema })
-  engineHealth(@Param("id") projectId: string): Promise<ProjectEngineHealthResponse> {
-    return this.health.projectEngineHealth(projectId);
+  @ApiContract({ operationId: "getProjectEngineHealth", querySchema: projectEngineHealthQuerySchema, responseSchema: projectEngineHealthResponseSchema, listOf: true })
+  engineHealth(
+    @Param("id") projectId: string,
+    @Query(new ZodValidationPipe(projectEngineHealthQuerySchema)) query: ProjectEngineHealthQuery,
+  ): Promise<Page<ProjectEngineHealthEntry>> {
+    return this.health.projectEngineHealth(projectId, query);
   }
 }

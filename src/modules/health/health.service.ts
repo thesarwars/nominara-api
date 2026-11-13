@@ -1,4 +1,6 @@
 import { Inject, Injectable, Logger, Optional, ServiceUnavailableException, type OnModuleDestroy } from "@nestjs/common";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { HealthCheckService, HealthIndicatorService, type HealthCheckResult } from "@nestjs/terminus";
 import type { Queue } from "bullmq";
 import type { Redis } from "ioredis";
@@ -10,7 +12,7 @@ import type {
   QueueDepth,
   ReadinessResponse,
 } from "../../../contracts/common/health.schema.js";
-import { ENGINE_CATALOG_STATUSES, projectEngineState, type EngineStatusEntry, type EngineStatusResponse, type ProjectEngineHealthResponse } from "../../../contracts/engines/index.js";
+import { ENGINE_CATALOG_STATUSES, projectEngineState, type EngineStatusEntry, type EngineStatusResponse, type ProjectEngineHealthEntry, type ProjectEngineHealthQuery } from "../../../contracts/engines/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
 import { PG_POOL } from "../../db/pg-pool.js";
@@ -62,6 +64,9 @@ export const CACHE_CONNECTION_TOKEN = Symbol("HEALTH_CACHE_CONNECTION");
 // is observability inside a probe an orchestrator polls, so being late is a
 // worse answer than being empty.
 const QUEUE_DEPTH_READ_TIMEOUT_MS = 2_000;
+
+/** The cursor's list name: another list's cursor is a 400 here (STORY-117 AC6). */
+const PROJECT_ENGINE_HEALTH_LIST = "project_engine_health";
 
 @Injectable()
 export class HealthService implements OnModuleDestroy {
@@ -123,7 +128,7 @@ export class HealthService implements OnModuleDestroy {
    * transaction (RLS scopes it; a project of another workspace is a 404); the engine/breaker half is the global read above, taken AFTER that read so no
    * Valkey call happens while the transaction is doing database work. Never a partial list: an engine the status read could not report fails the request.
    */
-  async projectEngineHealth(projectId: string): Promise<ProjectEngineHealthResponse> {
+  async projectEngineHealth(projectId: string, query: ProjectEngineHealthQuery): Promise<Page<ProjectEngineHealthEntry>> {
     const store = currentTenantStore();
     if (store === undefined) throw new Error("projectEngineHealth requires an active tenant context");
     const found = await store.client.query("SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL", [projectId]);
@@ -146,12 +151,21 @@ export class HealthService implements OnModuleDestroy {
     incrementCounter("nominara_health_project_engine_health_reads_total");
     const reported = new Map(status.engines.map((engine) => [engine.engine_key, engine]));
     // An enabled engine with no dispatching adapter (registry `disabled`) cannot capture, so it is `unavailable` with no episode start: never silently left out.
-    return [...keys].sort().map((key) => {
-      const engine = reported.get(key);
-      return engine === undefined
-        ? { engine_key: key, state: "unavailable" as const, since: null }
-        : { engine_key: key, state: projectEngineState(engine), since: engine.unavailable_since };
-    });
+    // Keyset on `engine_key` (unique per project): the page after the cursor's key, one row over the limit so `has_more` needs no count.
+    const after = query.cursor === undefined ? undefined : String(decodeCursor(query.cursor, PROJECT_ENGINE_HEALTH_LIST, 1)[0]);
+    const rows = [...keys].sort().filter((key) => after === undefined || key > after).slice(0, query.limit + 1);
+    return pageFrom(
+      rows,
+      query.limit,
+      PROJECT_ENGINE_HEALTH_LIST,
+      (key): ProjectEngineHealthEntry => {
+        const engine = reported.get(key);
+        return engine === undefined
+          ? { engine_key: key, state: "unavailable", since: null }
+          : { engine_key: key, state: projectEngineState(engine), since: engine.unavailable_since };
+      },
+      (key) => [key],
+    );
   }
 
   async onModuleDestroy(): Promise<void> {

@@ -1,3 +1,4 @@
+import { encodeCursor } from "../../src/api/pagination/cursor.js";
 import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 import { Pool } from "pg";
@@ -99,8 +100,8 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
     await harness.db().query("INSERT INTO projects (id, workspace_id, name, slug, root_url, root_domain) VALUES ($1,$2,'P',$3,'https://e.test','e.test')", [id, workspaceId, `p-${id.slice(0, 8)}`]);
     return id;
   }
-  const health = (actor: { accessToken: string; csrfToken: string }, projectId: string) =>
-    harness.app().inject({ method: "GET", url: apiUrl(`/projects/${projectId}/engine-health`), cookies: { [ACCESS_COOKIE_NAME]: actor.accessToken, [CSRF_COOKIE_NAME]: actor.csrfToken } });
+  const health = (actor: { accessToken: string; csrfToken: string }, projectId: string, query = "") =>
+    harness.app().inject({ method: "GET", url: apiUrl(`/projects/${projectId}/engine-health${query}`), cookies: { [ACCESS_COOKIE_NAME]: actor.accessToken, [CSRF_COOKIE_NAME]: actor.csrfToken } });
 
   it("STORY-090 · a project's engine health lists exactly its enabled engines, with the state the breaker and the catalog imply and when the episode began", async () => {
     const actor = await viewer();
@@ -120,6 +121,7 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
     expect(response.statusCode, response.body).toBe(200);
     const body = dataOf<ProjectEngineHealthResponse>(response);
     expect(projectEngineHealthResponseSchema.safeParse(body).success).toBe(true);
+    expect(response.json().pagination).toEqual({ cursor_next: null, has_more: false, limit: 50 });
     // A ladder-degraded engine leaves project_entitled_engines (it is `active`-only) but must stay listed: that is when the pip names it.
     expect(body.map((e) => e.engine_key).sort()).toEqual([...enabled].sort());
     const byKey = new Map(body.map((e) => [e.engine_key, e]));
@@ -129,6 +131,29 @@ describe("STORY-031 AC11 · GET /v1/engines/status", () => {
     for (const entry of body.filter((e) => e.engine_key !== open && e.engine_key !== degraded)) {
       expect(entry).toMatchObject({ state: dispatching.includes(entry.engine_key) ? "healthy" : "unavailable", since: null });
     }
+  });
+
+  it("STORY-090 · the engine list pages by engine key: limit 1 walks every enabled engine once, in order, and a foreign list's cursor is a 400", async () => {
+    const actor = await viewer();
+    const projectId = await project(actor.workspaceId);
+    const all = dataOf<ProjectEngineHealthResponse>(await health(actor, projectId)).map((e) => e.engine_key);
+    expect(all.length, "two engines at least, or there is no second page").toBeGreaterThan(1);
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page <= all.length; page += 1) {
+      const response = await health(actor, projectId, `?limit=1${cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`}`);
+      expect(response.statusCode, response.body).toBe(200);
+      const { data, pagination } = response.json() as { data: ProjectEngineHealthResponse; pagination: { cursor_next: string | null; has_more: boolean } };
+      expect(data).toHaveLength(1);
+      walked.push(data[0]!.engine_key);
+      expect(pagination.has_more).toBe(pagination.cursor_next !== null);
+      cursor = pagination.cursor_next;
+      if (cursor === null) break;
+    }
+    expect(walked).toEqual(all);
+    // A well-formed current-version cursor, issued for another list: refused for the list name alone.
+    const foreignCursor = encodeCursor("goals", ["a"]);
+    expect((await health(actor, projectId, `?cursor=${foreignCursor}`)).statusCode).toBe(400);
   });
 
   it("STORY-090 · another workspace's project is a 404, an unknown id is a 404, and no session is a 401", async () => {
