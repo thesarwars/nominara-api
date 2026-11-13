@@ -176,7 +176,13 @@ export const resultDocumentSchema = z
          * asserts and what makes the highlight map usable at all.
          */
         text: z.string(),
-        normalized_text_offsets: z.literal(true),
+        /** True while the document carries offsets into `text`; false once `raw_expired` (the text is gone, so no offset is served). */
+        normalized_text_offsets: z.boolean(),
+        /**
+         * Owner decision 100(f). Present ONLY when `raw_expired` is true: the retained excerpt (null if the capture never had one). With the text gone
+         * `text` is "" and `char_count` is 0, which then mean "not available", not "an empty answer".
+         */
+        excerpt: z.string().nullable().optional(),
       })
       .strict(),
     entities: z.array(resultEntitySchema),
@@ -203,6 +209,12 @@ export const resultDocumentSchema = z
       .strict(),
     highlight_map: z.array(highlightSchema),
     flags: z.array(z.string()),
+    /**
+     * Owner decision 100(f), STORY-077 R2: true once the capture is past the plan's raw-capture retention (or the sweep already expired it). The
+     * document is then served without its text (`raw_response.text` is "", `highlight_map` is empty, `capture.response_chars` is 0) and with its facts
+     * and excerpt; false inside the window. OPTIONAL only because a new required response field is classified a MAJOR change by contracts:diff.
+     */
+    raw_expired: z.boolean().optional(),
   })
   .strict();
 

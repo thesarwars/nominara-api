@@ -71,6 +71,21 @@ export interface JobPhases<Prepared, Fetched> {
 
 const PHASES: unique symbol = Symbol("nominara.job-phases");
 
+const NO_POOLED_CLIENT: unique symbol = Symbol("nominara.no-pooled-client");
+
+/**
+ * STORY-075 AC11 - opt a NON-TENANT processor out of the pre-acquired pooled client. By default a non-tenant job holds one pooled client for the
+ * whole run; a job that spends its run on an external service (the Stripe drift tick) must not pin a connection for that long, so it manages its
+ * own short connections and the factory neither acquires nor releases one (the processor is handed `undefined` in the client position).
+ */
+export function withoutPooledClient<T extends (...args: never[]) => unknown>(processor: T): T {
+  return Object.assign(processor, { [NO_POOLED_CLIENT]: true as const });
+}
+
+function wantsNoPooledClient(processor: unknown): boolean {
+  return typeof processor === "function" && (processor as { [NO_POOLED_CLIENT]?: true })[NO_POOLED_CLIENT] === true;
+}
+
 /**
  * Wraps `phases` as a JobProcessor. Called as a plain function (a test, a tool) it composes the three phases on the ONE client
  * it is handed, which is the pre-ADR shape. `createJobProcessor` recognises it and splits the transaction instead.
@@ -130,6 +145,7 @@ export function createJobProcessor(entry: QueueTopologyEntry, options: JobProces
 
   return async (job: Job): Promise<unknown> => {
     if (!entry.tenantScoped) {
+      if (wantsNoPooledClient(options.process)) return options.process(undefined as never, job);
       const client = await options.getClient();
       let failure: unknown;
       try {

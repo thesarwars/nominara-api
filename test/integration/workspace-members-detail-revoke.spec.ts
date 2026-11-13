@@ -243,6 +243,33 @@ describe("NEW-A-12 · workspace members, detail and invitation revoke — throug
     expect(dataOf<{ deletion_scheduled_at: string }>(res).deletion_scheduled_at).toBe("2030-01-01T00:00:00.000Z");
   });
 
+  // STORY-096 AC3 - when a retention-shortening downgrade defers its first purge (workspaces.retention_purge_not_before, STORY-077 slice B), the
+  // workspace says so, so the settings page can show WHEN the purge starts. Not on GET /billing/subscription: a workspace that cancelled to Free has no
+  // live subscription (404 there), and the deferral covers that case too.
+  it("STORY-096 AC3 · GET /workspaces/{id} reports no purge date when nothing is deferred, and never 0 or an empty string", async () => {
+    const owner = await newSession();
+    const ws = await createWorkspace(owner);
+    const res = await app.inject({ method: "GET", url: apiUrl(`/workspaces/${ws}`), ...(await scopedTo(owner, ws)) });
+    expect(dataOf<{ retention_purge_not_before: unknown }>(res).retention_purge_not_before).toBeNull();
+  });
+
+  it("STORY-096 AC3 · a deferral still in force is reported as the date the first purge may run", async () => {
+    const owner = await newSession();
+    const ws = await createWorkspace(owner);
+    await db.query("UPDATE workspaces SET retention_purge_not_before = now() + interval '15 days' WHERE id = $1", [ws]);
+    const expected = (await db.query<{ d: Date }>("SELECT retention_purge_not_before AS d FROM workspaces WHERE id = $1", [ws])).rows[0]!.d.toISOString();
+    const res = await app.inject({ method: "GET", url: apiUrl(`/workspaces/${ws}`), ...(await scopedTo(owner, ws)) });
+    expect(dataOf<{ retention_purge_not_before: string }>(res).retention_purge_not_before).toBe(expected);
+  });
+
+  it("STORY-096 AC3 · a deferral that has lapsed is not reported (the sweep is no longer held back), the same boundary the read paths use", async () => {
+    const owner = await newSession();
+    const ws = await createWorkspace(owner);
+    await db.query("UPDATE workspaces SET retention_purge_not_before = now() - interval '1 second' WHERE id = $1", [ws]);
+    const res = await app.inject({ method: "GET", url: apiUrl(`/workspaces/${ws}`), ...(await scopedTo(owner, ws)) });
+    expect(dataOf<{ retention_purge_not_before: unknown }>(res).retention_purge_not_before).toBeNull();
+  });
+
   // ---- DELETE /workspaces/{id}/invitations/{invitationId} ---------------------
 
   it("NEW-A-12 · revoking a pending invitation sets revoked_at, writes member.invitation_revoked and drops it from the list", async () => {

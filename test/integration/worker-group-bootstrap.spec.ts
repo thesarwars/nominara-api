@@ -44,6 +44,7 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "billing.downgrade_notice",
     // Decision 83(a) (2026-11-09) — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "billing.cancel_on_deletion",
+    "billing.stripe_drift",
     // STORY-064 AC5 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "task.resurface",
     // STORY-013 AC6 / AC14 / AC16 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
@@ -53,7 +54,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     // STORY-073 AC4 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "credit.verify",
   ],
-  report: ["report.build"],
+  // STORY-185 (decision 100(c)) — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+  report: ["report.build", "billing.retention_export"],
   deploy: ["deploy.cms"],
 };
 
@@ -306,6 +308,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
     ["credit.housekeeping", "30 2 * * *", 2, 30],
     ["credit.verify", "45 2 * * *", 2, 45],
     ["retention.purge", "40 3 * * *", 3, 40],
+    ["billing.stripe_drift", "45 3 * * *", 3, 45],
     ["report.cleanup", "30 3 * * *", 3, 30],
   ] as const)("⚠ WORKER_GROUP=rollup schedules %s at %s UTC", async (queue, pattern, hour, minute) => {
     // STORY-076 AC4 / STORY-071 AC10 / STORY-077 R4: a handler and a cron are worth nothing if the boot does not

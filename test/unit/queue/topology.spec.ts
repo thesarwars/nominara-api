@@ -341,12 +341,26 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "email in downgrade_notices inside its transaction (keyed by the Stripe event id or the operator's ticket) and enqueues one signed tenant job after " +
       "commit; the worker sends it with no transaction open (ADR-0003). §4's table allocates no queue to it. A queue of its own so a DLQ entry names it.",
   },
+  "billing.retention_export": {
+    workerGroup: "report",
+    because:
+      "STORY-185 / owner decision 100(c): a customer whose plan change shortens retention may take a full copy of what the purge removes while the deferral is pending. " +
+      "It reads every raw object the purge will remove, so it must never run on a request path (KAD-06): the request records the export and enqueues one signed tenant job " +
+      "after commit; the worker builds it in phases (ADR-0003) under each project's purge lock (EC-40) and stores the zip. §4's table allocates no queue to it. A queue of its own " +
+      "so a DLQ entry names the job that failed; the report worker group because it is a heavy build, not a short billing call.",
+  },
   "billing.cancel_on_deletion": {
     workerGroup: "rollup",
     because:
       "Decision 83(a) (2026-11-09): deleting a workspace sets its Stripe subscription to cancel at period end (no refund), so it is not billed through the grace period. " +
       "A Stripe call may never be made on a request path (KAD-06), so the deletion request enqueues one signed tenant job after commit; the worker reads the live " +
       "subscription. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed.",
+  },
+  "billing.stripe_drift": {
+    workerGroup: "rollup",
+    because:
+      "STORY-075 AC11 / owner decision 2026-10-28 section 100(e): a nightly provider-vs-local drift check that alerts and never writes. It fetches every Stripe " +
+      "subscription, and a Stripe call may never be made on a request path (KAD-06), so it is a cron job. §4's table allocates it no queue.",
   },
   "credit.housekeeping": {
     workerGroup: "rollup",
@@ -476,6 +490,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
     expect(systemScoped).toEqual([
       "audit.verify",
+      "billing.stripe_drift",
       "credit.housekeeping",
       "credit.reconcile",
       "credit.verify",

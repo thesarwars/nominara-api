@@ -299,6 +299,22 @@ describe("STORY-016 · email OTP fallback sign-in", () => {
     expect(sessions.rows.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("STORY-096 AC4 · a sign-in by email code stores the request's User-Agent on the session it creates, and stores nothing when there is none", async () => {
+    const email = "ua-otp@example.com";
+    const userId = await createUser(email);
+    await requestOtp(email);
+    const code = fakeSender.latestCodeFor(email)!;
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/otp/verify",
+      payload: { email, code },
+      headers: { "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0" },
+    });
+    expect(res.statusCode).toBe(200);
+    const stored = await db.query<{ user_agent: string | null }>("SELECT user_agent FROM sessions WHERE user_id = $1", [userId]);
+    expect(stored.rows.map((r) => r.user_agent)).toEqual(["Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0"]);
+  });
+
   // ---- Scenario 2 -----------------------------------------------------------
 
   // STORY-173 — this scenario used to add "...and writes no email_otp_codes

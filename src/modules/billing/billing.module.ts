@@ -12,12 +12,16 @@ import { IdentityModule } from "../identity/identity.module.js";
 import { AutoTopupService } from "./auto-topup.service.js";
 import { BillingSubscriptionController } from "./billing-subscription.controller.js";
 import { BillingSubscriptionService } from "./billing-subscription.service.js";
+import { RetentionExportController } from "./retention-export.controller.js";
+import { RETENTION_EXPORT_BASE_URL, RetentionExportService } from "./retention-export.service.js";
+import { StorageModule } from "../../lib/storage/storage.module.js";
 import { DowngradeKeepController } from "./downgrade-keep.controller.js";
 import { DowngradeKeepService } from "./downgrade-keep.service.js";
 import { PlanChangeController } from "./plan-change.controller.js";
 import { PlanChangeService } from "./plan-change.service.js";
 import { CreditPacksController } from "./credit-packs.controller.js";
 import { CreditPacksService } from "./credit-packs.service.js";
+import { BillingRetentionPurgeController } from "./billing-retention-purge.controller.js";
 import { BillingUsageController } from "./billing-usage.controller.js";
 import { BillingController } from "./billing.controller.js";
 import { BillingService } from "./billing.service.js";
@@ -31,8 +35,8 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
 // STORY-022 — system-architecture.md §5 module inventory. Registration
 // only — no logic here (coding-standards.md §1's module layout).
 @Module({
-  imports: [IdentityModule],
-  controllers: [BillingController, BillingUsageController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, PlanChangeController, DowngradeKeepController, StripeWebhookController],
+  imports: [IdentityModule, StorageModule],
+  controllers: [BillingController, BillingUsageController, BillingRetentionPurgeController, CreditPacksController, BillingSubscriptionController, BillingInvoicesController, BillingAddonsController, PlanChangeController, DowngradeKeepController, RetentionExportController, StripeWebhookController],
   providers: [
     // The short independent writes of checkout, the credit-pack purchase and add-ons run here, never on the
     // main pool their request already holds a connection of (hold-and-wait).
@@ -40,6 +44,8 @@ import { StripeWebhookService } from "./stripe-webhook.service.js";
     BillingService,
     BillingSubscriptionService,
     DowngradeKeepService,
+    { provide: RETENTION_EXPORT_BASE_URL, useFactory: (): string => loadEnv().OAUTH_REDIRECT_BASE_URL },
+    RetentionExportService,
     CreditPacksService,
     BillingInvoicesService,
     BillingAddonsService,

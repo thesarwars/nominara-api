@@ -24,6 +24,17 @@ export const usageResponseSchema = z
     pdf_exports: usageMeterSchema,
     /** Live (unrevoked, unexpired) share tokens. A gauge, not a period counter. */
     share_links_active: z.number().int().nonnegative(),
+    /**
+     * STORY-096 AC15 - the two customer-visible DAILY caps (plans-and-entitlements.md section 2). Capture-backed tool runs are one counter shared
+     * across every tool; command parses are the model-resolved ones (locally-resolved commands are free and uncounted). `used` is today's UTC-day
+     * count and `cap` the plan's CURRENT limit, `null` where the plan sets none (every paid tier). They are read from `credit_daily_counters`, not
+     * `usage_counters`, and a purchased pack never moves them. All three are OPTIONAL in the contract only because a new required response field is
+     * classified a MAJOR change by contracts:diff and these are purely additive; the server always sends them.
+     */
+    daily_lookups: usageMeterSchema.optional(),
+    daily_nlp_parses: usageMeterSchema.optional(),
+    /** The next UTC midnight, when both daily counters roll over. */
+    daily_resets_at: z.iso.datetime().optional(),
   })
   .strict();
 

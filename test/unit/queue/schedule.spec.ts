@@ -123,6 +123,12 @@ const FROM_OTHER_REFERENCES: Record<string, { cron: string; section: string; sou
       "data-model.md §5 / §8 / §7 and STORY-013 — vector recall checked nightly, orphan scan nightly, purge failures alert; the references state " +
       "no time of day, 03:10 UTC is a chosen quiet window ahead of the 03:20 partition tick, and the tick is READ-ONLY (no DDL, no rebuild)",
   },
+  "billing.stripe_drift": {
+    cron: "45 3 * * *",
+    section: "STORY-075 AC11",
+    source:
+      "STORY-075 AC11 / owner decision 2026-10-28 section 100(e) — nightly Stripe-vs-local drift check, alert only; the references state no time of day, 03:45 UTC is a chosen quiet window after the retention purge",
+  },
   "retention.purge": {
     cron: "40 3 * * *",
     section: "STORY-077 R4 / STORY-013",
@@ -191,9 +197,9 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(undatedSchedules().map((s) => s.queue).sort()).toEqual([...ON_DEMAND_ONLY].sort());
   });
 
-  it("STORY-140 AC11 · eighteen of twenty cron queues are dated, two are on demand", () => {
-    // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5) + maintenance.integrity (STORY-013) + report.cleanup (STORY-180 r5) + credit.verify (STORY-073 AC4) + rollup.category_benchmark (STORY-176).
-    expect(datedSchedules()).toHaveLength(18);
+  it("STORY-140 AC11 · nineteen of twenty-one cron queues are dated, two are on demand", () => {
+    // 9 dated before + geo.analyze, gsc.sync, topic.cluster, + domain.reverify (STORY-048 AC7) + task.resurface (STORY-064 AC5) + maintenance.integrity (STORY-013) + report.cleanup (STORY-180 r5) + credit.verify (STORY-073 AC4) + rollup.category_benchmark (STORY-176) + billing.stripe_drift (STORY-075 AC11).
+    expect(datedSchedules()).toHaveLength(19);
     expect(undatedSchedules()).toHaveLength(2);
   });
 
@@ -249,6 +255,7 @@ describe("G12 · the schedule table matches the reference", () => {
     expect(tenantScoped.sort()).toEqual(["attribution.rollup", "capture.plan", "geo.analyze", "gsc.sync", "rollup.metric_daily", "topic.cluster"]);
     expect(schedulable.sort()).toEqual([
       "audit.verify",
+      "billing.stripe_drift",
       "credit.housekeeping",
       "credit.reconcile",
       "credit.verify",
@@ -300,6 +307,6 @@ describe("G12 · describeSchedules — the one line a boot log gets", () => {
   });
 
   it("reports the cadence gap so an operator need not go and read the table", () => {
-    expect(describeSchedules(empty)).toContain("18 of 20 cron queues state a time");
+    expect(describeSchedules(empty)).toContain("19 of 21 cron queues state a time");
   });
 });

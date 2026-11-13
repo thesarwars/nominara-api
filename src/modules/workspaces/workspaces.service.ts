@@ -564,8 +564,11 @@ export class WorkspacesService {
    */
   async getDetail(workspaceId: string): Promise<{ detail: WorkspaceDetailResponse; entityTag: WorkspaceResponse }> {
     const client = currentTenantStore()!.client;
-    const result = await client.query<WorkspaceRow & { deletion_execute_at: Date | null }>(
-      `SELECT ${WORKSPACE_COLUMNS}, deletion_execute_at FROM workspaces WHERE id = $1`,
+    // `retention_purge_not_before` is read only while it is still in force (>= now(), the boundary resolveWorkspaceRetention uses), so a lapsed deferral reads null.
+    const result = await client.query<WorkspaceRow & { deletion_execute_at: Date | null; purge_not_before: Date | null }>(
+      `SELECT ${WORKSPACE_COLUMNS}, deletion_execute_at,
+              CASE WHEN retention_purge_not_before >= now() THEN retention_purge_not_before END AS purge_not_before
+         FROM workspaces WHERE id = $1`,
       [workspaceId],
     );
     const row = result.rows[0];
@@ -574,7 +577,11 @@ export class WorkspacesService {
     }
     const base = toWorkspaceResponse(row);
     return {
-      detail: { ...base, deletion_scheduled_at: row.deletion_execute_at ? row.deletion_execute_at.toISOString() : null },
+      detail: {
+        ...base,
+        deletion_scheduled_at: row.deletion_execute_at ? row.deletion_execute_at.toISOString() : null,
+        retention_purge_not_before: row.purge_not_before === null ? null : row.purge_not_before.toISOString(),
+      },
       entityTag: base,
     };
   }

@@ -1,9 +1,16 @@
 import { Inject, Injectable, Logger, UnauthorizedException } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { ClientBase, Pool } from "pg";
 import { loadEnv } from "../../config/env.js";
+import { NotFoundError } from "../../api/errors/domain-errors.js";
+import { decodeCursor } from "../../api/pagination/cursor.js";
+import { pageFrom, type Page } from "../../api/pagination/page.js";
+import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
+import type { SessionListItem } from "../../../contracts/identity/session-list-response.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { computeCsrfToken } from "../../lib/auth/csrf.js";
+import { describeUserAgent, normalizeUserAgent } from "../../lib/auth/user-agent.js";
 import {
   REFRESH_TOKEN_GRACE_CACHE_COOLOFF_MS,
   REFRESH_TOKEN_GRACE_CACHE_DEADLINE_MS,
@@ -23,6 +30,8 @@ import { uuidV7 } from "../../lib/ids/uuidv7.js";
 import type { StrongAuthMethod } from "../../tenancy/constants.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.service.js";
+
+const tracer = trace.getTracer("nominara.identity");
 
 // STORY-017 — dangerous area: rotation and reuse-detection logic. Full
 // history is checked (each refresh_tokens row is a distinct issued
@@ -850,6 +859,103 @@ export class SessionService {
       [userIds, exceptSessionId ?? null],
     );
     return result.rowCount ?? 0;
+  }
+
+  /**
+   * STORY-096 AC4/AC7 — remember the device's User-Agent on the session (sign-in and refresh). Cosmetic and best-effort: it is never read for an
+   * access decision, so a failure here must not fail a sign-in that already succeeded. An absent or empty header leaves the stored value as it was.
+   * The header is a fingerprint: it is stored and shown parsed, and never logged (the error path logs the session ID and the error class only).
+   */
+  async recordUserAgent(sid: string, rawUserAgent: string | readonly string[] | undefined): Promise<void> {
+    const userAgent = normalizeUserAgent(rawUserAgent);
+    if (userAgent === null) return;
+    try {
+      await this.pool.query(`UPDATE sessions SET user_agent = $2 WHERE id = $1`, [sid, userAgent]);
+    } catch (error) {
+      this.logger.warn(`session user agent not recorded session_id=${sid} error=${error instanceof Error ? error.name : "unknown"}`);
+    }
+  }
+
+  /**
+   * STORY-096 AC4 — the caller's OWN live sessions, newest first. `sessions` is a global auth-only table with no RLS, so `user_id = $1` (the verified
+   * token's `sub`, never a request value) is the control. Live means not revoked AND still holding an unexpired, unconsumed refresh token: a session whose
+   * token ran out cannot be used and is not shown. Only the parsed device and browser leave the server, never the stored header.
+   */
+  async listForUser(userId: string, currentSessionId: string, pagination: PaginationRequest): Promise<Page<SessionListItem>> {
+    return tracer.startActiveSpan("identity.sessions.list", async (span) => {
+      try {
+        span.setAttribute("nominara.user_id", userId);
+        const after = pagination.cursor === undefined ? undefined : decodeCursor(pagination.cursor, "identity.sessions", 2);
+        const result = await this.pool.query<{
+          id: string;
+          user_agent: string | null;
+          created_at: Date;
+          last_used_at: Date;
+          created_at_key: string;
+        }>(
+          `SELECT s.id, s.user_agent, s.created_at, s.last_used_at, s.created_at::text AS created_at_key
+             FROM sessions s
+            WHERE s.user_id = $1 AND s.revoked_at IS NULL
+              AND EXISTS (SELECT 1 FROM refresh_tokens rt
+                           WHERE rt.session_id = s.id AND rt.consumed_at IS NULL AND rt.expires_at > now())
+              AND ($2::timestamptz IS NULL OR (s.created_at, s.id) < ($2::timestamptz, $3::uuid))
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT $4`,
+          [userId, after?.[0] ?? null, after?.[1] ?? null, pagination.limit + 1],
+        );
+        span.setAttribute("nominara.sessions.listed", Math.min(result.rows.length, pagination.limit));
+        return pageFrom(
+          result.rows,
+          pagination.limit,
+          "identity.sessions",
+          (row): SessionListItem => ({
+            id: row.id,
+            ...describeUserAgent(row.user_agent),
+            created_at: row.created_at.toISOString(),
+            last_active_at: row.last_used_at.toISOString(),
+            current: row.id === currentSessionId,
+          }),
+          (row) => [row.created_at_key, row.id],
+        );
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
+  }
+
+  /**
+   * STORY-096 AC7 — end ONE of the caller's own sessions. The row is selected by `id` AND `user_id`; a session id is never enough on its own, so another
+   * account's session and an unknown id are the same 404 and nothing about the other account is revealed. Revoking a session already ended is a no-op
+   * that keeps its first reason (idempotent, like revoke-others). The caller's own current session may be revoked: it is then signed out exactly as by
+   * logout, and its cookies are refused on the next request. `revoked_reason` is `user_revoked`, distinct from `logout`.
+   */
+  async revokeOne(userId: string, sessionId: string, currentSessionId: string): Promise<void> {
+    return tracer.startActiveSpan("identity.sessions.revoke_one", async (span) => {
+      try {
+        span.setAttribute("nominara.user_id", userId);
+        span.setAttribute("nominara.sessions.current", sessionId === currentSessionId);
+        const revoked = await this.pool.query(
+          `UPDATE sessions SET revoked_at = now(), revoked_reason = 'user_revoked'
+            WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
+          [sessionId, userId],
+        );
+        if ((revoked.rowCount ?? 0) === 0) {
+          const owned = await this.pool.query(`SELECT 1 FROM sessions WHERE id = $1 AND user_id = $2`, [sessionId, userId]);
+          if ((owned.rowCount ?? 0) === 0) throw new NotFoundError({ message: "no such session" });
+          return;
+        }
+        this.logger.log(`session revoked by its owner user_id=${userId} session_id=${sessionId} current=${String(sessionId === currentSessionId)}`);
+        incrementCounter("nominara_identity_sessions_revoked_total", { reason: "session_revoke" });
+      } catch (error) {
+        if (!(error instanceof NotFoundError)) span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
   }
 
   /** Revokes the family and adds the current jti to the deny list for its remaining lifetime (sessions.revoked_at IS the deny list). */
