@@ -343,8 +343,10 @@ describe("NEW-D-6 · usage read and auto-top-up configuration", () => {
     await harness.db().query("INSERT INTO usage_counters (workspace_id, metric, period_start, limit_value, used_value) VALUES ($1,'fair_use_captures',$2,500,321)", [workspaceId, await periodStart(workspaceId)]);
     const res = await get(owner, "/billing/usage");
     expect(dataOf<{ pdf_exports: unknown }>(res).pdf_exports).toEqual({ used: 0, cap: 25 });
-    expect(res.body).not.toContain("fair_use");
-    expect(res.body).not.toContain("321");
+    // The data payload, not the whole body: meta.request_id is random hex and contained "321" once by chance.
+    const data = JSON.stringify(dataOf<unknown>(res));
+    expect(data).not.toContain("fair_use");
+    expect(data).not.toContain("321");
   });
 
   it("NEW-D-6 · share_links_active counts unrevoked, unexpired tokens only", async () => {

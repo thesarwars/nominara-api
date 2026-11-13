@@ -1,6 +1,7 @@
 import { createHash, createHmac, hkdfSync } from "node:crypto";
 import type { ClientBase } from "pg";
 import { REPORT_ATTACHMENT_MAX_BYTES } from "../../../contracts/reports/index.js";
+import { reportFileName } from "./artifact-filename.js";
 import { DegradedError } from "../../api/errors/domain-errors.js";
 import { API_VERSION_PREFIX } from "../../api/configure-app.js";
 import type { EmailAttachment } from "../../modules/identity/ports/email-sender.js";
@@ -90,7 +91,7 @@ const CONTENT_TYPE = { pdf: "application/pdf", csv: "text/csv" } as const;
  * the only write is the SHA-256 of a link token on an oversize artifact. Throws rather than skip: an artifact the report built and
  * the database cannot show is a defect, not a smaller email.
  */
-export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, workspaceId: string, artifactIds: readonly string[]): Promise<ArtifactMailPlan> {
+export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, workspaceId: string, artifactIds: readonly string[], showBrand = true): Promise<ArtifactMailPlan> {
   const store = deps.store.bind();
   const found = await tx.query<ArtifactRow>(
     "SELECT id, format, bytes, period_end::text AS period_end FROM report_artifacts WHERE id = ANY($1::uuid[]) AND workspace_id = $2",
@@ -112,7 +113,7 @@ export async function planArtifactMail(tx: ClientBase, deps: ArtifactMailDeps, w
     seen.set(row.format, index);
     // Several projects in one report give several files of one format: number them so the names differ.
     const suffix = (sameFormat.get(row.format) ?? 1) > 1 ? `-${String(index)}` : "";
-    const filename = `nominara-report-${row.period_end}${suffix}.${row.format}`;
+    const filename = reportFileName(showBrand, row.period_end, row.format, suffix);
     let link: string | null = null;
     if (row.bytes <= REPORT_ATTACHMENT_MAX_BYTES && attachedBytes + row.bytes <= REPORT_ATTACHMENT_MAX_BYTES) {
       attachedBytes += row.bytes;

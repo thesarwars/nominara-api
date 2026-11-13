@@ -5,7 +5,7 @@ import type { MintedShareToken, MintShareTokenRequest, ShareToken, ShareTokenLis
 import { EntitlementExceededError, NotFoundError, ProjectOutOfScopeError, ValidationFailedError } from "../../api/errors/domain-errors.js";
 import { pageFrom, type Page } from "../../api/pagination/page.js";
 import { decodeTimestampIdCursor, MICROS_FORMAT } from "../../api/pagination/timestamp-id-cursor.js";
-import { uuidV7 } from "../../lib/ids/uuidv7.js";
+import { writeNotification } from "../../lib/notifications/writer.js";
 import { resolveEntitlements } from "../../lib/entitlements/resolution.js";
 import { hash as argon2idHash } from "../../lib/crypto/argon2id.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -421,7 +421,7 @@ export class ShareTokensService {
    */
   async consumeView(id: string, view: ViewFacts): Promise<string | null> {
     const { client, workspaceId } = this.store();
-    const updated = await client.query<{ view_count: number; label: string }>(
+    const updated = await client.query<{ view_count: number; label: string; scope_project_ids: string[] }>(
       `UPDATE share_tokens
           SET view_count = view_count + 1, last_viewed_at = now(), failed_attempts = 0, locked_until = NULL
         WHERE id = $1
@@ -429,7 +429,7 @@ export class ShareTokensService {
           AND (expires_at IS NULL OR expires_at > now())
           AND (max_views IS NULL OR view_count < max_views)
           AND (locked_until IS NULL OR locked_until <= now())
-        RETURNING view_count, label`,
+        RETURNING view_count, label, scope_project_ids`,
       [id],
     );
     if (updated.rowCount !== 1) return null;
@@ -439,13 +439,28 @@ export class ShareTokensService {
     );
     // FR-AGY-01o — the FIRST view notifies the agency. "First" is decided by the same atomic UPDATE that took the view
     // (the row lock serialises parallel mints, so exactly one of them sees view_count = 1), and the notification commits
-    // or rolls back with it. In-app only (the column default): email is deferred. No visitor address, agent or secret.
+    // or rolls back with it. In-app and an immediate email through the notification outbox (relayed by the notify sweep). No visitor address, agent or secret.
     const taken = updated.rows[0];
     if (taken !== undefined && taken.view_count === 1) {
-      await client.query(
-        `INSERT INTO notifications (id, workspace_id, kind, severity, title, payload)
-         VALUES ($1, $2, 'portal.first_view', 'info', $3, $4::jsonb)`,
-        [uuidV7(), workspaceId, `${taken.label} was opened for the first time`, JSON.stringify({ share_token_id: id })],
+      await writeNotification(
+        client,
+        {
+          workspaceId,
+          // A single-project token files the in-app row under that project, so a scoped member sees it only if they see the project.
+          projectId: taken.scope_project_ids?.length === 1 ? taken.scope_project_ids[0]! : null,
+          userId: null,
+          kind: "portal.first_view",
+          severity: "info",
+          title: `${taken.label} was opened for the first time`,
+          body: null,
+          // One per token for its life: a redelivered or retried mint writes nothing a second time.
+          eventKey: `portal.first_view:${id}`,
+          facts: { share_token_id: id },
+          emailNow: true,
+          // PROVISIONAL: only members who may manage share tokens and see every project the token covers.
+          emailAudience: { permission: "share_token:mint", projectIds: taken.scope_project_ids ?? [] },
+        },
+        { relayOnly: true },
       );
       incrementCounter("nominara_portal_first_view_notifications_total", {});
       this.logger.log({ message: "portal first view notified", workspace_id: workspaceId, share_token_id: id });

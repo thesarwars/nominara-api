@@ -6,7 +6,7 @@ import { z } from "zod";
 // silent.
 
 /** Report sections. Frontend `ReportSection`; the DB default vocabulary {scorecards,...} is mapped by the service. */
-export const reportSectionSchema = z.enum(["overview", "growth_map", "matrix", "competitors", "sources", "tasks", "aux"]);
+export const reportSectionSchema = z.enum(["overview", "growth_map", "matrix", "competitors", "sources", "tasks", "aux", "attribution"]);
 export type ReportSection = z.infer<typeof reportSectionSchema>;
 
 export const reportFormatSchema = z.enum(["pdf", "csv"]);

@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as tenantContext from "../../tenancy/tenant-context.js";
 import { ShareTokensService } from "./share-tokens.service.js";
 
-// NEW-E-099b — FR-AGY-01o: "a first-view notification is sent". Only an in-app notification; email is deferred.
+// NEW-E-099b / STORY-098 AC "first-view notification is sent" — an in-app notification AND an immediate email through the one notification
+// outbox (PROVISIONAL, batch 13: the first view is `info`, so the email is requested explicitly rather than by raising the severity).
 // The first view is decided by the SAME atomic UPDATE that takes the view, so two parallel first mints cannot both be first.
 const WS = "0198f6a0-0000-7000-8000-000000000001";
 const TOKEN = "0198f6a0-0000-7000-8000-0000000000a1";
 const VIEW = "0198f6a0-0000-7000-8000-0000000000b1";
+const NOTIFICATION = "0198f6a0-0000-7000-8000-0000000000c1";
 
 interface Recorded {
   readonly sql: string;
@@ -23,6 +25,7 @@ describe("NEW-E-099b · ShareTokensService.consumeView first-view notification",
       client: {
         query: vi.fn(async (sql: string, params: unknown[]) => {
           calls.push({ sql, params });
+          if (/INSERT INTO notifications/.test(sql)) return { rowCount: 1, rows: [{ id: NOTIFICATION }] };
           return /UPDATE share_tokens/.test(sql) ? updated : /INSERT INTO share_token_views/.test(sql) ? { rowCount: 1, rows: [{ id: VIEW }] } : { rowCount: 1, rows: [] };
         }),
       },
@@ -42,10 +45,12 @@ describe("NEW-E-099b · ShareTokensService.consumeView first-view notification",
     expect(await svc.consumeView(TOKEN, view)).toBe(VIEW);
     const n = notifications();
     expect(n).toHaveLength(1);
-    expect(n[0]!.sql).toMatch(/'portal\.first_view'/);
+    expect(n[0]!.params).toContain("portal.first_view");
     expect(n[0]!.params).toContain(WS);
-    // Only in-app: email is deferred, so the channel list is never widened here.
-    expect(n[0]!.sql).not.toMatch(/email/i);
+    // The event key makes a retried mint write nothing twice.
+    expect(n[0]!.params).toContain(`portal.first_view:${TOKEN}`);
+    // In-app AND email: the writer records the outbox rows in the same transaction.
+    expect(n[0]!.params).toContainEqual(["in_app", "email"]);
   });
 
   it("FR-AGY-01o · the notification and the view row are written in the same flow as the counter (after it), never before the view is taken", async () => {

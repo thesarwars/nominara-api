@@ -173,3 +173,49 @@ export const gscCorrelationSchema = z
   })
   .strict();
 export type GscCorrelation = z.infer<typeof gscCorrelationSchema>;
+
+// STORY-115 AC11 / FR-PA-04 - the classic report's real queries, offered as prompt CANDIDATES. PROVISIONAL (batch 13): a read-only list; it
+// writes no prompt and spends nothing. Labelled "real Google query", distinct from "generated" (FR-PA-04), and it carries no estimate of AI
+// prompt volume (FR-PA-04a): the figures are Google search impressions and clicks, never a count of AI prompts.
+export const GSC_PROMPT_CANDIDATE_LABEL = "real Google query";
+export const GSC_PROMPT_CANDIDATE_LIMIT_COPY =
+  "Impressions and clicks are Google search figures for this query. They are not a count of AI prompts, and no AI prompt volume is estimated.";
+
+export const gscPromptCandidatesQuerySchema = z
+  .object({
+    timeframe: z.enum(["7d", "30d", "90d"]).default("90d"),
+    limit: z.coerce.number().int().min(1).max(50).default(25),
+  })
+  .strict();
+export type GscPromptCandidatesQuery = z.infer<typeof gscPromptCandidatesQuerySchema>;
+
+export const gscPromptCandidateSchema = z
+  .object({
+    text: z.string().min(1),
+    /** The stored provenance a prompt created from this candidate would carry (`tracked_prompts.generation_source`). */
+    source: z.literal("gsc_query"),
+    /** Always the classic report: a real search query, never evidence that anyone asked an answer engine. */
+    report: z.literal("classic"),
+    label: z.literal(GSC_PROMPT_CANDIDATE_LABEL),
+    impressions: z.number().int().min(0),
+    clicks: z.number().int().min(0),
+  })
+  .strict();
+export type GscPromptCandidate = z.infer<typeof gscPromptCandidateSchema>;
+
+export const gscPromptCandidatesSchema = z
+  .object({
+    connected: z.boolean(),
+    health_status: z.enum(GSC_HEALTH_STATUSES).nullable(),
+    window_days: z.union([z.literal(7), z.literal(30), z.literal(90)]),
+    /** `YYYY-MM-DD`; the end is the stored frontier, never today. Both `null` before the first sync. */
+    window_start: z.string().nullable(),
+    window_end: z.string().nullable(),
+    frontier: z.string().nullable(),
+    frontier_note: z.string(),
+    limits_note: z.string(),
+    /** Highest impressions first. A query a tracked prompt already covers (at or above the match floor) is not offered. Empty means none, not "not measured". */
+    candidates: z.array(gscPromptCandidateSchema),
+  })
+  .strict();
+export type GscPromptCandidates = z.infer<typeof gscPromptCandidatesSchema>;

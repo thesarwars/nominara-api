@@ -22,7 +22,7 @@ const KEY = `unit/${WS}/${ID}.pdf`;
 
 type Row = { object_key: string; format: string; period_end: string };
 
-function build(opts: { rows?: Row[]; presign?: () => Promise<string>; countFails?: boolean } = {}) {
+function build(opts: { rows?: Row[]; presign?: () => Promise<string>; countFails?: boolean; hideBrand?: boolean; removeBrandGranted?: boolean } = {}) {
   const order: string[] = [];
   const queries: Array<{ text: string; params: unknown[] }> = [];
   // The ambient request client: the lookup runs inside the interceptor's transaction, so the service must use THIS client for it.
@@ -30,7 +30,7 @@ function build(opts: { rows?: Row[]; presign?: () => Promise<string>; countFails
     query: vi.fn(async (text: string, params: unknown[]) => {
       order.push("lookup");
       queries.push({ text, params });
-      return { rows: opts.rows ?? [], rowCount: (opts.rows ?? []).length };
+      return { rows: (opts.rows ?? []).map((r) => ({ ...r, hide_brand: opts.hideBrand ?? null })), rowCount: (opts.rows ?? []).length };
     }),
   };
   vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({ context: { workspaceId: WS, actorId: "actor" }, client } as never);
@@ -49,7 +49,8 @@ function build(opts: { rows?: Row[]; presign?: () => Promise<string>; countFails
     order.push("presign");
     return opts.presign ? opts.presign() : `https://s3.example.test/${KEY}?sig=x`;
   });
-  const service = new ExportDownloadService({ bind: () => ({ presignGetStored }) } as never, pool as never);
+  const resolver = { resolveForWorkspace: async () => ({ entitlements: { "whitelabel.remove_branding": { value: opts.removeBrandGranted === true } } }) };
+  const service = new ExportDownloadService({ bind: () => ({ presignGetStored }) } as never, pool as never, resolver as never);
   const location = vi.fn((_url: string) => void order.push("location"));
   /** The whole request: the lookup in the transaction, then the after-transaction work. */
   const run = async (): Promise<void> => {
@@ -188,5 +189,38 @@ describe("STORY-180 AC2 · GET /v1/exports/{id}/download", () => {
     expect(reflector.get(REQUIRE_PERMISSION_KEY, handler)).toBe("export:data");
     expect(Reflect.getMetadata(SCOPED_BY_QUERY_KEY, handler)).toBe(true);
     expect(reflector.get(API_CONTRACT_KEY, handler)).toMatchObject({ operationId: "downloadExport", redirect: true });
+  });
+});
+
+describe("STORY-097 AC4 · the download file name", () => {
+  const row = { object_key: KEY, format: "pdf", period_end: "2026-10-31" };
+  const nameOf = (h: ReturnType<typeof build>): string => (h.presignGetStored.mock.calls[0]![2] as { downloadFilename: string }).downloadFilename;
+
+  it("brand not removed: the platform-named file", async () => {
+    const h = build({ rows: [row] });
+    await h.run();
+    expect(nameOf(h)).toBe("nominara-report-2026-10-31.pdf");
+  });
+  it("brand removed with the entitlement: no platform name", async () => {
+    const h = build({ rows: [row], hideBrand: true, removeBrandGranted: true });
+    await h.run();
+    expect(nameOf(h)).toBe("report-2026-10-31.pdf");
+  });
+  it("brand switch stored but the entitlement lapsed: the platform name returns", async () => {
+    const h = build({ rows: [row], hideBrand: true, removeBrandGranted: false });
+    await h.run();
+    expect(nameOf(h)).toBe("nominara-report-2026-10-31.pdf");
+  });
+});
+
+describe("STORY-097 (review fix) · the entitlement read happens after the request transaction", () => {
+  it("resolveForWorkspace is not called by the in-transaction lookup, only by the after-transaction work", async () => {
+    const h = build({ rows: [{ object_key: KEY, format: "pdf", period_end: "2026-10-31" }] });
+    const resolver = (h.service as unknown as { resolver: { resolveForWorkspace: ReturnType<typeof vi.fn> } }).resolver;
+    const spy = vi.spyOn(resolver, "resolveForWorkspace");
+    await h.service.resolve({ id: ID }, h.location);
+    expect(spy).not.toHaveBeenCalled();
+    for (const task of h.afterTasks.splice(0)) await task();
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });

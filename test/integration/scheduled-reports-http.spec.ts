@@ -6,6 +6,7 @@ import { ACCESS_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from "../../sr
 import { applyPlanChange, planKeyOnly } from "../../src/lib/billing/apply-plan.js";
 import { InMemoryCacheAdapter } from "../../src/lib/cache/in-memory-cache.adapter.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { pdfText } from "../support/pdf-text.js";
 import { SessionService, type SessionTokens } from "../../src/modules/identity/session.service.js";
 import { ScheduledReportsService } from "../../src/modules/reports/scheduled-reports.service.js";
 import { MembershipService } from "../../src/modules/workspaces/membership.service.js";
@@ -233,6 +234,27 @@ describe("STORY-100 part C · scheduled reports over HTTP", () => {
     expect((await used(a.workspaceId))?.used).toBe(1);
     const listed = data<Array<{ deliveries: unknown[] }>>(await call(a, "GET", "/scheduled-reports"));
     expect(listed[0]!.deliveries).toEqual([{ ...delivery, status: "logged", recipients: 1 }]);
+  }, 180_000);
+
+  it("STORY-097 AC4 (review fix) · a report pinned to a brand-removed theme T while the DEFAULT shows the brand: no platform name in the subject, text, HTML, From name, attachment names or PDF text", async () => {
+    const { a, p } = await seeded("business");
+    const pinned = uuidV7();
+    await harness.db().query(`INSERT INTO brand_themes (workspace_id, name, is_default, hide_nominara_brand) VALUES ($1,'Default',true,false)`, [a.workspaceId]);
+    await harness.db().query(`INSERT INTO brand_themes (id, workspace_id, name, is_default, hide_nominara_brand, email_from_name) VALUES ($1,$2,'T',false,true,'Agency X')`, [pinned, a.workspaceId]);
+    const made = scheduledReportSchema.parse(data(await call(a, "POST", "/scheduled-reports", create([p], { theme_id: pinned }))));
+    const sent: Array<{ subject: string; textBody: string; htmlBody?: string; fromName?: string; attachments?: Array<{ filename: string; content: Buffer }> }> = [];
+    const restore = withSender({ delivers: true, send: async (m) => void sent.push(m as never) });
+    try {
+      expect((await call(a, "POST", `/scheduled-reports/${made.id}/send-now`)).statusCode).toBe(200);
+      await settleDeliveries();
+    } finally {
+      restore();
+    }
+    expect(sent).toHaveLength(1);
+    const m = sent[0]!;
+    for (const part of [m.subject, m.textBody, m.htmlBody ?? "", m.fromName ?? "", ...(m.attachments ?? []).map((f) => f.filename)]) expect(part).not.toMatch(/nominara/i);
+    expect(m.fromName).toBe("Agency X");
+    for (const f of m.attachments ?? []) expect(pdfText(f.content)).not.toMatch(/nominara/i);
   }, 180_000);
 
   it("STORY-180 AC1/AC3/AC6 · send-now attaches each file (8 MiB or less) read back from the reports bucket, with no link, and the artifact rows hold the real keys", async () => {

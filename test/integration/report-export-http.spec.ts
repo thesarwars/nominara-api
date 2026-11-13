@@ -1,3 +1,4 @@
+import { MEASURED_FLOOR_COPY } from "../../contracts/attribution/index.js";
 import { Pool } from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportResponseSchema } from "../../contracts/reports/index.js";
@@ -640,6 +641,38 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     // sentiment was never measured: an empty value cell, not a zero
     expect(rows).toMatch(/overview,,brand,gemini,sentiment_score,,low,3,/);
     expect(rows).not.toMatch(/sentiment_score,0,/);
+  }, 120_000);
+
+  it("STORY-100 s6 (batch 13) — the growth map carries each day's cell count and confidence from the rollup, and an unavailable section makes the footer say partial", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    await metric(a.workspaceId, p, "gemini", 2, { cells: 3, score: "70.000" });
+    await metric(a.workspaceId, p, "chatgpt", 2, { cells: 200, score: "50.000" });
+    await metric(a.workspaceId, p, "all", 2, { cells: 203, score: "52.000" });
+
+    const csv = await exportReport(a, p, body({ format: "csv", sections: ["growth_map", "matrix"] }));
+    expect(csv.statusCode, csv.body).toBe(201);
+    const rows = (await fileOf(exportResponseSchema.parse(data(csv)))).toString("utf8");
+    expect(rows).toMatch(/growth_map,\d{4}-\d{2}-\d{2},brand,gemini,visibility_score,70,low,3,/);
+    expect(rows).toMatch(/growth_map,\d{4}-\d{2}-\d{2},brand,chatgpt,visibility_score,50,high,200,/);
+    expect(rows).toContain("methodology,,,,export_status,partial,");
+    expect(rows).toContain("methodology,,,,unavailable_sections,matrix,");
+  }, 120_000);
+
+  it("STORY-116 AC19 (batch 13) — an export of the attribution section carries the measured-floor caveat and the methodology footer, in both formats, with nothing connected", async () => {
+    const a = await owner("growth");
+    const p = await project(a.workspaceId);
+    const csv = await exportReport(a, p, body({ format: "csv", sections: ["attribution"] }));
+    expect(csv.statusCode, csv.body).toBe(201);
+    const rows = (await fileOf(exportResponseSchema.parse(data(csv)))).toString("utf8");
+    expect(rows).toContain(`attribution,,,,measured_floor_note,"${MEASURED_FLOOR_COPY}"`); // the spec wording carries a comma, so CSV quotes it
+    expect(rows).toContain("methodology,,,,note,");
+    expect(rows).not.toContain("unavailable,");
+    const pdf = await exportReport(a, p, body({ sections: ["attribution"] }));
+    expect(pdf.statusCode, pdf.body).toBe(201);
+    const text = pdfText(await fileOf(exportResponseSchema.parse(data(pdf))));
+    expect(text).toContain("A measured floor. Referrer stripping");
+    expect(text).toContain(METHODOLOGY_NOTE);
   }, 120_000);
 
   // ---- STORY-180 r5 (d): revoking a sent link --------------------------------------------------------------------------------------

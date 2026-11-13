@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import PDFDocument from "pdfkit";
+import { confidenceFor } from "../scoring/index.js";
 import type { ExportDocument, MetricSummary } from "./export-document.js";
 
 // NEW-E-100b — the PDF rendering of an ExportDocument, with pdfkit (pure JS,
@@ -171,7 +172,43 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
           const each = Math.max(40, Math.floor((width - 70 - 50) / Math.max(keys.length, 1)));
           const columns = [{ label: "Date", width: 70 }, ...keys.map((key) => ({ label: key, width: each })), { label: "Blend", width: 50 }];
           if (section.days.length === 0) text(`${DASH} no days measured in this window`, 9);
-          else table(columns, section.days.map((day) => [day.date, ...keys.map((key) => score(day.byEngine[key] ?? null)), score(day.blended)]));
+          else {
+            // A figure behind fewer cells than the low-confidence line is starred (STORY-100, PROVISIONAL); no cell count = no star.
+            const isLow = (value: number | null, cells: number | undefined): boolean => value !== null && cells !== undefined && confidenceFor(cells) === "low";
+            const marked = (value: number | null, cells: number | undefined): string => (isLow(value, cells) ? `${score(value)}*` : score(value));
+            table(columns, section.days.map((day) => [day.date, ...keys.map((key) => marked(day.byEngine[key] ?? null, day.cells?.byEngine[key])), marked(day.blended, day.cells?.blended)]));
+            const anyLow = section.days.some((day) => isLow(day.blended, day.cells?.blended) || keys.some((key) => isLow(day.byEngine[key] ?? null, day.cells?.byEngine[key])));
+            if (anyLow) text("* low confidence: fewer cells than the interface needs to show a trend; indicative only.", 8);
+          }
+        } else if (section.kind === "attribution") {
+          heading(`Attribution - AI-referred sessions${section.windowDays === null ? "" : ` (last ${String(section.windowDays)} days)`}`);
+          // The caveat comes first and in bold: it is the section's permanent frame, not a footnote (STORY-116 AC13).
+          text(section.measuredFloorNote, 9, true);
+          pdf.moveDown(0.4);
+          const t = section.totals;
+          if (t === null) text(`${DASH} no attribution window has been computed yet`, 9);
+          else {
+            const n = (v: number | null): string => (v === null ? DASH : String(v));
+            table(
+              [{ label: "Measure", width: 170 }, { label: "Current", width: 80 }, { label: "Prior", width: 80 }],
+              [
+                ["AI-referred sessions", n(t.ai_sessions.current), n(t.ai_sessions.prior)],
+                ["Conversions", n(t.conversions.current), n(t.conversions.prior)],
+                ["Conversion rate", percent(t.conversion_rate), percent(t.conversion_rate_prior)],
+                ...t.by_engine.map((e) => [`  ${e.referrer_class} sessions`, n(e.sessions.current), n(e.sessions.prior)]),
+                ["Unattributed sessions (not in the AI total)", n(t.unattributed.sessions.current), n(t.unattributed.sessions.prior)],
+              ],
+            );
+            text(`Measured from ${t.measured_from ?? DASH} to ${t.measured_to ?? DASH}.`, 8);
+          }
+          pdf.moveDown(0.4);
+          if (section.rows.length === 0) text(`${DASH} no page measured in this window`, 9);
+          else {
+            table(
+              [{ label: "Page", width: 190 }, { label: "Cited", width: 40 }, { label: "Sessions", width: 55 }, { label: "Conv.", width: 40 }, { label: "Rate", width: 40 }, { label: "Pattern", width: 130 }],
+              section.rows.map((r) => [r.url, String(r.citations), String(r.ai_sessions), String(r.conversions), percent(r.conversion_rate), r.pattern]),
+            );
+          }
         } else {
           heading("Competitors");
           if (section.competitors.length === 0) text(`${DASH} no competitor measured in this window`, 9);
@@ -203,6 +240,7 @@ export function renderPdf(doc: ExportDocument, options: RenderPdfOptions = {}): 
         `Live capture ratio: ${percent(footer.live_capture_ratio)}`,
         `Scoring version: ${footer.scoring_version}`,
         `Weight overrides: ${overrides}`,
+        doc.unavailableSections.length === 0 ? "Export status: complete" : `Export status: partial (not included: ${doc.unavailableSections.join(", ")})`,
       ]) {
         text(line, 9);
       }

@@ -5,6 +5,8 @@ import { afterTransaction } from "../../api/after-transaction.js";
 import { DegradedError, NotFoundError } from "../../api/errors/domain-errors.js";
 import { API_VERSION_PREFIX } from "../../api/configure-app.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
+import { reportFileName } from "../../lib/reports/artifact-filename.js";
 import { isStoredObjectKey } from "../../lib/reports/artifact-key.js";
 import { TenantObjectStore } from "../../lib/storage/tenant-object-store.js";
 import { incrementCounter } from "../../lib/telemetry/metrics.js";
@@ -40,6 +42,7 @@ export class ExportDownloadService {
   constructor(
     private readonly objects: TenantObjectStore,
     @Inject(PG_POOL) private readonly pool: Pool,
+    private readonly resolver: EntitlementResolver,
   ) {}
 
   /**
@@ -55,8 +58,12 @@ export class ExportDownloadService {
     let outcome = "error";
     let deferred = false;
     try {
-      const found = await tx.query<{ object_key: string; format: string; period_end: string }>(
-        `SELECT object_key, format, period_end::text AS period_end FROM report_artifacts
+      const found = await tx.query<{ object_key: string; format: string; period_end: string; hide_brand: boolean | null }>(
+        `SELECT object_key, format, period_end::text AS period_end,
+                (SELECT t.hide_nominara_brand FROM brand_themes t
+                  WHERE t.id = (SELECT r.theme_id FROM scheduled_reports r WHERE r.id = report_artifacts.scheduled_report_id) OR t.is_default
+                  ORDER BY (t.id = (SELECT r.theme_id FROM scheduled_reports r WHERE r.id = report_artifacts.scheduled_report_id)) DESC NULLS LAST, t.is_default DESC, t.created_at, t.id LIMIT 1) AS hide_brand
+           FROM report_artifacts
           WHERE id = $1 AND workspace_id = app.current_workspace() AND expires_at > now()
             AND (cardinality(app.current_scope_projects()) = 0 OR project_ids <@ app.current_scope_projects())`,
         [params.id],
@@ -68,9 +75,13 @@ export class ExportDownloadService {
       const registered = afterTransaction(async () => {
         let after = "error";
         try {
+          // STORY-097 AC4: the file name carries no platform name once the brand is removed (entitlement held NOW and the theme's switch set).
+          // Resolved HERE, after the request transaction ended, so no entitlement read is made while it is open (ADR-0003).
+          const entitlements = await this.resolver.resolveForWorkspace(context.workspaceId);
+          const showBrand = !(row.hide_brand === true && entitlements.entitlements["whitelabel.remove_branding"]?.value === true);
           const url = await bound.presignGetStored("reports", row.object_key, {
             expiresInSeconds: EXPORT_DOWNLOAD_URL_SECONDS,
-            downloadFilename: `nominara-report-${row.period_end}.${row.format}`,
+            downloadFilename: reportFileName(showBrand, row.period_end, row.format),
           });
           setLocation(url);
           after = "redirected";

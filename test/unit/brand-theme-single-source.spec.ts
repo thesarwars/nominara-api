@@ -59,6 +59,8 @@ const THEME_SYMBOLS: Readonly<Record<string, readonly string[]>> = {
   "contracts/agency/theme.schema.ts": ["agencyThemeSchema", "agencyThemeAdminSchema", "updateAgencyThemeRequestSchema", "saveAgencyThemeResponseSchema"],
   "src/lib/theme/contrast.ts": ["PLATFORM_DEFAULT_COLORS", "ThemeColorField", "PAIRS", "validateThemeContrast"],
   "src/lib/theme/export-palette.ts": ["StoredThemeValues", "exportPaletteFrom"],
+  // STORY-097: the email's pure view over the same stored values (it reads no table and holds no colour of its own).
+  "src/lib/theme/email-theme.ts": ["StoredEmailThemeValues", "themeForEmail"],
   "src/modules/agency/agency.service.ts": ["COLOR_FIELDS", "ThemeRow", "COLUMNS", "toTheme", "platformDefaultTheme", "mergedColors"],
 };
 /** The one symbol that may hold colour VALUES: the platform default palette (D6). Pure black/white contrast picks are neutral, not branding. */
