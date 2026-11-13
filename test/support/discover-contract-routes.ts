@@ -62,7 +62,7 @@ function joinPath(classPath: string, methodPath: string): string {
   return [normalizeSegment(classPath), normalizeSegment(methodPath)].filter(Boolean).join("/");
 }
 
-async function walkRoutes(discovery: DiscoveryService, scanner: MetadataScanner): Promise<DiscoveredRoute[]> {
+export async function walkRoutes(discovery: DiscoveryService, scanner: MetadataScanner): Promise<DiscoveredRoute[]> {
   const routes: DiscoveredRoute[] = [];
   for (const wrapper of discovery.getControllers()) {
     const instance = wrapper.instance as Record<string, unknown> | undefined;

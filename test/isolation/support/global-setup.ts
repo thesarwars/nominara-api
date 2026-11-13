@@ -7,6 +7,7 @@ import { MIGRATIONS_DIR, migrateUp, appliedMigrationNames } from "../../../src/d
 import { seedThreeTenantFixture, type ThreeTenantFixture } from "./three-tenant-fixture.js";
 import type { IsolationProvidedContext } from "./context.js";
 import { assertRecognizedStagingDatabase, parseStagingTarget } from "./staging-target.js";
+import { assertWithinBudget } from "./budget.js";
 
 // STORY-012 T2 — ONE shared container, ONE migration chain, ONE fixture
 // seed, for the WHOLE `pnpm test:isolation` (or `:breakers`) run — per-file
@@ -95,14 +96,14 @@ async function setupStaging(setupStartedAt: number, project: TestProject): Promi
   project.provide("isolation", provided);
 
   return async () => {
-    const elapsedMs = Date.now() - setupStartedAt;
-    const budgetMs = 5 * 60 * 1000;
-    if (elapsedMs > budgetMs) {
+    try {
+      assertWithinBudget(Date.now() - setupStartedAt);
+    } catch (error) {
       // vitest 4.1.10 does not turn a globalSetup teardown throw into a
       // non-zero process exit code on its own — set it explicitly so a
       // budget overrun actually fails CI.
       process.exitCode = 1;
-      throw new Error(`STORY-012 D-5: isolation suite took ${elapsedMs}ms, over the ${budgetMs}ms budget`);
+      throw error;
     }
   };
 }
@@ -167,13 +168,14 @@ export default async function setup(project: TestProject): Promise<() => Promise
     // from this SAME setup's start, approximates that invocation's total
     // runtime end to end.
     const elapsedMs = Date.now() - setupStartedAt;
-    const budgetMs = 5 * 60 * 1000;
     await container?.stop();
-    if (elapsedMs > budgetMs) {
+    try {
+      assertWithinBudget(elapsedMs);
+    } catch (error) {
       // See the staging branch above — vitest 4.1.10 does not set a
       // non-zero exit code from a teardown throw on its own.
       process.exitCode = 1;
-      throw new Error(`STORY-012 D-5: isolation suite took ${elapsedMs}ms, over the ${budgetMs}ms budget`);
+      throw error;
     }
   };
 }
