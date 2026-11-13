@@ -171,6 +171,8 @@ CREATE POLICY portal_scope_source_domains ON source_domains
 
 **`sessions.user_agent` (STORY-096, owner decision 100(d), migration 0204, batch 11).** The User-Agent header at sign-in and refresh, at most 512 characters, parsed only for the account's own session list (`GET /me/sessions`: browser, OS, device type; the raw header is never returned) and **never logged**. **No IP address is stored.** The same migration adds `'user_revoked'` to the `revoked_reason` CHECK (`DELETE /me/sessions/{id}`).
 
+**Batch 14 column additions on existing tenant tables (no policy change):** `tracked_prompts.embedding_next` / `embedding_next_model` and `semantic_nodes.embedding_next` / `embedding_next_model` (migration 0211, STORY-186 re-embed staging; inventory: `embedding_next_model` `exportable`, `embedding_next` `omit`). Both tables were already tenant-scoped with RLS forced.
+
 **Batch 10 column additions on existing tenant tables (no policy change):** `tracked_prompts.status_changed_at` (migration 0199, STORY-066; inventory `exportable`) and `geo_alignments.page_structure` (migration 0201, STORY-060 S3; inventory `omit`).
 
 **Batch 8 column additions on existing tenant tables (no policy change):** `capture_runs.retry_of` (migration 0195, STORY-195 AC4) and `workspace_members.sentiment_alerts_enabled` (migration 0196, decision 96a). Both tables were already tenant-scoped with RLS; the subject inventory lists both new columns.
