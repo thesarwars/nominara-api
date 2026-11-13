@@ -27,11 +27,13 @@ function shiftDays(date: string, days: number): string {
   return new Date(Date.parse(date + "T00:00:00Z") + days * DAY_MS).toISOString().slice(0, 10);
 }
 
-/** Pure judgement of one range against the workspace-local `today` and the retention window. The first problem in a fixed order: future, retention, length. */
-export function judgeCustomRange(input: { readonly from: string; readonly to: string; readonly today: string; readonly retentionDays: number | null }): CustomRangeRefusal | null {
+/** Pure judgement of one range against the workspace-local `today`, the UTC date `utcToday` and the retention window. The first problem in a fixed order: future, retention, length. */
+export function judgeCustomRange(input: { readonly from: string; readonly to: string; readonly today: string; readonly utcToday: string; readonly retentionDays: number | null }): CustomRangeRefusal | null {
   if (input.to > input.today) return { reason: "in_future", field: "to", today: input.today };
   if (input.retentionDays !== null) {
-    const earliest = shiftDays(input.today, -input.retentionDays);
+    // The sweep (`expireRollups`) deletes `metric_date < (UTC date of now) - N`, so a day is kept from the UTC-cutoff date on. West of UTC the local date can lag the UTC
+    // one, and local today minus N would then name a day already deleted: the boundary is the LATER of the two, which is the later of today and the UTC today, minus N.
+    const earliest = shiftDays(input.today > input.utcToday ? input.today : input.utcToday, -input.retentionDays);
     if (input.from < earliest) return { reason: "beyond_retention", field: "from", earliest_allowed: earliest, retention_days: input.retentionDays };
   }
   if (customRangeDays(input.from, input.to) > CUSTOM_RANGE_MAX_DAYS) return { reason: "too_long", field: "to", max_days: CUSTOM_RANGE_MAX_DAYS };
@@ -59,10 +61,17 @@ export async function assertCustomRangeAllowed(
   timezone: string,
   range: { readonly from: string; readonly to: string },
   surface: string,
+  /** The instant "today" is judged at. Production passes nothing; the retention-boundary test fixes it to the instant it also runs the sweep at. */
+  now: Date = new Date(),
 ): Promise<void> {
-  const today = (await tx.query<{ today: string }>("SELECT to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today", [timezone])).rows[0]!.today;
-  const retention = await resolveWorkspaceRetention(tx, workspaceId);
-  const refusal = judgeCustomRange({ ...range, today, retentionDays: retentionDaysOf(retention.rollupsDays) });
+  const days = (
+    await tx.query<{ today: string; utc_today: string }>(
+      "SELECT to_char(($2::timestamptz AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today, to_char(($2::timestamptz AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS utc_today",
+      [timezone, now.toISOString()],
+    )
+  ).rows[0]!;
+  const retention = await resolveWorkspaceRetention(tx, workspaceId, now);
+  const refusal = judgeCustomRange({ ...range, today: days.today, utcToday: days.utc_today, retentionDays: retentionDaysOf(retention.rollupsDays) });
   if (refusal === null) {
     incrementCounter("nominara_analytics_custom_range_reads_total", { surface, outcome: "served" });
     return;

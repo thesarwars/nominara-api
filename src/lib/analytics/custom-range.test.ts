@@ -3,7 +3,7 @@ import { judgeCustomRange, retentionDaysOf } from "./custom-range.js";
 
 // STORY-090 AC9 - "a custom range is bounded by plan retention, with out-of-range dates disabled and explained, never silently clamped".
 // `today` is the workspace-local date; `retentionDays` is the rollup window IN FORCE (null = never purged). All dates are YYYY-MM-DD.
-const base = { today: "2026-11-13", retentionDays: 395 as number | null };
+const base = { today: "2026-11-13", utcToday: "2026-11-13", retentionDays: 395 as number | null };
 
 describe("STORY-090 AC9 · judgeCustomRange", () => {
   it("accepts a range inside the window, today included as `to`, and a one-day range", () => {
@@ -40,8 +40,24 @@ describe("STORY-090 AC9 · judgeCustomRange", () => {
   });
 
   it("leap days do not move the boundary: 395 days before 2028-03-01 is 2027-01-31", () => {
-    expect(judgeCustomRange({ today: "2028-03-01", retentionDays: 395, from: "2027-01-31", to: "2027-02-02" })).toBeNull();
-    expect(judgeCustomRange({ today: "2028-03-01", retentionDays: 395, from: "2027-01-30", to: "2027-02-02" })).toMatchObject({ reason: "beyond_retention", earliest_allowed: "2027-01-31" });
+    expect(judgeCustomRange({ today: "2028-03-01", utcToday: "2028-03-01", retentionDays: 395, from: "2027-01-31", to: "2027-02-02" })).toBeNull();
+    expect(judgeCustomRange({ today: "2028-03-01", utcToday: "2028-03-01", retentionDays: 395, from: "2027-01-30", to: "2027-02-02" })).toMatchObject({ reason: "beyond_retention", earliest_allowed: "2027-01-31" });
+  });
+});
+
+describe("STORY-090 AC9 · the boundary is the one the sweep deletes at (expireRollups: metric_date < the UTC date of now minus N days)", () => {
+  // America/Los_Angeles at 2026-11-13 20:00 local = 2026-11-14 04:00Z: the local date is still the 13th, the UTC date is already the 14th.
+  const west = { today: "2026-11-13", utcToday: "2026-11-14", retentionDays: 395 as number | null };
+
+  it("west of UTC, between 00:00Z and local midnight, the earliest allowed day is the UTC-cutoff date (2025-10-15), not local today minus N (2025-10-14, already deleted)", () => {
+    expect(judgeCustomRange({ ...west, from: "2025-10-14", to: "2025-10-20" })).toEqual({ reason: "beyond_retention", field: "from", earliest_allowed: "2025-10-15", retention_days: 395 });
+    expect(judgeCustomRange({ ...west, from: "2025-10-15", to: "2025-10-20" })).toBeNull();
+  });
+
+  it("east of UTC the local date is ahead, so local today minus N is the later bound and stays the boundary", () => {
+    const east = { today: "2026-11-14", utcToday: "2026-11-13", retentionDays: 395 as number | null };
+    expect(judgeCustomRange({ ...east, from: "2025-10-14", to: "2025-10-20" })).toMatchObject({ reason: "beyond_retention", earliest_allowed: "2025-10-15" });
+    expect(judgeCustomRange({ ...east, from: "2025-10-15", to: "2025-10-20" })).toBeNull();
   });
 });
 
