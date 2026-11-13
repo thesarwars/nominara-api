@@ -69,8 +69,8 @@ describe("STORY-185 · the routes", () => {
   });
 });
 
-type Row = { id: string; status: string; created_at: Date; expires_at: Date; ready_at: Date | null; coverage: unknown; error_code: string | null; object_key: string | null };
-const READY: Row = { id: ID, status: "ready", created_at: new Date("2026-11-12T00:00:00Z"), expires_at: new Date(Date.now() + 5 * 86_400_000), ready_at: new Date("2026-11-12T00:05:00Z"), coverage: null, error_code: null, object_key: KEY };
+type Row = { id: string; status: string; created_at: Date; expires_at: Date; ready_at: Date | null; coverage: unknown; error_code: string | null; object_key: string | null; object_purged_at: Date | null };
+const READY: Row = { id: ID, status: "ready", created_at: new Date("2026-11-12T00:00:00Z"), expires_at: new Date(Date.now() + 5 * 86_400_000), ready_at: new Date("2026-11-12T00:05:00Z"), coverage: null, error_code: null, object_key: KEY, object_purged_at: null };
 
 function build(rows: Row[], presign?: () => Promise<string>) {
   const queries: Array<{ text: string; params: unknown[] }> = [];
@@ -122,6 +122,12 @@ describe("STORY-185 AC3 · GET /v1/billing/retention-export/{id}/download", () =
       await expect(h.run()).rejects.toBeInstanceOf(NotFoundError);
       expect(h.presignGetStored).not.toHaveBeenCalled();
     }
+  });
+
+  it("an export whose object the cleanup deleted is the same neutral 404 whatever its date says", async () => {
+    const h = build([{ ...READY, object_purged_at: new Date() }]);
+    await expect(h.run()).rejects.toBeInstanceOf(NotFoundError);
+    expect(h.presignGetStored).not.toHaveBeenCalled();
   });
 
   it("an export still building or failed is 503 degraded, never a presign", async () => {

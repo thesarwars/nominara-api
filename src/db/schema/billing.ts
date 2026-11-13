@@ -165,6 +165,7 @@ export const retentionExports = pgTable("retention_exports", {
   emailedAt: timestamp("emailed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
+  objectPurgedAt: timestamp("object_purged_at", { withTimezone: true }),
 });
 
 export const stripeSubscriptionSyncs = pgTable("stripe_subscription_syncs", {

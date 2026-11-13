@@ -53,9 +53,10 @@ interface Row {
   coverage: unknown;
   error_code: string | null;
   object_key: string | null;
+  object_purged_at: Date | null;
 }
 
-const COLUMNS = "id, status, created_at, expires_at, ready_at, coverage, error_code, object_key";
+const COLUMNS = "id, status, created_at, expires_at, ready_at, coverage, error_code, object_key, object_purged_at";
 
 @Injectable()
 export class RetentionExportService {
@@ -135,7 +136,8 @@ export class RetentionExportService {
     try {
       const found = await client.query<Row>(`SELECT ${COLUMNS} FROM retention_exports WHERE id = $1 AND workspace_id = app.current_workspace()`, [params.id]);
       const row = found.rows[0];
-      if (row === undefined || row.expires_at.getTime() <= Date.now()) throw new NotFoundError({ message: "no such export" });
+      // An expired export, and one whose object the cleanup deleted (whatever its date says), is the same neutral 404.
+      if (row === undefined || row.expires_at.getTime() <= Date.now() || row.object_purged_at !== null) throw new NotFoundError({ message: "no such export" });
       if (row.status !== "ready" || row.object_key === null) throw new DegradedError({ message: "the export file is not available" });
       const key = row.object_key;
       const readyAt = row.ready_at ?? row.created_at;
@@ -171,7 +173,7 @@ export class RetentionExportService {
 
   private render(row: Row, _workspaceId: string): RetentionExport {
     const expired = row.expires_at.getTime() <= Date.now();
-    const status: RetentionExportStatus = expired && row.status !== "failed" ? "expired" : (row.status as RetentionExportStatus);
+    const status: RetentionExportStatus = (expired || row.object_purged_at !== null) && row.status !== "failed" ? "expired" : (row.status as RetentionExportStatus);
     return {
       id: row.id,
       status,

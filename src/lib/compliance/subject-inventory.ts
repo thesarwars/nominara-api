@@ -106,7 +106,7 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
     omit: "",
   },
   retention_exports: {
-    columns: "id workspace_id requested_by status coverage error_code expires_at ready_at emailed_at created_at updated_at",
+    columns: "id workspace_id requested_by status coverage error_code expires_at ready_at emailed_at created_at updated_at object_purged_at",
     omit: "object_key",
   },
   geo_alignments: {

@@ -3,6 +3,7 @@ import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { connect, withKeepalives } from "../../../db/client.js";
+import { runRetentionExportCleanup } from "../../billing/retention-export/cleanup.js";
 import { runReportArtifactCleanup, type CleanupResult } from "../../reports/artifact-cleanup.js";
 import { S3Adapter } from "../../storage/s3.adapter.js";
 import { resolveStorageConfig } from "../../storage/storage-config.js";
@@ -72,8 +73,20 @@ export function createReportCleanupHandler(context: QueueHandlerContext, deps: R
           incrementCounter("nominara_reports_cleanup_runs_total", { status: result.status });
           // Counts only - never a key, an artifact id or a workspace name.
           logger.log({ event: "report.cleanup.run", status: result.status, purged: result.purged, workspaces: result.workspaces, failed: result.failed, refused: result.refused });
+          // STORY-185 / decision 100(j): the full-data exports whose link has expired lose their stored zip in the same nightly pass. A failure of
+          // one pass never skips the other; both are idempotent, and either's failure fails the job below.
+          const exports = await runRetentionExportCleanup(owner, context.pool, store, {
+            ...(deps.batchSize === undefined ? {} : { batchSize: deps.batchSize }),
+          }).catch((error: unknown) => {
+            logger.error({ event: "report.cleanup.retention_exports_failed", error: error instanceof Error ? error.name : "unknown" });
+            return { purged: 0, workspaces: 0, failed: 1, refused: 0 };
+          });
+          span.setAttribute("nominara.report_cleanup.retention_exports_purged", exports.purged);
+          span.setAttribute("nominara.report_cleanup.retention_exports_failed", exports.failed);
+          logger.log({ event: "report.cleanup.retention_exports", purged: exports.purged, workspaces: exports.workspaces, failed: exports.failed, refused: exports.refused });
+          const failures = result.failed + exports.failed;
           // A partial run fails the job so the retry ladder is the prompt second try (the sweep is idempotent, so re-running costs nothing).
-          if (result.failed > 0) throw new Error(`report cleanup: ${String(result.failed)} failure(s) - see the log`);
+          if (failures > 0) throw new Error(`report cleanup: ${String(failures)} failure(s) - see the log`);
           return result;
         } catch (error) {
           span.setStatus({ code: SpanStatusCode.ERROR });
