@@ -132,10 +132,19 @@ export async function resolveReportSender(client: ClientBase, themeId: string | 
     [themeId],
   );
   const row = found.rows[0];
+  const theme = themeForEmail(row, brandRemovalGranted);
+  // PROVISIONAL: with the brand removed and no display name stored, the From must not fall back to the platform sender's own display name:
+  // use the workspace's name, else "Reports" (never a name that itself reads as the platform).
+  let fromName = row?.email_from_name ?? undefined;
+  if (fromName === undefined && !theme.showBrandLine) {
+    const workspace = await client.query<{ name: string | null }>("SELECT name FROM workspaces WHERE id = app.current_workspace()");
+    const name = workspace.rows[0]?.name?.trim() ?? "";
+    fromName = name === "" || /nominara/i.test(name) ? "Reports" : name;
+  }
   return {
-    ...(row?.email_from_name != null ? { fromName: row.email_from_name } : {}),
+    ...(fromName !== undefined ? { fromName } : {}),
     ...(row?.email_reply_to != null ? { replyTo: row.email_reply_to } : {}),
-    theme: themeForEmail(row, brandRemovalGranted),
+    theme,
   };
 }
 

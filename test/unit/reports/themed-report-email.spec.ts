@@ -52,3 +52,43 @@ describe("STORY-097 · one theme per run: the export build is given the report's
     for (const c of calls) expect(c[3]).toEqual({ scheduledReport: { id: "r1", themeId: null } });
   });
 });
+
+describe("STORY-097 · the From header under brand removal (PROVISIONAL neutral name)", () => {
+  const themeRow = (over: Record<string, unknown> = {}) => ({ email_from_name: null, email_reply_to: null, color_primary: null, color_accent: null, color_bg: null, color_fg: null, hide_nominara_brand: true, email_footer_html: null, ...over });
+  const client = (theme: Record<string, unknown> | undefined, workspaceName: string | null) =>
+    ({ query: async (text: string) => (/FROM brand_themes/.test(text) ? { rows: theme ? [theme] : [] } : /FROM workspaces/.test(text) ? { rows: workspaceName === null ? [] : [{ name: workspaceName }] } : { rows: [] }) }) as never;
+
+  it("brand removed, no email_from_name: the workspace's display name, never the platform sender's", async () => {
+    const { resolveReportSender } = await import("../../../src/lib/reports/run-scheduled-report.js");
+    expect((await resolveReportSender(client(themeRow(), "Acme Agency"), null, true)).fromName).toBe("Acme Agency");
+  });
+  it("brand removed, nothing usable: 'Reports'", async () => {
+    const { resolveReportSender } = await import("../../../src/lib/reports/run-scheduled-report.js");
+    expect((await resolveReportSender(client(themeRow(), null), null, true)).fromName).toBe("Reports");
+    expect((await resolveReportSender(client(themeRow(), "Nominara QA"), null, true)).fromName).toBe("Reports");
+  });
+  it("the theme's own email_from_name always wins; with the brand shown (or not entitled) nothing is invented", async () => {
+    const { resolveReportSender } = await import("../../../src/lib/reports/run-scheduled-report.js");
+    expect((await resolveReportSender(client(themeRow({ email_from_name: "Agency X" }), "Acme"), null, true)).fromName).toBe("Agency X");
+    expect((await resolveReportSender(client(themeRow(), "Acme"), null, false)).fromName).toBeUndefined();
+    expect((await resolveReportSender(client(themeRow({ hide_nominara_brand: false }), "Acme"), null, true)).fromName).toBeUndefined();
+  });
+
+  it("content scan incl. the From header: through the real Resend adapter, a brand-removed message's From, subject and bodies carry no platform name", async () => {
+    const { applyFakeApiEnv } = await import("../../support/fake-env.js");
+    applyFakeApiEnv();
+    process.env.NODE_ENV = "test";
+    const { ResendEmailSenderAdapter } = await import("../../../src/modules/identity/adapters/resend-email-sender.adapter.js");
+    const { resolveReportSender } = await import("../../../src/lib/reports/run-scheduled-report.js");
+    const bodies: Array<Record<string, unknown>> = [];
+    const adapter = new ResendEmailSenderAdapter({
+      apiKey: "k", from: "Nominara Reports <reports@sender.example>",
+      fetch: (async (_u: unknown, init: { body: string }) => (bodies.push(JSON.parse(init.body) as Record<string, unknown>), new Response("{}", { status: 200 }))) as never,
+    });
+    const sender = await resolveReportSender(client(themeRow(), "Acme Agency"), null, true);
+    await sendReportEmails(adapter, { name: "Monthly", recipients: ["a@example.test"] }, plan, sender);
+    expect(bodies).toHaveLength(1);
+    expect(JSON.stringify([bodies[0]!.from, bodies[0]!.subject, bodies[0]!.text, bodies[0]!.html])).not.toMatch(/nominara/i);
+    expect(bodies[0]!.from).toBe("Acme Agency <reports@sender.example>");
+  });
+});
