@@ -64,5 +64,6 @@ export function embedBatchKey(table: EmbedTable, ids: readonly string[], stageTa
   const canonical = [...new Set(ids.map((id) => id.toLowerCase()))].sort();
   // A stage job for the same rows is a different job from a direct one (it writes elsewhere), and from a stage job for another target model, so
   // it keys differently. A direct key is unchanged.
-  return `emb:${createHash("sha256").update([stageTargetModel === undefined ? table : `${table}:stage:${stageTargetModel}`, ...canonical].join("\n")).digest("hex")}`;
+  const discriminator = stageTargetModel === undefined ? table : table + ":stage:" + stageTargetModel;
+  return `emb:${createHash("sha256").update([discriminator, ...canonical].join("\n")).digest("hex")}`;
 }
