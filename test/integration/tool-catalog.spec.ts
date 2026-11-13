@@ -128,6 +128,43 @@ describe("STORY-078 · scenario 23 - the tool catalog route", () => {
     expect({ wallet: await walletRow(a.workspaceId), runs: await jobs() }).toEqual(before);
   });
 
+  // STORY-095 AC12 / owner decision 106(d): the SHARED daily lookup meter beside the catalog, at workspace:read (every role that can open a tool surface), from the
+  // same helper as /billing/usage and /billing/wallet.
+  const today = "(now() AT TIME ZONE 'UTC')::date";
+  const dayRow = (workspaceId: string, action: string, used: number, limit: number, when = today) =>
+    harness.db().query(`INSERT INTO credit_daily_counters (workspace_id, utc_date, action_code, used_count, limit_count) VALUES ($1, ${when}, $2, $3, $4)`, [workspaceId, action, used, limit]);
+  const meter = async (a: Actor) => (await catalog(a)).json().data as { daily_lookups?: unknown; daily_resets_at?: string };
+
+  it("STORY-095 AC12 - the catalog serves today's shared lookup count and the cap: 2 of 3 on Free, 0 with no use (not absent), null on a paid plan (not 0), yesterday's row is not today's", async () => {
+    const a = await owner("free");
+    expect((await meter(a)).daily_lookups).toEqual({ used: 0, cap: 3 });
+    await dayRow(a.workspaceId, "lookup", 3, 3, `${today} - 1`);
+    expect((await meter(a)).daily_lookups).toEqual({ used: 0, cap: 3 });
+    await dayRow(a.workspaceId, "lookup", 2, 3);
+    await dayRow(a.workspaceId, "nlp_command", 9, 20);
+    const body = await meter(a);
+    expect(body.daily_lookups).toEqual({ used: 2, cap: 3 });
+    expect(body.daily_resets_at).toMatch(/T00:00:00\.000Z$/u);
+    const paid = await owner("growth");
+    await dayRow(paid.workspaceId, "lookup", 1, 3);
+    expect((await meter(paid)).daily_lookups).toEqual({ used: 1, cap: null });
+  });
+
+  it("STORY-095 AC12 - a viewer (workspace:read only) reads the same meter, and the read creates no counter row", async () => {
+    const a = await owner("free");
+    await dayRow(a.workspaceId, "lookup", 1, 3);
+    const userId = uuidV7();
+    await harness.db().query(`INSERT INTO users (id, email, email_verified_at, status, created_at, updated_at) VALUES ($1,$2,now(),'active',now(),now())`, [userId, `${userId}@example.test`]);
+    await harness.db().query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1,$2,'viewer')", [a.workspaceId, userId]);
+    const version = (await harness.db().query<{ entitlement_version: number }>("SELECT entitlement_version FROM workspaces WHERE id = $1", [a.workspaceId])).rows[0]!.entitlement_version;
+    const tokens = await sessions.createSession(userId);
+    const entered = await sessions.switchWorkspace(tokens.sid, userId, a.workspaceId, "viewer", null, version);
+    const res = await harness.app().inject({ method: "GET", url: apiUrl("/tools"), headers: { cookie: cookieOf(entered), [CSRF_HEADER_NAME]: entered.csrfToken } });
+    expect(res.statusCode, res.body).toBe(200);
+    expect((res.json().data as { daily_lookups: unknown }).daily_lookups).toEqual({ used: 1, cap: 3 });
+    expect((await harness.db().query("SELECT 1 FROM credit_daily_counters WHERE workspace_id = $1", [a.workspaceId])).rowCount).toBe(1);
+  });
+
   it("STORY-089 - the notifications inbox read refuses a member who has been removed, on the very next request", async () => {
     const a = await owner("growth");
     const userId = uuidV7();
