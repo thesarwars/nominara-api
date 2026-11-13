@@ -189,6 +189,10 @@ export async function probeSemanticReuse(
            AND source_prompt.project_id = $1                   -- same project (its prompt)
            AND source_prompt.embedding IS NOT NULL
            AND target.embedding IS NOT NULL
+           -- STORY-186 AC2 / EC-23: ONE VECTOR SPACE PER COMPARISON. Cosine across two models is silently wrong, and mid re-embed a
+           -- project's prompts sit under two. IS NOT DISTINCT FROM (the clustering rule) so a legacy NULL pair still compares; a NULL against a
+           -- named model does not. A refusal costs a live capture, never a wrong reuse.
+           AND source_prompt.embedding_model IS NOT DISTINCT FROM target.embedding_model
            AND 1 - (source_prompt.embedding <=> target.embedding) >= $4
          ORDER BY source_prompt.embedding <=> target.embedding
          LIMIT 1
