@@ -25,6 +25,7 @@ import { TenantObjectStore } from "../../src/lib/storage/tenant-object-store.js"
 import { startLocalstack, type LocalstackFixture } from "../support/localstack-fixture.js";
 import type { DirtyEntry } from "../../src/lib/rollup/dirty-dates.js";
 import { ReparseService } from "../../src/modules/tracking/reparse.service.js";
+import { NORMALIZER_VERSION } from "../../src/lib/parser/normalize.js";
 import { rawRetentionCutoff } from "../../src/modules/tracking/raw-retention.js";
 import { ResultDocumentService } from "../../src/modules/tracking/result-document.service.js";
 import { ResultsListService } from "../../src/modules/tracking/results-list.service.js";
@@ -433,6 +434,78 @@ describe("STORY-034 · results list, re-parse and retention", () => {
     const doc = await as(() => new ResultDocumentService().get(id));
     expect(doc.raw_expired).toBe(true);
     expect(doc.raw_response.text).toBe("");
+  });
+
+  // A reused (L2) row stores no text of its own and reads its SOURCE's. Retention is judged on the source too: otherwise the expired source's text is served
+  // through a reused row that is itself inside the window (audit finding, batch 11 S3).
+  async function reusedOf(sourceId: string, opts: { capturedAt?: Date } = {}): Promise<string> {
+    const id = await seed({ status: "parsed", cacheLayer: "l2", capturedAt: opts.capturedAt ?? new Date(Date.now() - 2 * DAY) });
+    await db.query(`UPDATE answer_captures SET payload = '{"format":"markdown"}'::jsonb, source_result_id = $2, raw_object_key = NULL, response_excerpt = NULL WHERE id = $1`, [id, sourceId]);
+    return id;
+  }
+
+  it("034-AC10d · a reused (L2) result inside the window whose SOURCE is past the cutoff is raw_expired and serves none of the source's text", async () => {
+    const source = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    const reused = await reusedOf(source);
+    const doc = await as(() => new ResultDocumentService().get(reused));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.raw_response.text).toBe("");
+    expect(doc.raw_response.excerpt).toBeNull(); // the reused row's own excerpt: it has none, and the source's is never borrowed
+    expect(JSON.stringify(doc)).not.toContain("HubSpot");
+  });
+
+  it("034-AC10e · a reused (L2) result whose source the sweep marked raw_expired is raw_expired too", async () => {
+    const source = await seed({ status: "parsed", payloadExtra: { raw_expired: true } });
+    const reused = await reusedOf(source);
+    const doc = await as(() => new ResultDocumentService().get(reused));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.raw_response.text).toBe("");
+  });
+
+  it("034-AC10d · control: a reused result over a LIVE source still serves the source's text, raw_expired false", async () => {
+    const source = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 5 * DAY) });
+    const reused = await reusedOf(source);
+    const doc = await as(() => new ResultDocumentService().get(reused));
+    expect(doc.raw_expired).toBe(false);
+    expect(doc.raw_response.text).toContain("HubSpot");
+  });
+
+  it("034-AC10d · the source's expiry is judged by the same boundary: one second inside the cutoff is served, one second past is not", async () => {
+    const cutoff = (await as(() => rawRetentionCutoff(currentTenantStore()!.client, workspaceId)))!;
+    const inside = await reusedOf(await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() + 5_000) }));
+    const past = await reusedOf(await seed({ status: "parsed", capturedAt: new Date(cutoff.getTime() - 5_000) }));
+    expect((await as(() => new ResultDocumentService().get(inside))).raw_expired).toBe(false);
+    expect((await as(() => new ResultDocumentService().get(past))).raw_expired).toBe(true);
+  });
+
+  it("034-AC9 · re-parsing a reused result over an expired source reveals nothing: refused, as for any reused row (no text of its own)", async () => {
+    const source = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    const reused = await reusedOf(source);
+    await expect(as(() => reparseService().reparse(reused))).rejects.toBeInstanceOf(PreconditionUnmetError);
+  });
+
+  it("034-AC10d · an expired document carries no offsets at all: no occurrence spans, no evidence spans, and normalized_text_offsets is false", async () => {
+    const id = await seed({ status: "parsed", capturedAt: new Date(Date.now() - 200 * DAY) });
+    await seedStaleFacts(id);
+    await db.query("UPDATE answer_captures SET normalizer_version = $2 WHERE id = $1", [id, NORMALIZER_VERSION]); // a CURRENT normaliser, so offsets are not already withheld as stale
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_expired).toBe(true);
+    expect(doc.entities.length).toBeGreaterThan(0);
+    for (const entity of doc.entities) {
+      expect(entity.occurrences).toEqual([]);
+      expect(entity.sentiment.evidence_char_start).toBeNull();
+      expect(entity.sentiment.evidence_char_end).toBeNull();
+    }
+    expect(doc.raw_response.normalized_text_offsets).toBe(false);
+  });
+
+  it("034-AC10d · inside the window the offsets stay: normalized_text_offsets true and occurrences present", async () => {
+    const id = await seed({ status: "parsed" });
+    await seedStaleFacts(id);
+    await db.query("UPDATE answer_captures SET normalizer_version = $2 WHERE id = $1", [id, NORMALIZER_VERSION]); // a CURRENT normaliser, so offsets are not already withheld as stale
+    const doc = await as(() => new ResultDocumentService().get(id));
+    expect(doc.raw_response.normalized_text_offsets).toBe(true);
+    expect(doc.entities.some((e) => e.occurrences.length > 0)).toBe(true);
   });
 
   // ---------------------------------------------------------- AC9: re-parse

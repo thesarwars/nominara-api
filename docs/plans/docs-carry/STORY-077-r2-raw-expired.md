@@ -5,3 +5,5 @@
 **STORY-034 AC10:** the "result document past retention is 507" clause is amended the same way; tests `034-AC10d` and `034-AC10e` in `test/integration/tracking-results-reparse.spec.ts` were rewritten (they pinned the old 507 on this route), and boundary, facts-kept, tenant and failed-cell tests were added.
 
 **STORY-077 R2:** the API half is built; the client still owes the "text expired, charts kept" copy.
+
+**Fix round (audit):** a reused (L2) result is `raw_expired` when its SOURCE is past the cutoff or marked expired (the source's text is never served through an in-window reused row). When `raw_expired`, `entities[].occurrences` is `[]` and `sentiment.evidence_char_*` are null (the same withholding as a stale normaliser; the contract keeps `char_start/char_end` non-null, so occurrences are omitted rather than nulled), and `raw_response.normalized_text_offsets` is `false` (the schema is now `boolean`, was `literal(true)`). `/raw` and `/reparse` had no L2 text path (a reused row has no object and no text of its own: 404 and 422) and are pinned by tests.

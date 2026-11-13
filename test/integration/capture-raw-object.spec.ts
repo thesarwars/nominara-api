@@ -589,6 +589,13 @@ describe("STORY-181 · raw capture objects", () => {
     await expect(download((s) => s.signedUrl(resultId))).rejects.toBeInstanceOf(RetentionExceededError);
   });
 
+  it("181-AC4g · a reused (L2) row is never pointed at its source's object, whether or not the source has expired", async () => {
+    const source = await seedCapture({ objectText: ANSWER, capturedAt: new Date(Date.now() - 400 * 86_400_000) });
+    const reused = await seedCapture({ objectText: null });
+    await db.query(`UPDATE answer_captures SET cache_layer = 'l2', source_result_id = $2 WHERE id = $1`, [reused, source]);
+    await expect(download((s) => s.signedUrl(reused))).rejects.toBeInstanceOf(NotFoundError);
+  });
+
   it("181-AC3b · a LEGACY row with no object is 404 not_found (nothing to redirect to)", async () => {
     const resultId = await seedCapture({ objectText: null });
     await expect(download((s) => s.signedUrl(resultId))).rejects.toBeInstanceOf(NotFoundError);

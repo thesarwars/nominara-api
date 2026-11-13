@@ -65263,8 +65263,7 @@
                               "type": "string"
                             },
                             "normalized_text_offsets": {
-                              "type": "boolean",
-                              "const": true
+                              "type": "boolean"
                             },
                             "excerpt": {
                               "anyOf": [

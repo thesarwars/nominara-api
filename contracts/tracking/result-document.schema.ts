@@ -176,7 +176,8 @@ export const resultDocumentSchema = z
          * asserts and what makes the highlight map usable at all.
          */
         text: z.string(),
-        normalized_text_offsets: z.literal(true),
+        /** True while the document carries offsets into `text`; false once `raw_expired` (the text is gone, so no offset is served). */
+        normalized_text_offsets: z.boolean(),
         /**
          * Owner decision 100(f). Present ONLY when `raw_expired` is true: the retained excerpt (null if the capture never had one). With the text gone
          * `text` is "" and `char_count` is 0, which then mean "not available", not "an empty answer".
