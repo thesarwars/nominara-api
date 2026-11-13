@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { EnvValidationError, loadEnv } from "../../src/config/env.js";
 import { KNOWN_KEYS } from "../../src/config/env.js";
+import { assertReembedEnabled, ReembedDisabledError } from "../../src/lib/embedding/reembed.js";
 import { envSchema } from "../../src/config/env.schema.js";
 import { testCacheRedisUrl, testQueueRedisUrl } from "../support/test-valkey.js";
 
@@ -450,11 +451,18 @@ describe("Group C item 3 · object storage configuration", () => {
     });
   });
 
-  // STORY-186 / owner decision 104(b) - the operator re-embed switch: off by default, and only the literal "true" turns it on.
-  it("STORY-186 - EMBED_REEMBED_ENABLED is optional, accepts only the literal true, and is a known key", () => {
+  // STORY-186 / owner decision 104(b) - the operator re-embed switch: off by default. It must NEVER stop the API booting: any value loads,
+  // and only the command's own gate (assertReembedEnabled) decides, accepting the literal "true" alone.
+  it("STORY-186 - EMBED_REEMBED_ENABLED is optional, loads for ANY value, and the gate refuses everything but the literal true", () => {
     expect(loadEnv(VALID).EMBED_REEMBED_ENABLED).toBeUndefined();
-    expect(loadEnv({ ...VALID, EMBED_REEMBED_ENABLED: "true" }).EMBED_REEMBED_ENABLED).toBe("true");
-    expect(() => loadEnv({ ...VALID, EMBED_REEMBED_ENABLED: "1" })).toThrow(EnvValidationError);
+    expect(() => assertReembedEnabled(loadEnv(VALID))).toThrow(ReembedDisabledError);
+    for (const value of ["false", "1", "", "TRUE", "yes"]) {
+      const env = loadEnv({ ...VALID, EMBED_REEMBED_ENABLED: value });
+      expect(env.EMBED_REEMBED_ENABLED, value).toBe(value);
+      expect(() => assertReembedEnabled(env), value).toThrow(ReembedDisabledError);
+    }
+    const on = loadEnv({ ...VALID, EMBED_REEMBED_ENABLED: "true" });
+    expect(() => assertReembedEnabled(on)).not.toThrow();
     expect(KNOWN_KEYS).toContain("EMBED_REEMBED_ENABLED");
   });
 });
