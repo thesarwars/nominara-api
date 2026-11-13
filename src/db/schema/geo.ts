@@ -118,7 +118,7 @@ export const geoAnalyses = pgTable("geo_analyses", {
 
 export const nameMatchJudgeUsage = pgTable("name_match_judge_usage", {
   workspaceId: uuid("workspace_id").notNull(),
-  month: date("month", { mode: "string" }).notNull(),
+  month: date("month").notNull(),
   matchesSent: integer("matches_sent").notNull().default(sql`0`),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`now()`),
 }, (table) => [primaryKey({ columns: [table.workspaceId, table.month] })]);

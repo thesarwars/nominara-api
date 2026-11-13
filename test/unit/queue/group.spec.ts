@@ -50,7 +50,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     // STORY-176 / decision 93 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "rollup.category_benchmark",
   ],
-  report: ["report.build"],
+  // STORY-185 / decision 100(c) - billing.retention_export is not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+  report: ["report.build", "billing.retention_export"],
   deploy: ["deploy.cms"],
 };
 

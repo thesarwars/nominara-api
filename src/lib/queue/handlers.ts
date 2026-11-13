@@ -5,6 +5,7 @@ import { createBillingAutoTopupHandler } from "./handlers/billing-auto-topup.han
 import { createBillingCancelOnDeletionHandler } from "./handlers/billing-cancel-on-deletion.handler.js";
 import { createBillingCustomerEmailHandler } from "./handlers/billing-customer-email.handler.js";
 import { createBillingDowngradeNoticeHandler } from "./handlers/billing-downgrade-notice.handler.js";
+import { createBillingRetentionExportHandler } from "./handlers/billing-retention-export.handler.js";
 import { createGscSyncHandler } from "./handlers/gsc-sync.handler.js";
 import { createEmbedBatchHandler } from "./handlers/embed-batch.handler.js";
 import { createGeoAnalyzeHandler } from "./handlers/geo-analyze.handler.js";
@@ -161,6 +162,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "billing.auto_topup": (context) => createBillingAutoTopupHandler(context),
   "billing.customer_email": (context) => createBillingCustomerEmailHandler(context),
   "billing.downgrade_notice": (context) => createBillingDowngradeNoticeHandler(context),
+  "billing.retention_export": (context) => createBillingRetentionExportHandler(context),
   "billing.cancel_on_deletion": (context) => createBillingCancelOnDeletionHandler(context),
   "notify.dispatch": (context) => createNotifyDispatchHandler(context),
   "report.build": (context) => createReportBuildHandler(context),

@@ -500,6 +500,11 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
     "INSERT INTO name_match_judge_usage (workspace_id, month, matches_sent) SELECT $1, (date_trunc('month', now()) - make_interval(months => g))::date, 3 FROM generate_series(0, $2::int - 1) g",
     [workspaceId, R],
   );
+  // STORY-185 (migration 0203, decision 100) - failed full-data exports (history, none in flight: the one-in-flight index is partial). Tenant-scoped, not portal-readable.
+  await client.query(
+    "INSERT INTO retention_exports (id, workspace_id, status, error_code, expires_at) SELECT gen_random_uuid(), $1, 'failed', 'fixture', now() + interval '14 days' FROM generate_series(1, $2::int)",
+    [workspaceId, R],
+  );
   // STORY-191 (migration 0197, decision 99c) - a model verdict per project. Tenant-scoped, not portal-readable.
   for (let i = 0; i < R; i++) {
     await client.query(

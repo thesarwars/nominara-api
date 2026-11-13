@@ -43,8 +43,8 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
       to: 90 as number | "unlimited" | null,
       cutoff: new Date("2026-08-13T09:30:00.000Z"),
       projects: [
-        { name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z") },
-        { name: "Acme Blog", count: 1, oldest: new Date("2026-01-01T00:00:00.000Z"), newest: new Date("2026-01-01T00:00:00.000Z") },
+        { projectId: "0198a1f0-0000-7000-8000-000000000001", name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z") },
+        { projectId: "0198a1f0-0000-7000-8000-000000000002", name: "Acme Blog", count: 1, oldest: new Date("2026-01-01T00:00:00.000Z"), newest: new Date("2026-01-01T00:00:00.000Z") },
       ],
     },
     rollups: null,
@@ -68,8 +68,8 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
       raw: {
         ...base.raw,
         projects: [
-          { name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z") },
-          { name: "Gone (deleted project)", count: 2, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2025-10-02T00:00:00.000Z") },
+          { projectId: "0198a1f0-0000-7000-8000-000000000003", name: "Acme Site", count: 120, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2026-08-12T00:00:00.000Z") },
+          { projectId: "0198a1f0-0000-7000-8000-000000000004", name: "Gone (deleted project)", count: 2, oldest: new Date("2025-10-01T00:00:00.000Z"), newest: new Date("2025-10-02T00:00:00.000Z") },
         ],
       },
     };
@@ -121,8 +121,8 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
   // Review round 1 (minor): the rollup window also removes attribution_daily and the derived analyses, so the notice names them,
   // and the cutoff is a rolling one (the nightly job runs up to a day after the purge date).
   it("R1 · a rollup shortening also names the attribution chart data and the derived analyses that go with it", () => {
-    const section = { from: 730 as number | "unlimited" | null, to: 395 as number | "unlimited" | null, cutoff: new Date("2026-08-13T00:00:00.000Z"), projects: [{ name: "Rollup Co", count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-01-02T00:00:00.000Z") }] };
-    const attribution = { ...section, projects: [{ name: "Rollup Co", count: 4, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-01-04T00:00:00.000Z") }] };
+    const section = { from: 730 as number | "unlimited" | null, to: 395 as number | "unlimited" | null, cutoff: new Date("2026-08-13T00:00:00.000Z"), projects: [{ projectId: "0198a1f0-0000-7000-8000-000000000005", name: "Rollup Co", count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-01-02T00:00:00.000Z") }] };
+    const attribution = { ...section, projects: [{ projectId: "0198a1f0-0000-7000-8000-000000000006", name: "Rollup Co", count: 4, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-01-04T00:00:00.000Z") }] };
     const body = retentionShorteningEmail("o@example.com", { ...base, raw: null, rollups: section, attribution }).textBody;
     expect(body).toContain("Rollup Co: 4 days, 2025-01-01 to 2025-01-04");
     expect(body).toMatch(/attribution/i);
@@ -137,7 +137,7 @@ describe("STORY-077 R1 · retentionShorteningEmail", () => {
   });
 
   it("R1 · names every project (no cap) and keeps the totals exact", () => {
-    const many = Array.from({ length: 80 }, (_, i) => ({ name: `P${String(i)}`, count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-02-01T00:00:00.000Z") }));
+    const many = Array.from({ length: 80 }, (_, i) => ({ projectId: `0198a1f0-0000-7000-8000-${String(i).padStart(12, "0")}`, name: `P${String(i)}`, count: 2, oldest: new Date("2025-01-01T00:00:00.000Z"), newest: new Date("2025-02-01T00:00:00.000Z") }));
     const body = retentionShorteningEmail("o@example.com", { ...base, raw: { ...base.raw, projects: many } }).textBody;
     expect(body).toContain("160");
     expect(body).not.toMatch(/and \d+ more/);

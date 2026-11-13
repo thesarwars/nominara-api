@@ -105,6 +105,10 @@ const EXPORT_COLUMNS: Readonly<Record<string, { readonly columns: string; readon
       "id workspace_id request_id kind recipient subject text_body created_at sent_at",
     omit: "",
   },
+  retention_exports: {
+    columns: "id workspace_id requested_by status coverage error_code expires_at ready_at emailed_at created_at updated_at object_purged_at scope",
+    omit: "object_key",
+  },
   geo_alignments: {
     columns:
       "id workspace_id project_id task_id target_url prompt_cluster_id engine_keys embedding_model embedding_dims centroid_source_count centroid_domains live_content_md draft_content_md baseline_alignment current_alignment target_band_low target_band_high percentile_vs_corpus coverage_ratio recommendations status created_by created_at updated_at",
@@ -271,6 +275,7 @@ export const SUBJECT_INVENTORY: Readonly<Record<string, InventoryEntry>> = Objec
   displacement_events: exportOf("displacement_events"),
   domain_verifications: exportOf("domain_verifications"),
   downgrade_notices: exportOf("downgrade_notices"),
+  retention_exports: exportOf("retention_exports"), // requested_by references users
   entity_nodes: exempt(DERIVED),
   geo_alignments: exportOf("geo_alignments"),
   geo_analyses: exportOf("geo_analyses"),

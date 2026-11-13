@@ -67,6 +67,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "billing.cancel_on_deletion",
       "billing.customer_email",
       "billing.downgrade_notice",
+      "billing.retention_export",
       "capture.execute",
       "capture.parse",
       "capture.plan",
@@ -142,7 +143,9 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "billing.customer_email",
       // STORY-077 (owner decision 2026-10-23) — declared after billing.customer_email in topology.ts.
       "billing.downgrade_notice",
-      // Decision 83(a) (2026-11-09) — declared after billing.downgrade_notice in topology.ts.
+      // STORY-185 (decision 100(c)) — declared after billing.downgrade_notice in topology.ts.
+      "billing.retention_export",
+      // Decision 83(a) (2026-11-09) — declared after billing.retention_export in topology.ts.
       "billing.cancel_on_deletion",
       // STORY-076 / STORY-071 and STORY-077 R4 — declared after billing.cancel_on_deletion in topology.ts.
       "credit.housekeeping",

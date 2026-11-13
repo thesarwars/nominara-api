@@ -81,6 +81,8 @@ describe("STORY-011 · pnpm db:rls-check", () => {
       "0197_name_match_verdicts",
       // STORY-191 fix round (owner decision 99l) - the twelfth post-0006 tenant table (name_match_judge_usage); its policy ships in migration 0202.
       "0202_name_match_judge_usage",
+      // STORY-185 (owner decision 100) - the thirteenth post-0006 tenant table (retention_exports); its policy ships in migration 0203.
+      "0203_retention_exports",
     ]) {
       for (const ext of ["up", "down"] as const) {
         const content = await readFile(path.join(MIGRATIONS_DIR, `${name}.${ext}.sql`), "utf8");

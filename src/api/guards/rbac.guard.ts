@@ -5,6 +5,7 @@ import { evaluatePermission, type Permission } from "../../tenancy/permission-ma
 import { assertStepUpFresh } from "../../tenancy/step-up.js";
 import { IS_PUBLIC_KEY } from "../decorators/public.decorator.js";
 import { PROJECT_PARAM_KEY } from "../decorators/project-param.decorator.js";
+import { REQUIRE_STEP_UP_KEY } from "../decorators/require-step-up.decorator.js";
 import { REQUIRE_PERMISSION_KEY } from "../decorators/require-permission.decorator.js";
 import { SCOPED_BY_QUERY_KEY } from "../decorators/scoped-by-query.decorator.js";
 import type { WorkspaceScopedRequest } from "./workspace.guard.js";
@@ -69,7 +70,8 @@ export class RbacGuard implements CanActivate {
       this.assertInScope(req, permission, context);
     }
 
-    if (rule.stepUp) {
+    // The matrix's step-up, or a route's own (owner decision 100(j)): the same check either way.
+    if (rule.stepUp || this.reflector.get<boolean | undefined>(REQUIRE_STEP_UP_KEY, context.getHandler()) === true) {
       this.assertStepUp(req);
     }
 
