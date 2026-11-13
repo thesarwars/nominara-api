@@ -85,6 +85,18 @@ export const matrixCellSchema = z
     cache_age_ms: z.number().int().nonnegative().nullable(),
     /** NEW-A-5 — null on a pending, failed or blocked cell: nothing was measured. */
     data_source: dataSourceSchema.nullable().optional(),
+    /**
+     * STORY-091 — where the brand sits in THIS answer: its first occurrence's `position_class` (the same value the result document gives the brand
+     * entity). NULL where nothing places the brand: a cell with no capture, a failed or blocked one, or an answer that does not name it. Never a
+     * default class: `neutral_list` is a placement, and a cell that was not measured has none. OPTIONAL in the contract only because `contracts:diff`
+     * classes a new required response field a MAJOR change; the server always sends it.
+     */
+    position_class: z.enum(["recommendation", "ranked", "neutral_list", "also_consider", "caveat"]).nullable().optional(),
+    /**
+     * STORY-091 — the flags the parse stamped on the answer (`answer_captures.flags`: `engine_refused_to_answer`, `empty_answer`, ...), the same open string
+     * list the result document carries, so a refusal can be told from any other absence. `[]` is a capture with none; NULL is a cell with no capture at all.
+     */
+    flags: z.array(z.string()).nullable().optional(),
   })
   .strict();
 

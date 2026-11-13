@@ -55110,6 +55110,36 @@
                                           "type": "null"
                                         }
                                       ]
+                                    },
+                                    "position_class": {
+                                      "anyOf": [
+                                        {
+                                          "type": "string",
+                                          "enum": [
+                                            "recommendation",
+                                            "ranked",
+                                            "neutral_list",
+                                            "also_consider",
+                                            "caveat"
+                                          ]
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "flags": {
+                                      "anyOf": [
+                                        {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
                                     }
                                   },
                                   "required": [
