@@ -21,7 +21,7 @@ const rel = (p: string): string => relative(ROOT, p);
 export function caveatFindings(path: string, text: string): string[] {
   const found: string[] = [];
   // 1. The caveat's words live only in the constant: a hand-typed copy can drift from, or replace, the shared one.
-  if (path !== "contracts/attribution/attribution-report.schema.ts" && /measured counts and a floor/i.test(text)) found.push(`${path}: hand-written caveat text`);
+  if (path !== "contracts/attribution/attribution-report.schema.ts" && /A measured floor\. Referrer stripping/i.test(text)) found.push(`${path}: hand-written caveat text`);
   // 2. Every attribution report literal takes the note from the constant.
   for (const m of text.matchAll(/measured_floor_note:\s*([^,\n;}]+)/g)) {
     const value = m[1]!.trim();
@@ -56,8 +56,9 @@ describe("STORY-116 AC13 · the measured-floor caveat cannot be omitted (decisio
   it("the gate is live: a producer that reworded the caveat is reported", () => {
     expect(caveatFindings("src/x.ts", "const r = { measured_floor_note: 'all good' };")).toHaveLength(1);
     expect(caveatFindings("src/x.ts", "const r = { measuredFloorNote: reword(MEASURED_FLOOR_COPY) };")).toHaveLength(1);
-    expect(caveatFindings("src/x.ts", `const note = "Figures are measured counts and a floor";`)).toHaveLength(1);
+    expect(caveatFindings("src/x.ts", `const note = "A measured floor. Referrer stripping means something else";`)).toHaveLength(1);
     expect(caveatFindings("src/x.ts", "const r = { measured_floor_note: MEASURED_FLOOR_COPY };")).toEqual([]);
-    expect(MEASURED_FLOOR_COPY).toMatch(/measured counts and a floor/);
+    // The spec's wording, verbatim (ui-ux-guidelines.md section 5, `attribution_floor`).
+    expect(MEASURED_FLOOR_COPY).toBe("A measured floor. Referrer stripping means some AI traffic is unattributable, and this figure is never extrapolated.");
   });
 });

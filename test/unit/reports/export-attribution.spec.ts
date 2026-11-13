@@ -49,7 +49,7 @@ describe("STORY-116 AC19 · the attribution export section", () => {
     const { csv, text } = await both(buildExportDocument(input()));
     expect(csv).toContain("attribution,,,,measured_floor_note,");
     expect(csv).toContain(MEASURED_FLOOR_COPY);
-    expect(text).toContain("measured counts and a floor");
+    expect(text).toContain("A measured floor. Referrer stripping");
     expect(csv).toContain("methodology,,,,note,");
     expect(text).toContain(METHODOLOGY_NOTE);
   });
@@ -67,7 +67,7 @@ describe("STORY-116 AC19 · the attribution export section", () => {
     const doc = buildExportDocument(input({ attribution: undefined, palette: { ...palette, showBrandLine: false } }));
     const { csv, text } = await both(doc);
     expect(csv).toContain(MEASURED_FLOOR_COPY);
-    expect(text).toContain("measured counts and a floor");
+    expect(text).toContain("A measured floor. Referrer stripping");
   });
 
   it("scenario 6 - the unattributed class is a separate line, never added into the AI total", () => {

@@ -671,7 +671,7 @@ describe("STORY-100 · on-demand export over HTTP", () => {
     const pdf = await exportReport(a, p, body({ sections: ["attribution"] }));
     expect(pdf.statusCode, pdf.body).toBe(201);
     const text = pdfText(await fileOf(exportResponseSchema.parse(data(pdf))));
-    expect(text).toContain("measured counts and a floor");
+    expect(text).toContain("A measured floor. Referrer stripping");
     expect(text).toContain(METHODOLOGY_NOTE);
   }, 120_000);
 
