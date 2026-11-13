@@ -30,6 +30,7 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { resolveBillingPeriod } from "../../lib/usage/billing-period.js";
 import { httpReservationJobId } from "../../lib/usage/reservation-job-id.js";
 import { commitTierCap, limitValueFor, readCounter, releaseTierCap, UNLIMITED_LIMIT } from "../../lib/usage/tier-caps.js";
+import { reportFileName } from "../../lib/reports/artifact-filename.js";
 import { exportPaletteFrom, type ExportPalette, type StoredThemeValues } from "../../lib/theme/export-palette.js";
 import { SYSTEM_ACTOR_ID } from "../../tenancy/constants.js";
 import { afterCommit, currentTenantStore, withTenantContext, type TenantContext } from "../../tenancy/tenant-context.js";
@@ -233,12 +234,13 @@ export class ExportService {
           .filter((c) => c.engines.length > 0 || c.blended.measuredCells > 0);
       }
 
+      const palette = await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true);
       const doc = buildExportDocument({
         projectName: project.rows[0].name,
         generatedAt: new Date().toISOString(),
         timeframe: body.timeframe,
         window: { from: window.from, to: window.to },
-        palette: await this.palette(tx, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true),
+        palette,
         footer,
         sections: body.sections,
         hideCompetitors: body.hide_competitors,
@@ -289,7 +291,7 @@ export class ExportService {
       return {
         export_id: exportId,
         format: body.format,
-        filename: `nominara-report-${stamp}.${body.format}`,
+        filename: reportFileName(palette.showBrandLine, stamp, body.format),
         download_url: exportDownloadUrl(this.publicBaseUrl, exportId),
         footer,
         pdf,

@@ -119,6 +119,16 @@ describe("NEW-E-100b · STORY-100 s2 — brand removal does not remove the foote
   });
 });
 
+describe("STORY-097 AC4 · scenario 5 - the export content scan", () => {
+  it("STORY-097 s5 - with the brand removed no platform name appears anywhere in the PDF text or the CSV; with it shown the scan is live", async () => {
+    const hidden = await everyFormat(buildExportDocument(input({ palette: { ...palette, showBrandLine: false } })));
+    expect(hidden.pdfText).not.toMatch(/nominara/i);
+    expect(hidden.csv).not.toMatch(/nominara/i);
+    const shown = await everyFormat(buildExportDocument(input()));
+    expect(shown.pdfText).toMatch(/nominara/i);
+  });
+});
+
 describe("NEW-E-100b · STORY-100 s3 — the footer cannot be suppressed", () => {
   it("STORY-100 s3 — no section selection removes it, including selecting nothing renderable", async () => {
     for (const sections of [["overview"], ["growth_map"], ["competitors"], ["tasks"], ["aux", "sources"], ["matrix"]] as const) {

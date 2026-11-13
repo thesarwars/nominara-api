@@ -14,6 +14,7 @@ import { incrementCounter } from "../telemetry/metrics.js";
 import { resolveBillingPeriod } from "../usage/billing-period.js";
 import { storedKeySql } from "./artifact-key.js";
 import { commitTierCap, provisionUsageCounters, readCounter, releaseTierCap, reserveTierCap, UNLIMITED_LIMIT } from "../usage/tier-caps.js";
+import { renderReportEmail, themeForEmail, type EmailTheme } from "../theme/email-theme.js";
 import { advanceNextSendAt, type ScheduleCadence } from "./next-send-at.js";
 import { planArtifactMail, resolveMailParts, type ArtifactMailDeps, type ArtifactMailPlan } from "./report-artifact-mail.js";
 
@@ -50,6 +51,7 @@ const logger = new Logger("reports.scheduled");
 
 export const PDF_ENTITLEMENT = "exports.pdf_per_cycle";
 export const CSV_ENTITLEMENT = "exports.csv";
+const BRAND_REMOVAL_FEATURE = "whitelabel.remove_branding";
 
 export interface ScheduledReportRow {
   id: string;
@@ -90,6 +92,8 @@ export interface ReportRunDeps {
 export interface ReportSender {
   readonly fromName?: string;
   readonly replyTo?: string;
+  /** STORY-097: the stored theme the mail is drawn with. Absent = the platform default look. */
+  readonly theme?: EmailTheme;
 }
 
 export function reportNeedsPdf(format: ScheduledReport["format"]): boolean {
@@ -110,9 +114,19 @@ export function failureReason(error: unknown): string {
  * place the mail identity is read, from the theme row, so there is no second branding source (STORY-097 AC4). A theme that
  * stores neither field, or none at all, gives an empty sender: the platform's own name, and no Reply-To header.
  */
-export async function resolveReportSender(client: ClientBase, themeId: string | null): Promise<ReportSender> {
-  const found = await client.query<{ email_from_name: string | null; email_reply_to: string | null }>(
-    `SELECT email_from_name, email_reply_to FROM brand_themes
+export async function resolveReportSender(client: ClientBase, themeId: string | null, brandRemovalGranted: boolean): Promise<ReportSender> {
+  const found = await client.query<{
+    email_from_name: string | null;
+    email_reply_to: string | null;
+    color_primary: string | null;
+    color_accent: string | null;
+    color_bg: string | null;
+    color_fg: string | null;
+    hide_nominara_brand: boolean;
+    email_footer_html: string | null;
+  }>(
+    `SELECT email_from_name, email_reply_to, color_primary, color_accent, color_bg, color_fg, hide_nominara_brand, email_footer_html
+       FROM brand_themes
       WHERE ($1::uuid IS NOT NULL AND id = $1::uuid) OR is_default
       ORDER BY (id = $1::uuid) DESC NULLS LAST, is_default DESC, created_at, id LIMIT 1`,
     [themeId],
@@ -121,6 +135,7 @@ export async function resolveReportSender(client: ClientBase, themeId: string | 
   return {
     ...(row?.email_from_name != null ? { fromName: row.email_from_name } : {}),
     ...(row?.email_reply_to != null ? { replyTo: row.email_reply_to } : {}),
+    theme: themeForEmail(row, brandRemovalGranted),
   };
 }
 
@@ -199,20 +214,22 @@ export async function sendReportEmails(
     return { sent: 0, failed: report.recipients.length, suppressed: 0 };
   }
   incrementCounter("nominara_reports_mail_artifacts_total", { outcome: "ready" });
-  const lines = [`Your report "${report.name}" is ready.`];
-  if (parts.attachments.length > 0) lines.push("", "Attached:", ...parts.attachments.map((a) => `- ${a.filename}`));
-  if (parts.links.length > 0) {
-    lines.push("", `Too large to attach. Download (each link is valid for ${String(REPORT_LINK_TTL_DAYS)} days):`, ...parts.links.map((l) => `- ${l.filename}: ${l.url}`));
-  }
-  const textBody = `${lines.join("\n")}\n`;
+  const rendered = renderReportEmail({
+    reportName: report.name,
+    attachments: parts.attachments.map((a) => a.filename),
+    links: parts.links,
+    linkTtlDays: REPORT_LINK_TTL_DAYS,
+    theme: sender.theme ?? themeForEmail(undefined, false),
+  });
   let failed = 0;
   let suppressed = 0;
   for (const to of report.recipients) {
     try {
       await email.send({
         to,
-        subject: "Your scheduled Nominara report is ready",
-        textBody,
+        subject: rendered.subject,
+        textBody: rendered.textBody,
+        htmlBody: rendered.htmlBody,
         ...(parts.attachments.length > 0 ? { attachments: parts.attachments } : {}),
         ...(sender.fromName !== undefined ? { fromName: sender.fromName } : {}),
         ...(sender.replyTo !== undefined ? { replyTo: sender.replyTo } : {}),
@@ -411,7 +428,8 @@ export async function prepareScheduledRun(tx: ClientBase, deps: ReportRunDeps, i
     [deliveryId, workspaceId, reportId, artifacts[0] ?? null],
   );
   if (deps.mail === undefined) throw new Error("a scheduled run needs its artifact mail dependencies");
-  const mail = await planArtifactMail(tx, { ...deps.mail, uploaded: (ids) => deps.exports.uploaded(ids) }, workspaceId, artifacts);
+  const sender = await resolveReportSender(tx, report.theme_id, entitlements.entitlements[BRAND_REMOVAL_FEATURE]?.value === true);
+  const mail = await planArtifactMail(tx, { ...deps.mail, uploaded: (ids) => deps.exports.uploaded(ids) }, workspaceId, artifacts, sender.theme?.showBrandLine ?? true);
   return {
     kind: "send",
     prepared: {
@@ -423,7 +441,7 @@ export async function prepareScheduledRun(tx: ClientBase, deps: ReportRunDeps, i
       deliveryId,
       recipients: report.recipients,
       artifacts,
-      sender: await resolveReportSender(tx, report.theme_id),
+      sender,
       finalAttempt,
     },
   };
