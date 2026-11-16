@@ -21,7 +21,7 @@ interface Recorded {
   readonly params: unknown[];
 }
 
-function tenantClientRecording(calls: Recorded[], rows: unknown[] = [], cooccurring: unknown[] = []) {
+function tenantClientRecording(calls: Recorded[], rows: unknown[] = [], cooccurring: unknown[] = [], competitorRows: unknown[] = []) {
   return {
     query: vi.fn(async (sql: string, params: unknown[]) => {
       calls.push({ sql, params });
@@ -29,6 +29,8 @@ function tenantClientRecording(calls: Recorded[], rows: unknown[] = [], cooccurr
       if (sql.includes("embedding IS NULL")) return { rows: [] };
       // STORY-043 AC11 - the first-capture co-occurrence read (mention_facts): tests that want one say so with `cooccurring`.
       if (sql.includes("mention_facts")) return { rows: cooccurring };
+      // STORY-043 AC11 - the project's tracked competitors (name, source), read in the same tenant transaction.
+      if (sql.includes("FROM competitors")) return { rows: competitorRows };
       return { rows };
     }),
   };
@@ -510,10 +512,10 @@ describe("STORY-043 · ProjectsService.create", () => {
 describe("STORY-043 · ProjectsService.discoveryFor", () => {
   let calls: Recorded[];
 
-  function serviceReading(rows: unknown[], cooccurring: unknown[] = []) {
+  function serviceReading(rows: unknown[], cooccurring: unknown[] = [], competitorRows: unknown[] = []) {
     calls = [];
     vi.spyOn(tenantContext, "currentTenantStore").mockReturnValue({
-      client: tenantClientRecording(calls, rows, cooccurring),
+      client: tenantClientRecording(calls, rows, cooccurring, competitorRows),
     } as never);
     return new ProjectsService(
       { enqueueTenantJob: vi.fn() } as unknown as QueueProducer,
@@ -566,6 +568,31 @@ describe("STORY-043 · ProjectsService.discoveryFor", () => {
       ["Pipedrive", "own comparison page"],
       ["Salesforce", "co-occurring in first capture"],
     ]);
+  });
+
+  const FINISHED = {
+    discovery_status: "completed", duration_ms: 1, fields: {}, competitors_proposed: [],
+    prompts_generated: [], prompts_free_remaining: 10, credits_charged: 0, low_confidence_fields: [],
+  };
+  const PROJECT_ROW = { discovery: FINISHED, discovery_status: "completed", name: "HubSpot", brand_aliases: [], root_domain: "hubspot.com" };
+  const ENTITIES = [{ label: "Salesforce", results: 8, brand_results: 10 }, { label: "Zoho", results: 7, brand_results: 10 }];
+
+  it("STORY-043 AC11 - competitors the user supplied or confirmed (rows with source 'user') suppress the co-occurrence merge altogether", async () => {
+    const result = await serviceReading([PROJECT_ROW], ENTITIES, [{ name: "Pipedrive", source: "user" }]).discoveryFor("p1");
+    expect(result.competitors_proposed).toEqual([]);
+    expect(calls.some((c) => c.sql.includes("mention_facts"))).toBe(false);
+  });
+
+  it("STORY-043 AC11 - a name already in the project's competitors table (ignoring case and punctuation) is never re-proposed", async () => {
+    const result = await serviceReading([PROJECT_ROW], ENTITIES, [{ name: "SALES-force", source: "auto_detected" }]).discoveryFor("p1");
+    expect(result.competitors_proposed.map((c) => c.name)).toEqual(["Zoho"]);
+  });
+
+  it("STORY-043 AC11 - the competitors read is in the same tenant transaction, soft-deleted rows excluded, and takes no workspace predicate", async () => {
+    await serviceReading([PROJECT_ROW], ENTITIES, []).discoveryFor("p1");
+    const read = calls.find((c) => c.sql.includes("FROM competitors"))!;
+    expect(read.sql).toContain("deleted_at IS NULL");
+    expect(read.sql).not.toContain("workspace_id");
   });
 
   it("STORY-043 AC11 - a pass still running proposes nothing from a capture (no read at all)", async () => {

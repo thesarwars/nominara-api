@@ -71,9 +71,11 @@ export function mergeCooccurringEntities(input: {
   readonly own: readonly ProposedCompetitor[];
   readonly entities: readonly CooccurringEntity[];
   readonly ownBrandNames: readonly string[];
+  /** Names the project already tracks (its competitors table): never proposed again. Compared like the proposals, ignoring case and punctuation. */
+  readonly excludeNames?: readonly string[];
 }): ProposedCompetitor[] {
   const merged = [...input.own].slice(0, MAX_PROPOSED_COMPETITORS);
-  const seen = new Set(merged.map((c) => norm(c.name)));
+  const seen = new Set([...merged.map((c) => norm(c.name)), ...(input.excludeNames ?? []).map(norm)]);
 
   const candidates = input.entities
     .flatMap((e) => {

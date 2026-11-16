@@ -437,6 +437,11 @@ export class ProjectsService {
     stored: DiscoveryResponse,
   ): Promise<DiscoveryResponse> {
     if ((stored.discovery_status !== "completed" && stored.discovery_status !== "partial") || stored.competitors_proposed.length >= MAX_PROPOSED_COMPETITORS) return stored;
+    // Same tenant transaction, RLS-scoped. A project holding a user-authored competitor - supplied at creation or confirmed since, both
+    // written with source 'user' - has taken the decision itself, so nothing is proposed on top of it. Any other tracked name is excluded.
+    const tracked = await client.query("SELECT name, source FROM competitors WHERE project_id = $1 AND deleted_at IS NULL", [projectId]);
+    const trackedRows = tracked.rows as { name: string; source: string }[];
+    if (trackedRows.some((c) => c.source === "user")) return stored;
     const entities = await loadCooccurringEntities(client as never, projectId);
     if (entities.length === 0) return stored;
     const discoveredName = stored.fields.brand_name?.value;
@@ -444,6 +449,7 @@ export class ProjectsService {
     const merged = mergeCooccurringEntities({
       own: stored.competitors_proposed,
       entities,
+      excludeNames: trackedRows.map((c) => c.name),
       ownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? []), ...(typeof discoveredName === "string" ? [discoveredName] : []), ...(stem === undefined ? [] : [stem])],
     });
     return merged.length === stored.competitors_proposed.length ? stored : { ...stored, competitors_proposed: merged };
