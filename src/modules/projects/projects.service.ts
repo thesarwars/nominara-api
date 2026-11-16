@@ -34,6 +34,9 @@ import type { PortalProjectEngines } from "../../lib/portal/portal-facts.js";
 import { EntitlementResolver } from "../../lib/entitlements/entitlement-resolver.js";
 import { FREE_PROMPT_ALLOWANCE } from "../../lib/discovery/discover.js";
 import { generateFreeAllowance } from "../../lib/discovery/free-prompts.js";
+import { loadCooccurringEntities, mergeCooccurringEntities } from "../../lib/discovery/cooccurrence.js";
+import { domainStem } from "../../lib/discovery/discover.js";
+import { MAX_PROPOSED_COMPETITORS } from "../../lib/discovery/competitors.js";
 import { handlerFor } from "../../lib/queue/handlers.js";
 import { structuralLimitFrom } from "../../lib/entitlements/classification.js";
 import type { EntitlementValue } from "../../db/seed/plan-entitlements.js";
@@ -405,8 +408,8 @@ export class ProjectsService {
    */
   async discoveryFor(projectId: string): Promise<DiscoveryResponse> {
     const client = currentTenantStore()!.client;
-    const result = await client.query<{ discovery: unknown; discovery_status: string }>(
-      "SELECT discovery, discovery_status FROM projects WHERE id = $1 AND deleted_at IS NULL",
+    const result = await client.query<{ discovery: unknown; discovery_status: string; name?: string | null; brand_aliases?: string[] | null; root_domain?: string | null }>(
+      "SELECT discovery, discovery_status, name, brand_aliases, root_domain FROM projects WHERE id = $1 AND deleted_at IS NULL",
       [projectId],
     );
     // No workspace predicate: RLS scopes the transaction, so another tenant's
@@ -417,9 +420,33 @@ export class ProjectsService {
     const stored = row.discovery;
     // A written payload carries its own status; an unwritten one is the `{}`
     // default and takes the column's.
-    if (isDiscoveryPayload(stored)) return stored;
+    if (isDiscoveryPayload(stored)) return this.withCooccurringCompetitors(client, projectId, row, stored);
 
     return emptyDiscovery(row.discovery_status as DiscoveryResponse["discovery_status"]);
+  }
+
+  /**
+   * STORY-043 AC11 - the third competitor basis, "entities co-occurring in the first capture run". No capture exists while discovery runs, so it is applied
+   * here, on read, behind the two bases the pass wrote and only into the places they left empty (cooccurrence.ts). Derived from stored mention facts, never
+   * persisted. Not while the pass is still running: the payload is a checkpoint then, and the bases above it are not final.
+   */
+  private async withCooccurringCompetitors(
+    client: { query: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }> },
+    projectId: string,
+    row: { name?: string | null; brand_aliases?: string[] | null; root_domain?: string | null },
+    stored: DiscoveryResponse,
+  ): Promise<DiscoveryResponse> {
+    if ((stored.discovery_status !== "completed" && stored.discovery_status !== "partial") || stored.competitors_proposed.length >= MAX_PROPOSED_COMPETITORS) return stored;
+    const entities = await loadCooccurringEntities(client as never, projectId);
+    if (entities.length === 0) return stored;
+    const discoveredName = stored.fields.brand_name?.value;
+    const stem = row.root_domain ? domainStem(row.root_domain) : undefined;
+    const merged = mergeCooccurringEntities({
+      own: stored.competitors_proposed,
+      entities,
+      ownBrandNames: [...(row.name ? [row.name] : []), ...(row.brand_aliases ?? []), ...(typeof discoveredName === "string" ? [discoveredName] : []), ...(stem === undefined ? [] : [stem])],
+    });
+    return merged.length === stored.competitors_proposed.length ? stored : { ...stored, competitors_proposed: merged };
   }
 
   /**

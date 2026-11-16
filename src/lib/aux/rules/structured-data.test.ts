@@ -55,6 +55,14 @@ describe("STORY-051 AUX-R-008 · JSON-LD syntax error", () => {
   });
 });
 
+describe("STORY-050 AC5 · AUX-R-008 is JSON-LD only", () => {
+  it("STORY-050 AC5 · a microdata or RDFa parse error is not a JSON-LD syntax error: AUX-R-008 does not fire on it", async () => {
+    const other = (format: "microdata" | "rdfa", reason: "itemprop_outside_scope" | "rdfa_missing_vocab") => ({ format, variant: "raw" as const, index: 0, reason, position: null, snippet: 'itemprop="name"' });
+    const doc = makeDoc({ raw: variant({ structured: { jsonLd: [], microdata: [], rdfa: [], parseErrors: [other("microdata", "itemprop_outside_scope"), other("rdfa", "rdfa_missing_vocab")] } }) });
+    expect(await findings(doc, "AUX-R-008")).toEqual([]);
+  });
+});
+
 describe("STORY-051 AUX-R-008 · an empty block is not a syntax error (owner decision 9)", () => {
   const base = { format: "jsonld" as const, variant: "raw" as const, position: null };
   const empty = (index: number) => ({ ...base, index, reason: "empty" as const, snippet: "" });

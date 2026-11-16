@@ -30,6 +30,8 @@ export const jsonLdSyntaxError = defineRule({
     // An empty or whitespace-only block is not invalid JSON-LD (owner decision 9); the document model still records it as "empty".
     const errors = doc.structured.parseErrors.filter((e) => {
       if (e.reason === "empty") return false;
+      // STORY-050 AC5: the model now also reports microdata and RDFa malformations. This rule is JSON-LD's ("fails JSON.parse"); the others are not its finding.
+      if (e.format !== "jsonld") return false;
       const key = `${String(e.index)}|${String(e.position)}|${e.snippet}`;
       if (seen.has(key)) return false;
       seen.add(key);
