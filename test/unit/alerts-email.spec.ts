@@ -383,4 +383,12 @@ describe("alert email · shutdown drain", () => {
     await drainAlertEmails(5000);
     expect(sender.sent).toHaveLength(1);
   });
+
+  it("STORY-010 · a session id is the alert's subject id when nothing more specific is named (the break-glass alert names no workspace)", () => {
+    const rendered = renderAlertEmail("the break-glass database role has an open session", { alertName: "breakglass_login", severity: "critical", sessionId: "4242:1000", pid: 4242 }, "test", new Date(0));
+    expect(rendered.subjectId).toBe("4242:1000");
+    expect(rendered.subject).toBe("[Nominara alert] breakglass_login (4242:1000)");
+    // The workspace, queue and engine keys still outrank it.
+    expect(renderAlertEmail("m", { alertName: "a", sessionId: "s", queue: "q" }, "test", new Date(0)).subjectId).toBe("q");
+  });
 });
