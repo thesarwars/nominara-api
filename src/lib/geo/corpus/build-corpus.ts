@@ -127,18 +127,30 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     );
     // STORY-058 AC4 - URLs fetched earlier that produced no passage of their own (every passage a copy, or none relevant): the same
     // 30-day cache, remembered in corpus_url_checks because corpus_passages has no row to say so.
-    const checked = await tx.query<{ h: string }>(
-      `SELECT encode(citation_url_hash, 'hex') AS h
+    const checked = await tx.query<{ h: string; outcome: string }>(
+      `SELECT encode(citation_url_hash, 'hex') AS h, outcome
          FROM corpus_url_checks
         WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
           AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
       [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
     );
+    // Whether any passage of this corpus belongs to a URL that is NOT a candidate of this build: the write phase deletes those rows, which
+    // is exactly when a remembered `duplicate_only` stops being true (its twin's text is about to be freed). Decided HERE, before the
+    // cache decision below, so such a URL is fetched in this build rather than skipped until the next.
+    const departing = await tx.query(
+      `SELECT 1 FROM corpus_passages
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
+          AND embedding_model = $3 AND NOT (encode(citation_url_hash, 'hex') = ANY($4::text[]))
+        LIMIT 1`,
+      [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
+    );
     return {
       candidates,
+      someUrlDeparts: (departing.rowCount ?? 0) > 0,
       terms: queryTermsOf(prompts.rows.map((row) => row.text)),
       liveHashes: new Set(live.rows.map((row) => row.h)),
       checkedHashes: new Set(checked.rows.map((row) => row.h)),
+      duplicateOnlyHashes: new Set(checked.rows.filter((row) => row.outcome === "duplicate_only").map((row) => row.h)),
     };
   });
 
@@ -157,7 +169,10 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
       cachedCandidates.push(candidate);
       continue;
     }
-    if (read.checkedHashes.has(candidate.urlHashHex)) {
+    // A duplicate_only check whose twin departs this build is not trusted: the twin's text is freed in the write below, so the URL is
+    // fetched now (falls through) and keeps the text in the corpus within this build.
+    const duplicateOfDeparting = read.someUrlDeparts && read.duplicateOnlyHashes.has(candidate.urlHashHex);
+    if (read.checkedHashes.has(candidate.urlHashHex) && !duplicateOfDeparting) {
       // Fetched within the cache period and found to add nothing of its own: counted as cached, not fetched again.
       counts.cached += 1;
       continue;

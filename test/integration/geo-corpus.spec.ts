@@ -437,7 +437,7 @@ describe("STORY-058 - corpus passages and centroid", () => {
     expect(fetchCalls).toEqual(["https://down.example/p"]);
   }, 60_000);
 
-  it("scenario 7 - AC4 - when the URL that held the text leaves the corpus, the remembered duplicate is released and is sourced on the build after", async () => {
+  it("scenario 7 - AC4 - when the URL that held the text leaves the corpus, the remembered duplicate is fetched in the SAME build and the text stays in the corpus", async () => {
     const prompt = await addPrompt(PROMPT_TEXTS[0]!);
     await cite(prompt, "https://one.example/p", { weight: 5 });
     await cite(prompt, "https://two.example/p");
@@ -447,17 +447,19 @@ describe("STORY-058 - corpus passages and centroid", () => {
     await build();
     expect((await passageRows()).map((row) => row.url)).toEqual(["https://one.example/p"]);
 
-    // one.example is no longer cited: it falls out of the candidate set and its passage goes with it. two.example is still skipped on THIS
-    // build (its check is live when the build reads), but the departure releases the check so that the NEXT build takes it.
+    // batch 18 fix (owner decision 108): one.example is no longer cited, so its passage departs in this build's write. two.example's
+    // `duplicate_only` check was live when the build read, and it used to be trusted - leaving the text out of the corpus until the NEXT
+    // build. A departure now voids duplicate_only checks BEFORE the cache decision: two.example is fetched now and owns the text at once.
     await db.query("DELETE FROM citation_facts WHERE normalized_url = 'https://one.example/p'");
     fetchCalls.length = 0;
     await build();
-    expect(fetchCalls).toEqual([]);
-    expect(await passageRows()).toHaveLength(0);
+    expect(fetchCalls).toEqual(["https://two.example/p"]);
+    expect((await passageRows()).map((row) => row.url)).toEqual(["https://two.example/p"]);
     expect(await checkRows()).toHaveLength(0);
 
+    fetchCalls.length = 0;
     await build();
-    expect(fetchCalls).toEqual(["https://two.example/p"]);
+    expect(fetchCalls).toEqual([]);
     expect((await passageRows()).map((row) => row.url)).toEqual(["https://two.example/p"]);
   }, 60_000);
 
