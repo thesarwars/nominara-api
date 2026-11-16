@@ -413,7 +413,8 @@ describe("STORY-079 · Visibility Scan", () => {
     const cta = frames(res.body).at(-1)!.data["convert_cta"] as { endpoint: string; prefill: Record<string, unknown> };
     const id = enqueued[0]!.payload["toolRunId"] as string;
     expect(cta.endpoint).toBe(`/v1/tools/runs/${id}/convert`);
-    expect(cta.prefill).toEqual({ project_name: "Acme", root_url: "https://acme.test", prompts: [asked.query_text], competitors: ["HubSpot"] });
+    // Decision 108(b): the prefill also carries the engines that answered the run, in run order (display only).
+    expect(cta.prefill).toEqual({ project_name: "Acme", root_url: "https://acme.test", prompts: [asked.query_text], competitors: ["HubSpot"], engines: ["perplexity", "chatgpt"] });
     const preview = ((await get(a, `/tools/runs/${id}/convert`)).json() as { data: unknown }).data;
     expect(preview).toMatchObject({ prefill: cta.prefill, project_slot: { free: true }, prompt_slots: { carried: 1 } });
   });
