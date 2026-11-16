@@ -185,4 +185,5 @@ export const mentionFacts = pgTable("mention_facts", {
   positionClass: text("position_class").notNull().default(sql`'neutral_list'::text`),
   answerForm: text("answer_form"),
   scoringVersion: text("scoring_version").notNull().default(sql`'v1'::text`),
+  inLink: boolean("in_link").notNull().default(sql`false`),
 }, (table) => [primaryKey({ columns: [table.capturedAt, table.id] })]);
