@@ -109,6 +109,7 @@ export const KNOWN_KEYS = [
   "STORAGE_SSE",
   "STORAGE_KMS_KEY_ID",
   "STORAGE_KEY_ENV",
+  "AUDIT_EXPORT_BUCKET",
 ] as const;
 
 /**

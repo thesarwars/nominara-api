@@ -356,6 +356,13 @@ const ADDED_BEYOND_REFERENCE: Record<string, { workerGroup: string; because: str
       "A Stripe call may never be made on a request path (KAD-06), so the deletion request enqueues one signed tenant job after commit; the worker reads the live " +
       "subscription. §4's table allocates no queue to it. A queue of its own so a DLQ entry names the job that failed.",
   },
+  "audit.export": {
+    workerGroup: "rollup",
+    because:
+      "STORY-020 AC8 / security-and-tenancy.md §12: the nightly export of every audit chain to object storage under Object Lock COMPLIANCE mode. It was a hand-run " +
+      "script (workers/rollup/audit-export.ts) with no queue, so nothing ran it; §4's table allocates it none. Not tenant-scoped: it streams every workspace's chain " +
+      "on the owner connection, as the verifier does. A queue of its own so a DLQ entry names the job that failed.",
+  },
   "billing.stripe_drift": {
     workerGroup: "rollup",
     because:
@@ -489,6 +496,7 @@ describe("STORY-030 · queue topology declares §4's 21 queues, plus what we hav
     // one workspace would not be a verifier.
     const systemScoped = QUEUE_TOPOLOGY.filter((entry) => !entry.tenantScoped).map((entry) => entry.name).sort();
     expect(systemScoped).toEqual([
+      "audit.export",
       "audit.verify",
       "billing.stripe_drift",
       "credit.housekeeping",

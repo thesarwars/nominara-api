@@ -51,6 +51,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "rollup.category_benchmark",
     // STORY-075 AC11 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "billing.stripe_drift",
+    // STORY-020 AC8 - not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "audit.export",
   ],
   // STORY-185 / decision 100(c) - billing.retention_export is not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
   report: ["report.build", "billing.retention_export"],

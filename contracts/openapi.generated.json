@@ -81325,13 +81325,20 @@
                                   "items": {
                                     "type": "string"
                                   }
+                                },
+                                "engines": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
                                 }
                               },
                               "required": [
                                 "project_name",
                                 "root_url",
                                 "prompts",
-                                "competitors"
+                                "competitors",
+                                "engines"
                               ],
                               "additionalProperties": false
                             }
@@ -83092,13 +83099,20 @@
                               "items": {
                                 "type": "string"
                               }
+                            },
+                            "engines": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           },
                           "required": [
                             "project_name",
                             "root_url",
                             "prompts",
-                            "competitors"
+                            "competitors",
+                            "engines"
                           ],
                           "additionalProperties": false
                         },

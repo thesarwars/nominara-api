@@ -10,6 +10,17 @@ describe("NEW-D-3 · audit-log category derivation (owner decision: from the act
     expect(categoryOf("apikey.create")).toBe("security");
     expect(categoryOf("support.grant")).toBe("security");
   });
+  it("STORY-096 AC11 (decision 108): sso.*, passkey.* and the two session security events are security", () => {
+    expect(categoryOf("sso.login")).toBe("security");
+    expect(categoryOf("passkey.register")).toBe("security");
+    expect(categoryOf("session.reuse_detected")).toBe("security");
+    expect(categoryOf("session.refresh_grace_reuse")).toBe("security");
+  });
+  it("STORY-096 AC11: only those two session events are security, not the whole session namespace, and namespaces match whole", () => {
+    expect(categoryOf("session.created")).toBe("data");
+    expect(categoryOf("ssox.thing")).toBe("data");
+    expect(categoryOf("passkeys.thing")).toBe("data");
+  });
   it("AC-category: billing.* is billing; workspace.* and member.* are workspace", () => {
     expect(categoryOf("billing.addon.create")).toBe("billing");
     expect(categoryOf("workspace.create")).toBe("workspace");
@@ -26,9 +37,9 @@ describe("NEW-D-3 · audit-log category derivation (owner decision: from the act
   });
   it("AC-category: the SQL predicate partitions the same way (data = the complement)", () => {
     expect(categoryPredicate("billing")).toEqual({ include: ["billing."] });
-    expect(categoryPredicate("security")).toEqual({ include: ["auth.", "apikey.", "support."] });
+    expect(categoryPredicate("security")).toEqual({ include: ["auth.", "apikey.", "support.", "sso.", "passkey.", "session.reuse_detected", "session.refresh_grace_reuse"] });
     expect(categoryPredicate("data").include).toBeUndefined();
-    expect(categoryPredicate("data").exclude).toEqual(["auth.", "apikey.", "support.", "billing.", "workspace.", "member."]);
+    expect(categoryPredicate("data").exclude).toEqual(["auth.", "apikey.", "support.", "sso.", "passkey.", "billing.", "workspace.", "member.", "session.reuse_detected", "session.refresh_grace_reuse"]);
   });
 });
 

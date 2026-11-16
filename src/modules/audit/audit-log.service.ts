@@ -23,12 +23,25 @@ const NAMESPACE_CATEGORY: Readonly<Record<string, Exclude<Category, "data">>> = 
   auth: "security",
   apikey: "security",
   support: "security",
+  // STORY-096 AC11 (owner decision 108): the Trust page's security feed is `category=security` on this log. `sso` and `passkey` are reserved
+  // namespaces (SSO and passkey routes exist or are specified; no audit action is written under them yet, so no row changes today).
+  sso: "security",
+  passkey: "security",
   billing: "billing",
   workspace: "workspace",
   member: "workspace",
 };
 
+/**
+ * STORY-096 AC11 (decision 108): the two refresh-token security events of security-and-tenancy.md section 6. RESERVED: today they are raised as a
+ * log line and a metric (`session.service.ts`), not an audit row; when an audit write lands under these names it is categorised already. Listed by
+ * exact action, not as a `session.` namespace, because a later benign `session.*` action must not become a security event. Matched as a prefix
+ * so the SQL predicate (a LIKE prefix) and `categoryOf` cannot disagree.
+ */
+const SECURITY_ACTION_PREFIXES = ["session.reuse_detected", "session.refresh_grace_reuse"] as const;
+
 export function categoryOf(action: string): Category {
+  if (SECURITY_ACTION_PREFIXES.some((prefix) => action.startsWith(prefix))) return "security";
   const dot = action.indexOf(".");
   if (dot < 0) return "data";
   return NAMESPACE_CATEGORY[action.slice(0, dot)] ?? "data";
@@ -41,8 +54,8 @@ const prefixesOf = (category: Exclude<Category, "data">): string[] =>
 
 /** The SQL-side mirror of `categoryOf`: `data` is the complement of every mapped namespace. */
 export function categoryPredicate(category: Category): { include?: string[]; exclude?: string[] } {
-  if (category === "data") return { exclude: Object.keys(NAMESPACE_CATEGORY).map((namespace) => `${namespace}.`) };
-  return { include: prefixesOf(category) };
+  if (category === "data") return { exclude: [...Object.keys(NAMESPACE_CATEGORY).map((namespace) => `${namespace}.`), ...SECURITY_ACTION_PREFIXES] };
+  return { include: category === "security" ? [...prefixesOf(category), ...SECURITY_ACTION_PREFIXES] : prefixesOf(category) };
 }
 
 function utcMidnight(day: string): number {

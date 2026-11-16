@@ -31,6 +31,8 @@ const EXPECTED_GROUP_MEMBERSHIP: Record<string, string[]> = {
     "maintenance.partition",
     // STORY-143 — not in §4; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "audit.verify",
+    // STORY-020 AC8 - not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
+    "audit.export",
     // STORY-173 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
     "identity.sweep_unverified",
     // NEW-D-7 — not in §4 either; see ADDED_BEYOND_REFERENCE in topology.spec.ts.
@@ -305,6 +307,7 @@ describe("STORY-030 · worker-group-bootstrap — bootstrapWorker() constructs e
   }, 20_000);
 
   it.each([
+    ["audit.export", "55 2 * * *", 2, 55],
     ["credit.housekeeping", "30 2 * * *", 2, 30],
     ["credit.verify", "45 2 * * *", 2, 45],
     ["retention.purge", "40 3 * * *", 3, 40],
