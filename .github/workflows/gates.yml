@@ -92,6 +92,13 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm typecheck
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      # STORY-110 AC14 - standing controls that block the build. Secrets: an in-repo scan of every tracked file for credential
+      # shapes (src/ci/secret-scan.ts). Dependencies: pnpm's own advisory audit, HIGH and above, production tree. Image
+      # scanning is NOT here: it needs a scanner that is neither GitHub-owned nor available offline (see STORY-110).
+      - run: pnpm scan:secrets
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - run: pnpm scan:deps
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm contracts:check
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: pnpm test:unit

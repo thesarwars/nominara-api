@@ -55,6 +55,8 @@
     "client:generate": "tsx src/contracts/client.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "scan:secrets": "tsx src/ci/secret-scan.ts",
+    "scan:deps": "pnpm audit --audit-level=high --prod",
     "test": "vitest run",
     "test:unit": "vitest run test/unit src contracts",
     "test:integration": "vitest run --config vitest.integration.config.ts",

@@ -147,6 +147,11 @@ const GATE_BODIES: Readonly<Record<string, string>> = {
   "db:schema-check": "tsx src/db/schema/schema-check.ts",
   // STORY-006 AC 7 — apply every migration forward, roll every one back, re-apply, on a shadow database.
   "db:roundtrip-check": "tsx src/db/roundtrip-check.ts",
+  // STORY-110 AC14 - standing controls that block the build. The secrets scan is in-repo (src/ci/secret-scan.ts): a scanner
+  // action would be a third-party dependency (section 6), and this repository's own tests pin what it finds. The dependency
+  // scan is pnpm's own advisory audit, at HIGH and above, over the production tree.
+  "scan:secrets": "tsx src/ci/secret-scan.ts",
+  "scan:deps": "pnpm audit --audit-level=high --prod",
   "test:integration": "vitest run --config vitest.integration.config.ts",
   "test:isolation": 'vitest run --config vitest.isolation.config.ts --exclude "test/isolation/breakers/**"',
   "test:isolation:breakers": "vitest run --config vitest.isolation.config.ts test/isolation/breakers",
@@ -202,6 +207,14 @@ describe("STORY-155 · the CI workflow, parsed, runs every gate this repository 
     expect(gateScriptOf({ run: "pnpm lint --quiet" }), "an argument can narrow a gate").toBeNull();
     expect(gateScriptOf({ run: "pnpm lint || true" }), "a chained gate can be excused").toBeNull();
     expect(gateScriptOf({ run: INSTALL })).toBeNull();
+  });
+
+  it("STORY-110 AC14 - the secrets scan and the dependency audit are gates on every push, in the static job", () => {
+    const staticSteps = workflow.jobs["static-and-database"]!.steps.map(gateScriptOf);
+    expect(staticSteps).toContain("scan:secrets");
+    expect(staticSteps).toContain("scan:deps");
+    // Image scanning (the third standing control) has no GitHub-owned action and no offline scanner: it is NOT claimed here.
+    expect(invoked.has("scan:image")).toBe(false);
   });
 
   it("⚠ triggers on every push to every branch, with no path filter that could skip a change", () => {
