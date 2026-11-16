@@ -19,7 +19,7 @@ const rowsFor = (sql: string): unknown[] => (/pg_advisory_xact_lock/.test(sql) ?
 
 const session = (pid: number, startMs: number | null = 1_000): BreakglassSession => ({ pid, backendStartMs: startMs });
 
-function monitor(options: { audit?: (s: BreakglassSession) => Promise<void> } = {}) {
+function monitor(options: { audit?: (s: BreakglassSession, sessionId: string, requestKey: string) => Promise<void> } = {}) {
   const pages: Array<{ message: string; context: Record<string, unknown> }> = [];
   const pager: Pager = { page: (message, context) => void pages.push({ message, context }) };
   const audited: string[] = [];
@@ -115,6 +115,72 @@ describe("STORY-010-AC2 · BreakglassLoginMonitor", () => {
     expect(h.pages).toHaveLength(1);
   });
 
+  it("STORY-010-AC2 · two successive sessions on one pid with no visible backend start get DISTINCT audit request keys", async () => {
+    const keys: string[] = [];
+    const h = monitor({ audit: async (_s, _id, requestKey) => void keys.push(requestKey) });
+    await h.m.observe([session(7, null)]);
+    h.nowRef.now = 60_000;
+    await h.m.observe([]);
+    h.nowRef.now = 120_000;
+    await h.m.observe([session(7, null)]);
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(2);
+  });
+
+  it("STORY-010-AC2 · a session whose backend start is visible keeps its session id as the request key (already unique)", async () => {
+    const keys: string[] = [];
+    const h = monitor({ audit: async (_s, _id, requestKey) => void keys.push(requestKey) });
+    await h.m.observe([session(7, 1_000)]);
+    expect(keys).toEqual(["7:1000"]);
+  });
+
+  it("STORY-010-AC2 · the request key survives a state hand-over between replicas (a row written but not marked is not written twice)", async () => {
+    const keys: string[] = [];
+    let fail = true;
+    const a = monitor({ audit: async (_s, _id, k) => { keys.push(k); if (fail) throw new Error("db down"); } });
+    await a.m.observe([session(7, null)]);
+    fail = false;
+    const b = monitor({ audit: async (_s, _id, k) => void keys.push(k) });
+    b.m.importState(a.m.exportState());
+    b.nowRef.now = 99_999;
+    await b.m.observe([session(7, null)]);
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("STORY-010-AC2 · a session that ends before its failed audit is retried: the next tick writes the row, from the kept session data, without a second alert", async () => {
+    let fail = true;
+    const written: Array<{ pid: number; key: string }> = [];
+    const h = monitor({
+      audit: async (s, _id, k) => {
+        if (fail) throw new Error("db down");
+        written.push({ pid: s.pid, key: k });
+      },
+    });
+    await h.m.observe([session(5, 2_000)]);
+    expect(h.pages).toHaveLength(1);
+    await h.m.observe([]); // the session has ended; the audit had failed
+    expect(h.audited).toHaveLength(0);
+    fail = false;
+    await h.m.observe([]);
+    expect(written).toEqual([{ pid: 5, key: "5:2000" }]);
+    expect(h.pages).toHaveLength(1);
+    await h.m.observe([]);
+    expect(written).toHaveLength(1); // audited: written once, then forgotten
+    expect(Object.keys(h.m.exportState().sessions)).toHaveLength(0);
+  });
+
+  it("STORY-010-AC2 · an un-audited ended session is retried from state handed to another replica", async () => {
+    const a = monitor({ audit: async () => { throw new Error("db down"); } });
+    await a.m.observe([session(5, 2_000)]);
+    await a.m.observe([]);
+    const written: number[] = [];
+    const b = monitor({ audit: async (s) => void written.push(s.pid) });
+    b.m.importState(a.m.exportState());
+    await b.m.observe([]);
+    expect(written).toEqual([5]);
+  });
+
   it("STORY-010-AC2 · an ended session is forgotten, so the state does not grow", async () => {
     const h = monitor();
     await h.m.observe([session(1)]);
@@ -162,6 +228,21 @@ describe("STORY-010-AC2 · SQL", () => {
     expect(insert.params).toContain("system");
     expect(insert.params).toContain("breakglass-login:s-1");
     expect(sqls.at(-1)).toMatch(/RELEASE SAVEPOINT/);
+  });
+
+  it("STORY-010-AC2 · two sessions on a reused pid (no visible backend start) both get audit rows: the de-dupe is scoped to the request key", async () => {
+    const rows = new Set<string>();
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (/FROM audit_log/.test(sql)) return { rows: rows.has(String(params![1])) ? [{ one: 1 }] : [], rowCount: rows.has(String(params![1])) ? 1 : 0 };
+        if (/INSERT INTO audit_log/.test(sql)) rows.add(String(params!.find((p) => typeof p === "string" && p.startsWith("breakglass-login:"))));
+        return { rows: rowsFor(sql), rowCount: 0 };
+      }),
+    };
+    await recordBreakglassLogin(client as never, session(9, null), "9", "9:fs1000");
+    await recordBreakglassLogin(client as never, session(9, null), "9", "9:fs9000");
+    await recordBreakglassLogin(client as never, session(9, null), "9", "9:fs9000"); // a retry of the same session: still once
+    expect([...rows].sort()).toEqual(["breakglass-login:9:fs1000", "breakglass-login:9:fs9000"]);
   });
 
   it("STORY-010-AC2 · an audit row already written for the session is not written twice", async () => {
@@ -221,6 +302,42 @@ describe("STORY-010-AC2 · through the MonitorRuntime tick", () => {
     expect(h.pages.filter((p) => p.alertName === BREAKGLASS_ALERT_NAME)).toHaveLength(1);
     expect(h.recorded).toEqual(["77"]);
     expect(Object.keys(h.current()!.breakglass!.sessions)).toHaveLength(1);
+  });
+
+  it("STORY-010-AC2 · the state is saved only AFTER the transaction commits: a failed COMMIT leaves no audited:true behind for a row that was rolled back", async () => {
+    const events: string[] = [];
+    let failCommit = true;
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (/^COMMIT/.test(sql)) {
+          events.push("commit");
+          if (failCommit) throw new Error("commit failed");
+        }
+        return { rows: (/pg_try_advisory_xact_lock/.test(sql) ? [{ locked: true }] : []) as unknown[], rowCount: 0 };
+      }),
+      release: vi.fn(),
+    };
+    let stored: MonitorState | null = null;
+    const store: MonitorStateStore = { load: async () => stored, save: async (s) => { events.push("save"); stored = s; } };
+    const recorded: number[] = [];
+    const runtime = new MonitorRuntime({
+      pool: { connect: async () => client } as never,
+      store,
+      readDlqDepths: async () => new Map(),
+      readLastSuccess: async () => new Map(),
+      engines: [],
+      pager: { page: () => undefined },
+      readBreakglassSessions: async () => [session(77)],
+      recordBreakglassLogin: async (_db, s) => void recorded.push(s.pid),
+    });
+    await runtime.tick(); // the COMMIT fails: the audit row never became durable
+    expect(events).not.toContain("save");
+    expect(stored).toBeNull();
+    failCommit = false;
+    await runtime.tick(); // so the next tick still sees the session as un-audited and writes the row
+    expect(recorded).toEqual([77, 77]);
+    expect(events.indexOf("save")).toBeGreaterThan(events.lastIndexOf("commit"));
+    expect(stored!.breakglass!.sessions["77:1000"]!.audited).toBe(true);
   });
 
   it("STORY-010-AC2 · a previously stored state with no break-glass section still loads", async () => {

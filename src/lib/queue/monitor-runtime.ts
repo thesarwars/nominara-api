@@ -131,7 +131,7 @@ export interface MonitorRuntimeOptions {
   /** STORY-010 AC2 — live sessions of the break-glass role, read on the locked client. Optional: absent means not watched. */
   readonly readBreakglassSessions?: (db: ClientBase) => Promise<readonly BreakglassSession[]>;
   /** STORY-010 AC2 — writes the audit row on the locked client (inside the election transaction). Required with the reader. */
-  readonly recordBreakglassLogin?: (db: ClientBase, session: BreakglassSession, sessionId: string) => Promise<void>;
+  readonly recordBreakglassLogin?: (db: ClientBase, session: BreakglassSession, sessionId: string, requestKey: string) => Promise<void>;
   readonly engines?: readonly EngineKey[];
   readonly pager?: Pager;
   readonly clock?: () => number;
@@ -208,7 +208,18 @@ export class MonitorRuntime {
       await client.query("BEGIN");
       const elected = await tryWithGlobalQueueLock(client, MONITOR_DRIVER_LOCK, () => this.round(client));
       await client.query("COMMIT");
-      return elected.acquired ? elected.value : "skipped";
+      if (!elected.acquired) return "skipped";
+      // AFTER the commit, never before: the break-glass audit row written in this transaction is only durable now, and a state saved
+      // earlier would read `audited: true` for a row a failed COMMIT rolled back, so it would never be written again.
+      let outcome = elected.value.outcome;
+      try {
+        await this.store.save(elected.value.state);
+      } catch (error) {
+        // A page may already have gone out from this tick; if the state is lost the next tick can repeat it. Loud, not fatal.
+        outcome = "partial";
+        logger.error(`monitor: state could not be saved — a page from this tick may repeat: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return outcome;
     } catch (error) {
       try {
         await client.query("ROLLBACK");
@@ -222,7 +233,7 @@ export class MonitorRuntime {
   }
 
   /** Runs under the lock. */
-  private async round(client: ClientBase): Promise<TickOutcome> {
+  private async round(client: ClientBase): Promise<{ outcome: TickOutcome; state: MonitorState }> {
     // Loaded only now, under the lock. If it cannot be read the tick is skipped rather than run on empty state, which
     // would forget an open window and an already-paged breach.
     const stored = await this.store.load();
@@ -274,7 +285,7 @@ export class MonitorRuntime {
     const readSessions = this.readBreakglassSessions;
     const record = this.recordBreakglassLogin;
     if (readSessions && record) {
-      const breakglass = new BreakglassLoginMonitor({ clock: now, pager: this.pager, audit: (session, sessionId) => record(client, session, sessionId) });
+      const breakglass = new BreakglassLoginMonitor({ clock: now, pager: this.pager, audit: (session, sessionId, requestKey) => record(client, session, sessionId, requestKey) });
       breakglass.importState(breakglassState);
       try {
         await breakglass.observe(await readSessions(client));
@@ -286,16 +297,8 @@ export class MonitorRuntime {
       }
     }
 
-    try {
-      await this.store.save({ dlq: dlq.exportState(), blackout: blackout.exportState(), breakglass: breakglassState });
-    } catch (error) {
-      // A page may already have gone out from this tick; if the state is lost the next tick can repeat it. Loud, not fatal.
-      outcome = "partial";
-      logger.error(`monitor: state could not be saved — a page from this tick may repeat: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
     logger.log({ message: "monitor tick", outcome, queuesObserved, enginesObserved });
-    return outcome;
+    return { outcome, state: { dlq: dlq.exportState(), blackout: blackout.exportState(), breakglass: breakglassState } };
   }
 
   start(): void {

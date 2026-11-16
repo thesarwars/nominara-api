@@ -23,8 +23,15 @@ import type { Pager } from "./dead-letter.js";
 //
 // ONCE PER SESSION. A session is keyed `pid:backend_start` (just `pid` where backend_start is not visible to the
 // reading role). The alert and the audit row are tracked separately: the alert is a synchronous pager call and is
-// marked first; the audit write can fail, and is retried on the next tick WITHOUT a second alert. A row written but
-// not yet marked (a crash) is not written again: the request id is checked first.
+// marked first; the audit write can fail, and is retried on every later tick WITHOUT a second alert, until it is
+// written - even after the session has ended (the entry keeps the session's pid and backend start for that). A row
+// written but not yet marked (a crash) is not written again: the request id is checked first.
+//
+// THE AUDIT REQUEST ID. With no visible backend start the session key is the pid alone, and a pid is reused by later
+// sessions; a request id of the pid alone would make the second session's row look already written and silently lose
+// it. So the request id (the de-dupe key) is the session key plus, in that case only, the time the watcher first saw the
+// session (kept in the state, so a retry or another replica computes the same id). A backend start, where visible, is
+// already unique.
 
 const logger = new Logger("breakglass-monitor");
 const tracer = trace.getTracer("nominara-api");
@@ -42,7 +49,16 @@ export interface BreakglassSession {
 
 export const breakglassStateSchema = z
   .object({
-    sessions: z.record(z.string(), z.object({ firstSeenMs: z.number(), alerted: z.boolean(), audited: z.boolean() }).strict()),
+    sessions: z.record(z.string(), z
+        .object({
+          firstSeenMs: z.number(),
+          alerted: z.boolean(),
+          audited: z.boolean(),
+          // What an un-audited session needs to be audited after it has ended. Optional: state written before this field existed has none.
+          pid: z.number().optional(),
+          backendStartMs: z.number().nullable().optional(),
+        })
+        .strict()),
   })
   .strict();
 export type BreakglassState = z.infer<typeof breakglassStateSchema>;
@@ -53,15 +69,29 @@ export const sessionIdOf = (s: BreakglassSession): string => (s.backendStartMs =
 export interface BreakglassLoginMonitorOptions {
   readonly pager: Pager;
   readonly clock?: () => number;
-  /** Writes the audit row. Throws on failure; the monitor retries on the next observation. */
-  readonly audit: (session: BreakglassSession, sessionId: string) => Promise<void>;
+  /**
+   * Writes the audit row. Throws on failure; the monitor retries on the next observation until it succeeds. `requestKey` is what the
+   * row's request id is made from and what a "written already?" check must key on: unique per session, stable across retries.
+   */
+  readonly audit: (session: BreakglassSession, sessionId: string, requestKey: string) => Promise<void>;
 }
+
+interface SeenEntry {
+  firstSeenMs: number;
+  alerted: boolean;
+  audited: boolean;
+  pid?: number | undefined;
+  backendStartMs?: number | null | undefined;
+}
+
+const requestKeyOf = (sessionId: string, backendStartMs: number | null, firstSeenMs: number): string =>
+  backendStartMs === null ? `${sessionId}:fs${firstSeenMs}` : sessionId;
 
 export class BreakglassLoginMonitor {
   private readonly pager: Pager;
   private readonly clock: () => number;
   private readonly audit: BreakglassLoginMonitorOptions["audit"];
-  private seen = new Map<string, { firstSeenMs: number; alerted: boolean; audited: boolean }>();
+  private seen = new Map<string, SeenEntry>();
 
   constructor(options: BreakglassLoginMonitorOptions) {
     this.pager = options.pager;
@@ -77,12 +107,13 @@ export class BreakglassLoginMonitor {
     return { sessions: Object.fromEntries([...this.seen].map(([key, value]) => [key, { ...value }])) };
   }
 
-  /** The full current list of live sessions of the role. A session absent from it has ended and is forgotten. */
+  /** The full current list of live sessions of the role. A session absent from it has ended and is forgotten once its audit row is written. */
   async observe(sessions: readonly BreakglassSession[]): Promise<void> {
     await tracer.startActiveSpan("queue.breakglass_watch", async (span) => {
       try {
         const live = new Map(sessions.map((s) => [sessionIdOf(s), s]));
-        for (const key of [...this.seen.keys()]) if (!live.has(key)) this.seen.delete(key);
+        // An ended session is forgotten only once audited; one whose audit failed stays, with its session data, and is retried below.
+        for (const [key, entry] of [...this.seen]) if (!live.has(key) && (entry.audited || entry.pid === undefined)) this.seen.delete(key);
         span.setAttribute("nominara.breakglass.live_sessions", live.size);
 
         for (const [key, session] of live) {
@@ -95,6 +126,8 @@ export class BreakglassLoginMonitor {
               observeValue("nominara_breakglass_detection_lag_seconds", Math.max(0, (this.clock() - session.backendStartMs) / 1000));
             }
           }
+          entry.pid = session.pid;
+          entry.backendStartMs = session.backendStartMs;
           if (!entry.alerted) {
             entry.alerted = true;
             // Fixed text plus IDs: this is emailed verbatim (see Pager).
@@ -107,23 +140,30 @@ export class BreakglassLoginMonitor {
             });
             incrementCounter("nominara_breakglass_alert_total");
           }
-          if (!entry.audited) {
-            try {
-              await this.audit(session, key);
-              entry.audited = true;
-              incrementCounter("nominara_breakglass_audit_total", { outcome: "written" });
-            } catch (error) {
-              incrementCounter("nominara_breakglass_audit_total", { outcome: "failed" });
-              span.setStatus({ code: SpanStatusCode.ERROR });
-              logger.error(`break-glass audit row could not be written for session ${key}; retrying next tick: ${error instanceof Error ? error.name : "unknown error"}`);
-            }
-          }
+          await this.tryAudit(span, key, entry, session);
+        }
+        for (const [key, entry] of [...this.seen]) {
+          if (live.has(key) || entry.audited || entry.pid === undefined) continue;
+          await this.tryAudit(span, key, entry, { pid: entry.pid, backendStartMs: entry.backendStartMs ?? null });
         }
         logger.log({ message: "break-glass watch", liveSessions: live.size });
       } finally {
         span.end();
       }
     });
+  }
+
+  private async tryAudit(span: { setStatus: (s: { code: SpanStatusCode }) => unknown }, key: string, entry: SeenEntry, session: BreakglassSession): Promise<void> {
+    if (entry.audited) return;
+    try {
+      await this.audit(session, key, requestKeyOf(key, session.backendStartMs, entry.firstSeenMs));
+      entry.audited = true;
+      incrementCounter("nominara_breakglass_audit_total", { outcome: "written" });
+    } catch (error) {
+      incrementCounter("nominara_breakglass_audit_total", { outcome: "failed" });
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      logger.error(`break-glass audit row could not be written for session ${key}; retrying next tick: ${error instanceof Error ? error.name : "unknown error"}`);
+    }
   }
 }
 
@@ -143,8 +183,8 @@ const chain = new AuditChainService();
  * transaction it runs in. The workspace context is transaction-local (set_config is_local = true) and is cleared by the
  * caller's COMMIT.
  */
-export async function recordBreakglassLogin(db: ClientBase, session: BreakglassSession, sessionId: string): Promise<void> {
-  const requestId = `breakglass-login:${sessionId}`;
+export async function recordBreakglassLogin(db: ClientBase, session: BreakglassSession, sessionId: string, requestKey: string = sessionId): Promise<void> {
+  const requestId = `breakglass-login:${requestKey}`;
   await db.query("SAVEPOINT breakglass_audit");
   try {
     await db.query("SELECT set_config($1, $2, true)", [WORKSPACE_GUC, PLATFORM_AUDIT_WORKSPACE_ID]);

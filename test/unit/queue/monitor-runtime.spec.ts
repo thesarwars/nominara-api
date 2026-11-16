@@ -141,7 +141,7 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
     expect(h.client.release).toHaveBeenCalledTimes(1);
   });
 
-  it("state is loaded AFTER the lock and saved before COMMIT", async () => {
+  it("state is loaded AFTER the lock and saved AFTER the COMMIT (batch 17: a failed COMMIT must not leave break-glass audited:true behind)", async () => {
     const order: string[] = [];
     const h = harness({
       store: {
@@ -155,7 +155,7 @@ describe("STORY-179 AC3 · tick lifecycle and failure handling", () => {
       return { rows: isLock ? [{ locked: true }] : [], rowCount: 0 };
     });
     await h.runtime.tick();
-    expect(order).toEqual(["BEGIN", "lock", "load", "save", "COMMIT"]);
+    expect(order).toEqual(["BEGIN", "lock", "load", "COMMIT", "save"]);
   });
 
   it("a state-store outage skips the tick: nothing is observed, nothing pages, nothing throws, the client is released", async () => {
