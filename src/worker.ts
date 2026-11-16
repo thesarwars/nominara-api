@@ -44,6 +44,7 @@ import { queuesForGroup } from "./lib/queue/group.js";
 import { handlerFor } from "./lib/queue/handlers.js";
 import { buildQueue } from "./lib/queue/queue-factory.js";
 import { QueueProducer } from "./lib/queue/queue-producer.js";
+import { RedactingLogger } from "./lib/logging/redacting-logger.js";
 import { describeSchedules, reconcileSchedules } from "./lib/queue/schedule-registrar.js";
 import { buildWorker, signingKeysFromEnv } from "./lib/queue/worker-factory.js";
 
@@ -607,7 +608,11 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
   @Module({ providers })
   class WorkerRootModule {}
 
-  const app = await NestFactory.createApplicationContext(WorkerRootModule, { bufferLogs: true });
+  const app = await NestFactory.createApplicationContext(WorkerRootModule, {
+    bufferLogs: true,
+    // STORY-005 AC2 - the redaction transport, installed before any application code runs.
+    logger: new RedactingLogger(),
+  });
   app.enableShutdownHooks();
   // STORY-043 review — WITHOUT THIS THE WORKER LOGS NOTHING, EVER. `bufferLogs`
   // holds every log line until something flushes it, and main.ts and

@@ -6,6 +6,7 @@ import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fa
 import { loadEnv } from "./config/env.js";
 import { RealtimeModule } from "./gateway/gateway.module.js";
 import { RealtimeGateway } from "./gateway/realtime.gateway.js";
+import { RedactingLogger } from "./lib/logging/redacting-logger.js";
 import { cacheKeyNamespace } from "./lib/cache/key-namespace.js";
 import { realtimeControlChannel, realtimeFanoutChannel } from "./lib/cache/realtime-publisher.js";
 
@@ -17,6 +18,8 @@ export async function bootstrapGateway(): Promise<NestFastifyApplication> {
   const env = loadEnv();
   const app = await NestFactory.create<NestFastifyApplication>(RealtimeModule, new FastifyAdapter(), {
     bufferLogs: true,
+    // STORY-005 AC2 - the redaction transport, installed before any application code runs.
+    logger: new RedactingLogger(),
   });
   app.enableShutdownHooks();
   await app.listen({ port: env.GATEWAY_PORT, host: "0.0.0.0" });

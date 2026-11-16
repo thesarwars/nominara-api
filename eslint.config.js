@@ -1,5 +1,6 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
+import metricNameConvention from "./eslint-rules/metric-name-convention.js";
 import noPoolLevelTenantQuery from "./eslint-rules/no-pool-level-tenant-query.js";
 import noRepositoryLayer from "./eslint-rules/no-repository-layer.js";
 import noRequestHandlerNetworkCall from "./eslint-rules/no-request-handler-network-call.js";
@@ -17,6 +18,7 @@ const nominaraLocalPlugin = {
     "no-repository-layer": noRepositoryLayer,
     "no-spend-meter-postgres-access": noSpendMeterPostgresAccess,
     "no-pool-level-tenant-query": noPoolLevelTenantQuery,
+    "metric-name-convention": metricNameConvention,
   },
 };
 
@@ -105,6 +107,15 @@ export default tseslint.config(
           ],
         },
       ],
+    },
+  },
+  {
+    // STORY-005 AC8 - coding-standards.md section 7: nominara_<subsystem>_<measure> with the unit in the name. Tests call the
+    // metric helpers with throwaway names on purpose.
+    files: ["src/**/*.ts"],
+    ignores: ["**/*.spec.ts", "**/*.test.ts"],
+    rules: {
+      "nominara/metric-name-convention": "error",
     },
   },
   {
