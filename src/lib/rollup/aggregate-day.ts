@@ -372,6 +372,9 @@ export async function aggregateRange(
                JOIN day_cells dc ON dc.id = m.result_id
               WHERE dc.engine_key = e.engine_key AND m.entity_type = e.entity_type
                 AND COALESCE(m.entity_id, $1::uuid) = e.entity_id
+                -- STORY-036 AC5: an occurrence inside a URL, a code span or a link target is a citation, not a mention. The parse
+                -- already leaves it out of brand_present and prominence; counting it here made the rollup disagree with the cell.
+                AND NOT m.in_link
                 AND ($5::text IS NULL OR m.scoring_version = $5::text))::text  AS cells_present,
             -- §2.3's numerator. answer_captures.sov is the BRAND's share,
             -- so a competitor row carries 0 here: per-entity share over a
@@ -406,6 +409,8 @@ export async function aggregateRange(
           WHERE dc.engine_key = e.engine_key
             AND m.entity_type = e.entity_type
             AND COALESCE(m.entity_id, $1::uuid) = e.entity_id
+            -- Same rule as cells_present above: a link-internal occurrence is no mention, so it is not counted, weighted or ranked.
+            AND NOT m.in_link
             AND ($5::text IS NULL OR m.scoring_version = $5::text)
        ) agg
        CROSS JOIN LATERAL (

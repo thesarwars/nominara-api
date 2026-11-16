@@ -186,6 +186,31 @@ describe("STORY-135 · capture.parse", () => {
     expect(rows.rows[rows.rows.length - 1]!.in_link).toBe(true);
   });
 
+  it("STORY-036 AC5 - the rollup agrees with the parse: a brand that appears ONLY inside a URL is not present, and its link-internal rows are no mention", async () => {
+    const onlyLinked = await seedCapture("1. Salesforce - deeper reporting.\n\nSee https://docs.hubspot.com/api/crm for details.");
+    const plain = await seedCapture(ANSWER);
+    await run(handler(), job(onlyLinked));
+    await run(handler(), job(plain));
+
+    const linkRows = await db.query<{ in_link: boolean }>("SELECT in_link FROM mention_facts WHERE result_id = $1 AND entity_type = 'brand'", [onlyLinked]);
+    expect(linkRows.rows.length).toBeGreaterThan(0);
+    expect(linkRows.rows.every((row) => row.in_link)).toBe(true);
+    expect((await presenceOf(onlyLinked)).brand_present).toBe(false);
+
+    const aggregates = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+      aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null),
+    );
+    const brand = aggregates.find((row) => row.entityType === "brand")!;
+    const plainBrandRows = await db.query<{ n: string }>(
+      "SELECT count(*) AS n FROM mention_facts WHERE result_id = $1 AND entity_type = 'brand' AND NOT in_link",
+      [plain],
+    );
+    expect(brand.cellsTotal).toBe(2);
+    // Present in the plain cell only, exactly as brand_present says; the link-only cell is a measured cell with the brand absent.
+    expect(brand.cellsPresent).toBe(1);
+    expect(brand.mentionsTotal).toBe(Number(plainBrandRows.rows[0]!.n));
+  });
+
   it("MATCHES THE PROJECT NAME even with no brand_aliases configured", async () => {
     // A project created from a URL alone has none. A matcher built from an
     // empty set matches nothing, which would report every answer as
