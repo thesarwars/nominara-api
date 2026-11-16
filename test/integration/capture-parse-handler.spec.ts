@@ -211,6 +211,35 @@ describe("STORY-135 · capture.parse", () => {
     expect(brand.mentionsTotal).toBe(Number(plainBrandRows.rows[0]!.n));
   });
 
+  it("batch 18 fix - the rollup agrees with the parse for a COMPETITOR too: one that appears only inside a link is absent from the cell and the rollup, and present when it also appears in plain text", async () => {
+    const linkOnly = await seedCapture("1. HubSpot - pipelines.\n\nSee https://www.salesforce.com/crm for details.");
+    await run(handler(), job(linkOnly));
+
+    const linkRows = await db.query<{ in_link: boolean }>("SELECT in_link FROM mention_facts WHERE result_id = $1 AND entity_type = 'competitor'", [linkOnly]);
+    expect(linkRows.rows.length).toBeGreaterThan(0);
+    expect(linkRows.rows.every((row) => row.in_link)).toBe(true);
+
+    const aggregate = () =>
+      withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) => aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null));
+    const competitorOf = async () => (await aggregate()).find((row) => row.entityType === "competitor" && row.entityId === competitorId);
+
+    // Absent from the cell (no non-link mention row) and from the rollup (counted in neither cells_present nor mentions_total).
+    const plainRows = await db.query<{ n: string }>("SELECT count(*) AS n FROM mention_facts WHERE result_id = $1 AND entity_type = 'competitor' AND NOT in_link", [linkOnly]);
+    expect(Number(plainRows.rows[0]!.n)).toBe(0);
+    const absent = await competitorOf();
+    expect(absent?.cellsPresent ?? 0).toBe(0);
+    expect(absent?.mentionsTotal ?? 0).toBe(0);
+
+    // The same competitor in plain text as well: now present in both.
+    const plain = await seedCapture(ANSWER);
+    await run(handler(), job(plain));
+    const plainCompetitorRows = await db.query<{ n: string }>("SELECT count(*) AS n FROM mention_facts WHERE result_id = $1 AND entity_type = 'competitor' AND NOT in_link", [plain]);
+    expect(Number(plainCompetitorRows.rows[0]!.n)).toBeGreaterThan(0);
+    const present = await competitorOf();
+    expect(present?.cellsPresent).toBe(1);
+    expect(present?.mentionsTotal).toBe(Number(plainCompetitorRows.rows[0]!.n));
+  });
+
   it("MATCHES THE PROJECT NAME even with no brand_aliases configured", async () => {
     // A project created from a URL alone has none. A matcher built from an
     // empty set matches nothing, which would report every answer as
