@@ -69,6 +69,7 @@ export const SCHEMA_SUBSYSTEMS = {
     "geo_alignments",
     "content_chunks",
     "corpus_passages",
+    "corpus_url_checks",
     "semantic_nodes",
     "patches",
     "name_match_verdicts",

@@ -267,6 +267,7 @@ export const SUBJECT_INVENTORY: Readonly<Record<string, InventoryEntry>> = Objec
   competitors: exportOf("competitors"),
   content_chunks: exempt("Chunk of the customer's own crawled pages; references no person."),
   corpus_passages: exempt("Passage of the customer's own crawled pages; references no person."),
+  corpus_url_checks: exempt("A URL hash and a fetch outcome for a cited page; references no person."),
   credit_daily_counters: exempt(AGGREGATE),
   credit_hold_carries: exempt(AGGREGATE),
   credit_ledger: exportOf("credit_ledger"),

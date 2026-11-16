@@ -31,6 +31,8 @@ import { centroidWeight, expiresAtFrom } from "./weights.js";
 //
 // CACHE AND EXPIRY (AC4/AC12). A URL with an unexpired passage under the pinned model is NOT fetched again (the 30-day cache is the
 // table itself); an expired one is re-fetched and, once its fresh passages are written, its superseded expired rows are deleted.
+// A URL that was fetched and yielded no row of its own (every passage a copy of another URL's, or none relevant) is remembered in
+// corpus_url_checks (migration 0214, STORY-058 AC4) for the same 30 days and not fetched again; a refused or failed URL is not remembered.
 //
 // A URL that cannot be sourced (refused by the guard, failed, nothing relevant) is counted and the build carries on; any such URL
 // makes the build `partial`, never a silent `complete`.
@@ -123,10 +125,20 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
           AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
       [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
     );
+    // STORY-058 AC4 - URLs fetched earlier that produced no passage of their own (every passage a copy, or none relevant): the same
+    // 30-day cache, remembered in corpus_url_checks because corpus_passages has no row to say so.
+    const checked = await tx.query<{ h: string }>(
+      `SELECT encode(citation_url_hash, 'hex') AS h
+         FROM corpus_url_checks
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
+          AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
+      [projectId, clusterId, deps.embeddingModel, candidates.map((candidate) => candidate.urlHashHex)],
+    );
     return {
       candidates,
       terms: queryTermsOf(prompts.rows.map((row) => row.text)),
       liveHashes: new Set(live.rows.map((row) => row.h)),
+      checkedHashes: new Set(checked.rows.map((row) => row.h)),
     };
   });
 
@@ -134,11 +146,20 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   const counts = { cached: 0, fromFragment: 0, fetched: 0, refused: 0, failed: 0, empty: 0 };
   const drafts: PassageDraft[] = [];
   const cachedCandidates: Candidate[] = [];
+  // STORY-058 AC4 - fetched URLs, split by whether they had anything to keep. Whether a URL WITH passages ends up owning a row is only
+  // known after the write below (a text another URL of this corpus holds is dropped), so that half is decided there.
+  const noRelevantChunk: Candidate[] = [];
+  const fetchedWithPassages: Candidate[] = [];
 
   for (const candidate of read.candidates) {
     if (read.liveHashes.has(candidate.urlHashHex)) {
       counts.cached += 1;
       cachedCandidates.push(candidate);
+      continue;
+    }
+    if (read.checkedHashes.has(candidate.urlHashHex)) {
+      // Fetched within the cache period and found to add nothing of its own: counted as cached, not fetched again.
+      counts.cached += 1;
       continue;
     }
     const directive = candidate.textFragment === null ? null : passageFromTextFragment(candidate.textFragment);
@@ -162,7 +183,12 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     }
     counts.fetched += 1;
     const kept = selectTopChunks(chunkDocument(extractReadable(page.html), deps.tokenizer), read.terms);
-    if (kept.length === 0) counts.empty += 1;
+    if (kept.length === 0) {
+      counts.empty += 1;
+      noRelevantChunk.push(candidate);
+    } else {
+      fetchedWithPassages.push(candidate);
+    }
     for (const chunk of kept) drafts.push(draftOf(candidate, chunk.index, chunk.text, chunk.tokenCount, false));
   }
 
@@ -185,11 +211,21 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
     // The corpus is THIS build's selection (reference section 6: top K, owned excluded). A URL that fell out of the top set, or
     // became owned, must stop contributing now, not at its 30-day expiry. Done BEFORE the upsert so the text of a departed URL is
     // free for the URL that replaces it.
-    await tx.query(
+    const departed = await tx.query(
       `DELETE FROM corpus_passages
         WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
           AND embedding_model = $3 AND NOT (encode(citation_url_hash, 'hex') = ANY($4::text[]))`,
       [projectId, clusterId, deps.embeddingModel, read.candidates.map((c) => c.urlHashHex)],
+    );
+
+    // STORY-058 AC4 - the remembered checks follow the corpus. An expired one, one for a URL no longer a candidate, and (when a URL left and
+    // took its passages with it) every `duplicate_only` one go: that URL may have been the twin whose text made the others duplicates, so they
+    // are judged afresh by the next build. A `no_relevant_chunk` check does not depend on any other URL and stays.
+    await tx.query(
+      `DELETE FROM corpus_url_checks
+        WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2 AND embedding_model = $3
+          AND (expires_at <= now() OR NOT (encode(citation_url_hash, 'hex') = ANY($4::text[])) OR ($5::boolean AND outcome = 'duplicate_only'))`,
+      [projectId, clusterId, deps.embeddingModel, read.candidates.map((c) => c.urlHashHex), (departed.rowCount ?? 0) > 0],
     );
 
     if (unique.length > 0) {
@@ -230,6 +266,37 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
       // A rejected draft is a copy of text this corpus already holds under another of its URLs: deduplicated, not an error.
       const stored = new Set(upsert.rows.map((row) => row.ch));
       deduplicated = unique.filter((draft) => !stored.has(draft.contentHashHex)).length;
+    }
+
+    // STORY-058 AC4 - remember the URLs that were fetched and produced no passage of their own, so the next build does not fetch them
+    // again inside the cache period: a URL with nothing relevant, and a URL whose every passage is a copy of one another URL of this corpus
+    // holds (it owns no live row after the upsert above). A refused or failed URL is never recorded here: it is tried again.
+    const fetchedHashes = fetchedWithPassages.map((c) => c.urlHashHex);
+    const owning = new Set<string>();
+    if (fetchedHashes.length > 0) {
+      const owners = await tx.query<{ h: string }>(
+        `SELECT DISTINCT encode(citation_url_hash, 'hex') AS h
+           FROM corpus_passages
+          WHERE workspace_id = app.current_workspace() AND project_id = $1 AND prompt_cluster_id IS NOT DISTINCT FROM $2
+            AND embedding_model = $3 AND expires_at > now() AND encode(citation_url_hash, 'hex') = ANY($4::text[])`,
+        [projectId, clusterId, deps.embeddingModel, fetchedHashes],
+      );
+      for (const row of owners.rows) owning.add(row.h);
+    }
+    const checks = [
+      ...noRelevantChunk.map((c) => ({ hash: c.urlHashHex, outcome: "no_relevant_chunk" })),
+      ...fetchedWithPassages.filter((c) => !owning.has(c.urlHashHex)).map((c) => ({ hash: c.urlHashHex, outcome: "duplicate_only" })),
+    ];
+    if (checks.length > 0) {
+      await tx.query(
+        `INSERT INTO corpus_url_checks (workspace_id, project_id, prompt_cluster_id, citation_url_hash, embedding_model, outcome, checked_at, expires_at)
+         SELECT app.current_workspace(), $1, $2, decode(v.uh, 'hex'), $3, v.outcome, $4, $5
+           FROM unnest($6::text[], $7::text[]) AS v(uh, outcome)
+         ON CONFLICT (workspace_id, project_id, prompt_cluster_id, citation_url_hash, embedding_model)
+         DO UPDATE SET outcome = EXCLUDED.outcome, checked_at = EXCLUDED.checked_at, expires_at = EXCLUDED.expires_at`,
+        [projectId, clusterId, deps.embeddingModel, fetchedAt.toISOString(), expiresAt.toISOString(), checks.map((c) => c.hash), checks.map((c) => c.outcome)],
+      );
+      for (const check of checks) incrementCounter("nominara_geo_corpus_urls_total", { outcome: check.outcome === "duplicate_only" ? "url_duplicate_only" : "url_no_relevant_chunk" });
     }
 
     // A cached URL keeps its text but its citations moved on: refresh the weights the centroid reads.

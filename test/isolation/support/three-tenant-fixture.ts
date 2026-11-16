@@ -505,6 +505,13 @@ export async function seedTenant(client: Client, label: string): Promise<TenantF
     "INSERT INTO retention_exports (id, workspace_id, status, error_code, expires_at) SELECT gen_random_uuid(), $1, 'failed', 'fixture', now() + interval '14 days' FROM generate_series(1, $2::int)",
     [workspaceId, R],
   );
+  // STORY-058 AC4 (migration 0214, decision 108g) - a fetched URL that produced no passage of its own. Tenant-scoped, not portal-readable.
+  for (let i = 0; i < R; i++) {
+    await client.query(
+      "INSERT INTO corpus_url_checks (workspace_id, project_id, prompt_cluster_id, citation_url_hash, embedding_model, outcome, expires_at) VALUES ($1, $2, NULL, sha256(gen_random_uuid()::text::bytea), 'fixture-model', 'duplicate_only', now() + interval '30 days')",
+      [workspaceId, projectIds[i]],
+    );
+  }
   // STORY-191 (migration 0197, decision 99c) - a model verdict per project. Tenant-scoped, not portal-readable.
   for (let i = 0; i < R; i++) {
     await client.query(
