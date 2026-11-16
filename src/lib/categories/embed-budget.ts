@@ -66,7 +66,7 @@ export class ValkeyTokenCounterStore implements TokenCounterStore {
 }
 
 export type BudgetDecision =
-  | { readonly status: "admitted"; readonly text: string; readonly reservedTokens: number }
+  | { readonly status: "admitted"; readonly text: string; readonly reservedTokens: number; readonly dayKey: string }
   | { readonly status: "refused"; readonly reason: "daily_ceiling" | "budget_unavailable" };
 
 export interface CategoryEmbedBudgetOptions {
@@ -102,27 +102,32 @@ export class CategoryEmbedBudget {
   async admit(siteText: string): Promise<BudgetDecision> {
     const text = siteText.slice(0, this.maxInputTokens * ESTIMATED_CHARS_PER_TOKEN);
     const reservedTokens = estimateTokens(text);
-    if (reservedTokens === 0) return { status: "admitted", text, reservedTokens: 0 };
+    if (reservedTokens === 0) return { status: "admitted", text, reservedTokens: 0, dayKey: this.dayKey() };
     const key = this.dayKey();
     try {
       const total = await this.store.addAndGet(key, reservedTokens, COUNTER_TTL_SECONDS);
       if (total > this.dailyCeiling) {
         // Handed back, so a refused call does not use up the ceiling that the admitted ones are counted against.
+        // If this refund itself throws, the catch below reports `budget_unavailable` and the reservation stays on the counter: the
+        // ceiling is over-counted for the day, never under-counted (conservative, fails closed).
         await this.store.addAndGet(key, -reservedTokens, COUNTER_TTL_SECONDS);
         return { status: "refused", reason: "daily_ceiling" };
       }
     } catch {
       return { status: "refused", reason: "budget_unavailable" };
     }
-    return { status: "admitted", text, reservedTokens };
+    return { status: "admitted", text, reservedTokens, dayKey: key };
   }
 
-  /** Replaces the reservation with what the provider reported. Best-effort: a failure here must not lose the classification. */
-  async settle(reservedTokens: number, actualTokens: number): Promise<void> {
+  /**
+   * Replaces the reservation with what the provider reported. Best-effort: a failure here must not lose the classification.
+   * `dayKey` is the one `admit` returned, so a call that straddles UTC midnight corrects the day it reserved against.
+   */
+  async settle(reservedTokens: number, actualTokens: number, dayKey: string = this.dayKey()): Promise<void> {
     const delta = actualTokens - reservedTokens;
     if (delta === 0) return;
     try {
-      await this.store.addAndGet(this.dayKey(), delta, COUNTER_TTL_SECONDS);
+      await this.store.addAndGet(dayKey, delta, COUNTER_TTL_SECONDS);
     } catch {
       // The reservation already counted; only the correction is lost.
     }

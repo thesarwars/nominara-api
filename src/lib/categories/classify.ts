@@ -129,6 +129,8 @@ export async function classifyCategory(
   siteText: string,
   categories: readonly CategoryDescriptor[],
   embedder: TextEmbedder,
+  /** Filled with what the provider reported for the calls this made, whether or not a category matched (the caller settles its budget with it). */
+  spend?: { tokens: number },
 ): Promise<CategoryClassification | null> {
   const text = siteText.trim();
   if (text === "" || categories.length === 0) return null;
@@ -145,8 +147,10 @@ export async function classifyCategory(
   }
   const categoryVectors = await entry;
   const spentOnCategories = startedEmbedding ? categoryVectors.tokens : 0;
+  if (spend !== undefined) spend.tokens += spentOnCategories;
 
   const site = await embedAll(embedder, [text.slice(0, MAX_CLASSIFICATION_TEXT_CHARS)]);
+  if (spend !== undefined) spend.tokens += site.tokens;
   const siteVector = site.vectors[0]!;
   const cosines = categoryVectors.vectors.map((v) => cosineSimilarity(siteVector, v));
   const confidence = categoryConfidence(cosines);

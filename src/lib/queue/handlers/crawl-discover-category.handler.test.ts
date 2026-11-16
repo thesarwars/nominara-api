@@ -5,7 +5,7 @@ import type { ClientBase } from "pg";
 import { createCrawlDiscoverHandler } from "./crawl-discover.handler.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import type { DiscoverDeps } from "../../discovery/discover.js";
-import type { TextEmbedder } from "../../categories/classify.js";
+import { classifyCategory, type TextEmbedder } from "../../categories/classify.js";
 import { phasesOf } from "../worker-factory.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
 import { CategoryEmbedBudget, InMemoryTokenCounterStore, estimateTokens, type TokenCounterStore } from "../../categories/embed-budget.js";
@@ -13,6 +13,10 @@ import { emailAlert } from "../../alerts/alerts.js";
 
 vi.mock("../../telemetry/metrics.js", () => ({ observeValue: vi.fn(), incrementCounter: vi.fn() }));
 vi.mock("../../alerts/alerts.js", () => ({ emailAlert: vi.fn() }));
+vi.mock("../../categories/classify.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../categories/classify.js")>();
+  return { ...original, classifyCategory: vi.fn(original.classifyCategory) };
+});
 
 // STORY-189 AC3-AC5 at the handler: the taxonomy is read in `prepare`, the classification happens in `run` (no transaction held across the
 // embedding call, ADR-0003), and the curated peers are merged in `commit` after the site's own comparison links.
@@ -306,6 +310,17 @@ describe("STORY-189 · crawl.discover classifies and proposes peers", () => {
       await phases.commit(txFor([]), prepared as never, fetched, job());
       expect(events).toContain("budget");
       expect(events.indexOf("budget")).toBeGreaterThan(events.lastIndexOf("tx"));
+    });
+
+    it("AC7 — a null classification after the provider was paid still leaves the spend on the counter (not refunded)", async () => {
+      const counter = store();
+      const budget = new CategoryEmbedBudget({ store: counter, dailyCeiling: 1_000_000, maxInputTokens: 2000 });
+      vi.mocked(classifyCategory).mockImplementationOnce(async (_text, _cats, _embedder, spend) => {
+        if (spend) spend.tokens += 500; // paid for, then no match
+        return null;
+      });
+      await createCrawlDiscoverHandler(CONTEXT, serving(PAGE), embedderPicking("crm"), budget)(txFor([]), job());
+      expect(await counter.addAndGet(budget.dayKey(), 0, 1)).toBeGreaterThanOrEqual(500);
     });
 
     it("AC7 — an unreadable counter is a distinct outcome and never reads as a provider failure", async () => {

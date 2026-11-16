@@ -138,10 +138,16 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
                     span.setAttribute("nominara.discovery.category_refused", admitted.reason);
                     return null;
                   }
-                  const result = await classifyCategory(admitted.text, prepared.categories, embedderFor());
-                  await budget.settle(admitted.reservedTokens, result?.tokens ?? 0);
+                  // Tokens are paid for whether or not a category matches, so settle with what was spent, not with the result's.
+                  const spend = { tokens: 0 };
+                  let result: Awaited<ReturnType<typeof classifyCategory>>;
+                  try {
+                    result = await classifyCategory(admitted.text, prepared.categories, embedderFor(), spend);
+                  } finally {
+                    await budget.settle(admitted.reservedTokens, spend.tokens, admitted.dayKey);
+                    classification.tokens += spend.tokens;
+                  }
                   span.setAttribute("nominara.discovery.category_found", result !== null);
-                  classification.tokens += result?.tokens ?? 0;
                   return result;
                 } catch (error) {
                   classification.failed = true;

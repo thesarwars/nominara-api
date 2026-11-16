@@ -83,6 +83,16 @@ describe("STORY-189 AC7 · daily platform-wide ceiling", () => {
     expect(await store.addAndGet(b.dayKey(DAY), 0, 1)).toBe(7_100);
   });
 
+  it("AC7 — settle after a midnight rollover corrects the day the reservation was made on, not the new day", async () => {
+    const { b, store, clock } = budget({ dailyCeiling: 100_000 });
+    const r = await b.admit("x".repeat(300)); // 100 reserved on day 1
+    if (r.status !== "admitted") throw new Error("expected admitted");
+    clock.now = DAY + 24 * 3_600_000; // the provider call straddled midnight
+    await b.settle(r.reservedTokens, 400, r.dayKey);
+    expect(await store.addAndGet(b.dayKey(DAY), 0, 1)).toBe(400);
+    expect(await store.addAndGet(b.dayKey(clock.now), 0, 1)).toBe(0);
+  });
+
   it("AC7 — a new UTC day starts from zero", async () => {
     const { b, clock } = budget({ dailyCeiling: 100 });
     expect((await b.admit("x".repeat(300))).status).toBe("admitted");
