@@ -94,6 +94,8 @@ export const toolRunConversionSchema = z
         prompts: z.array(z.string()),
         /** The competitor names the run found (`result_json.competitors`); empty for a tool that finds none, and once the payload has expired. */
         competitors: z.array(z.string()),
+        /** The engines that answered the run, as engine keys, to suggest on the conversion panel (FR-SCAN-01g); empty for a tool that ran none. Informational: a project's engines come from its plan. */
+        engines: z.array(z.string()),
       })
       .strict(),
   })

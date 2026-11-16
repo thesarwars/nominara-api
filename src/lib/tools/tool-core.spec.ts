@@ -213,6 +213,12 @@ describe("STORY-078 · scenarios 18 and 21 - one conversion contract", () => {
     ...over,
   });
 
+  it("STORY-095 AC13 - the conversion prefill suggests the engines that answered the run, in order, deduplicated; none when none did", () => {
+    expect(toolConversionPlan(run({ engines_succeeded: ["gemini", "chatgpt", "gemini"] })).prefill.engines).toEqual(["gemini", "chatgpt"]);
+    expect(toolConversionPlan(run({ engines_succeeded: [] })).prefill.engines).toEqual([]);
+    expect(toolConversionPlan(run()).prefill.engines).toEqual([]);
+  });
+
   it("scenario 18 - every one of the six tools has an answer; none throws", () => {
     for (const tool of ["visibility_scan", "prompt_research", "competitor_finder", "aux_audit", "schema_builder", "compare_runs"] as const) {
       expect(() => toolConversionPlan(run({ tool_key: tool }))).not.toThrow();
