@@ -8,8 +8,11 @@ import type { DiscoverDeps } from "../../discovery/discover.js";
 import type { TextEmbedder } from "../../categories/classify.js";
 import { phasesOf } from "../worker-factory.js";
 import { incrementCounter } from "../../telemetry/metrics.js";
+import { CategoryEmbedBudget, InMemoryTokenCounterStore, estimateTokens, type TokenCounterStore } from "../../categories/embed-budget.js";
+import { emailAlert } from "../../alerts/alerts.js";
 
 vi.mock("../../telemetry/metrics.js", () => ({ observeValue: vi.fn(), incrementCounter: vi.fn() }));
+vi.mock("../../alerts/alerts.js", () => ({ emailAlert: vi.fn() }));
 
 // STORY-189 AC3-AC5 at the handler: the taxonomy is read in `prepare`, the classification happens in `run` (no transaction held across the
 // embedding call, ADR-0003), and the curated peers are merged in `commit` after the site's own comparison links.
@@ -246,6 +249,69 @@ describe("STORY-189 · crawl.discover classifies and proposes peers", () => {
       expect(line).toContain(WORKSPACE);
       expect(line).toMatch(/1 selected, 1 read/);
       expect(line).not.toMatch(/salesforce|\/compare/i);
+    });
+  });
+
+  describe("AC7 / decision 107(b) — token budget", () => {
+    const store = () => new InMemoryTokenCounterStore();
+
+    it("AC7 — over the daily ceiling: not classified, no provider call, outcome names the reason, and the owner is alerted", async () => {
+      const emailAlertMock = vi.mocked(emailAlert);
+      emailAlertMock.mockClear();
+      const calls: { sql: string; params: unknown[] }[] = [];
+      const embedder = embedderPicking("crm");
+      const budget = new CategoryEmbedBudget({ store: store(), dailyCeiling: 1, maxInputTokens: 2000 });
+      await createCrawlDiscoverHandler(CONTEXT, serving(PAGE), embedder, budget)(txFor(calls), job());
+      expect(embedder.calls).toEqual([]);
+      expect(storedPayload(calls).fields.category).toBeUndefined();
+      expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_discovery_category_total", { outcome: "budget_exhausted" });
+      expect(emailAlertMock).toHaveBeenCalledTimes(1);
+      expect(emailAlertMock.mock.calls[0]![1]).toMatchObject({ alertName: "category_embed_daily_ceiling", reason: "daily_ceiling" });
+    });
+
+    it("AC7 — the pass still completes (other fields discovered), and nothing is charged to the workspace", async () => {
+      const calls: { sql: string; params: unknown[] }[] = [];
+      const budget = new CategoryEmbedBudget({ store: store(), dailyCeiling: 1, maxInputTokens: 2000 });
+      await createCrawlDiscoverHandler(CONTEXT, serving(PAGE), embedderPicking("crm"), budget)(txFor(calls), job());
+      expect(storedPayload(calls).fields.description).toBeDefined();
+      expect(calls.some((c) => /credit_ledger|credit_wallets|reserve_credits|debit/i.test(c.sql))).toBe(false);
+    });
+
+    it("AC7 — under the ceiling the site text sent to the provider is within the per-project cap", async () => {
+      const embedder = embedderPicking("crm");
+      const budget = new CategoryEmbedBudget({ store: store(), dailyCeiling: 1_000_000, maxInputTokens: 10 });
+      await createCrawlDiscoverHandler(CONTEXT, serving(PAGE), embedder, budget)(txFor([]), job());
+      const siteCall = embedder.calls.find((c) => c.length === 1 && !c[0]!.startsWith("CRM.") && !c[0]!.startsWith("Banks."))!;
+      expect(estimateTokens(siteCall[0]!)).toBeLessThanOrEqual(10);
+    });
+
+    it("AC7 / ADR-0003 — the budget check and the embedding both happen with no transaction in use", async () => {
+      const events: string[] = [];
+      const counting: TokenCounterStore = {
+        addAndGet: async (key, delta, ttl) => {
+          events.push("budget");
+          return store().addAndGet(key, delta, ttl);
+        },
+      };
+      const budget = new CategoryEmbedBudget({ store: counting });
+      const prepareTx = txFor([]);
+      const original = prepareTx.query as unknown as (sql: string, params?: unknown[]) => Promise<unknown>;
+      (prepareTx as unknown as { query: unknown }).query = async (sql: string, params?: unknown[]) => {
+        events.push("tx");
+        return original(sql, params);
+      };
+      const phases = phasesOf(createCrawlDiscoverHandler(CONTEXT, serving(PAGE), embedderPicking("crm"), budget))!;
+      const prepared = await phases.prepare(prepareTx, job());
+      const fetched = await phases.run(prepared as never, job());
+      await phases.commit(txFor([]), prepared as never, fetched, job());
+      expect(events).toContain("budget");
+      expect(events.indexOf("budget")).toBeGreaterThan(events.lastIndexOf("tx"));
+    });
+
+    it("AC7 — an unreadable counter is a distinct outcome and never reads as a provider failure", async () => {
+      const down: TokenCounterStore = { addAndGet: async () => { throw new Error("down"); } };
+      await createCrawlDiscoverHandler(CONTEXT, serving(PAGE), embedderPicking("crm"), new CategoryEmbedBudget({ store: down }))(txFor([]), job());
+      expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_discovery_category_total", { outcome: "budget_unavailable" });
     });
   });
 });

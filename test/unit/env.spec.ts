@@ -466,3 +466,25 @@ describe("Group C item 3 · object storage configuration", () => {
     expect(KNOWN_KEYS).toContain("EMBED_REEMBED_ENABLED");
   });
 });
+
+describe("STORY-189 AC7 · category embedding budget env", () => {
+  it("AC7 — defaults are 2000 input tokens and 1,000,000 tokens a day", () => {
+    const env = loadEnv(VALID);
+    expect(env.CATEGORY_EMBED_MAX_INPUT_TOKENS).toBe(2000);
+    expect(env.CATEGORY_EMBED_DAILY_TOKEN_CEILING).toBe(1_000_000);
+  });
+
+  it("AC7 — a valid value is taken", () => {
+    const env = loadEnv({ ...VALID, CATEGORY_EMBED_MAX_INPUT_TOKENS: "500", CATEGORY_EMBED_DAILY_TOKEN_CEILING: "42" });
+    expect(env.CATEGORY_EMBED_MAX_INPUT_TOKENS).toBe(500);
+    expect(env.CATEGORY_EMBED_DAILY_TOKEN_CEILING).toBe(42);
+  });
+
+  it("AC7 — a malformed, zero or negative value never breaks boot: it falls back to the default", () => {
+    for (const bad of ["abc", "0", "-5", "1.5", ""]) {
+      const env = loadEnv({ ...VALID, CATEGORY_EMBED_MAX_INPUT_TOKENS: bad, CATEGORY_EMBED_DAILY_TOKEN_CEILING: bad });
+      expect(env.CATEGORY_EMBED_MAX_INPUT_TOKENS).toBe(2000);
+      expect(env.CATEGORY_EMBED_DAILY_TOKEN_CEILING).toBe(1_000_000);
+    }
+  });
+});

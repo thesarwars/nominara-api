@@ -12,6 +12,8 @@ import { generateFreeAllowance } from "../../discovery/free-prompts.js";
 import { defaultDiscoveryLatencyMonitor } from "../../discovery/latency-alert.js";
 import { incrementCounter, observeValue } from "../../telemetry/metrics.js";
 import type { QueueHandlerContext } from "../handlers.js";
+import { emailAlert } from "../../alerts/alerts.js";
+import { CATEGORY_EMBED_ALERT_NAME, CategoryEmbedBudget, InMemoryTokenCounterStore } from "../../categories/embed-budget.js";
 import { textEmbedderFor } from "./embed-batch.handler.js";
 import { PHASES_DONE, phasedProcessor, type JobProcessor, type PhaseFailure, type TenantStep } from "../worker-factory.js";
 
@@ -60,10 +62,18 @@ interface Prepared {
 //   prepare  short tenant transaction: confirm the project, mark it running (committed BEFORE the fetch, so a poll mid-flight says so).
 //   run      NO transaction: the guarded fetch and the pure parsing.
 //   commit   short tenant transaction: the free allowance and the review payload, written together.
-export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: DiscoverDeps, categoryEmbedder?: TextEmbedder): JobProcessor {
+export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: DiscoverDeps, categoryEmbedder?: TextEmbedder, categoryBudget?: CategoryEmbedBudget): JobProcessor {
   const logger = new Logger("crawl.discover");
   // Built on first use: a process that never classifies (nothing seeded, or every category supplied) never selects a provider.
   let embedder: TextEmbedder | undefined = categoryEmbedder;
+  // STORY-189 AC7 / decision 107(b) - the spend limit. Env values are optional on the context (absent = the documented defaults).
+  const budget =
+    categoryBudget ??
+    new CategoryEmbedBudget({
+      store: context.categoryTokenStore ?? new InMemoryTokenCounterStore(),
+      ...(context.env.CATEGORY_EMBED_MAX_INPUT_TOKENS === undefined ? {} : { maxInputTokens: context.env.CATEGORY_EMBED_MAX_INPUT_TOKENS }),
+      ...(context.env.CATEGORY_EMBED_DAILY_TOKEN_CEILING === undefined ? {} : { dailyCeiling: context.env.CATEGORY_EMBED_DAILY_TOKEN_CEILING }),
+    });
   const embedderFor = (): TextEmbedder => (embedder ??= textEmbedderFor(context.env));
 
   return phasedProcessor<Prepared, DiscoveryResponse>({
@@ -113,7 +123,7 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
     // The category classification (an embedding call) lives HERE, in `run`: no transaction and no pooled connection is held across it
     // (ADR-0003 / KAD-06). A provider failure proposes no category; it never fails the pass.
     async run(prepared, _job, step?: TenantStep) {
-      const classification = { attempted: false, failed: false, tokens: 0 };
+      const classification = { attempted: false, failed: false, tokens: 0, refused: undefined as "daily_ceiling" | "budget_unavailable" | undefined };
       const classify =
         prepared.categories.length === 0
           ? undefined
@@ -121,7 +131,15 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
               trace.getTracer("nominara.discovery").startActiveSpan("discovery.classify_category", async (span) => {
                 classification.attempted = true;
                 try {
-                  const result = await classifyCategory(siteText, prepared.categories, embedderFor());
+                  const admitted = await budget.admit(siteText);
+                  if (admitted.status === "refused") {
+                    // Not classified, with the reason; the pass carries on. No provider call, and nothing charged to the workspace.
+                    classification.refused = admitted.reason;
+                    span.setAttribute("nominara.discovery.category_refused", admitted.reason);
+                    return null;
+                  }
+                  const result = await classifyCategory(admitted.text, prepared.categories, embedderFor());
+                  await budget.settle(admitted.reservedTokens, result?.tokens ?? 0);
                   span.setAttribute("nominara.discovery.category_found", result !== null);
                   classification.tokens += result?.tokens ?? 0;
                   return result;
@@ -169,7 +187,11 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
       const category = result.fields.category;
       const outcome = categoryIsDecided(prepared.payload.fieldsSupplied, prepared.humanDecided)
         ? "supplied"
-        : classification.failed
+        : classification.refused !== undefined
+          ? classification.refused === "daily_ceiling"
+            ? "budget_exhausted"
+            : "budget_unavailable"
+          : classification.failed
           ? "failed"
           : category === undefined
             ? "none"
@@ -177,6 +199,15 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
               ? "low_confidence"
               : "proposed";
       incrementCounter("nominara_discovery_category_total", { outcome });
+      if (classification.refused !== undefined) {
+        // Workspace and project IDs only. The alert is fixed text plus IDs and numbers (see Pager).
+        logger.warn(`workspace ${prepared.payload.workspaceId} project ${prepared.payload.projectId}: category not classified (${classification.refused})`);
+        emailAlert("category classification skipped: the daily embedding token ceiling is reached or its counter is unreadable", {
+          alertName: CATEGORY_EMBED_ALERT_NAME,
+          reason: classification.refused,
+          ceilingTokens: budget.ceiling,
+        });
+      }
       // What the provider reported for this pass. The budget is stated, not metered to the workspace: one site text of at most
       // MAX_CLASSIFICATION_TEXT_CHARS, plus the category vectors once per process and model.
       if (classification.attempted && classification.tokens > 0) observeValue("nominara_discovery_category_embed_tokens", classification.tokens);
