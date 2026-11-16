@@ -598,6 +598,16 @@ describe("NEW-C-9 · crawl.audit handler (site-file stage)", () => {
     expect(a.robots_hash.toString("hex")).toBe((await import("node:crypto")).createHash("sha256").update(hostile).digest("hex"));
   });
 
+  it("STORY-049 AC4 · the robots.txt snapshot is stored VERBATIM: CRLF, tabs, control characters and no final newline survive, and the stored text hashes to robots_hash", async () => {
+    const verbatim = "\uFEFFUser-agent: *\r\nDisallow:\t/private  \r\n# note \u0001 \u0085\r\nAllow: /";
+    await run(job(), depsServing(healthy(verbatim)));
+    const [a] = await audits();
+    expect(a.status === "completed" || a.status === "partial").toBe(true);
+    expect(a.robots_snapshot).toBe(verbatim);
+    const { createHash: sha } = await import("node:crypto");
+    expect(sha("sha256").update(Buffer.from(a.robots_snapshot, "utf8")).digest().equals(a.robots_hash)).toBe(true);
+  });
+
   it("STORY-049 AC12 · storage that is not configured fails the pages (storage_unavailable), not the audit: the site-file findings are still written", async () => {
     const { store: _configured, ...deps } = depsServing(healthy(BLOCKED));
     void _configured;
