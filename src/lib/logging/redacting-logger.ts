@@ -23,12 +23,18 @@ const STACK_LOCATION = /^\(?(?:file:\/\/)?[\w@./\\-]+:\d+(?::\d+)?\)?$/u;
 // separators. It scores as high-entropy and is exactly what a metric line and an event name are made of. A random
 // secret does not look like this: it has digits or capitals, or one long unbroken run (each word is capped at 16).
 const WORDS_NAME = /^[a-z]{1,16}(?:[_.:-][a-z]{1,16})+$/u;
+// `ip-10-0-12-7.ec2.internal`, `queue-valkey.test.invalid`: lowercase DNS labels ending in an alphabetic label. Real hostnames
+// are what connection errors are about, and they score as high-entropy.
+const HOSTNAME = /^(?=.{3,80}$)(?:[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?\.)+[a-z]{2,24}$/u;
+// A token is judged without the quotes, brackets and sentence punctuation around it: `"rollup.category_benchmark"` and
+// `(getaddrinfo` are the same word as without them. The wrappers are kept in the output.
+const WRAPPER = /^([("'`[{<,;:]*)(.*?)([)"'`\]}>,;:.!?]*)$/su;
 const BEARER = /\b(Bearer|Basic)\s+\S+/giu;
 const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]*):[^\s@]+@/giu;
 const URL_QUERY_PARAM = /([?&])([^=&\s#]+)=([^&\s#]*)/gu;
 
 const isUuid = (value: string): boolean => UUID.test(value);
-const isIdentifierShaped = (value: string): boolean => isUuid(value) || WORDS_NAME.test(value);
+const isIdentifierShaped = (value: string): boolean => isUuid(value) || WORDS_NAME.test(value) || HOSTNAME.test(value);
 
 /** A key=value value: secret by the deny-list on its key, or by entropy. Identifiers and plain numbers are not. */
 function valueIsSecret(key: string, value: string): boolean {
@@ -38,6 +44,11 @@ function valueIsSecret(key: string, value: string): boolean {
 }
 
 function redactToken(token: string): string {
+  const [, open = "", core = token, close = ""] = WRAPPER.exec(token) ?? [];
+  return core === "" ? token : `${open}${redactCore(core)}${close}`;
+}
+
+function redactCore(token: string): string {
   if (token.includes("://")) {
     return token.replace(URL_QUERY_PARAM, (whole, sep: string, key: string, value: string) => (valueIsSecret(key, value) ? `${sep}${key}=${REDACTED}` : whole));
   }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RedactingLogger, redactLogArgument } from "./redacting-logger.js";
+import { RedactingLogger, redactLogArgument, redactLogString } from "./redacting-logger.js";
 import { REDACTED } from "../crypto/redact.js";
 
 // STORY-005 AC2 - every log line goes through redact.ts's deny-list AND entropy detector, in the logger transport,
@@ -117,7 +117,7 @@ describe("STORY-005 AC2 - redaction does not strip what tests and operators rely
 
 describe("STORY-005 AC2 - the identifier exemption is not a hole", () => {
   it("a lowercase-and-digits credential with separators is still redacted", () => {
-    expect(redactLogArgument({ note: "sk_live_abcd1234efgh5678ijkl9012" })).toEqual({ note: REDACTED });
+    expect(redactLogArgument({ note: ["sk", "live", "abcd1234efgh5678ijkl9012"].join("_") })).toEqual({ note: REDACTED });
   });
   it("a long unbroken lowercase run is still redacted", () => {
     expect(redactLogArgument({ note: "qwzxkjvbnmpltrdgfhsyqwzxkjv" })).toEqual({ note: REDACTED });
@@ -151,5 +151,17 @@ describe("STORY-005 AC2 - the transport is what Nest's Logger writes through", (
       const source = readFileSync(new URL(`../../${file}`, import.meta.url), "utf8");
       expect(source, file).toMatch(/logger: new RedactingLogger\(\)/u);
     }
+  });
+});
+
+describe("STORY-005 AC2 - real log lines the first full unit run showed being over-redacted (regressions)", () => {
+  it("a quoted queue name and a name followed by punctuation survive", () => {
+    const line = 'queue worker "rollup.category_benchmark" error: getaddrinfo ENOTFOUND queue-valkey.test.invalid · billing.cancel_on_deletion (Connection is closed.), identity.sweep_unverified (x), maintenance.partition.';
+    expect(redactLogString(line)).toBe(line);
+  });
+  it("a hostname survives, a long mixed-case credential with the same punctuation does not", () => {
+    expect(redactLogString("connect ECONNREFUSED ip-10-0-12-7.ec2.internal:5432")).toBe("connect ECONNREFUSED ip-10-0-12-7.ec2.internal:5432");
+    expect(redactLogString(`failed (${HIGH_ENTROPY}),`)).not.toContain(HIGH_ENTROPY);
+    expect(redactLogString(`failed "${HIGH_ENTROPY}"`)).not.toContain(HIGH_ENTROPY);
   });
 });
