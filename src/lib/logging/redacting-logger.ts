@@ -33,6 +33,16 @@ const BEARER = /\b(Bearer|Basic)\s+\S+/giu;
 const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]*):[^\s@]+@/giu;
 const URL_QUERY_PARAM = /([?&])([^=&\s#]+)=([^&\s#]*)/gu;
 
+// `password: x`, `"apiKey":"x"`, `x-api-key: x`, `secret=x`: a key, optional quotes, `:` or `=`, then a quoted or bare value. Only a
+// key the deny-list matches is touched (the callback decides), and the key and quotes are kept so the line stays readable.
+const KEY_VALUE = /(["']?)([\w.-]+)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s"',;&}\]]+)/gu;
+// A prefixed identifier is `name:uuid`, `queue/uuid`, `ws:uuid`: every `:` / `/` segment is a UUID or a plain word.
+const WORD = /^[a-z]{1,16}(?:[_.-][a-z]{1,16})*$/u;
+
+// `audit-export-2026-11-16T02-55-00-123Z.jsonl`: a file or directory name of short lowercase words, numbers and timestamp
+// fragments joined by `-` `_` `.`. A random path secret is one unbroken mixed run, so it has no such parts.
+const PATH_NAME_PART = /^(?:[a-z]{1,16}|\d{1,6}|\d{2}T\d{2}|\d{3}Z)$/u;
+
 const isUuid = (value: string): boolean => UUID.test(value);
 const isIdentifierShaped = (value: string): boolean => isUuid(value) || WORDS_NAME.test(value) || HOSTNAME.test(value);
 
@@ -43,6 +53,34 @@ function valueIsSecret(key: string, value: string): boolean {
   return !isIdentifierShaped(value) && isHighEntropySecret(value);
 }
 
+function redactKeyValues(text: string): string {
+  return text.replace(KEY_VALUE, (whole, quote: string, key: string, glue: string, raw: string) => {
+    if (!SECRET_KEY_PATTERN.test(key) || raw === REDACTED) return whole;
+    const wrapper = raw.startsWith('"') || raw.startsWith("'") ? raw[0] : "";
+    const value = wrapper === "" ? raw : raw.slice(1, -1);
+    if (value === REDACTED || !valueIsSecret(key, value)) return whole;
+    return `${quote}${key}${quote}${glue}${wrapper}${REDACTED}${wrapper}`;
+  });
+}
+
+function isPrefixedIdentifier(token: string): boolean {
+  const segments = token.split(/[:/]/u);
+  return segments.length > 1 && segments.every((segment) => isUuid(segment) || WORD.test(segment));
+}
+
+/** `scheme://host/seg/seg?query`: scheme and host are kept; each path segment is judged on its own; query params by key. */
+function redactUrl(token: string): string {
+  const match = /^([a-z][a-z0-9+.-]*:\/\/[^/?#]*)([^?#]*)(.*)$/isu.exec(token);
+  if (match === null) return token;
+  const [, origin = "", path = "", rest = ""] = match;
+  const safePath = path
+    .split("/")
+    .map((segment) => (segment === "" || STACK_LOCATION.test(segment) || isIdentifierShaped(segment) || segment.split(/[-_.]/u).every((part) => PATH_NAME_PART.test(part)) ? segment : isHighEntropySecret(segment) ? REDACTED : segment))
+    .join("/");
+  const safeRest = rest.replace(URL_QUERY_PARAM, (whole, sep: string, key: string, value: string) => (valueIsSecret(key, value) ? `${sep}${key}=${REDACTED}` : whole));
+  return `${origin}${safePath}${safeRest}`;
+}
+
 function redactToken(token: string): string {
   const [, open = "", core = token, close = ""] = WRAPPER.exec(token) ?? [];
   return core === "" ? token : `${open}${redactCore(core)}${close}`;
@@ -50,9 +88,9 @@ function redactToken(token: string): string {
 
 function redactCore(token: string): string {
   if (token.includes("://")) {
-    return token.replace(URL_QUERY_PARAM, (whole, sep: string, key: string, value: string) => (valueIsSecret(key, value) ? `${sep}${key}=${REDACTED}` : whole));
+    return redactUrl(token);
   }
-  if (STACK_LOCATION.test(token) || isIdentifierShaped(token)) return token;
+  if (STACK_LOCATION.test(token) || isIdentifierShaped(token) || isPrefixedIdentifier(token)) return token;
   const eq = token.indexOf("=");
   if (eq > 0) {
     const key = token.slice(0, eq);
@@ -63,10 +101,18 @@ function redactCore(token: string): string {
 }
 
 export function redactLogString(text: string): string {
-  return text
-    .replace(BEARER, `$1 ${REDACTED}`)
-    .replace(URL_CREDENTIALS, `$1:${REDACTED}@`)
-    .replace(/\S+/gu, redactToken);
+  const keyed = redactKeyValues(text.replace(BEARER, `$1 ${REDACTED}`).replace(URL_CREDENTIALS, `$1:${REDACTED}@`));
+  // A token is split at each redaction already made, so a marker inside `{"apiKey":"[redacted]"}` does not make the
+  // entropy check blank the whole token, and a second secret in the same token is still judged.
+  return keyed.replace(/\S+/gu, (token) => (token.includes("://") ? redactToken(token) : token.split(REDACTED).map(redactToken).join(REDACTED)));
+}
+
+function redactEntry(key: string, child: unknown, seen: WeakSet<object>): unknown {
+  const secretKey = SECRET_KEY_PATTERN.test(key);
+  if (!secretKey || child === null || child === undefined || typeof child === "number" || typeof child === "boolean") return redact(child, seen);
+  if (ID_KEY.test(key) && typeof child === "string" && isUuid(child)) return child;
+  if (typeof child === "string" || typeof child === "object") return REDACTED;
+  return redact(child, seen);
 }
 
 function redact(value: unknown, seen: WeakSet<object>): unknown {
@@ -80,22 +126,19 @@ function redact(value: unknown, seen: WeakSet<object>): unknown {
       const copy = new Error(redactLogString(value.message));
       copy.name = value.name;
       if (value.stack !== undefined) copy.stack = redactLogString(value.stack);
+      // code, detail, constraint, statusCode, $metadata: the properties that say WHY it failed. Each goes through the same
+      // per-key rules as a plain object. `cause` is non-enumerable when set by the constructor, so it is read explicitly.
+      for (const [key, child] of Object.entries(value)) {
+        if (key !== "message" && key !== "stack") Object.assign(copy, { [key]: redactEntry(key, child, seen) });
+      }
+      if ("cause" in value && value.cause !== undefined) {
+        Object.defineProperty(copy, "cause", { value: redact(value.cause, seen), enumerable: false, writable: true, configurable: true });
+      }
       return copy;
     }
     if (Array.isArray(value)) return value.map((item) => redact(item, seen));
     const result: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value)) {
-      const secretKey = SECRET_KEY_PATTERN.test(key);
-      if (!secretKey || child === null || child === undefined || typeof child === "number" || typeof child === "boolean") {
-        result[key] = redact(child, seen);
-      } else if (ID_KEY.test(key) && typeof child === "string" && isUuid(child)) {
-        result[key] = child;
-      } else if (typeof child === "string" || typeof child === "object") {
-        result[key] = REDACTED;
-      } else {
-        result[key] = redact(child, seen);
-      }
-    }
+    for (const [key, child] of Object.entries(value)) result[key] = redactEntry(key, child, seen);
     return result;
   } finally {
     seen.delete(value);

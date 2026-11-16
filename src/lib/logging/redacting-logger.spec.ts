@@ -165,3 +165,59 @@ describe("STORY-005 AC2 - real log lines the first full unit run showed being ov
     expect(redactLogString(`failed "${HIGH_ENTROPY}"`)).not.toContain(HIGH_ENTROPY);
   });
 });
+
+describe("batch 18 fix - redaction gaps found in review", () => {
+  it("(a) a secret in `key: value`, quoted JSON and header-dump form is redacted; the key survives", () => {
+    expect(redactLogString("password: hunter2xyz")).toBe(`password: ${REDACTED}`);
+    expect(redactLogString('{"apiKey":"sk_test_abc123"}')).toBe(`{"apiKey":"${REDACTED}"}`);
+    expect(redactLogString("x-api-key: abcdefabcdefabcdef12")).toBe(`x-api-key: ${REDACTED}`);
+    expect(redactLogString('{"password": "my pass phrase", "user": "bob"}')).toBe(`{"password": "${REDACTED}", "user": "bob"}`);
+  });
+  it("(a) counts and id-keyed UUIDs under a secret-looking key stay in the free-text form too", () => {
+    expect(redactLogString("token_count: 5")).toBe("token_count: 5");
+    expect(redactLogString(`share_token_id=${UUID}`)).toBe(`share_token_id=${UUID}`);
+  });
+  it("(b) a secret in a URL path segment is redacted; scheme, host and ordinary segments survive", () => {
+    const out = redactLogString("hook https://hooks.slack.com/services/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");
+    expect(out).not.toContain("xK9mQ2vL8pR4tW7yB3nZ5cF1");
+    expect(out).toContain("https://hooks.slack.com/services/");
+    const s3 = "s3://bucket/audit-exports/2026-11-16/audit-export-2026-11-16T02-55-00-123Z.jsonl";
+    expect(redactLogString(s3)).toBe(s3);
+  });
+  it("(c) prefixed identifiers (name:uuid, queue:uuid, ws:uuid) survive", () => {
+    for (const id of [`capture.parse:${UUID}`, `queue:${UUID}`, `ws:${UUID}`, `queue/${UUID}`]) {
+      expect(redactLogString(`job ${id} ok`)).toBe(`job ${id} ok`);
+    }
+  });
+  it("(c) a prefix does not launder a secret, and a sha256 hex digest stays redacted (deliberate: fail closed)", () => {
+    expect(redactLogString(`queue:${HIGH_ENTROPY}`)).not.toContain(HIGH_ENTROPY);
+    const sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    expect(redactLogString(`hash ${sha}`)).toBe(`hash ${REDACTED}`);
+  });
+  it("(d) an Error keeps its own properties (redacted) and its cause chain", () => {
+    const err = Object.assign(new Error("boom"), {
+      code: "23505",
+      constraint: "uq_x",
+      statusCode: 409,
+      $metadata: { requestId: "r-1", apiKey: "zz" },
+      password: "hunter2",
+    });
+    err.cause = new Error("db password=abc123");
+    const out = redactLogArgument(err) as Error & Record<string, unknown>;
+    expect(out).toBeInstanceOf(Error);
+    expect(out.code).toBe("23505");
+    expect(out.constraint).toBe("uq_x");
+    expect(out.statusCode).toBe(409);
+    expect(out.$metadata).toEqual({ requestId: "r-1", apiKey: REDACTED });
+    expect(out.password).toBe(REDACTED);
+    expect((out.cause as Error).message).not.toContain("abc123");
+    expect((out.cause as Error).message).toContain("db password=");
+    expect(err.password).toBe("hunter2");
+  });
+});
+
+describe("batch 18 fix - a URL with credentials keeps its host", () => {
+  it("postgres://user:pw@host:port/db redacts only the password", () => {
+    expect(redactLogString("connect postgres://app:Sup3rS3cr3t@db.prod.internal:5432/x")).toBe(`connect postgres://app:${REDACTED}@db.prod.internal:5432/x`);
+  });
+});
