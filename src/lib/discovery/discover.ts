@@ -12,7 +12,7 @@ import { isSameSite, proposeCompetitors, selectComparisonPages } from "./competi
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { extractHtmlSignals, type ComparisonLink } from "./html-signals.js";
-import { crawlGatedFetch, type FetchLike } from "../net/crawl-gate.js";
+import { CrawlRefusal, crawlGatedFetch, type FetchLike } from "../net/crawl-gate.js";
 import { collectSitemap, SitemapFetchSkipped } from "../aux/sitemap.js";
 import { isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../net/robots.js";
 import { detectPlatform, GENERATOR_CONFIDENCE } from "./platform.js";
@@ -427,7 +427,8 @@ async function deriveSiteFileMetadata(
 }
 
 /**
- * STORY-190 - opens the comparison pages the home page links to, through the guarded fetcher (`deps.fetch`), at most 3, same registrable
+ * STORY-190 - opens the comparison pages the home page links to, through the crawl gate (robots.txt + per-host budget, decisions 70(d) /
+ * 106(g)) over the guarded fetcher (`deps.gatedFetch`; production always supplies it, `deps.fetch` stands in only for a caller that did not), at most 3, same registrable
  * domain only. Concurrent, all inside ONE shared budget: a page that does not answer in what is left is skipped, and nothing here throws.
  * No transaction is open (the caller is the run phase); public pages only (a plain GET, no credentials, no forms); counts and ids only.
  */
@@ -439,6 +440,7 @@ async function fetchComparisonPages(
 ): Promise<{ url: string; html: string }[]> {
   const selection = selectComparisonPages(links, input.rootUrl, input.rootDomain);
   if (selection.urls.length === 0 && selection.offSite === 0) return [];
+  const pageFetch: FetchLike = deps.gatedFetch ?? (deps.fetch as FetchLike);
   return trace.getTracer("nominara.discovery").startActiveSpan("discovery.comparison_pages", async (span) => {
     const stats = { fetched: 0, redirectedOff: 0, refused: 0, failed: 0, skippedBudget: 0 };
     const pages: { url: string; html: string }[] = [];
@@ -450,7 +452,7 @@ async function fetchComparisonPages(
           selection.urls.map(async (url) => {
             try {
               const response = await withinBudget(
-                deps.fetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootUrl, input.rootDomain) }),
+                pageFetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootUrl, input.rootDomain) }),
                 budgetMs,
               );
               if (response.status >= 300 && response.status < 400) {
@@ -464,7 +466,7 @@ async function fetchComparisonPages(
                 pages.push({ url: response.finalUrl, html: response.body.toString("utf8") });
               }
             } catch (error) {
-              if (error instanceof GuardedFetchRefusal) stats.refused += 1;
+              if (error instanceof GuardedFetchRefusal || error instanceof CrawlRefusal) stats.refused += 1;
               else if (error instanceof Error && error.message === BUDGET_EXCEEDED) stats.skippedBudget += 1;
               else stats.failed += 1;
             }

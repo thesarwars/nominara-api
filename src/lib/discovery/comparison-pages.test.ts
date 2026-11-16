@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { discover, DISCOVERY_BUDGET_MS, type DiscoverDeps } from "./discover.js";
 import { MAX_PROPOSED_COMPETITORS, proposeCompetitors, selectComparisonPages } from "./competitors.js";
 import { GuardedFetchRefusal } from "../net/guarded-fetch.js";
+import { CrawlRefusal, createCrawlGate } from "../net/crawl-gate.js";
 import { incrementCounter } from "../telemetry/metrics.js";
 
 vi.mock("../telemetry/metrics.js", () => ({ observeValue: vi.fn(), incrementCounter: vi.fn() }));
@@ -206,6 +207,42 @@ describe("STORY-190 · discover() opens comparison pages through the guarded fet
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("STORY-043 AC10 / decisions 70(d), 106(g) - comparison pages are read through the crawl gate, never the bare fetcher; a robots-disallowed one is not fetched", async () => {
+    const bare = serving({
+      "https://hubspot.com": home,
+      "https://hubspot.com/compare": `<h1>HubSpot vs Salesforce</h1>`,
+      "https://hubspot.com/alternatives": `<table><tr><th>HubSpot</th><th>Pipedrive</th></tr></table>`,
+    });
+    // The real gate over the bare fetcher: robots.txt disallows /alternatives.
+    const underneath = vi.fn(async (url: string, init?: unknown) => {
+      if (url.endsWith("/robots.txt")) return { status: 200, headers: {}, body: Buffer.from("User-agent: *\nDisallow: /alternatives\n"), finalUrl: url, redirectChain: [] };
+      return (bare.fetch as unknown as (u: string, i?: unknown) => Promise<unknown>)(url, init) as never;
+    });
+    const gate = createCrawlGate({ fetch: underneath as never });
+    const gatedSpy = vi.fn(gate);
+    const bareCalls: string[] = [];
+    const bareOnly = async (url: string) => {
+      bareCalls.push(url);
+      if (url !== "https://hubspot.com") throw new Error(`the bare fetcher was used for ${url}`);
+      return { status: 200, headers: { "content-type": "text/html" }, body: Buffer.from(home), finalUrl: url };
+    };
+    const result = await discover(BASE, { fetch: bareOnly as never, gatedFetch: gatedSpy as never, now: () => Date.now() });
+    expect(result.competitors_proposed.map((c) => c.name)).toEqual(["Salesforce"]);
+    expect(gatedSpy.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining(["https://hubspot.com/compare", "https://hubspot.com/alternatives"]));
+    expect(bareCalls).toEqual(["https://hubspot.com"]); // only the home page uses the bare fetcher
+    expect(underneath.mock.calls.map((c) => c[0])).not.toContain("https://hubspot.com/alternatives"); // disallowed: never requested
+  });
+
+  it("STORY-043 AC10 - a gate refusal on a comparison page is counted as refused, not failed", async () => {
+    const seen: unknown[] = [];
+    const bare = serving({ "https://hubspot.com": home });
+    const gated = vi.fn(async () => {
+      throw new CrawlRefusal("robots_disallowed");
+    });
+    await discover(BASE, { fetch: bare.fetch as never, gatedFetch: gated as never, now: () => Date.now(), onComparisonPages: (s) => seen.push(s) });
+    expect(seen).toEqual([expect.objectContaining({ refused: 2, failed: 0, fetched: 0 })]);
   });
 
   it("AC4 - supplied competitors: nothing proposed and no comparison page is fetched", async () => {
