@@ -539,6 +539,9 @@ export const envSchema = z
     // because NODE_ENV cannot name a deployment (staging); a lowercase slug, defaulting to NODE_ENV.
     // `crawl` stays reserved (it was the leading segment of the old crawl layout, `crawl/{env}/{ws}/…`, and the reservation keeps
     // a leftover old-layout key unambiguous); the crawl namespace is now `{env}/{ws}/crawl/…`.
+    // STORY-020 AC8 - the Object Lock bucket of the nightly audit export. It must be created WITH Object Lock enabled (a deploy prerequisite);
+    // it reuses the STORAGE_* endpoint, region, credentials and encryption. Unset = the `audit.export` job has no sink (it fails closed in production).
+    AUDIT_EXPORT_BUCKET: requiredString.optional(),
     STORAGE_KEY_ENV: z
       .string()
       .regex(/^[a-z0-9][a-z0-9-]{0,31}$/, { message: "must be a lowercase slug of at most 32 characters" })

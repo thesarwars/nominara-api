@@ -68,6 +68,11 @@ export const QUEUE_SCHEDULES: readonly QueueSchedule[] = [
   // estate-wide walks do not contend for the same connections.
   { queue: "audit.verify", cron: "40 2 * * *", statedAs: "security-and-tenancy.md §12: verifier re-walks each chain daily" },
 
+  // ⚠ NOT FROM §4 - STORY-020 AC8, security-and-tenancy.md section 12: the nightly audit export under Object Lock COMPLIANCE mode. The
+  // reference says "nightly" and gives no hour; THE HOUR IS A CHOICE: 02:55 UTC, after the verifier (02:40) and the unverified sweep (02:50)
+  // in the same quiet window, so the export copies chains the verifier has just walked; :55 and not :00 for the reason §6.1 gives `capture.plan` :05.
+  { queue: "audit.export", cron: "55 2 * * *", statedAs: "security-and-tenancy.md §12: nightly export to object storage, Object Lock COMPLIANCE" },
+
   // ⚠ NOT FROM §4 EITHER — STORY-173's stale-unverified-account sweep, daily by
   // owner decision (2026-10-05). 02:50 UTC: the same quiet window as the audit
   // verifier (02:40) and the partition tick (03:20), ten minutes after the
