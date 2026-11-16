@@ -2,7 +2,7 @@ import { Logger } from "@nestjs/common";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { parse, type DefaultTreeAdapterMap } from "parse5";
 import { toRegistrableDomain } from "../net/registrable-domain.js";
-import { observeValue } from "../telemetry/metrics.js";
+import { incrementCounter, observeValue } from "../telemetry/metrics.js";
 import { sanitiseText } from "./sanitise.js";
 import type { Tokenizer, TokenizerIdentity } from "./tokenizer.js";
 
@@ -40,23 +40,29 @@ export interface StructuredItem {
   readonly properties: Record<string, unknown[]>;
 }
 
+/**
+ * A malformation in one of the three structured-data formats, captured instead of discarded (STORY-050 AC5: "a parse error is itself a finding").
+ * Each format has its own closed set of reasons, defined and documented beside its checker below (JSON-LD: `extractJsonLd`; microdata:
+ * MICRODATA_ERRORS; RDFa: RDFA_ERRORS). The error cases are the ones the formats' own specifications define as invalid. Anything a lenient reader
+ * would still make sense of but a validator would only warn about is NOT an error here.
+ */
 export interface ParseError {
-  /**
-   * Only JSON-LD has a syntax to get wrong. Microdata and RDFa are read leniently: an orphan `itemprop`, a missing `vocab` and an
-   * `itemref` raise no error (and `itemref` properties are not collected). A malformation check for them is a specification gap, not
-   * a silent omission — see STORY-050.
-   */
-  readonly format: "jsonld";
+  readonly format: "jsonld" | "microdata" | "rdfa";
   /** Which copy the broken markup was in. A parse error in the plain copy is a finding even when the rendered copy is clean. */
   readonly variant: "raw" | "rendered";
-  /** Ordinal of the offending block among that format's blocks in the document. */
+  /**
+   * Ordinal of the offending block (JSON-LD: among the document's ld+json scripts) or element (microdata: among elements carrying an item* attribute;
+   * RDFa: among elements carrying typeof, property, prefix or vocab), in document order.
+   */
   readonly index: number;
-  readonly reason: "invalid_json" | "empty" | "not_object_or_array";
-  /** Character offset the JSON parser reported, or null when it did not report one. */
+  readonly reason: JsonLdErrorReason | MicrodataErrorReason | RdfaErrorReason;
+  /** Character offset the JSON parser reported, or null when it did not report one (always null for microdata and RDFa: they have no parse offset). */
   readonly position: number | null;
-  /** The first characters of the block, so the finding can quote it. */
+  /** JSON-LD: the first characters of the block. Microdata and RDFa: the offending attribute as written. Bounded and sanitised, never the page's text. */
   readonly snippet: string;
 }
+
+export type JsonLdErrorReason = "invalid_json" | "empty" | "not_object_or_array";
 
 export interface StructuredData {
   jsonLd: unknown[];
@@ -368,7 +374,7 @@ function extractJsonLd(doc: Node, variant: "raw" | "rendered", out: StructuredDa
     const text = childrenOf(el).filter(isText).map((t) => t.value).join("");
     const at = index;
     index += 1;
-    const fail = (reason: ParseError["reason"], position: number | null): void => {
+    const fail = (reason: JsonLdErrorReason, position: number | null): void => {
       out.parseErrors.push({ format: "jsonld", variant, index: at, reason, position, snippet: sanitiseText(text.trim(), SNIPPET_CHARS) });
     };
     if (text.trim() === "") return fail("empty", null);
@@ -393,6 +399,8 @@ interface ItemSyntax {
   typeOf(el: Element): string | undefined;
   valueOf(el: Element): string;
   vocabOf?(el: Element): string | undefined;
+  /** Microdata only: the ids an item also takes its properties from (`itemref`). */
+  refsOf?(el: Element): string[];
 }
 
 const URL_VALUE: Readonly<Record<string, string>> = { audio: "src", embed: "src", iframe: "src", img: "src", source: "src", track: "src", video: "src", a: "href", area: "href", link: "href", object: "data" };
@@ -401,6 +409,8 @@ const MICRODATA: ItemSyntax = {
   isScope: (el) => attrOf(el, "itemscope") !== undefined,
   nameOf: (el) => attrOf(el, "itemprop"),
   typeOf: (el) => attrOf(el, "itemtype"),
+  // WHATWG HTML 5.4.1: itemref is read on an element with itemscope only; elsewhere it is an error (itemref_without_itemscope) and contributes nothing.
+  refsOf: (el) => (attrOf(el, "itemscope") === undefined ? [] : names(attrOf(el, "itemref") ?? "")),
   valueOf: (el) => {
     if (el.tagName === "meta") return sanitiseText(attrOf(el, "content") ?? "");
     const attr = URL_VALUE[el.tagName];
@@ -434,29 +444,68 @@ const RDFA: ItemSyntax = {
 
 const names = (value: string): string[] => value.split(/\s+/u).filter((n) => n !== "");
 
-function buildItem(scope: Element, syntax: ItemSyntax): StructuredItem {
-  const props = new Map<string, unknown[]>();
-  const add = (name: string, value: unknown): void => {
-    const list = props.get(name);
-    if (list === undefined) props.set(name, [value]);
-    else list.push(value);
+/** What a microdata build shares across the items of one document: ids, document order, and what the builds reached. Absent for RDFa. */
+interface MicrodataContext {
+  /** `getElementById`: the FIRST element in tree order wins when an id repeats. */
+  readonly byId: ReadonlyMap<string, Element>;
+  /** Tree-order index of every element: property values are listed in tree order, however they were reached (WHATWG HTML 5.4.1 step "sort results in tree order"). */
+  readonly order: ReadonlyMap<Element, number>;
+  /** Every element carrying an itemprop that some item reached, by descent or by itemref. What is left over is an orphan. */
+  readonly claimed: Set<Element>;
+  /** Items being built right now (the stack): reaching one again through an itemref is a cycle. */
+  readonly building: Set<Element>;
+  /** The itemprop-and-itemscope elements an itemref led back into. */
+  readonly cyclic: Set<Element>;
+}
+
+function buildItem(scope: Element, syntax: ItemSyntax, ctx?: MicrodataContext): StructuredItem {
+  const entries: { order: number; name: string; value: unknown }[] = [];
+  const seen = new Set<Element>();
+  ctx?.building.add(scope);
+
+  const visit = (child: Element): void => {
+    if (INVISIBLE.has(child.tagName) || seen.has(child)) return;
+    seen.add(child);
+    const nameAttr = syntax.nameOf(child);
+    const scoped = syntax.isScope(child);
+    if (nameAttr !== undefined) {
+      ctx?.claimed.add(child);
+      if (scoped && ctx?.building.has(child) === true) {
+        // An itemref led back into an item that is still being built: cut here, or it would never end. Reported as itemref_cycle.
+        ctx.cyclic.add(child);
+        return;
+      }
+      const value = scoped ? buildItem(child, syntax, ctx) : syntax.valueOf(child);
+      const at = ctx?.order.get(child) ?? 0;
+      for (const n of names(nameAttr)) entries.push({ order: at, name: sanitiseText(n), value });
+      if (scoped) return;
+    } else if (scoped) {
+      return; // an item of its own, not a property of this one
+    }
+    collect(child);
   };
   const collect = (node: Node): void => {
-    for (const child of childrenOf(node)) {
-      if (!isElement(child) || INVISIBLE.has(child.tagName)) continue;
-      const nameAttr = syntax.nameOf(child);
-      const scoped = syntax.isScope(child);
-      if (nameAttr !== undefined) {
-        const value = scoped ? buildItem(child, syntax) : syntax.valueOf(child);
-        for (const n of names(nameAttr)) add(sanitiseText(n), value);
-        if (scoped) continue;
-      } else if (scoped) {
-        continue; // an item of its own, not a property of this one
-      }
-      collect(child);
-    }
+    for (const child of childrenOf(node)) if (isElement(child)) visit(child);
   };
+
   collect(scope);
+  // itemref (microdata): the elements it names are walked as if they were children of the item. An id that names nothing is skipped here and reported
+  // by the checker (itemref_missing_id).
+  if (ctx !== undefined) {
+    for (const id of syntax.refsOf?.(scope) ?? []) {
+      const target = ctx.byId.get(id);
+      if (target !== undefined) visit(target);
+    }
+  }
+  ctx?.building.delete(scope);
+
+  // Tree order, stable: an itemref target ahead of the scope comes first, as it does in the document.
+  const props = new Map<string, unknown[]>();
+  for (const e of ctx === undefined ? entries : [...entries].sort((x, y) => x.order - y.order)) {
+    const list = props.get(e.name);
+    if (list === undefined) props.set(e.name, [e.value]);
+    else list.push(e.value);
+  }
   const type = syntax.typeOf(scope);
   const vocab = syntax.vocabOf?.(scope);
   return {
@@ -466,12 +515,12 @@ function buildItem(scope: Element, syntax: ItemSyntax): StructuredItem {
   };
 }
 
-function extractItems(doc: Node, syntax: ItemSyntax): StructuredItem[] {
+function extractItems(doc: Node, syntax: ItemSyntax, ctx?: MicrodataContext): StructuredItem[] {
   const items: StructuredItem[] = [];
   walk(doc, (el) => {
     if (INVISIBLE.has(el.tagName) && el.tagName !== "head") return false;
     if (syntax.isScope(el) && syntax.nameOf(el) === undefined) {
-      items.push(buildItem(el, syntax));
+      items.push(buildItem(el, syntax, ctx));
       // Keep walking: a top-level item inside another item's markup is still a top-level item.
     }
     return undefined;
@@ -479,11 +528,185 @@ function extractItems(doc: Node, syntax: ItemSyntax): StructuredItem[] {
   return items;
 }
 
+function microdataContext(doc: Node): MicrodataContext {
+  const byId = new Map<string, Element>();
+  const order = new Map<Element, number>();
+  walk(doc, (el) => {
+    order.set(el, order.size);
+    const id = attrOf(el, "id");
+    if (id !== undefined && id !== "" && !byId.has(id)) byId.set(id, el);
+  });
+  return { byId, order, claimed: new Set(), building: new Set(), cyclic: new Set() };
+}
+
+/** The elements a structured-data check looks at: the document's, minus what a reader never sees (script, style, noscript, template), `head` included. */
+function walkVisible(doc: Node, visit: (el: Element) => void): void {
+  walk(doc, (el) => {
+    if (INVISIBLE.has(el.tagName) && el.tagName !== "head") return false;
+    visit(el);
+    return undefined;
+  });
+}
+
+/** `name="value"` as written, bounded and sanitised: what a finding quotes. Never the element's text. */
+const attrSnippet = (name: string, value: string): string => sanitiseText(`${name}="${value}"`, SNIPPET_CHARS);
+
+// --- Microdata -------------------------------------------------------------------------------------------------------------
+//
+// MICRODATA_ERRORS - the cases WHATWG HTML 5.4 (Microdata) defines as invalid, and nothing more:
+//   itemprop_outside_scope        an element with itemprop that no item reaches: it has no itemscope ancestor and no itemref names it (or an ancestor of it)
+//   empty_itemprop                an itemprop whose value has no name tokens (a property named by nothing)
+//   itemref_missing_id            an itemref token naming an id that is not in the document (one error per missing id)
+//   itemref_without_itemscope     itemref on an element that has no itemscope (the spec reads itemref only on an item)
+//   itemtype_without_itemscope    itemtype on an element that has no itemscope (the spec reads itemtype only on an item)
+//   itemref_cycle                 an itemref that leads back into an item still being built; the walk is cut there so it terminates
+// NOT errors (a lenient reader copes, and the spec allows them): an item with no itemtype, an item with no properties, an itemprop whose value is empty,
+// the same property name twice, an unknown itemtype vocabulary (whether a type is a real schema.org type is AUX-R-016's business, not a parse error).
+export type MicrodataErrorReason =
+  | "itemprop_outside_scope"
+  | "empty_itemprop"
+  | "itemref_missing_id"
+  | "itemref_without_itemscope"
+  | "itemtype_without_itemscope"
+  | "itemref_cycle";
+
+function checkMicrodata(doc: Node, variant: "raw" | "rendered", ctx: MicrodataContext, out: StructuredData): void {
+  const marked: Element[] = [];
+  walkVisible(doc, (el) => {
+    if (["itemscope", "itemprop", "itemref", "itemtype"].some((a) => attrOf(el, a) !== undefined)) marked.push(el);
+  });
+
+  // An itemprop that is an item but belongs to nothing is built once, only so the properties inside it are not each reported as orphans too:
+  // one orphan, reported once, however much markup hangs off it.
+  for (const el of marked) {
+    if (attrOf(el, "itemprop") !== undefined && names(attrOf(el, "itemprop")!).length > 0 && !ctx.claimed.has(el) && MICRODATA.isScope(el)) {
+      buildItem(el, MICRODATA, ctx);
+    }
+  }
+
+  marked.forEach((el, index) => {
+    const add = (reason: MicrodataErrorReason, snippet: string): void => {
+      out.parseErrors.push({ format: "microdata", variant, index, reason, position: null, snippet });
+    };
+    const itemprop = attrOf(el, "itemprop");
+    const itemref = attrOf(el, "itemref");
+    const itemtype = attrOf(el, "itemtype");
+    const scoped = MICRODATA.isScope(el);
+
+    if (itemprop !== undefined) {
+      if (names(itemprop).length === 0) add("empty_itemprop", attrSnippet("itemprop", itemprop));
+      else if (!ctx.claimed.has(el)) add("itemprop_outside_scope", attrSnippet("itemprop", itemprop));
+    }
+    if (itemref !== undefined) {
+      if (!scoped) add("itemref_without_itemscope", attrSnippet("itemref", itemref));
+      else for (const id of names(itemref)) if (!ctx.byId.has(id)) add("itemref_missing_id", attrSnippet("itemref", id));
+    }
+    if (itemtype !== undefined && !scoped) add("itemtype_without_itemscope", attrSnippet("itemtype", itemtype));
+    if (ctx.cyclic.has(el)) add("itemref_cycle", attrSnippet("itemref", itemref ?? ""));
+  });
+}
+
+// --- RDFa ------------------------------------------------------------------------------------------------------------------
+//
+// RDFA_ERRORS - the cases RDFa 1.1 Core defines as unresolvable, i.e. where a conforming processor would DROP the triple:
+//   rdfa_missing_vocab                  a bare term (no colon) in typeof or property with no `vocab` in scope and not an initial-context term: it resolves to
+//                                       nothing. Once per element.
+//   rdfa_undeclared_prefix              a CURIE (`prefix:reference`) whose prefix is not declared by a `prefix` attribute or `xmlns:` on the element or an
+//                                       ancestor, and is not in the RDFa initial context
+//   rdfa_malformed_prefix_declaration   a `prefix` attribute that is not whitespace-separated `name: absolute-IRI` pairs
+//   rdfa_malformed_curie                a token with a colon whose prefix is not a valid name, or whose reference is empty (`schema:`)
+// NOT errors: a property with no typeof (it describes the document itself, valid RDFa Lite), an absolute IRI or blank node (`http://...`, `_:b`), the default
+// prefix (`:name`, which resolves to the XHTML vocabulary), an unknown vocabulary or type name, `vocab=""` (it deliberately clears the vocab).
+export type RdfaErrorReason = "rdfa_missing_vocab" | "rdfa_undeclared_prefix" | "rdfa_malformed_prefix_declaration" | "rdfa_malformed_curie";
+
+/** RDFa 1.1 Initial Context prefixes (https://www.w3.org/2011/rdfa-context/rdfa-1.1): declared on every page without any markup. Compared case-insensitively. */
+const RDFA_INITIAL_PREFIXES: ReadonlySet<string> = new Set([
+  "as", "cc", "cnt", "csvw", "ctag", "dc", "dc11", "dcat", "dcterms", "dqv", "duv", "foaf", "gr", "grddl", "ical", "ldp", "ma", "oa", "odrl", "og", "org",
+  "owl", "prov", "qb", "rdf", "rdfa", "rdfs", "rif", "rr", "schema", "sd", "sioc", "skos", "skosxl", "v", "vcard", "void", "wdr", "wdrs", "xhv", "xml", "xsd",
+]);
+/** RDFa 1.1 Initial Context terms (the XHTML vocabulary's reserved words): a bare term that needs no `vocab`. */
+const RDFA_INITIAL_TERMS: ReadonlySet<string> = new Set([
+  "alternate", "appendix", "bookmark", "cite", "chapter", "contents", "copyright", "first", "glossary", "help", "icon", "index", "last", "license", "meta",
+  "next", "prev", "previous", "role", "section", "stylesheet", "subsection", "start", "top", "up", "describedby",
+]);
+
+const PREFIX_NAME = /^[\p{L}_][\p{L}\p{N}_.-]*$/u;
+const ABSOLUTE_IRI = /^[A-Za-z][A-Za-z0-9+.-]*:\S+$/u;
+
+/** `name: iri name: iri`, or null when it is not that. */
+function parsePrefixDeclaration(value: string): string[] | null {
+  const tokens = names(value);
+  if (tokens.length === 0 || tokens.length % 2 !== 0) return null;
+  const declared: string[] = [];
+  for (let i = 0; i < tokens.length; i += 2) {
+    const name = tokens[i]!;
+    if (!name.endsWith(":") || !PREFIX_NAME.test(name.slice(0, -1)) || !ABSOLUTE_IRI.test(tokens[i + 1]!)) return null;
+    declared.push(name.slice(0, -1).toLowerCase());
+  }
+  return declared;
+}
+
+function checkRdfa(doc: Node, variant: "raw" | "rendered", out: StructuredData): void {
+  let index = -1;
+  walkVisible(doc, (el) => {
+    if (!["typeof", "property", "prefix", "vocab"].some((a) => attrOf(el, a) !== undefined)) return;
+    index += 1;
+    const at = index;
+    const add = (reason: RdfaErrorReason, snippet: string): void => {
+      out.parseErrors.push({ format: "rdfa", variant, index: at, reason, position: null, snippet });
+    };
+
+    // What is in scope: the nearest `vocab` (an empty one clears it), and every prefix declared on this element or above it.
+    let vocab: string | undefined;
+    let vocabFound = false;
+    const declared = new Set<string>();
+    for (let n: ParentNode | undefined = el; n !== undefined && isElement(n); n = n.parentNode ?? undefined) {
+      if (!vocabFound) {
+        const v = attrOf(n, "vocab");
+        if (v !== undefined) {
+          vocab = v.trim() === "" ? undefined : v;
+          vocabFound = true;
+        }
+      }
+      for (const a of n.attrs) if (a.name.startsWith("xmlns:") && a.name.length > 6) declared.add(a.name.slice(6).toLowerCase());
+      const px = attrOf(n, "prefix");
+      if (px !== undefined) for (const d of parsePrefixDeclaration(px) ?? []) declared.add(d);
+    }
+
+    const prefixAttr = attrOf(el, "prefix");
+    if (prefixAttr !== undefined && parsePrefixDeclaration(prefixAttr) === null) add("rdfa_malformed_prefix_declaration", attrSnippet("prefix", prefixAttr));
+
+    let missingVocabReported = false;
+    for (const attr of ["typeof", "property"] as const) {
+      const value = attrOf(el, attr);
+      if (value === undefined) continue;
+      for (const token of names(value)) {
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(token) || token.startsWith("_:")) continue; // an absolute IRI or a blank node
+        const colon = token.indexOf(":");
+        if (colon === -1) {
+          if (vocab === undefined && !RDFA_INITIAL_TERMS.has(token.toLowerCase()) && !missingVocabReported) {
+            missingVocabReported = true;
+            add("rdfa_missing_vocab", attrSnippet(attr, value));
+          }
+          continue;
+        }
+        const prefix = token.slice(0, colon);
+        const reference = token.slice(colon + 1);
+        if (reference === "" || (prefix !== "" && !PREFIX_NAME.test(prefix))) add("rdfa_malformed_curie", attrSnippet(attr, value));
+        else if (prefix !== "" && !declared.has(prefix.toLowerCase()) && !RDFA_INITIAL_PREFIXES.has(prefix.toLowerCase())) add("rdfa_undeclared_prefix", attrSnippet(attr, value));
+      }
+    }
+  });
+}
+
 function extractStructured(doc: Node, variant: "raw" | "rendered"): StructuredData {
   const out: StructuredData = { jsonLd: [], microdata: [], rdfa: [], parseErrors: [] };
   extractJsonLd(doc, variant, out);
-  out.microdata = extractItems(doc, MICRODATA);
+  const ctx = microdataContext(doc);
+  out.microdata = extractItems(doc, MICRODATA, ctx);
   out.rdfa = extractItems(doc, RDFA);
+  checkMicrodata(doc, variant, ctx, out);
+  checkRdfa(doc, variant, out);
   return out;
 }
 
@@ -683,6 +906,10 @@ export function buildAuxDocument(snapshot: DocumentSnapshot, tokenizer: Tokenize
       };
       span.setAttribute("nominara.aux.parse_errors", raw.variant.structured.parseErrors.length + (rendered?.variant.structured.parseErrors.length ?? 0));
       span.setAttribute("nominara.aux.blocks", document.blocks.length);
+      // STORY-050 AC5 - by format and reason, so a surge in one malformation is visible. Labels are closed sets: never a URL, an id or page text.
+      for (const e of [...raw.variant.structured.parseErrors, ...(rendered?.variant.structured.parseErrors ?? [])]) {
+        incrementCounter("nominara_aux_structured_parse_errors_total", { format: e.format, reason: e.reason });
+      }
       // Counts only: no URL, no page text.
       logger.debug({ event: "aux_document_built", blocks: document.blocks.length, parse_errors: structured.parseErrors.length, rendered: rendered !== null });
       return document;

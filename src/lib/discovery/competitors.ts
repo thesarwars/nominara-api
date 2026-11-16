@@ -9,7 +9,7 @@ import { extractComparisonPageSignals, type ComparisonLink } from "./html-signal
 // ONLY THE FIRST BASIS IS BUILT, and only as far as the ROOT DOCUMENT shows it: a link the site itself publishes to a comparison
 // or alternatives page, read by its visible text. The other two are not faked:
 //   category peers          needs the 180-category taxonomy (no table, seed or story owns it), so there is no "category" to be a peer in;
-//   first-capture entities  needs a capture, which cannot exist when discovery runs.
+//   first-capture entities  needs a capture, which cannot exist when discovery runs: built in cooccurrence.ts and applied when the payload is READ (STORY-043 AC11).
 // STORY-190 (owner decision 13) opens up to MAX_COMPARISON_PAGES same-site pages those links point to, through the guarded fetcher in
 // the run phase (discover.ts). Public pages only: an unverified domain is limited to its public surface (aux-and-geo-analysis.md §1).
 // Names on those pages come from their structure (title and headings that pair "X vs Y", header cells of a table that has the brand's
@@ -67,7 +67,7 @@ function containsTokens(haystack: readonly string[], needle: readonly string[]):
  * Is `name` the brand, or the brand plus a descriptor ("HubSpot CRM")? Compared by whole name or whole tokens. It used to be two-way
  * substring containment, which dropped real rivals ("Salesforce" contains the stem "force") and treated "Hub" as "hubspot.com".
  */
-function isBrand(name: string, brands: readonly string[]): boolean {
+export function isBrand(name: string, brands: readonly string[]): boolean {
   const n = norm(name);
   if (n === "") return false;
   const nameTokens = tokens(name);

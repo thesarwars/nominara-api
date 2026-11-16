@@ -280,7 +280,11 @@ describe("STORY-114 - attribution rollup", () => {
     }
     const writes = statements.filter((s) => /^\s*(INSERT|UPDATE|DELETE)/i.test(s));
     expect(writes.length).toBeGreaterThan(0);
-    for (const sql of writes) expect(sql).toMatch(/attribution_url_rollup|notifications|notification_emails/);
+    // Decision 107(d): exactly one write outside the rollup and alert tables is allowed, the per-project "last rolled up" marker.
+    // It is matched as the whole statement, so any other write to projects (or any other table) still fails here.
+    const MARKER = /^\s*UPDATE projects SET attribution_rolled_up_at = now\(\) WHERE workspace_id = app\.current_workspace\(\) AND id = \$1\s*$/;
+    for (const sql of writes) if (!MARKER.test(sql)) expect(sql).toMatch(/attribution_url_rollup|notifications|notification_emails/);
+    expect(writes.filter((sql) => MARKER.test(sql))).toHaveLength(1);
     const reads = statements.join("\n");
     expect(reads).not.toMatch(/\b(visitor|session_id|cookie|ip_address|user_agent)\b/i);
     const columns = (await db.query("SELECT column_name FROM information_schema.columns WHERE table_name IN ('attribution_daily','attribution_url_rollup')")).rows.map((r) => r.column_name as string);

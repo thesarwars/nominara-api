@@ -13,6 +13,7 @@ import { createTopicClusterHandler } from "./handlers/topic-cluster.handler.js";
 import { createLookupExecuteHandler } from "./handlers/lookup-execute.handler.js";
 import { createCaptureExecuteHandler } from "./handlers/capture-execute.handler.js";
 import { createCapturePlanHandler } from "./handlers/capture-plan.handler.js";
+import type { TokenCounterStore } from "../categories/embed-budget.js";
 import type { DirtyEntry } from "../rollup/dirty-dates.js";
 import { createCaptureParseHandler } from "./handlers/capture-parse.handler.js";
 import { createCreditHousekeepingHandler } from "./handlers/credit-housekeeping.handler.js";
@@ -66,6 +67,8 @@ export interface QueueHandlerContext {
   readonly env: Env;
   /** STORY-042 AC6 — the dirty-set writer the worker group owns (set for `capture.parse` only). */
   readonly markRollupDirty?: (entry: DirtyEntry) => Promise<void>;
+  /** STORY-189 AC7 - the shared (queue Valkey) counter behind the daily category-embedding token ceiling (`crawl.discover` only). */
+  readonly categoryTokenStore?: TokenCounterStore;
 }
 
 export type QueueHandlerFactory = (context: QueueHandlerContext) => JobProcessor;

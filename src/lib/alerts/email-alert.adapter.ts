@@ -46,6 +46,9 @@ const SAFE_STRING_KEYS: ReadonlySet<string> = new Set([
   "queue",
   "engineKey",
   "workspaceId",
+  "sessionId",
+  "severity",
+  "role",
   "seq",
   "reason",
   "counter",
@@ -91,7 +94,7 @@ function nameOf(message: string, context: Record<string, unknown>): string {
 }
 
 function subjectIdOf(context: Record<string, unknown>): string {
-  for (const key of ["workspaceId", "queue", "engineKey"]) {
+  for (const key of ["workspaceId", "queue", "engineKey", "sessionId"]) {
     const value = context[key];
     if (typeof value === "string" && value.length > 0) return scrub(value);
   }

@@ -8,6 +8,12 @@ import { BlackoutMonitor } from "../engines/blackout.js";
 import type { EngineKey } from "../engines/contract.js";
 import { ACTIVE_ENGINE_KEYS } from "../engines/registry.js";
 import { incrementCounter } from "../telemetry/metrics.js";
+import {
+  BreakglassLoginMonitor,
+  EMPTY_BREAKGLASS_STATE,
+  breakglassStateSchema,
+  type BreakglassSession,
+} from "./breakglass-monitor.js";
 import { DlqDepthMonitor, defaultPager, type Pager } from "./dead-letter.js";
 import { tryWithGlobalQueueLock } from "./locks.js";
 import { emitOldestJobAges } from "./queue-age-monitor.js";
@@ -40,6 +46,8 @@ export const monitorStateSchema = z
   .object({
     dlq: z.object({ aboveSince: z.record(z.string(), z.number()), alreadyPaged: z.array(z.string()) }).strict(),
     blackout: z.object({ darkSinceMs: z.record(z.string(), z.number()), lastPagedAtMs: z.record(z.string(), z.number()) }).strict(),
+    // STORY-010 AC2 — optional so state stored before this section existed still loads.
+    breakglass: breakglassStateSchema.optional(),
   })
   .strict();
 export type MonitorState = z.infer<typeof monitorStateSchema>;
@@ -47,6 +55,7 @@ export type MonitorState = z.infer<typeof monitorStateSchema>;
 export const EMPTY_MONITOR_STATE: MonitorState = {
   dlq: { aboveSince: {}, alreadyPaged: [] },
   blackout: { darkSinceMs: {}, lastPagedAtMs: {} },
+  breakglass: EMPTY_BREAKGLASS_STATE,
 };
 
 /** Where the monitors' small state lives between ticks and across replicas. `load` rejects on an outage and returns null when nothing is stored. */
@@ -119,6 +128,10 @@ export interface MonitorRuntimeOptions {
   readonly readLastSuccess: (engines: readonly EngineKey[], db: ClientBase) => Promise<ReadonlyMap<EngineKey, number | null>>;
   /** STORY-030 AC8 — oldest waiting job age per interactive queue, in seconds (null: nothing waiting). Optional: absent means no age signal. */
   readonly readOldestAges?: () => Promise<ReadonlyMap<string, number | null>>;
+  /** STORY-010 AC2 — live sessions of the break-glass role, read on the locked client. Optional: absent means not watched. */
+  readonly readBreakglassSessions?: (db: ClientBase) => Promise<readonly BreakglassSession[]>;
+  /** STORY-010 AC2 — writes the audit row on the locked client (inside the election transaction). Required with the reader. */
+  readonly recordBreakglassLogin?: (db: ClientBase, session: BreakglassSession, sessionId: string, requestKey: string) => Promise<void>;
   readonly engines?: readonly EngineKey[];
   readonly pager?: Pager;
   readonly clock?: () => number;
@@ -133,6 +146,8 @@ export class MonitorRuntime {
   private readonly readDlqDepths: MonitorRuntimeOptions["readDlqDepths"];
   private readonly readLastSuccess: MonitorRuntimeOptions["readLastSuccess"];
   private readonly readOldestAges: MonitorRuntimeOptions["readOldestAges"];
+  private readonly readBreakglassSessions: MonitorRuntimeOptions["readBreakglassSessions"];
+  private readonly recordBreakglassLogin: MonitorRuntimeOptions["recordBreakglassLogin"];
   private readonly engines: readonly EngineKey[];
   private readonly pager: Pager;
   private readonly clock: () => number;
@@ -146,6 +161,8 @@ export class MonitorRuntime {
     this.readDlqDepths = options.readDlqDepths;
     this.readLastSuccess = options.readLastSuccess;
     this.readOldestAges = options.readOldestAges;
+    this.readBreakglassSessions = options.readBreakglassSessions;
+    this.recordBreakglassLogin = options.recordBreakglassLogin;
     this.engines = options.engines ?? ACTIVE_ENGINE_KEYS;
     this.pager = options.pager ?? defaultPager;
     this.clock = options.clock ?? (() => Date.now());
@@ -191,7 +208,18 @@ export class MonitorRuntime {
       await client.query("BEGIN");
       const elected = await tryWithGlobalQueueLock(client, MONITOR_DRIVER_LOCK, () => this.round(client));
       await client.query("COMMIT");
-      return elected.acquired ? elected.value : "skipped";
+      if (!elected.acquired) return "skipped";
+      // AFTER the commit, never before: the break-glass audit row written in this transaction is only durable now, and a state saved
+      // earlier would read `audited: true` for a row a failed COMMIT rolled back, so it would never be written again.
+      let outcome = elected.value.outcome;
+      try {
+        await this.store.save(elected.value.state);
+      } catch (error) {
+        // A page may already have gone out from this tick; if the state is lost the next tick can repeat it. Loud, not fatal.
+        outcome = "partial";
+        logger.error(`monitor: state could not be saved — a page from this tick may repeat: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return outcome;
     } catch (error) {
       try {
         await client.query("ROLLBACK");
@@ -205,7 +233,7 @@ export class MonitorRuntime {
   }
 
   /** Runs under the lock. */
-  private async round(client: ClientBase): Promise<TickOutcome> {
+  private async round(client: ClientBase): Promise<{ outcome: TickOutcome; state: MonitorState }> {
     // Loaded only now, under the lock. If it cannot be read the tick is skipped rather than run on empty state, which
     // would forget an open window and an already-paged breach.
     const stored = await this.store.load();
@@ -252,16 +280,25 @@ export class MonitorRuntime {
       }
     }
 
-    try {
-      await this.store.save({ dlq: dlq.exportState(), blackout: blackout.exportState() });
-    } catch (error) {
-      // A page may already have gone out from this tick; if the state is lost the next tick can repeat it. Loud, not fatal.
-      outcome = "partial";
-      logger.error(`monitor: state could not be saved — a page from this tick may repeat: ${error instanceof Error ? error.message : String(error)}`);
+    // STORY-010 AC2 — last, because the audit write sets a transaction-local workspace context on this client.
+    let breakglassState = state.breakglass ?? EMPTY_BREAKGLASS_STATE;
+    const readSessions = this.readBreakglassSessions;
+    const record = this.recordBreakglassLogin;
+    if (readSessions && record) {
+      const breakglass = new BreakglassLoginMonitor({ clock: now, pager: this.pager, audit: (session, sessionId, requestKey) => record(client, session, sessionId, requestKey) });
+      breakglass.importState(breakglassState);
+      try {
+        await breakglass.observe(await readSessions(client));
+        breakglassState = breakglass.exportState();
+      } catch (error) {
+        // Not observed: an unreadable catalog must not look like "no session", so the stored state is kept as it was.
+        outcome = "partial";
+        logger.warn(`monitor: break-glass sessions unreadable this tick — not observed: ${error instanceof Error ? error.name : "unknown error"}`);
+      }
     }
 
     logger.log({ message: "monitor tick", outcome, queuesObserved, enginesObserved });
-    return outcome;
+    return { outcome, state: { dlq: dlq.exportState(), blackout: blackout.exportState(), breakglass: breakglassState } };
   }
 
   start(): void {

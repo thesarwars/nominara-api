@@ -14,7 +14,7 @@ export interface PlatformReading {
   readonly confidence: number;
 }
 
-const GENERATOR_CONFIDENCE = 0.95;
+export const GENERATOR_CONFIDENCE = 0.95;
 const ASSET_CONFIDENCE = 0.85;
 
 const GENERATORS: ReadonlyArray<readonly [FingerprintPlatform, RegExp]> = [

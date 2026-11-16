@@ -138,9 +138,11 @@ describe("STORY-050 document model", () => {
     expect(build({ rawHtml: bad, renderedHtml: null }).structured.parseErrors.map((e) => e.variant)).toEqual(["raw"]);
   });
 
-  it("STORY-050 #6e · a parse error names the format it can be raised for: only JSON-LD is reported, microdata and RDFa are read leniently", () => {
+  it("STORY-050 #6e · AC5: an orphan itemprop and a property with no vocab are PARSE ERRORS in their own formats, not read leniently (they extract no item)", () => {
+    // Replaces the batch-8 assertion that these raised no error: that was the recorded gap STORY-050 AC5 closes. The cases are in document-model-structured.test.ts.
     const d = build({ rawHtml: `<html><body><div itemprop="name">orphan</div><div property="name">orphan</div></body></html>` });
-    expect(d.structured.parseErrors).toEqual([]);
+    expect(d.raw.structured.parseErrors.map((e) => [e.format, e.reason])).toEqual([["microdata", "itemprop_outside_scope"], ["rdfa", "rdfa_missing_vocab"]]);
+    expect(d.structured.parseErrors).toHaveLength(4); // both copies, as for JSON-LD (#6d)
     expect(d.structured.microdata).toEqual([]);
     expect(d.structured.rdfa).toEqual([]);
   });

@@ -12,6 +12,10 @@ import { isSameSite, proposeCompetitors, selectComparisonPages } from "./competi
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import { incrementCounter } from "../telemetry/metrics.js";
 import { extractHtmlSignals, type ComparisonLink } from "./html-signals.js";
+import { CrawlRefusal, crawlGatedFetch, type FetchLike } from "../net/crawl-gate.js";
+import { collectSitemap, SitemapFetchSkipped } from "../aux/sitemap.js";
+import { isAllowed, parseRobots, sitemapUrlsOf, type ParsedRobots } from "../net/robots.js";
+import { detectPlatform, GENERATOR_CONFIDENCE } from "./platform.js";
 
 // STORY-043 — the discovery pass. api-specification.md §4.5.
 //
@@ -65,6 +69,12 @@ export interface DiscoverInput {
 
 export interface DiscoverDeps {
   readonly fetch: typeof guardedFetch;
+  /**
+   * STORY-043 AC10 - how robots.txt and the sitemap are read: the shared crawl gate (robots.txt + per-host budget, decisions 70(d) / 106(g)) over the
+   * SSRF-guarded fetcher, never the bare one. Absent means "no gate to read them through": those two metadata fields are then not derived (the CMS
+   * is read from the document already in hand and needs no fetch).
+   */
+  readonly gatedFetch?: FetchLike | undefined;
   readonly now: () => number;
   /**
    * STORY-189 — classifies the page text against the taxonomy (nearest-match embeddings). Absent means "no taxonomy to classify against":
@@ -111,7 +121,7 @@ async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T> {
   }
 }
 
-export const DEFAULT_DISCOVER_DEPS: DiscoverDeps = { fetch: guardedFetch, now: () => Date.now() };
+export const DEFAULT_DISCOVER_DEPS: DiscoverDeps = { fetch: guardedFetch, gatedFetch: crawlGatedFetch, now: () => Date.now() };
 
 type PageSignals = ReturnType<typeof extractHtmlSignals>;
 type Described = NonNullable<ReturnType<typeof extractFromHtml>["description"]>;
@@ -206,6 +216,7 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
 
       if (!skip.has("products") && products) put(fields, "products", products);
       if (!skip.has("locale") && extracted.locale) put(fields, "locale", extracted.locale);
+      if (!skip.has("cms")) put(fields, "cms", cmsField(html));
       // AC6 - the document's fields are known now; the category classification below is a provider call and can take seconds.
       await report();
 
@@ -238,6 +249,31 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
         // STORY-190 - up to 3 same-site comparison pages, in this run phase (no transaction held), inside what is left of the budget.
         const pages = await fetchComparisonPages(signals.comparisonLinks, input, deps, DISCOVERY_BUDGET_MS - (deps.now() - startedAt));
         competitors = proposeCompetitors({ brandNames, links: signals.comparisonLinks, pages });
+      }
+    }
+
+    // STORY-043 AC10 - robots.txt state and sitemap size. After the competitors, so a slow site file never delays the fields a person reads first, and
+    // inside what is left of the budget. A failure here never fails the pass: the fields stand, the missing ones are simply not derived.
+    if (reachedSite && deps.gatedFetch !== undefined && (!skip.has("robots_state") || !skip.has("sitemap_urls"))) {
+      try {
+        const remaining = Math.max(1, DISCOVERY_BUDGET_MS - (deps.now() - startedAt));
+        const found = await trace.getTracer("nominara.discovery").startActiveSpan("discovery.site_files", async (span) => {
+          try {
+            return await withinBudget(deriveSiteFileMetadata(input.rootUrl, deps.gatedFetch!, skip), remaining);
+          } catch (error) {
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw error;
+          } finally {
+            span.end();
+          }
+        });
+        Object.assign(fields, found);
+        // Counts by field and outcome only: never a URL or a file's text.
+        for (const name of ["robots_state", "sitemap_urls"]) {
+          if (!skip.has(name)) incrementCounter("nominara_discovery_site_file_fields_total", { field: name, outcome: name in found ? "derived" : "not_derived" });
+        }
+      } catch {
+        // Not derived. Never a guess.
       }
     }
   } catch {
@@ -302,8 +338,97 @@ export async function discover(input: DiscoverInput, deps: DiscoverDeps = DEFAUL
   };
 }
 
+/** The AI crawler robots_state is read for: the first of the product's AI_CRAWLER_AGENTS (aux/site-files.ts), and the §4.5 example's "gptbot_allowed". */
+const GPTBOT = "GPTBot";
+const PLATFORM_SOURCE_GENERATOR = "generator meta tag";
+const PLATFORM_SOURCE_ASSETS = "platform asset URLs";
+/** A site with no platform marker is most likely hand-built or headless, but absence of a marker is weak evidence: it is proposed, and flagged for review. NOT FROM THE REFERENCE. */
+const CMS_CUSTOM_CONFIDENCE = 0.5;
+
+/** product-spec.md section 2.1 "CMS/stack detection", from the one document in hand: a named platform when a marker was found, else "custom" below the review line. */
+function cmsField(html: string): { value: unknown; confidence: number; source: string } {
+  const platform = detectPlatform(html);
+  if (platform === undefined) return { value: "custom", confidence: CMS_CUSTOM_CONFIDENCE, source: "no platform marker found" };
+  return {
+    value: platform.value,
+    confidence: platform.confidence,
+    source: platform.confidence >= GENERATOR_CONFIDENCE ? PLATFORM_SOURCE_GENERATOR : PLATFORM_SOURCE_ASSETS,
+  };
+}
+
 /**
- * STORY-190 - opens the comparison pages the home page links to, through the guarded fetcher (`deps.fetch`), at most 3, same registrable
+ * NOT FROM THE REFERENCE: the most sitemap files discovery opens (an index and four children). A sitemap index can name 25+ files (sitemap.ts) and each is a
+ * request; discovery has a 45 s budget and one customer waiting, so it reads a few and says so.
+ */
+export const DISCOVERY_SITEMAP_MAX_FILES = 5;
+
+/** A file that answered "there is none here" (404, 410) is an answer; every other problem with a file we asked for means we could not read it. */
+const isGone = (reason: string): boolean => reason === "http_404" || reason === "http_410";
+const isUnreadable = (reason: string): boolean =>
+  reason === "fetch_failed" || reason === "not_a_sitemap" || reason === "too_large" || (reason.startsWith("http_") && !isGone(reason));
+
+/**
+ * STORY-043 AC10 - robots.txt state and sitemap size, read through the crawl gate. Returns only what it could actually read: a 5xx, a timeout or a
+ * refusal derives NOTHING for that field (unknown is not "allowed" and not 0), and a real 0 stays 0.
+ *   robots_state   "gptbot_allowed" | "gptbot_blocked" (GPTBot, the product's reference AI crawler, at the root path) | "no_robots_txt" (a 4xx)
+ *   sitemap_urls   URLs counted in the sitemap robots.txt declares (else /sitemap.xml); "no sitemap found" is 0 at 0.9; a partly read index is a lower bound at 0.5
+ */
+async function deriveSiteFileMetadata(
+  rootUrl: string,
+  gated: FetchLike,
+  skip: ReadonlySet<string>,
+): Promise<Record<string, DiscoveredField>> {
+  const out: Record<string, DiscoveredField> = {};
+  const origin = new URL(rootUrl).origin;
+
+  let robots: ParsedRobots | null = null;
+  try {
+    const response = await gated(new URL("/robots.txt", origin).href, { truncateAtCap: true });
+    if (response.status >= 200 && response.status < 300) {
+      robots = parseRobots(response.body.toString("utf8"));
+      if (!skip.has("robots_state")) {
+        put(out, "robots_state", { value: isAllowed(robots, GPTBOT, "/") ? "gptbot_allowed" : "gptbot_blocked", confidence: 1, source: "robots.txt" });
+      }
+    } else if (response.status >= 400 && response.status < 500) {
+      if (!skip.has("robots_state")) put(out, "robots_state", { value: "no_robots_txt", confidence: 1, source: "robots.txt" });
+    }
+  } catch {
+    // Unreadable: no state, no guess.
+  }
+
+  if (skip.has("sitemap_urls")) return out;
+  let opened = 0;
+  try {
+    const sitemap = await collectSitemap({
+      origin,
+      declared: robots === null ? [] : sitemapUrlsOf(robots),
+      fetch: async (url) => {
+        if (opened >= DISCOVERY_SITEMAP_MAX_FILES) throw new SitemapFetchSkipped();
+        opened += 1;
+        const response = await gated(url, { truncateAtCap: true });
+        return { status: response.status, body: response.body };
+      },
+    });
+    const unreadable = sitemap.problems.filter((p) => isUnreadable(p.reason)).length;
+    const gone = sitemap.problems.filter((p) => isGone(p.reason)).length;
+    const read = sitemap.filesFetched - unreadable - gone;
+    const cutShort = sitemap.problems.some((p) => p.reason === "crawl_delay_budget" || p.reason === "file_budget_exhausted" || p.reason === "depth_exceeded");
+    if (read > 0) {
+      put(out, "sitemap_urls", cutShort
+        ? { value: sitemap.totalSeen, confidence: 0.5, source: "sitemap (partial read)" }
+        : { value: sitemap.totalSeen, confidence: 1, source: "sitemap" });
+    } else if (gone > 0 && unreadable === 0) {
+      put(out, "sitemap_urls", { value: 0, confidence: 0.9, source: "no sitemap found" });
+    }
+  } catch {
+    // Unreadable: no size, no guess.
+  }
+  return out;
+}
+
+/**
+ * STORY-190 - opens the comparison pages the home page links to, through the crawl gate (robots.txt + per-host budget, decisions 70(d) /
+ * 106(g)) over the guarded fetcher (`deps.gatedFetch`; production always supplies it, `deps.fetch` stands in only for a caller that did not), at most 3, same registrable
  * domain only. Concurrent, all inside ONE shared budget: a page that does not answer in what is left is skipped, and nothing here throws.
  * No transaction is open (the caller is the run phase); public pages only (a plain GET, no credentials, no forms); counts and ids only.
  */
@@ -315,6 +440,7 @@ async function fetchComparisonPages(
 ): Promise<{ url: string; html: string }[]> {
   const selection = selectComparisonPages(links, input.rootUrl, input.rootDomain);
   if (selection.urls.length === 0 && selection.offSite === 0) return [];
+  const pageFetch: FetchLike = deps.gatedFetch ?? (deps.fetch as FetchLike);
   return trace.getTracer("nominara.discovery").startActiveSpan("discovery.comparison_pages", async (span) => {
     const stats = { fetched: 0, redirectedOff: 0, refused: 0, failed: 0, skippedBudget: 0 };
     const pages: { url: string; html: string }[] = [];
@@ -326,7 +452,7 @@ async function fetchComparisonPages(
           selection.urls.map(async (url) => {
             try {
               const response = await withinBudget(
-                deps.fetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootUrl, input.rootDomain) }),
+                pageFetch(url, { truncateAtCap: true, followRedirect: (next) => isSameSite(next, input.rootUrl, input.rootDomain) }),
                 budgetMs,
               );
               if (response.status >= 300 && response.status < 400) {
@@ -340,7 +466,7 @@ async function fetchComparisonPages(
                 pages.push({ url: response.finalUrl, html: response.body.toString("utf8") });
               }
             } catch (error) {
-              if (error instanceof GuardedFetchRefusal) stats.refused += 1;
+              if (error instanceof GuardedFetchRefusal || error instanceof CrawlRefusal) stats.refused += 1;
               else if (error instanceof Error && error.message === BUDGET_EXCEEDED) stats.skippedBudget += 1;
               else stats.failed += 1;
             }

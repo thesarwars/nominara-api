@@ -445,6 +445,11 @@ export const envSchema = z
     // nothing else reads it and nothing starts a re-embed automatically (no deploy trigger, no schedule). ANY string loads (a stray value must never stop the API
     // booting); only `assertReembedEnabled` decides, and only the literal "true" enables it.
     EMBED_REEMBED_ENABLED: z.string().optional(),
+    // STORY-189 AC7 / owner decision 107(b) - the spend limit on category-classification embedding. Both are `.catch`ed to their default:
+    // a stray, zero or negative value must never stop the API or a worker booting; it falls back to the documented default.
+    // Input tokens per project (the site text is trimmed to fit), and a PLATFORM-WIDE daily ceiling (over it a site is "not classified" and an alert is sent).
+    CATEGORY_EMBED_MAX_INPUT_TOKENS: z.coerce.number().int().positive().catch(2000),
+    CATEGORY_EMBED_DAILY_TOKEN_CEILING: z.coerce.number().int().positive().catch(1_000_000),
     // STORY-067 - the two verification horizons after a task completes. UNSET = the documented defaults (+48 h, +14 d).
     TASK_VERIFICATION_SHORT_HOURS: z.coerce.number().int().positive().optional(),
     TASK_VERIFICATION_LONG_DAYS: z.coerce.number().int().positive().optional(),
