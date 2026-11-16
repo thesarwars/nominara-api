@@ -23,6 +23,9 @@ export interface AuditQueryFilter {
   /** NEW-D-3 — namespace prefixes (`billing.`), matched with starts_with(), never LIKE. */
   readonly actionPrefixes?: readonly string[];
   readonly excludeActionPrefixes?: readonly string[];
+  /** Exact actions OR-ed with `actionPrefixes` (a category's reserved actions); `actionsNotIn` excludes exact actions. */
+  readonly actionsIn?: readonly string[];
+  readonly actionsNotIn?: readonly string[];
   readonly limit?: number;
 }
 
@@ -64,16 +67,25 @@ export class AuditQueryService {
       params.push(filter.beforeSeq);
       conditions.push(`audit_log.seq < $${params.length}::int8`);
     }
-    if (filter.actionPrefixes !== undefined && filter.actionPrefixes.length > 0) {
-      const tests = filter.actionPrefixes.map((prefix) => {
+    if ((filter.actionPrefixes?.length ?? 0) > 0 || (filter.actionsIn?.length ?? 0) > 0) {
+      const tests = (filter.actionPrefixes ?? []).map((prefix) => {
         params.push(prefix);
         return `starts_with(action, $${params.length})`;
       });
+      for (const exact of filter.actionsIn ?? []) {
+        params.push(exact);
+        tests.push(`action = $${params.length}`);
+      }
       conditions.push(`(${tests.join(" OR ")})`);
     }
     for (const prefix of filter.excludeActionPrefixes ?? []) {
       params.push(prefix);
       conditions.push(`NOT starts_with(action, $${params.length})`);
+    }
+
+    for (const exact of filter.actionsNotIn ?? []) {
+      params.push(exact);
+      conditions.push(`action <> $${params.length}`);
     }
 
     const limit = Math.min(filter.limit ?? DEFAULT_LIMIT, MAX_LIMIT);

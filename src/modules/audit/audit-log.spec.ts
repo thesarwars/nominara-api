@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { auditLogEntrySchema } from "../../../contracts/trust/index.js";
+import type { ClientBase } from "pg";
+import { AuditQueryService } from "./audit-query.service.js";
 import { categoryOf, categoryPredicate, dayAfter, toAuditLogEntry } from "./audit-log.service.js";
 
 // NEW-D-3 — pure parts of GET /v1/audit-log. The query path itself is covered
@@ -21,6 +23,12 @@ describe("NEW-D-3 · audit-log category derivation (owner decision: from the act
     expect(categoryOf("ssox.thing")).toBe("data");
     expect(categoryOf("passkeys.thing")).toBe("data");
   });
+  it("batch 18 fix: a session action is security only when EXACT or dotted under one of the two names (session.reuse_detected_cleared is not)", () => {
+    expect(categoryOf("session.reuse_detected.cleared")).toBe("security");
+    expect(categoryOf("session.refresh_grace_reuse.x")).toBe("security");
+    expect(categoryOf("session.reuse_detected_cleared")).toBe("data");
+    expect(categoryOf("session.refresh_grace_reuse_ok")).toBe("data");
+  });
   it("AC-category: billing.* is billing; workspace.* and member.* are workspace", () => {
     expect(categoryOf("billing.addon.create")).toBe("billing");
     expect(categoryOf("workspace.create")).toBe("workspace");
@@ -37,9 +45,14 @@ describe("NEW-D-3 · audit-log category derivation (owner decision: from the act
   });
   it("AC-category: the SQL predicate partitions the same way (data = the complement)", () => {
     expect(categoryPredicate("billing")).toEqual({ include: ["billing."] });
-    expect(categoryPredicate("security")).toEqual({ include: ["auth.", "apikey.", "support.", "sso.", "passkey.", "session.reuse_detected", "session.refresh_grace_reuse"] });
+    // batch 18 fix: the two session actions are matched exact-or-dot, so the predicate carries them as exact actions AND dotted prefixes.
+    expect(categoryPredicate("security")).toEqual({
+      include: ["auth.", "apikey.", "support.", "sso.", "passkey.", "session.reuse_detected.", "session.refresh_grace_reuse."],
+      includeActions: ["session.reuse_detected", "session.refresh_grace_reuse"],
+    });
     expect(categoryPredicate("data").include).toBeUndefined();
-    expect(categoryPredicate("data").exclude).toEqual(["auth.", "apikey.", "support.", "sso.", "passkey.", "billing.", "workspace.", "member.", "session.reuse_detected", "session.refresh_grace_reuse"]);
+    expect(categoryPredicate("data").exclude).toEqual(["auth.", "apikey.", "support.", "sso.", "passkey.", "billing.", "workspace.", "member.", "session.reuse_detected.", "session.refresh_grace_reuse."]);
+    expect(categoryPredicate("data").excludeActions).toEqual(["session.reuse_detected", "session.refresh_grace_reuse"]);
   });
 });
 
@@ -78,5 +91,23 @@ describe("NEW-D-3 · date range and entry shape", () => {
     expect(entry.category).toBe("billing");
     expect(Object.keys(entry)).not.toEqual(expect.arrayContaining(["prev_hash"]));
     expect(JSON.stringify(entry)).not.toMatch(/secret|prev_hash|row_hash|before_state|after_state|actor_ip|10\.0\.0\.1/u);
+  });
+});
+
+describe("batch 18 fix - the query matches the two session actions exactly", () => {
+  const captured = async (filter: Parameters<AuditQueryService["query"]>[1]): Promise<{ sql: string; params: unknown[] }> => {
+    const seen: { sql: string; params: unknown[] }[] = [];
+    const client = { query: (sql: string, params: unknown[]) => (seen.push({ sql, params }), Promise.resolve({ rows: [] })) } as unknown as ClientBase;
+    await new AuditQueryService().query(client, filter);
+    return seen[0]!;
+  };
+  it("security: prefixes OR exact actions; data: NOT prefix and NOT exact", async () => {
+    const security = categoryPredicate("security");
+    const inc = await captured({ workspaceId: "w", actionPrefixes: security.include!, actionsIn: security.includeActions! });
+    expect(inc.sql).toMatch(/starts_with\(action, \$\d+\) OR .*action = \$\d+/u);
+    expect(inc.params).toEqual(expect.arrayContaining(["session.reuse_detected", "session.reuse_detected."]));
+    const data = categoryPredicate("data");
+    const exc = await captured({ workspaceId: "w", excludeActionPrefixes: data.exclude!, actionsNotIn: data.excludeActions! });
+    expect(exc.sql).toMatch(/action <> \$\d+/u);
   });
 });
