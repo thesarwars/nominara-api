@@ -1,5 +1,6 @@
 import type { ClientBase } from "pg";
 import type { ProposedCompetitor } from "../../../contracts/projects/index.js";
+import { hasFactsStatusSql } from "../rollup/aggregate-day.js";
 import { isBrand, MAX_PROPOSED_COMPETITORS } from "./competitors.js";
 
 // STORY-043 AC11 - the THIRD competitor basis (product-spec.md section 2.1, api-specification.md 4.5): "entities co-occurring in the first capture run".
@@ -46,7 +47,7 @@ export async function loadCooccurringEntities(client: Pick<ClientBase, "query">,
         WHERE status IN ('completed', 'partial')
      ),
      answers AS (
-       SELECT c.id FROM answer_captures c JOIN first_run r ON c.run_id = r.id WHERE c.project_id = $1 AND c.status = 'parsed'
+       SELECT c.id FROM answer_captures c JOIN first_run r ON c.run_id = r.id WHERE c.project_id = $1 AND ${hasFactsStatusSql("c.status")}
      ),
      brand AS (
        SELECT DISTINCT m.result_id FROM mention_facts m WHERE m.project_id = $1 AND m.entity_type = 'brand' AND m.result_id IN (SELECT id FROM answers)
