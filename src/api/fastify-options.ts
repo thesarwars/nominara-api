@@ -37,5 +37,11 @@ import { loadEnv } from "../config/env.js";
  */
 export function fastifyServerOptions(): FastifyServerOptions {
   const hops = loadEnv().TRUST_PROXY_HOPS;
-  return hops === undefined ? {} : { trustProxy: hops };
+  // fastify >= 5.12.2 made a NUMERIC trustProxy fail closed (request.ip is always the socket peer: a hop count cannot validate
+  // the immediate peer, so a direct client could spoof X-Forwarded-For). That would put every client behind the load balancer in
+  // one rate-limit bucket. A trust FUNCTION is not touched by that change, and `(_, hop) => hop < hops` is exactly what a hop
+  // count meant before: trust the first N hops from the socket peer. The same precondition applies as before and is now
+  // explicit - the API must be reachable only through its proxy chain (network policy), because the peer itself is trusted.
+  // Pinned by test/unit/trust-proxy.spec.ts. OWNER DECISION 108(c) follow-up: a CIDR allow-list would remove the precondition.
+  return hops === undefined ? {} : { trustProxy: (_address: string, hop: number): boolean => hop < hops };
 }

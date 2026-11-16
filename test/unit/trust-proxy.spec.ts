@@ -157,6 +157,11 @@ describe("STORY-026 · request.ip behind a proxy", () => {
     app = await appWith(undefined);
     expect(fastifyServerOptions()).toEqual({});
     process.env.TRUST_PROXY_HOPS = "2";
-    expect(fastifyServerOptions()).toEqual({ trustProxy: 2 });
+    // fastify >= 5.12.2 fails a numeric trustProxy closed, so the option is a trust FUNCTION that trusts the first N hops from
+    // the socket peer (batch 18, owner decision 108(c)). The behaviour is what the HTTP tests above pin; this pins its shape.
+    const { trustProxy } = fastifyServerOptions();
+    expect(typeof trustProxy).toBe("function");
+    const trusts = trustProxy as (address: string, hop: number) => boolean;
+    expect([0, 1, 2, 3].map((hop) => trusts("10.0.0.5", hop))).toEqual([true, true, false, false]);
   });
 });

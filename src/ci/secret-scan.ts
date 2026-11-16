@@ -29,10 +29,10 @@ const RULES: ReadonlyArray<{ readonly rule: string; readonly pattern: RegExp; re
   { rule: "slack-token", pattern: /\bxox[baprs]-[0-9A-Za-z-]{10,}/u },
   { rule: "google-api-key", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/u },
 ];
-// scheme://user:password@host - a credential embedded in a URL. Local development hosts and template placeholders are not.
+// A credential embedded in a URL (scheme, user, password, host). Local development hosts and template placeholders are not.
 const URL_CREDENTIALS = /\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'"`$]+:([^\s@'"`/]+)@([^\s/:'"`]+)/giu;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "host.docker.internal", "postgres", "pgbouncer", "valkey", "redis"]);
-// Test files hold deliberately hostile URLs (`https://me:pw@host/...` as a SSRF or log-redaction input). Every other
+// Test files hold deliberately hostile URLs (a URL with a password, as an SSRF or log-redaction input). Every other
 // fixed-shape rule still applies to them - a real provider key in a test is exactly the leak this gate exists for.
 const TEST_FILE = /(?:^|\/)test\/|\.(?:spec|test)\.[cm]?[jt]sx?$/u;
 const ALLOW_MARKER = "nominara-secret-scan:allow";
