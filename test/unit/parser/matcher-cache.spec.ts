@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AliasEntry } from "../../../src/lib/parser/entity-matcher.js";
+import { aliasSetHash, matchEntities } from "../../../src/lib/parser/entity-matcher.js";
 import { MATCHER_CACHE_CAPACITY, clearMatcherCache, matcherCacheStats, matcherFor } from "../../../src/lib/parser/matcher-cache.js";
 
 // STORY-036 AC1 - the automaton is built once per (project, alias-set hash), not once per capture.
@@ -83,5 +84,30 @@ describe("STORY-036 AC1 - parseCapture uses the cache", () => {
     expect(first.brandPresent).toBe(true);
     expect(second.brandPresent).toBe(true);
     expect(matcherCacheStats()).toMatchObject({ builds: 1, hits: 1 });
+  });
+});
+
+describe("batch 18 fix - the alias-set hash and the automaton are order- and field-boundary-safe", () => {
+  beforeEach(() => clearMatcherCache());
+
+  it("fields within an alias entry cannot run into each other: (label 'Acme Corp', alias 'X') vs (label 'Acme', alias 'Corp X')", () => {
+    const one: AliasEntry = { entityType: "competitor", entityId: "c1", label: "Acme Corp", alias: "X" };
+    const two: AliasEntry = { entityType: "competitor", entityId: "c1", label: "Acme", alias: "Corp X" };
+    expect(aliasSetHash([one], [])).not.toBe(aliasSetHash([two], []));
+    // and a label/alias pair cannot be re-cut across the entry boundary either
+    const split = [alias("a", "b"), alias("c", "d")];
+    const merged = [alias("a", "b\u0001competitor\u0000c1\u0000c")];
+    expect(aliasSetHash(split, [])).not.toBe(aliasSetHash(merged, []));
+  });
+
+  it("two entities claiming the SAME alias: the winner does not depend on the order the cache first saw them in", () => {
+    const first: AliasEntry = { entityType: "competitor", entityId: "c-1", label: "Acme One", alias: "Acme" };
+    const second: AliasEntry = { entityType: "competitor", entityId: "c-2", label: "Acme Two", alias: "Acme" };
+    const winner = (aliases: readonly AliasEntry[]): string | null => {
+      clearMatcherCache();
+      const mention = matchEntities({ text: "We like Acme.", aliases, negativeAliases: [] }, matcherFor("p1", aliases, []))[0];
+      return mention?.entityId ?? null;
+    };
+    expect(winner([first, second])).toBe(winner([second, first]));
   });
 });
