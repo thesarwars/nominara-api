@@ -65,31 +65,43 @@ export function trackedEnvFindings(paths: readonly string[]): Finding[] {
 }
 
 const BINARY_EXTENSIONS = /\.(?:png|jpe?g|gif|webp|ico|pdf|woff2?|ttf|zip|gz|lockb)$/iu;
-const MAX_BYTES = 2 * 1024 * 1024;
+export const MAX_SCAN_BYTES = 2 * 1024 * 1024;
 
-export async function scanTracked(root: string = fileURLToPath(new URL("../../", import.meta.url))): Promise<Finding[]> {
+export async function scanTracked(root?: string): Promise<Finding[]> {
+  return (await scanTrackedDetailed(root)).findings;
+}
+
+/** Findings plus the tracked files NOT scanned because they exceed MAX_SCAN_BYTES (paths only: never content). */
+export async function scanTrackedDetailed(root: string = fileURLToPath(new URL("../../", import.meta.url))): Promise<{ findings: Finding[]; skipped: string[] }> {
   const paths = execFileSync("git", ["ls-files", "-z"], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
     .split("\0")
     .filter((path) => path !== "");
   const findings = trackedEnvFindings(paths);
+  const skipped: string[] = [];
   for (const path of paths) {
     if (BINARY_EXTENSIONS.test(path)) continue;
     let text: string;
     try {
       const buffer = readFileSync(`${root}${path}`);
-      if (buffer.length > MAX_BYTES || buffer.includes(0)) continue;
+      if (buffer.length > MAX_SCAN_BYTES) {
+        skipped.push(path);
+        continue;
+      }
+      if (buffer.includes(0)) continue;
       text = buffer.toString("utf8");
     } catch {
       continue; // listed but absent from the working tree (a deletion in progress): nothing to scan.
     }
     findings.push(...scanText(path, text));
   }
-  return findings;
+  return { findings, skipped };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  const findings = await scanTracked();
+  const { findings, skipped } = await scanTrackedDetailed();
   for (const finding of findings) process.stderr.write(`secret-scan: ${finding.rule} at ${finding.path}:${String(finding.line)}\n`);
-  process.stdout.write(`secret-scan: ${String(findings.length)} finding(s)\n`);
+  // Not a finding (the exit code is unchanged), but never silent: a file the scan could not read is a file it did not clear.
+  for (const path of skipped) process.stderr.write(`secret-scan: skipped (over ${String(MAX_SCAN_BYTES)} bytes) ${path}\n`);
+  process.stdout.write(`secret-scan: ${String(findings.length)} finding(s), ${String(skipped.length)} file(s) skipped over the size cap\n`);
   process.exit(findings.length === 0 ? 0 : 1);
 }

@@ -1,5 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { scanTracked, scanText, type Finding } from "./secret-scan.js";
+import { MAX_SCAN_BYTES, scanTrackedDetailed, scanTracked, scanText, type Finding } from "./secret-scan.js";
 
 // STORY-110 AC14 (standing control: secrets scanning blocks the build). Test scenario 17: "Introduce a secret ... each
 // blocks at its documented severity" - here, any finding of a known credential shape blocks (exit 1).
@@ -64,5 +67,17 @@ describe("STORY-110 AC14 - the secrets scan", () => {
   it("a tracked .env file (other than .env.example) is itself a finding", async () => {
     const { trackedEnvFindings } = await import("./secret-scan.js");
     expect(trackedEnvFindings([".env", "api/.env.local", ".env.example", "src/env.ts"]).map((f) => f.path)).toEqual([".env", "api/.env.local"]);
+  });
+
+  it("batch 18 fix - a tracked file over the size cap is counted and named as SKIPPED, never silently passed, and its content is never reported", async () => {
+    const root = `${mkdtempSync(`${tmpdir()}/secret-scan-`)}/`;
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    writeFileSync(`${root}small.txt`, "hello\n");
+    // A real-shaped key hidden past the cap: the scan cannot see it, which is exactly what the report must say.
+    writeFileSync(`${root}big.txt`, `${"x".repeat(MAX_SCAN_BYTES)}\n${join("AK", "IA", "A".repeat(16))}\n`);
+    execFileSync("git", ["add", "."], { cwd: root });
+    const { findings, skipped } = await scanTrackedDetailed(root);
+    expect(findings).toEqual([]);
+    expect(skipped).toEqual(["big.txt"]);
   });
 });
