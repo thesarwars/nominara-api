@@ -34,6 +34,7 @@ import { ACTIVE_ENGINE_KEYS } from "./lib/engines/registry.js";
 import { warnMissingSpendCeilings } from "./lib/engines/spend-meter.js";
 import { createQueueMonitorConnection, createQueueReaderConnection, createQueueWorkerConnection, queueKeyPrefix } from "./lib/queue/connection.js";
 import { attachDeadLetterHandler, buildDlqQueue } from "./lib/queue/dead-letter.js";
+import { readBreakglassSessions, recordBreakglassLogin } from "./lib/queue/breakglass-monitor.js";
 import { MonitorRuntime, ValkeyMonitorStateStore, dlqDepthReader } from "./lib/queue/monitor-runtime.js";
 import { INTERACTIVE_QUEUES, queueAgeReader } from "./lib/queue/queue-age-monitor.js";
 import { QUEUE_TOPOLOGY } from "./lib/queue/topology.js";
@@ -508,6 +509,9 @@ export async function bootstrapWorker(): Promise<INestApplicationContext> {
       readDlqDepths: dlqDepthReader(dlqReaders),
       readLastSuccess: (engines, db) => engineHealth.lastSuccessAtMs(engines, db),
       readOldestAges: queueAgeReader(interactiveReaders),
+      // STORY-010 AC2 / decision 107(a)
+      readBreakglassSessions: readBreakglassSessions,
+      recordBreakglassLogin: recordBreakglassLogin,
     });
     monitorRuntime.start();
     providers.push({

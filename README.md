@@ -429,16 +429,12 @@ takes any contribution that isn't run through the local gates by hand.
 STORY-003 (the Terraform baseline) hasn't landed, so four things genuinely
 can't be done locally. Each is disclosed here rather than faked:
 
-- **G-1 — no PagerDuty for break-glass paging.** The `ON login` event trigger
-  (`app.breakglass_login_alert()`, migration `0005`) emits a structured
-  `RAISE LOG` line naming the role, database, backend pid, and timestamp when
-  `session_user = 'nominara_breakglass'`. In production this is what a
-  log-based alert would page on; locally it's just a log line. The
-  "immutable audit record" half of AC-19 is **not** achieved by this trigger
-  either: break-glass connections aren't workspace-scoped, and a dedicated
-  table for them would break the 69-table census (STORY-009). No workaround
-  was invented for this — it's an open gap for whoever wires the production
-  logging pipeline.
+- **G-1 — RESOLVED for detection, audit and alert (STORY-010 AC2, owner decision 107(a)); no PagerDuty.** The
+  `ON login` event trigger (migration `0005`) still only emits a `RAISE LOG` line. The worker's monitor driver
+  (`src/lib/queue/breakglass-monitor.ts`, ticking every 60 s) now polls `pg_stat_activity` for `nominara_breakglass`
+  sessions, appends a critical `auth.breakglass_login` row to the hash chain (the reserved nil-uuid platform chain,
+  because the event has no workspace) and sends one critical alert per session through the Resend alert route. Limit: a
+  session that opens and closes between two ticks is not seen by polling; the `RAISE LOG` line is its only record.
 - **G-2 — break-glass / runtime-role credential issuance via Secrets
   Manager.** Production issues every database credential from Secrets
   Manager with 30-day automatic rotation (`NFR-SEC-16`); there is no static
