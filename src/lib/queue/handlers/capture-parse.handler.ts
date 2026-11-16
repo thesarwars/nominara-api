@@ -18,7 +18,7 @@ import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
 import { TasksService } from "../../../modules/tasks/tasks.service.js";
 import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
-import { CANDIDATE_FLAG, candidatesCrossingThreshold, discoveryTaskInput } from "../../parser/candidate-discovery.js";
+import { CANDIDATE_FLAG, CANDIDATE_FLAG_UPDATE_SQL, candidatesCrossingThreshold, discoveryTaskInput } from "../../parser/candidate-discovery.js";
 import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 import { captureFlagSchema } from "../../engines/contract.js";
 import { decodeRawObject, type RawObjectBody } from "../../capture/raw-object.js";
@@ -199,12 +199,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
         span.setAttribute("candidates.crossed", crossed.length);
         if (crossed.length === 0 && !capture.flags.includes(CANDIDATE_FLAG)) return;
 
-        await tx.query(
-          `UPDATE answer_captures
-              SET flags = CASE WHEN $2 THEN array_append(array_remove(flags, $3), $3) ELSE array_remove(flags, $3) END
-            WHERE id = $1`,
-          [capture.resultId, crossed.length > 0, CANDIDATE_FLAG],
-        );
+        await tx.query(CANDIDATE_FLAG_UPDATE_SQL, [capture.resultId, crossed.length > 0, CANDIDATE_FLAG, capture.capturedAt]);
         for (const signal of crossed) {
           const outcome = await tasksService().createGeneratedTask(discoveryTaskInput(capture.projectId, signal));
           incrementCounter("nominara_parser_candidate_competitor_tasks_total", { outcome: outcome.outcome });

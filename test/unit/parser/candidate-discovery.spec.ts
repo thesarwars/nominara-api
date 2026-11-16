@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AliasEntry } from "../../../src/lib/parser/entity-matcher.js";
 import {
   CANDIDATE_FLAG,
+  CANDIDATE_FLAG_UPDATE_SQL,
   CANDIDATE_THRESHOLD,
   CANDIDATE_WINDOW_DAYS,
   candidateKey,
@@ -61,6 +62,14 @@ describe("STORY-036 AC9 - crossing the threshold", () => {
     expect(call.sql).toMatch(/entity_type = 'other'/);
     expect(call.sql).toMatch(/count\(DISTINCT/i);
     expect(call.sql).toMatch(/30 days/);
+  });
+
+  it("batch 18 fix - the `mine` CTE carries the captured_at bound (partition pruning), and so does the flag UPDATE", async () => {
+    const { tx, calls } = fakeTx([]);
+    await ask(tx);
+    const mine = /WITH mine AS \(([\s\S]*?)\)\s*SELECT/.exec(calls[0]!.sql)?.[1] ?? "";
+    expect(mine).toMatch(/captured_at/);
+    expect(CANDIDATE_FLAG_UPDATE_SQL).toMatch(/captured_at/);
   });
 
   it("STORY-036 AC9 - the key folds case and runs of whitespace", () => {

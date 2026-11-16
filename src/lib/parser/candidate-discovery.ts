@@ -13,6 +13,16 @@ export const CANDIDATE_WINDOW_DAYS = 30;
 /** Carried on the capture's own `flags` (an open string list in the contract), like `highlights_withheld_normalizer_stale`. */
 export const CANDIDATE_FLAG = "candidate_competitor_detected";
 
+/**
+ * Sets or clears the flag on the capture's own row. $1 result id, $2 set?, $3 flag, $4 the capture's time. The row's `captured_at` is the
+ * partition key, so it is bounded; the 1 ms width absorbs the microseconds a JS Date cannot carry.
+ */
+export const CANDIDATE_FLAG_UPDATE_SQL = `UPDATE answer_captures
+              SET flags = CASE WHEN $2 THEN array_append(array_remove(flags, $3), $3) ELSE array_remove(flags, $3) END
+            WHERE id = $1
+              AND captured_at >= $4::timestamptz
+              AND captured_at < $4::timestamptz + interval '1 millisecond'`;
+
 /** A task title is bounded by `TASK_TITLE_MAX` in the contract; the label is engine text and is cut rather than trusted. */
 const LABEL_MAX = 80;
 
@@ -51,6 +61,8 @@ export async function candidatesCrossingThreshold(
        SELECT DISTINCT lower(btrim(regexp_replace(entity_label, '\\s+', ' ', 'g'))) AS key
          FROM mention_facts
         WHERE result_id = $2 AND entity_type = 'other'
+          AND captured_at <= $3::timestamptz
+          AND captured_at > $3::timestamptz - interval '30 days'
      )
      SELECT lower(btrim(regexp_replace(f.entity_label, '\\s+', ' ', 'g'))) AS key,
             min(f.entity_label) AS label,
