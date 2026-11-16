@@ -4,11 +4,11 @@
 export const ATTRIBUTION_LAG_OBJECTIVE_SECONDS = 2 * 60 * 60;
 
 /**
- * Null when nothing has been ingested: no figure, never a 0 (a 0 would read as "perfectly fresh"). A watermark ahead of the
- * commit (clock skew between the writer and this process) is a lag of 0, never a negative one.
+ * Null when nothing is pending: no figure, never a 0 (a 0 would read as "perfectly fresh"), and never a breach. An ingest time ahead of
+ * `nowMs` (clock skew between the writer and this process) is a lag of 0, never a negative one.
  */
-export function attributionLagSeconds(watermarkMs: number | null, committedAtMs: number): { lagSeconds: number; withinObjective: boolean } | null {
-  if (watermarkMs === null) return null;
-  const lagSeconds = Math.max(0, committedAtMs - watermarkMs) / 1000;
+export function attributionLagSeconds(oldestPendingMs: number | null, nowMs: number): { lagSeconds: number; withinObjective: boolean } | null {
+  if (oldestPendingMs === null) return null;
+  const lagSeconds = Math.max(0, nowMs - oldestPendingMs) / 1000;
   return { lagSeconds, withinObjective: lagSeconds <= ATTRIBUTION_LAG_OBJECTIVE_SECONDS };
 }

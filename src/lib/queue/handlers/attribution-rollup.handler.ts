@@ -68,16 +68,25 @@ export function createAttributionRollupHandler(_context: QueueHandlerContext): J
         const summary = await withProjectQueueLock(tx, "attribution.rollup", payload.projectId, async () => {
           if (payload.rebuild === true) await purgeProjectRollups(tx, payload.projectId);
           const today = await localToday(tx, timezone);
-          // STORY-114 AC6 / decision 107(c) - the ingest watermark: the newest beacon session or owned-page citation, read BEFORE the
-          // windows are computed so the figure is what this run can have covered. Null when nothing is ingested (no figure, never 0).
-          const watermark = await tx.query<{ watermark: Date | null }>(
-            `SELECT greatest(
-                      (SELECT max(d.ingested_at) FROM attribution_daily d WHERE d.workspace_id = app.current_workspace() AND d.project_id = $1),
-                      (SELECT max(c.captured_at) FROM citation_facts c WHERE c.workspace_id = app.current_workspace() AND c.project_id = $1 AND c.is_owned)
-                    ) AS watermark /* ingest watermark */`,
+          // STORY-114 AC6 / decision 107(c) - the lag is measured at the START of the run: now minus the OLDEST ingest time (beacon session
+          // or owned-page citation) among rows not yet included in a committed rollup of this project, the marker being
+          // projects.attribution_rolled_up_at. Nothing pending is no figure (a quiet site is not late); the gauge of seconds since the last
+          // committed rollup is what shows a stalled rollup.
+          const startedAtMs = Date.now();
+          const pending = await tx.query<{ oldest_pending: Date | null; last_committed: Date | null }>(
+            `SELECT least(
+                      (SELECT min(d.ingested_at) FROM attribution_daily d WHERE d.workspace_id = app.current_workspace() AND d.project_id = p.id AND (p.attribution_rolled_up_at IS NULL OR d.ingested_at > p.attribution_rolled_up_at)),
+                      (SELECT min(c.captured_at) FROM citation_facts c WHERE c.workspace_id = app.current_workspace() AND c.project_id = p.id AND c.is_owned AND (p.attribution_rolled_up_at IS NULL OR c.captured_at > p.attribution_rolled_up_at))
+                    ) AS oldest_pending, /* oldest pending ingest */
+                    p.attribution_rolled_up_at AS last_committed
+               FROM projects p
+              WHERE p.workspace_id = app.current_workspace() AND p.id = $1`,
             [payload.projectId],
           );
-          const watermarkMs = watermark.rows[0]?.watermark == null ? null : new Date(watermark.rows[0].watermark).getTime();
+          const oldestPending = pending.rows[0]?.oldest_pending ?? null;
+          const lastCommitted = pending.rows[0]?.last_committed ?? null;
+          const pendingMs = oldestPending === null ? null : new Date(oldestPending).getTime();
+          if (lastCommitted !== null) observeValue("nominara_rollup_attribution_seconds_since_last_commit", Math.max(0, startedAtMs - new Date(lastCommitted).getTime()) / 1000);
           let windows = 0;
           let rows = 0;
           let alertsRaised = 0;
@@ -91,11 +100,13 @@ export function createAttributionRollupHandler(_context: QueueHandlerContext): J
             rows += joined.length;
             alertsRaised += alerts.raised;
           }
-          // After COMMIT, so the observation is "visible in the rollup", as SLO #27 and STORY-042 do. The objective is a bound on this
-          // value (2 hours); the per-run observation is what it is judged on. A backfill or rebuild still measures against the newest data.
+          // The marker moves in this transaction, so it is advanced exactly when the rollup rows commit. `now()` is the transaction's start:
+          // a row ingested while the run was computing stays pending until the next one, never wrongly counted as included.
+          await tx.query("UPDATE projects SET attribution_rolled_up_at = now() WHERE workspace_id = app.current_workspace() AND id = $1", [payload.projectId]);
+          // After COMMIT, so the observation is only made for a rollup that is visible. The objective is a bound on this value (2 hours).
           if (currentTenantStore() !== undefined) {
             afterCommit(() => {
-              const measured = attributionLagSeconds(watermarkMs, Date.now());
+              const measured = attributionLagSeconds(pendingMs, startedAtMs);
               if (measured === null) return;
               observeValue("nominara_rollup_attribution_lag_seconds", measured.lagSeconds);
               incrementCounter("nominara_rollup_attribution_lag_observations_total", { within_objective: String(measured.withinObjective) });

@@ -3,7 +3,9 @@ import type { ClientBase } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // STORY-114 AC6 / owner decision 107(c): the attribution rollup lag objective is <= 2 hours, measured from the newest ingested
-// beacon/citation (the ingest watermark) to its appearance (the commit) in the attribution rollup.
+// beacon/citation to its appearance (the commit) in the attribution rollup. At the START of each run the lag is now minus the OLDEST
+// ingest time among rows not yet included in a committed rollup of the project (the per-project marker projects.attribution_rolled_up_at):
+// a quiet site with nothing pending is no figure and no breach, and a stalled rollup shows in the "seconds since last committed rollup" gauge.
 
 const deferred: Array<() => void> = [];
 vi.mock("../../src/tenancy/tenant-context.js", () => ({
@@ -34,7 +36,7 @@ describe("STORY-114-AC6 · the objective and the pure measurement", () => {
     expect(ATTRIBUTION_LAG_OBJECTIVE_SECONDS).toBe(7200);
   });
 
-  it("STORY-114-AC6 · lag is commit time minus the newest ingest, in seconds", () => {
+  it("STORY-114-AC6 · lag is run time minus the oldest pending ingest, in seconds", () => {
     expect(attributionLagSeconds(1_000_000, 1_000_000 + 90_000)).toEqual({ lagSeconds: 90, withinObjective: true });
   });
 
@@ -52,40 +54,70 @@ describe("STORY-114-AC6 · the objective and the pure measurement", () => {
   });
 });
 
-describe("STORY-114-AC6 · the handler emits the lag after commit", () => {
+describe("STORY-114-AC6 · the handler measures the oldest pending row at the start of the run", () => {
   beforeEach(() => {
     deferred.length = 0;
     vi.mocked(observeValue).mockClear();
     vi.mocked(incrementCounter).mockClear();
   });
 
-  const txWith = (watermark: Date | null): ClientBase =>
-    ({ query: vi.fn(async (sql: string) => ({ rows: /ingest watermark/.test(sql) ? [{ watermark }] : [] })) }) as unknown as ClientBase;
+  const txWith = (pending: { oldest: Date | null; lastCommit: Date | null }): ClientBase =>
+    ({
+      query: vi.fn(async (sql: string) => ({
+        rows: /oldest pending ingest/.test(sql) ? [{ oldest_pending: pending.oldest, last_committed: pending.lastCommit }] : [],
+      })),
+    }) as unknown as ClientBase;
 
   const lagCalls = () => vi.mocked(observeValue).mock.calls.filter(([name]) => name === "nominara_rollup_attribution_lag_seconds");
+  const sinceCalls = () => vi.mocked(observeValue).mock.calls.filter(([name]) => name === "nominara_rollup_attribution_seconds_since_last_commit");
+  const run = async (tx: ClientBase) => {
+    await createAttributionRollupHandler({ pool: {} as never, env: {} as never })(tx, job);
+    deferred.forEach((t) => t());
+  };
 
-  it("STORY-114-AC6 · nothing is emitted before the commit, and one observation is emitted after it", async () => {
-    const handler = createAttributionRollupHandler({ pool: {} as never, env: {} as never });
-    await handler(txWith(new Date(Date.now() - 60_000)), job);
+  it("STORY-114-AC6 · nothing is emitted before the commit, and one lag observation is emitted after it", async () => {
+    await createAttributionRollupHandler({ pool: {} as never, env: {} as never })(txWith({ oldest: new Date(Date.now() - 60_000), lastCommit: new Date() }), job);
     expect(lagCalls()).toHaveLength(0);
     deferred.forEach((t) => t());
     expect(lagCalls()).toHaveLength(1);
-    const [, value] = lagCalls()[0]!;
+    const value = lagCalls()[0]![1];
     expect(value).toBeGreaterThanOrEqual(60);
     expect(value).toBeLessThan(70);
   });
 
-  it("STORY-114-AC6 · a lag above 7200 s is counted as outside the objective", async () => {
-    const handler = createAttributionRollupHandler({ pool: {} as never, env: {} as never });
-    await handler(txWith(new Date(Date.now() - 7_300_000)), job);
-    deferred.forEach((t) => t());
+  it("STORY-114-AC6 · pending rows older than 7200 s are a breach", async () => {
+    await run(txWith({ oldest: new Date(Date.now() - 7_300_000), lastCommit: new Date(Date.now() - 7_300_000) }));
     expect(vi.mocked(incrementCounter)).toHaveBeenCalledWith("nominara_rollup_attribution_lag_observations_total", { within_objective: "false" });
   });
 
-  it("STORY-114-AC6 · no ingested data: no observation at all", async () => {
-    const handler = createAttributionRollupHandler({ pool: {} as never, env: {} as never });
-    await handler(txWith(null), job);
-    deferred.forEach((t) => t());
+  it("STORY-114-AC6 · a quiet site (old data, nothing pending) is no observation and not a breach", async () => {
+    await run(txWith({ oldest: null, lastCommit: new Date(Date.now() - 3 * 86_400_000) }));
     expect(lagCalls()).toHaveLength(0);
+    expect(vi.mocked(incrementCounter)).not.toHaveBeenCalledWith("nominara_rollup_attribution_lag_observations_total", expect.anything());
+  });
+
+  it("STORY-114-AC6 · nothing ingested and nothing committed: no lag observation", async () => {
+    await run(txWith({ oldest: null, lastCommit: null }));
+    expect(lagCalls()).toHaveLength(0);
+    expect(sinceCalls()).toHaveLength(0);
+  });
+
+  it("STORY-114-AC6 · the seconds since the last committed rollup are emitted, so a stall is visible even with nothing pending", async () => {
+    await run(txWith({ oldest: null, lastCommit: new Date(Date.now() - 3_600_000) }));
+    expect(sinceCalls()).toHaveLength(1);
+    expect(sinceCalls()[0]![1]).toBeGreaterThanOrEqual(3600);
+  });
+
+  it("STORY-114-AC6 · the lag is read before the windows are computed, and the marker is advanced in the same transaction", async () => {
+    const order: string[] = [];
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        if (/oldest pending ingest/.test(sql)) order.push("measure");
+        if (/SET attribution_rolled_up_at/.test(sql)) order.push("marker");
+        return { rows: [] };
+      }),
+    } as unknown as ClientBase;
+    await createAttributionRollupHandler({ pool: {} as never, env: {} as never })(tx, job);
+    expect(order).toEqual(["measure", "marker"]);
   });
 });
