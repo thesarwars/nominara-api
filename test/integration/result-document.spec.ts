@@ -105,9 +105,9 @@ describe("STORY-034 AC7 · the parser document", () => {
          (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_id,
           entity_label,matched_alias,occurrence_index,char_start,char_end,first_token_index,prominence,
           sentiment_label,sentiment_score,sentiment_confidence,sentiment_method,evidence_start,evidence_end,
-          negative_reasons,render_form,render_attrs,render_score,position_class,answer_form)
+          negative_reasons,render_form,render_attrs,render_score,position_class,answer_form,in_link)
        VALUES ($1,$2,$3,$4,'chatgpt', now(),$5,NULL,$6,$6,0,$7,$8,0,$9,$10,0.5,0.9,'lexicon',$11,$12,
-               '{}','described','{link}',0.16,'recommendation','narrative')`,
+               '{}','described','{link}',0.16,'recommendation','narrative',$13)`,
       [
         workspaceId,
         projectId,
@@ -121,6 +121,7 @@ describe("STORY-034 AC7 · the parser document", () => {
         (over.sentimentLabel as string | undefined) ?? "positive",
         (over.evidenceStart as number | undefined) ?? 0,
         (over.evidenceEnd as number | undefined) ?? 23,
+        (over.inLink as boolean | undefined) ?? false,
       ],
     );
   }
@@ -203,6 +204,14 @@ describe("STORY-034 AC7 · the parser document", () => {
     expect(brand.sentiment.evidence_char_start).toBe(0);
     expect(brand.sentiment.evidence_char_end).toBe(23);
     expect(ANSWER.slice(brand.sentiment.evidence_char_start!, brand.sentiment.evidence_char_end!)).toContain("recommended");
+  });
+
+  it("STORY-036 AC5 - in_link is read back from the stored row, true for a link-internal occurrence and false otherwise", async () => {
+    await addMention({ charStart: 0, charEnd: 7, inLink: true });
+    await addMention({ label: "Salesforce", entityType: "competitor", charStart: 20, charEnd: 30, inLink: false });
+    const document = await get();
+    expect(document.entities.find((entity) => entity.entity_type === "brand")!.occurrences[0]!.in_link).toBe(true);
+    expect(document.entities.find((entity) => entity.entity_type === "competitor")!.occurrences[0]!.in_link).toBe(false);
   });
 
   it("REFUSES a failed cell rather than returning an empty document", async () => {

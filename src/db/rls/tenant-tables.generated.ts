@@ -33,6 +33,7 @@ export const TENANT_TABLES: ReadonlySet<string> = new Set([
   "competitors",
   "content_chunks",
   "corpus_passages",
+  "corpus_url_checks",
   "credit_daily_counters",
   "credit_hold_carries",
   "credit_ledger",

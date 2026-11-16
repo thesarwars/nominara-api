@@ -53,6 +53,18 @@ export const corpusPassages = pgTable("corpus_passages", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`now()`),
 });
 
+export const corpusUrlChecks = pgTable("corpus_url_checks", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  projectId: uuid("project_id").notNull(),
+  promptClusterId: uuid("prompt_cluster_id"),
+  citationUrlHash: bytea("citation_url_hash").notNull(),
+  embeddingModel: text("embedding_model").notNull(),
+  outcome: text("outcome").notNull(),
+  checkedAt: timestamp("checked_at", { withTimezone: true }).notNull().default(sql`now()`),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+});
+
 export const entityNodes = pgTable("entity_nodes", {
   workspaceId: uuid("workspace_id").notNull(),
   projectId: uuid("project_id").notNull(),

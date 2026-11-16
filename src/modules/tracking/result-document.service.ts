@@ -94,6 +94,7 @@ interface MentionRow {
   render_score: number;
   position_class: ResultEntity["position_class"];
   answer_form: string | null;
+  in_link: boolean;
 }
 
 @Injectable()
@@ -158,7 +159,7 @@ export class ResultDocumentService {
               char_start, char_end, first_token_index, list_position, prominence,
               sentiment_label, sentiment_score, sentiment_confidence, sentiment_method,
               evidence_start, evidence_end, negative_reasons,
-              render_form, render_attrs, render_score, position_class, answer_form
+              render_form, render_attrs, render_score, position_class, answer_form, in_link
          FROM mention_facts
         WHERE result_id = $1 AND workspace_id = app.current_workspace()
         ORDER BY char_start`,
@@ -311,11 +312,8 @@ function groupEntities(rows: readonly MentionRow[], withheld: boolean): ResultEn
         char_end: row.char_end,
         first_token_index: row.first_token_index,
         list_position: row.list_position,
-        // `mention_facts` has no `in_link` column — recorded as a schema gap
-        // in STORY-036. Reported as false rather than omitted, because the
-        // field is part of §6's shape and a missing key would read as
-        // "unknown" where the honest answer is "we cannot say".
-        in_link: false,
+        // STORY-036 AC5 - stored per occurrence (0213). A row written before that migration reads false until it is re-parsed.
+        in_link: row.in_link,
       })),
       rank_position: first.list_position,
       prominence: first.prominence,

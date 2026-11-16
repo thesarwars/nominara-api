@@ -9,7 +9,8 @@ import {
   type PositionClass,
 } from "./answer-structure.js";
 import { dedupeWithinResponse, extractCitations, resolveCitation, type ResolveContext, type ResolvedCitation } from "./citations.js";
-import { buildMatcher, matchEntities, type AliasEntry, type Mention } from "./entity-matcher.js";
+import { matchEntities, type AliasEntry, type Mention } from "./entity-matcher.js";
+import { matcherFor } from "./matcher-cache.js";
 import { normalize, NORMALIZER_VERSION } from "./normalize.js";
 import { classifyRendering, type RenderingResult } from "./rendering.js";
 import { classifyMention, type SentimentVerdict, type StructuralContext } from "./sentiment/classify.js";
@@ -169,7 +170,8 @@ export async function parseCapture(capture: CaptureRow, context: ParseContext): 
   const structure = classifyAnswerForm(text, capture.structuredElements);
   const mentions = matchEntities(
     { text, aliases: context.aliases, negativeAliases: context.negativeAliases },
-    buildMatcher(context.aliases),
+    // STORY-036 AC1 - built once per (project, alias-set hash), not once per capture.
+    matcherFor(capture.projectId, context.aliases, context.negativeAliases),
   );
 
   // CITATIONS BEFORE SENTIMENT, because sentiment's `nearComplaintCitation`
@@ -330,9 +332,9 @@ export async function persistParse(
           occurrence_index, char_start, char_end, first_token_index, prominence, list_position,
           sentiment_label, sentiment_score, sentiment_confidence, sentiment_method,
           evidence_start, evidence_end, negative_reasons,
-          render_form, render_attrs, render_score, position_class, answer_form, scoring_version)
+          render_form, render_attrs, render_score, position_class, answer_form, scoring_version, in_link)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::text[],
-               $24,$25::text[],$26,$27,$28,$29)`,
+               $24,$25::text[],$26,$27,$28,$29,$30)`,
       [
         capture.workspaceId,
         capture.projectId,
@@ -367,6 +369,9 @@ export async function persistParse(
         entry.positionClass,
         result.answerForm,
         SCORING_VERSION,
+        // STORY-036 AC5 - recorded per occurrence; it is excluded from prominence upstream, and kept here so the citation panel can say
+        // "you are linked but not described".
+        entry.mention.inLink,
       ],
     );
   }

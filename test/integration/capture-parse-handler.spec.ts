@@ -12,6 +12,7 @@ import type { QueueHandlerContext } from "../../src/lib/queue/handlers.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
 import { SYSTEM_ACTOR_ID } from "../../src/tenancy/constants.js";
 import { withTenantContext } from "../../src/tenancy/tenant-context.js";
+import { NoopRealtimePublisher } from "../../src/lib/cache/realtime-publisher.js";
 import { testCacheRedisUrl } from "../support/test-valkey.js";
 
 // STORY-135 — the parse stage, end to end against a real database.
@@ -169,6 +170,45 @@ describe("STORY-135 · capture.parse", () => {
     const competitor = mentions.rows.find((row) => row.entity_type === "competitor");
     expect(brand).toMatchObject({ entity_label: "HubSpot", entity_id: null });
     expect(competitor).toMatchObject({ entity_label: "Salesforce", entity_id: competitorId });
+  });
+
+  it("STORY-036 AC5 - a brand inside a URL is stored with in_link = true, and a plain mention with false", async () => {
+    const resultId = await seedCapture(ANSWER);
+    await run(handler(), job(resultId));
+
+    const rows = await db.query<{ entity_type: string; char_start: number; in_link: boolean }>(
+      "SELECT entity_type, char_start, in_link FROM mention_facts WHERE result_id = $1 AND entity_type = 'brand' ORDER BY char_start",
+      [resultId],
+    );
+    // "**HubSpot**" in the list is a mention; "docs.hubspot.com" in the bare URL is a citation, not one.
+    expect(rows.rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows.rows[0]!.in_link).toBe(false);
+    expect(rows.rows[rows.rows.length - 1]!.in_link).toBe(true);
+  });
+
+  it("STORY-036 AC5 - the rollup agrees with the parse: a brand that appears ONLY inside a URL is not present, and its link-internal rows are no mention", async () => {
+    const onlyLinked = await seedCapture("1. Salesforce - deeper reporting.\n\nSee https://docs.hubspot.com/api/crm for details.");
+    const plain = await seedCapture(ANSWER);
+    await run(handler(), job(onlyLinked));
+    await run(handler(), job(plain));
+
+    const linkRows = await db.query<{ in_link: boolean }>("SELECT in_link FROM mention_facts WHERE result_id = $1 AND entity_type = 'brand'", [onlyLinked]);
+    expect(linkRows.rows.length).toBeGreaterThan(0);
+    expect(linkRows.rows.every((row) => row.in_link)).toBe(true);
+    expect((await presenceOf(onlyLinked)).brand_present).toBe(false);
+
+    const aggregates = await withTenantContext(db, { workspaceId, actorId: SYSTEM_ACTOR_ID }, (tx) =>
+      aggregateRange(tx, projectId, "2000-01-01", "2100-01-01", "UTC", null),
+    );
+    const brand = aggregates.find((row) => row.entityType === "brand")!;
+    const plainBrandRows = await db.query<{ n: string }>(
+      "SELECT count(*) AS n FROM mention_facts WHERE result_id = $1 AND entity_type = 'brand' AND NOT in_link",
+      [plain],
+    );
+    expect(brand.cellsTotal).toBe(2);
+    // Present in the plain cell only, exactly as brand_present says; the link-only cell is a measured cell with the brand absent.
+    expect(brand.cellsPresent).toBe(1);
+    expect(brand.mentionsTotal).toBe(Number(plainBrandRows.rows[0]!.n));
   });
 
   it("MATCHES THE PROJECT NAME even with no brand_aliases configured", async () => {
@@ -664,5 +704,97 @@ describe("STORY-135 · capture.parse", () => {
     const brand = aggregates.find((row) => row.entityType === "brand")!;
     expect(perPromptDenominator).toBe(1);
     expect(brand.cellsTotal - perPromptDenominator).toBe(1);
+  });
+
+  // STORY-036 AC9 - the rolling count, the flag and the discovery task. ANSWER lists "Zoho CRM" (untracked) at position 3.
+  describe("STORY-036 AC9 - candidate competitor discovery", () => {
+    const noop = new NoopRealtimePublisher();
+
+    /** `count` earlier captures that each listed the candidate, `daysAgo` days before now. Distinct result ids: the count is cells. */
+    async function seedEarlier(count: number, daysAgo: number, label = "Zoho CRM"): Promise<void> {
+      for (let i = 0; i < count; i += 1) {
+        await db.query(
+          `INSERT INTO mention_facts
+             (workspace_id,project_id,result_id,prompt_id,engine_key,captured_at,entity_type,entity_id,entity_label,matched_alias,
+              occurrence_index,char_start,char_end,first_token_index,prominence,sentiment_label,sentiment_score,sentiment_confidence,sentiment_method)
+           VALUES ($1,$2,$3,$4,'google_ai_mode', now() - make_interval(days => $5::int),'other',NULL,$6,$6,0,0,8,0,0.1,'neutral',0,0.5,'heuristic')`,
+          [workspaceId, projectId, randomUUID(), promptId, daysAgo, label],
+        );
+      }
+    }
+    const flagsOf = async (resultId: string): Promise<string[]> =>
+      (await db.query<{ flags: string[] }>("SELECT flags FROM answer_captures WHERE id = $1", [resultId])).rows[0]!.flags;
+    const tasksFor = async () =>
+      (await db.query<{ title: string; kind: string; origin: string }>("SELECT title, kind, origin FROM tasks WHERE project_id = $1", [projectId])).rows;
+
+    it("STORY-036 AC9 - the 10th capture in the window raises the flag and creates ONE discovery task", async () => {
+      await seedEarlier(9, 3);
+      const resultId = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(resultId));
+
+      expect(await flagsOf(resultId)).toContain("candidate_competitor_detected");
+      const tasks = await tasksFor();
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).toMatchObject({ kind: "monitoring", origin: "auto" });
+      expect(tasks[0]!.title).toContain("Zoho CRM");
+    });
+
+    it("STORY-036 AC9 - the 9th does not: no flag and no task", async () => {
+      await seedEarlier(8, 3);
+      const resultId = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(resultId));
+
+      expect(await flagsOf(resultId)).not.toContain("candidate_competitor_detected");
+      expect(await tasksFor()).toHaveLength(0);
+    });
+
+    it("STORY-036 AC9 - sightings older than 30 days are outside the rolling window", async () => {
+      await seedEarlier(9, 45);
+      const resultId = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(resultId));
+
+      expect(await flagsOf(resultId)).not.toContain("candidate_competitor_detected");
+      expect(await tasksFor()).toHaveLength(0);
+    });
+
+    it("STORY-036 AC9 - a re-parse and a second capture of the same candidate create no second task", async () => {
+      await seedEarlier(9, 3);
+      const first = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(first));
+      await run(handler({ realtime: noop }), job(first, true));
+      const second = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(second));
+
+      expect(await tasksFor()).toHaveLength(1);
+      expect(await flagsOf(first)).toContain("candidate_competitor_detected");
+      expect(await flagsOf(second)).toContain("candidate_competitor_detected");
+      // The flag is set once, not appended on every parse.
+      expect((await flagsOf(first)).filter((flag) => flag === "candidate_competitor_detected")).toHaveLength(1);
+    });
+
+    it("STORY-036 AC9 - a candidate that has since been TRACKED is no longer a discovery", async () => {
+      await seedEarlier(20, 3);
+      await db.query(
+        `INSERT INTO competitors (id, workspace_id, project_id, name, root_domain, aliases, source)
+         VALUES ($1, $2, $3, 'Zoho CRM', 'zoho.com', ARRAY[]::text[], 'user')`,
+        [randomUUID(), workspaceId, projectId],
+      );
+      const resultId = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(resultId));
+
+      expect(await flagsOf(resultId)).not.toContain("candidate_competitor_detected");
+      expect(await tasksFor()).toHaveLength(0);
+    });
+
+    it("STORY-036 AC9 - a re-parse that no longer crosses CLEARS the flag it had set", async () => {
+      await seedEarlier(9, 3);
+      const resultId = await seedCapture(ANSWER);
+      await run(handler({ realtime: noop }), job(resultId));
+      expect(await flagsOf(resultId)).toContain("candidate_competitor_detected");
+
+      await db.query("DELETE FROM mention_facts WHERE entity_type = 'other' AND result_id <> $1", [resultId]);
+      await run(handler({ realtime: noop }), job(resultId, true));
+      expect(await flagsOf(resultId)).not.toContain("candidate_competitor_detected");
+    });
   });
 });
