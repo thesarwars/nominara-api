@@ -40,7 +40,7 @@ import { CRAWL_AGENT, crawlDelayFor, isAllowed, parseRobots, sitemapUrlsOf, type
 import { AUX_AUDIT_RULE_VERSION, AUX_AUDIT_TOKENIZER } from "../../aux/audit-constants.js";
 import { failManualAudit } from "../../aux/fail-manual-audit.js";
 import { refundAuxAuditCharge } from "../../credits/aux-audit-refund.js";
-import { sanitiseText } from "../../aux/sanitise.js";
+import { robotsSnapshotOf, sanitiseText } from "../../aux/sanitise.js";
 import { AI_CRAWLER_AGENTS, evaluateSiteFiles, type SiteFile } from "../../aux/site-files.js";
 import { collectSitemap, MAX_SITEMAP_FILES, SitemapFetchSkipped, type SitemapResult } from "../../aux/sitemap.js";
 import { guardedFetch, type GuardedFetchInit, type GuardedResponse } from "../../net/guarded-fetch.js";
@@ -783,7 +783,8 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       errorSummary,
       llmsPresent,
       sitemapCount,
-      robotsSnapshot: robotsOk ? sanitiseText(robotsBody) : null,
+      // STORY-049 AC4 - verbatim (see robotsSnapshotOf), beside the hash over the same bytes.
+      robotsSnapshot: robotsOk && robots.responded ? robotsSnapshotOf(robots.raw, robotsBody) : null,
       robotsHash: robotsOk && robots.responded ? createHash("sha256").update(robots.raw).digest() : null,
       requests: budget.used,
       finishedAt,

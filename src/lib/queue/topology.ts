@@ -590,6 +590,20 @@ const RAW_QUEUE_TOPOLOGY: readonly RawQueueTopologyEntry[] = [
     idempotencyKeyPattern: "stripedrift:{yyyy_mm_dd}",
     tenantScoped: false,
   },
+  // STORY-020 AC8 / security-and-tenancy.md section 12: the nightly export of every audit chain to object storage under Object Lock COMPLIANCE
+  // mode. It was a hand-run script (`workers/rollup/audit-export.ts`) with no queue. Not tenant-scoped: it streams every workspace's chain on
+  // the owner connection, as the verifier does. Advisory-locked single-flight. Idempotent under at-least-once delivery: a repeat writes one more
+  // complete, locked pair under a new stamp, and a failed run leaves no half export (the spool is uploaded only after the stream has ended).
+  {
+    name: "audit.export",
+    producer: "cron daily (STORY-020 AC8, security-and-tenancy.md section 12; not in §4)",
+    workerGroup: "rollup",
+    concurrency: 1,
+    retry: { delaysMs: doubling(3) },
+    priority: 9,
+    idempotencyKeyPattern: "auditexp:{yyyy_mm_dd}",
+    tenantScoped: false,
+  },
   {
     name: "deploy.cms",
     producer: "API",

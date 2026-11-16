@@ -15,6 +15,8 @@ export interface ConvertibleRun {
   readonly converted_project_id: string | null;
   /** Read for one documented key only: `competitors` (see below). An expired run has none. */
   readonly result_json?: Readonly<Record<string, unknown>> | null;
+  /** The engines that answered the run: they are the suggested engines (FR-SCAN-01g). Kept on the row, so an expired run still has them. */
+  readonly engines_succeeded?: readonly string[];
 }
 
 export type ToolConversionPlan = Pick<ToolRunConversion, "state" | "reason" | "credits" | "prefill">;
@@ -49,7 +51,9 @@ export function toolConversionPlan(run: ConvertibleRun): ToolConversionPlan {
     prompts.push(trimmed);
   }
   const rootUrl = run.brand_url ?? run.target_url;
-  const prefill = { project_name: run.brand_name, root_url: rootUrl, prompts, competitors: competitorsOf(run.result_json) };
+  // SUGGESTED ENGINES (STORY-095 AC13): the engines that answered, in the run's order. A tool that ran none (Schema Builder) suggests none.
+  const engines = [...new Set(run.engines_succeeded ?? [])];
+  const prefill = { project_name: run.brand_name, root_url: rootUrl, prompts, competitors: competitorsOf(run.result_json), engines };
 
   // `converted` wins over everything: converting a second time returns the first project (AC20) whatever the run looks like now.
   if (run.converted_project_id !== null) return { state: "converted", reason: null, credits: 0, prefill };

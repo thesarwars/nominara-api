@@ -11,7 +11,12 @@ packages:
 # FastifyInstance type, and `pnpm typecheck` fails at
 # src/api/register-cookies.ts. system-architecture.md §11 pins the floor.
 overrides:
-  fastify: 5.12.0
+  fastify: 5.12.2
+  # Batch 18 (owner decision 108(c)): transitive packages with HIGH advisories that `pnpm scan:deps` blocks on. Each is the
+  # minimal patched version; drop an entry when its parent resolves a patched version on its own.
+  engine.io: 6.6.10
+  fast-uri: 3.1.7
+  "@grpc/grpc-js": 1.14.5
 
 # pnpm 11 runs a dependency-status check before every script and exits 1
 # with ERR_PNPM_IGNORED_BUILDS while any build script is unapproved — which

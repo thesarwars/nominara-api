@@ -468,6 +468,39 @@ describe("STORY-113 - attribution configuration and beacon", () => {
     expect(await dailyRows(b.actor.projectId)).toHaveLength(0);
   }, 120_000);
 
+  // STORY-113 AC8 / scenario 10 (owner decision 108(e)): the beacon adopts edge-cases-and-slos.md objective #5, API write latency
+  // p95 <= 500 ms, measured on the server side of the request (the same quantity as the "server span" the objective names).
+  // 400 events (under the per-configuration limit, so every one is a real ingest), 20 at a time, ALL on one landing URL so
+  // every request upserts the same daily counter row - the contended worst case. "Asynchronous" here is the queue boundary
+  // (KAD-06): the handler answers 202 and makes no network call.
+  it("STORY-113 S10 - ingest latency under concurrent load is within the p95 <= 500 ms write objective, and the handler makes no network call", async () => {
+    const { actor, token } = await connected();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const TOTAL = 400;
+    const CONCURRENCY = 20;
+    const P95_OBJECTIVE_MS = 500;
+    const durations: number[] = [];
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < TOTAL) {
+        next += 1;
+        const started = performance.now();
+        const res = await beacon(event(token));
+        durations.push(performance.now() - started);
+        expect(res.statusCode, res.body).toBe(202);
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+    expect(durations).toHaveLength(TOTAL);
+    const sorted = [...durations].sort((a, b) => a - b);
+    const p95 = sorted[Math.ceil(0.95 * sorted.length) - 1]!;
+    expect(p95, `p95 ${p95.toFixed(1)} ms over ${TOTAL} events at concurrency ${CONCURRENCY}`).toBeLessThanOrEqual(P95_OBJECTIVE_MS);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    // Nothing was lost to the contention: the one counter row holds every event.
+    const rows = await dailyRows(actor.projectId);
+    expect(rows.reduce((sum, r) => sum + Number(r.sessions ?? r.events ?? r.count ?? 0), 0)).toBe(TOTAL);
+  }, 240_000);
+
   it("STORY-113 S14 - status reads pending, then receiving with first and last event times, then stale", async () => {
     const { actor, token, config } = await connected();
     expect(config.receiving).toBe(false);

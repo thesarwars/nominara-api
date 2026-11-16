@@ -1,9 +1,10 @@
 import { Logger } from "@nestjs/common";
+import { SpanStatusCode, trace } from "@opentelemetry/api";
 import type { Job } from "bullmq";
 import type { ClientBase } from "pg";
 import { z } from "zod";
 import { decideL3 } from "../../capture/l3-short-circuit.js";
-import { loadParseContext, parseCapture, persistParse, type CaptureRow } from "../../parser/parse-capture.js";
+import { loadParseContext, parseCapture, persistParse, type CaptureRow, type ParseContext } from "../../parser/parse-capture.js";
 import { NORMALIZER_VERSION } from "../../parser/normalize.js";
 import { defaultParseAlertMonitor, observationFrom, type ParseAlertMonitor } from "../../parser/parse-alerts.js";
 import type { SentimentArbiter } from "../../parser/sentiment/arbiter.js";
@@ -15,6 +16,9 @@ import { createQueueWorkerConnection, queueKeyPrefix } from "../connection.js";
 import { QueueProducer } from "../queue-producer.js";
 import type { QueueHandlerContext } from "../handlers.js";
 import { requestRollupIfRunComplete as requestRunRollup } from "./run-rollup-request.js";
+import { TasksService } from "../../../modules/tasks/tasks.service.js";
+import { ValkeyRealtimePublisher, type RealtimePublisher } from "../../cache/realtime-publisher.js";
+import { CANDIDATE_FLAG, CANDIDATE_FLAG_UPDATE_SQL, candidatesCrossingThreshold, discoveryTaskInput } from "../../parser/candidate-discovery.js";
 import { PHASES_DONE, phasedProcessor, signingKeysFromEnv, type JobProcessor } from "../worker-factory.js";
 import { captureFlagSchema } from "../../engines/contract.js";
 import { decodeRawObject, type RawObjectBody } from "../../capture/raw-object.js";
@@ -33,6 +37,8 @@ import type { ObjectStoragePort } from "../../storage/storage.port.js";
 // never stored as `0`" failure the plan names as one of the two highest-risk
 // correctness bugs. So it waited for the libraries, and now it does not have
 // to invent anything.
+
+const tracer = trace.getTracer("nominara-api");
 
 const payloadSchema = z
   .object({
@@ -62,6 +68,8 @@ export interface CaptureParseDeps {
   ) => Promise<unknown>;
   /** STORY-042 AC6 — adds a late fact's (workspace, project, date) to the `rollup_dirty` set. Injected in tests; production gets it from the worker group through the handler context. */
   readonly markRollupDirty?: (entry: DirtyEntry) => Promise<void>;
+  /** STORY-036 AC9 - the realtime publisher the discovery task's `task.created` notice goes through (Valkey from env when absent). */
+  readonly realtime?: RealtimePublisher;
   /** STORY-181 - the object-storage port the raw capture object is read through (S3 from env when absent). */
   readonly storagePort?: ObjectStoragePort;
 }
@@ -146,6 +154,74 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
   const rematchOutcome = (outcome: "matched" | "already_matched" | "source_unavailable", workspaceId: string, resultId: string): void => {
     incrementCounter("nominara_capture_rematch_total", { outcome });
     logger.log({ event: "capture.rematch", outcome, workspace_id: workspaceId, result_id: resultId });
+  };
+
+  // Built on the first discovery task, not at registration: a worker group without a reachable cache must still boot.
+  let tasks: TasksService | undefined;
+  const tasksService = (): TasksService => (tasks ??= new TasksService(deps?.realtime ?? new ValkeyRealtimePublisher(_context.env.VALKEY_CACHE_URL)));
+
+  /**
+   * STORY-036 AC9 - the rolling count, the flag and the discovery task, in the parse transaction and AFTER the facts are written, so the
+   * count includes this capture. The flag is recomputed on every parse (a re-parse that no longer crosses clears it); the task is
+   * idempotent by fingerprint, so a redelivered job or a second capture of the same candidate creates nothing new.
+   */
+  const discoverCandidates = async (tx: ClientBase, capture: CaptureRow, tracked: ParseContext["aliases"]): Promise<void> => {
+    // AUXILIARY: the facts are already written in this transaction. A discovery failure (a soft-deleted project, a lock timeout, a
+    // task insert error) must not roll the parse back, so it runs inside a SAVEPOINT; on error only the discovery's own writes go.
+    await tx.query("SAVEPOINT candidate_discovery");
+    try {
+      await discoverCandidatesInner(tx, capture, tracked);
+      await tx.query("RELEASE SAVEPOINT candidate_discovery");
+    } catch (error) {
+      await tx.query("ROLLBACK TO SAVEPOINT candidate_discovery");
+      await tx.query("RELEASE SAVEPOINT candidate_discovery");
+      incrementCounter("nominara_parser_candidate_discovery_failed_total");
+      // IDs and the error class only: a message can carry engine text.
+      logger.warn({
+        event: "parser.candidate_discovery_failed",
+        workspace_id: capture.workspaceId,
+        project_id: capture.projectId,
+        result_id: capture.resultId,
+        error: error instanceof Error ? error.name : "unknown",
+      });
+    }
+  };
+
+  const discoverCandidatesInner = async (tx: ClientBase, capture: CaptureRow, tracked: ParseContext["aliases"]): Promise<void> => {
+    await tracer.startActiveSpan("parser.candidate_discovery", async (span) => {
+      try {
+        const crossed = await candidatesCrossingThreshold(tx, {
+          projectId: capture.projectId,
+          resultId: capture.resultId,
+          capturedAt: capture.capturedAt,
+          tracked,
+        });
+        span.setAttribute("candidates.crossed", crossed.length);
+        if (crossed.length === 0 && !capture.flags.includes(CANDIDATE_FLAG)) return;
+
+        await tx.query(CANDIDATE_FLAG_UPDATE_SQL, [capture.resultId, crossed.length > 0, CANDIDATE_FLAG, capture.capturedAt]);
+        for (const signal of crossed) {
+          const outcome = await tasksService().createGeneratedTask(discoveryTaskInput(capture.projectId, signal));
+          incrementCounter("nominara_parser_candidate_competitor_tasks_total", { outcome: outcome.outcome });
+        }
+        if (crossed.length > 0) {
+          incrementCounter("nominara_parser_candidate_competitor_flagged_total");
+          // IDs and counts only: a candidate's label is engine text.
+          logger.log({
+            event: "parser.candidate_competitor_detected",
+            workspace_id: capture.workspaceId,
+            project_id: capture.projectId,
+            result_id: capture.resultId,
+            candidates: crossed.length,
+          });
+        }
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
   };
 
   let stores: RawObjectStores | undefined;
@@ -326,6 +402,7 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
 
     // Stage 6 — the facts and the capture, in the job's own transaction.
     await persistParse(tx, capture, result, aliasFingerprint);
+    await discoverCandidates(tx, capture, context.aliases);
 
     // STORY-042 AC6 / EC-12 — facts written onto a day that is already closed and rolled up make that rollup stale:
     // mark the workspace-local date dirty (after commit) so the dirty-date sweep reprocesses it within 15 minutes.

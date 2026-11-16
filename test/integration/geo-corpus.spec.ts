@@ -364,13 +364,104 @@ describe("STORY-058 - corpus passages and centroid", () => {
     const again = await build();
     expect(again).not.toHaveProperty("passagesConflictSkipped");
     expect(again.status).toBe("complete");
-    expect(again.passagesDeduplicated).toBe(1);
+    // STORY-058 AC4 (decision 108g): the duplicate URL used to be RE-FETCHED on this rebuild and its copy deduplicated (1). It is now
+    // remembered as `duplicate_only`, so it is not fetched at all and there is nothing to deduplicate (0). Changed deliberately with the behaviour.
+    expect(again.passagesDeduplicated).toBe(0);
     expect(await passageRows()).toHaveLength(1);
   }, 60_000);
 
-  // Open: the duplicate URL has no row of its own, so it is re-fetched on every build (a fetch cost only). Needs a per-URL record
-  // (a negative-cache row or a widened key) - see the key question in plans-7day/questions-058-corpus-key.md.
-  it.todo("scenario 7 - AC4 - a URL whose text is a same-cluster duplicate is not re-fetched while the 30-day cache is live");
+  const checkRows = async (): Promise<{ outcome: string; expires_at: Date; checked_at: Date }[]> =>
+    (await db.query("SELECT outcome, expires_at, checked_at FROM corpus_url_checks ORDER BY outcome")).rows;
+  const OFF_TOPIC = { kind: "html", html: "<html><body><main><p>Zebras graze on savanna grass at dawn.</p></main></body></html>" } as const;
+
+  it("scenario 7 - AC4 - a URL whose text is a same-cluster duplicate is not re-fetched while the 30-day cache is live", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://one.example/p");
+    await cite(prompt, "https://two.example/p");
+    const same = { kind: "html", html: articleHtml("identical") } as const;
+    pages.set("https://one.example/p", same);
+    pages.set("https://two.example/p", same);
+    await build();
+    expect([...fetchCalls].sort()).toEqual(["https://one.example/p", "https://two.example/p"]);
+
+    const rows = await checkRows();
+    expect(rows.map((row) => row.outcome)).toEqual(["duplicate_only"]);
+    // 30 days, the same cache period as a passage.
+    const days = (rows[0]!.expires_at.getTime() - rows[0]!.checked_at.getTime()) / 86_400_000;
+    expect(days).toBeGreaterThan(29.9);
+    expect(days).toBeLessThan(30.1);
+
+    fetchCalls.length = 0;
+    const again = await build();
+    expect(fetchCalls).toEqual([]);
+    expect(again.cached).toBe(2);
+    expect(again.status).toBe("complete");
+    expect(await passageRows()).toHaveLength(1);
+  }, 60_000);
+
+  it("scenario 7 - AC4 - a URL with NO relevant chunk is remembered too, and not fetched again", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://offtopic.example/p");
+    pages.set("https://offtopic.example/p", OFF_TOPIC);
+    const first = await build();
+    expect(first.empty).toBe(1);
+    expect((await checkRows()).map((row) => row.outcome)).toEqual(["no_relevant_chunk"]);
+
+    fetchCalls.length = 0;
+    await build();
+    expect(fetchCalls).toEqual([]);
+  }, 60_000);
+
+  it("scenario 7 - AC4 - an EXPIRED check is ignored: the URL is fetched again and its record renewed", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://offtopic.example/p");
+    pages.set("https://offtopic.example/p", OFF_TOPIC);
+    await build();
+    await db.query("UPDATE corpus_url_checks SET expires_at = now() - interval '1 minute'");
+    fetchCalls.length = 0;
+    await build();
+    expect(fetchCalls).toEqual(["https://offtopic.example/p"]);
+    const rows = await checkRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.expires_at.getTime()).toBeGreaterThan(Date.now());
+  }, 60_000);
+
+  it("scenario 7 - AC4 - a refused or failed URL is NOT remembered: it is a transient condition and is tried again", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://down.example/p");
+    pages.set("https://down.example/p", { kind: "failed", reason: "http_503" });
+    await build();
+    expect(await checkRows()).toHaveLength(0);
+    fetchCalls.length = 0;
+    await build();
+    expect(fetchCalls).toEqual(["https://down.example/p"]);
+  }, 60_000);
+
+  it("scenario 7 - AC4 - when the URL that held the text leaves the corpus, the remembered duplicate is fetched in the SAME build and the text stays in the corpus", async () => {
+    const prompt = await addPrompt(PROMPT_TEXTS[0]!);
+    await cite(prompt, "https://one.example/p", { weight: 5 });
+    await cite(prompt, "https://two.example/p");
+    const same = { kind: "html", html: articleHtml("identical") } as const;
+    pages.set("https://one.example/p", same);
+    pages.set("https://two.example/p", same);
+    await build();
+    expect((await passageRows()).map((row) => row.url)).toEqual(["https://one.example/p"]);
+
+    // batch 18 fix (owner decision 108): one.example is no longer cited, so its passage departs in this build's write. two.example's
+    // `duplicate_only` check was live when the build read, and it used to be trusted - leaving the text out of the corpus until the NEXT
+    // build. A departure now voids duplicate_only checks BEFORE the cache decision: two.example is fetched now and owns the text at once.
+    await db.query("DELETE FROM citation_facts WHERE normalized_url = 'https://one.example/p'");
+    fetchCalls.length = 0;
+    await build();
+    expect(fetchCalls).toEqual(["https://two.example/p"]);
+    expect((await passageRows()).map((row) => row.url)).toEqual(["https://two.example/p"]);
+    expect(await checkRows()).toHaveLength(0);
+
+    fetchCalls.length = 0;
+    await build();
+    expect(fetchCalls).toEqual([]);
+    expect((await passageRows()).map((row) => row.url)).toEqual(["https://two.example/p"]);
+  }, 60_000);
 
   it("scenario 7 - AC12 - a higher-scoring duplicate whose twin row has EXPIRED adopts that row: the passage survives the stale-row delete", async () => {
     const prompt = await addPrompt(PROMPT_TEXTS[0]!);

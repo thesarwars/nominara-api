@@ -6,7 +6,7 @@
 
 export const REDACTED = "[redacted]";
 
-const SECRET_KEY_PATTERN =
+export const SECRET_KEY_PATTERN =
   /password|passwd|secret|token|api[_-]?key|apikey|authorization|credential|private[_-]?key|access[_-]?key|client[_-]?secret|ssn|social[_-]?security|card[_-]?number|cvv|cvc/i;
 
 /** Shannon entropy in bits per character. */
@@ -29,7 +29,7 @@ function entropy(value: string): number {
 const HIGH_ENTROPY_MIN_LENGTH = 20;
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 3.5;
 
-function isHighEntropySecret(value: string): boolean {
+export function isHighEntropySecret(value: string): boolean {
   // Real secrets (API keys, opaque tokens) are single unbroken runs with no
   // whitespace; natural-language prose of the same length reaches a similar
   // bits-per-char average but always contains spaces, so excluding

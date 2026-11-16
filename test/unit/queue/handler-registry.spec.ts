@@ -62,6 +62,7 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
     expect(Object.keys(QUEUE_HANDLERS).sort()).toEqual([
       // STORY-114 - the per-URL attribution rollup and the substitution alert.
       "attribution.rollup",
+      "audit.export",
       "audit.verify",
       "billing.auto_topup",
       "billing.cancel_on_deletion",
@@ -167,6 +168,8 @@ describe("STORY-124 · the registry is typed against the real queue names", () =
       "prompt.generate",
       // STORY-075 AC11 - billing.stripe_drift, declared after prompt.generate in topology.ts.
       "billing.stripe_drift",
+      // STORY-020 AC8 - audit.export, declared after billing.stripe_drift in topology.ts.
+      "audit.export",
     ]);
   });
 

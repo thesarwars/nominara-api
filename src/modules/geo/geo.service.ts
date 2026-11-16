@@ -107,6 +107,8 @@ export class GeoService {
         active.setStatus({ code: SpanStatusCode.ERROR });
         throw error;
       } finally {
+        // The convention is checked at this helper's call sites, where each name is a literal; here it is a parameter.
+        // eslint-disable-next-line nominara/metric-name-convention
         observeValue(metric, Math.round(performance.now() - started), { workspace_id: currentTenantStore()?.context.workspaceId ?? "none", ...labels });
         active.end();
       }

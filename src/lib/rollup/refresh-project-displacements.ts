@@ -22,7 +22,9 @@ import {
 import { deriveConceptGap, type ConceptCandidate } from "../analytics/concept-gap.js";
 import { isLowConfidence, suppressRecommendations } from "../geo/corpus/weights.js";
 import { answerElementSchema } from "../engines/contract.js";
-import { buildMatcher, matchEntities } from "../parser/entity-matcher.js";
+import type { buildMatcher } from "../parser/entity-matcher.js";
+import { matchEntities } from "../parser/entity-matcher.js";
+import { matcherFor } from "../parser/matcher-cache.js";
 import { normalize } from "../parser/normalize.js";
 import { loadParseContext } from "../parser/parse-capture.js";
 import { classifyDomain, normalizeCitationUrl } from "../parser/citation-url.js";
@@ -209,7 +211,7 @@ async function refreshProjectDisplacementsInner(
   // A thunk, started only by a capture that HAS structured elements: no promise is created (or left unawaited) for the rest.
   const matcher = (): Promise<EntityMatching> =>
     (matching ??= loadParseContext(tx, projectId).then(({ context }) => ({
-      automaton: buildMatcher(context.aliases),
+      automaton: matcherFor(projectId, context.aliases, context.negativeAliases),
       aliases: context.aliases,
       negativeAliases: context.negativeAliases,
     })));

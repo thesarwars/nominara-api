@@ -22,6 +22,7 @@ import { createReportCleanupHandler } from "./handlers/report-cleanup.handler.js
 import { createBillingStripeDriftHandler } from "./handlers/billing-stripe-drift.handler.js";
 import { createRetentionPurgeHandler } from "./handlers/retention-purge.handler.js";
 import { createCreditVerifyHandler } from "./handlers/credit-verify.handler.js";
+import { createAuditExportHandler } from "./handlers/audit-export.handler.js";
 import { createAuditVerifyHandler } from "./handlers/audit-verify.handler.js";
 import { createIdentitySweepUnverifiedHandler } from "./handlers/identity-sweep-unverified.handler.js";
 import { createMaintenanceIntegrityHandler } from "./handlers/maintenance-integrity.handler.js";
@@ -158,6 +159,7 @@ export const QUEUE_HANDLERS: Partial<Record<QueueName, QueueHandlerFactory>> = {
   "maintenance.partition": (context) => createMaintenancePartitionHandler(context),
   "maintenance.integrity": (context) => createMaintenanceIntegrityHandler(context),
   "audit.verify": (context) => createAuditVerifyHandler(context),
+  "audit.export": (context) => createAuditExportHandler(context),
   "identity.sweep_unverified": (context) => createIdentitySweepUnverifiedHandler(context),
   "source.verify_presence": (context) => createSourceVerifyPresenceHandler(context),
   "task.generate": (context) => createTaskGenerateHandler(context),

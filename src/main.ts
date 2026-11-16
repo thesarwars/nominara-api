@@ -8,6 +8,7 @@ import { configureApp } from "./api/configure-app.js";
 import { loadEnv } from "./config/env.js";
 import { announceAlertRouting } from "./lib/alerts/alerts.js";
 import { fastifyServerOptions } from "./api/fastify-options.js";
+import { RedactingLogger } from "./lib/logging/redacting-logger.js";
 
 // STORY-022 — API bootstrap (project-structure.md §2: "src/main.ts API
 // bootstrap (Fastify adapter)"). enableShutdownHooks() wires SIGTERM/SIGINT
@@ -22,6 +23,8 @@ export async function bootstrap(): Promise<NestFastifyApplication> {
   announceAlertRouting();
   const app = await NestFactory.create<NestFastifyApplication>(ApiModule, new FastifyAdapter(fastifyServerOptions()), {
     bufferLogs: true,
+    // STORY-005 AC2 - the redaction transport, installed before any application code runs.
+    logger: new RedactingLogger(),
   });
   app.enableShutdownHooks();
   await configureApp(app);
