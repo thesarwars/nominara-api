@@ -143,7 +143,7 @@ Pagination is **cursor-based** — an opaque base64 of the sort-key tuple. Offse
 | `PATCH`/`DELETE` | `/members/{id}` | `member:update_role` / `:remove` | |
 | `GET`/`PUT` | `/workspaces/{id}/sso` ↑ | `sso:configure` | |
 | `GET`/`POST`/`DELETE` | `/api-keys` ↑ | `apikey:create` | secret returned once |
-| `GET` | `/audit-log` | `audit_log:read` | cursor, filterable by action, actor, date |
+| `GET` | `/audit-log` | `audit_log:read` | cursor, filterable by action, actor, date. **`category=security` (batch 18, STORY-096 AC11, decision 108a)** is the Trust page's security event feed; it now also includes `sso.*`, `passkey.*`, `session.reuse_detected` and `session.refresh_grace_reuse`, matched exact-or-dot (the action itself or a dotted child) in `categoryOf` and the SQL predicate. The sso, passkey and session-reuse events are reserved: no audit rows are written for them yet |
 | `GET` | `/trust/access-grants` | `workspace:read` | live support-grant transparency panel |
 
 ### Billing, entitlements & credits
@@ -306,7 +306,7 @@ One resource family for all six tools. `tool_key` selects behaviour; lifecycle, 
 | `POST` | `/tools/compare-runs` | `lookup:read_history` | **0 credits.** Two stored snapshots; **no capture path exists** |
 | `GET` | `/tools/runs` · `/tools/runs/{id}` | `lookup:read_history` | shared timeline; `?tool_key=`, `?brand=`, `?pinned=`. Reading is **0 credits, always**. A run's presentation notes (`not_tracked_note`, `did_not_check`) are **stored with the run** in `tool_runs.result_json.presentation_notes` at write time and served from there on every re-open (STORY-095 AC9, batch 15); the stored key never appears in `result`, and a run stored before batch 15 or with no stored result reads the composed notes |
 | `PATCH` | `/tools/runs/{id}` | `lookup:read_history` | `{pinned}` |
-| `GET` | `/tools/runs/{id}/convert` | `lookup:read_history` | the conversion preview, before the click: `{state: available\|converted\|unavailable, reason: run_not_finished\|run_failed\|no_url \| null, credits: 0, prefill{project_name, root_url, prompts, competitors}, project_slot{used, max, free}, prompt_slots{carried, cap}, competitor_slots{carried, cap}}` |
+| `GET` | `/tools/runs/{id}/convert` | `lookup:read_history` | the conversion preview, before the click: `{state: available\|converted\|unavailable, reason: run_not_finished\|run_failed\|no_url \| null, credits: 0, prefill{project_name, root_url, prompts, competitors, engines}, project_slot{used, max, free}, prompt_slots{carried, cap}, competitor_slots{carried, cap}}`. **`prefill.engines` (batch 18, STORY-095 AC13, decision 108b):** the engines that answered the run (`engines_succeeded`), display only; it is never sent on create, and the project's engines still come from its plan |
 | `POST` | `/tools/runs/{id}/convert` ✚ ⛨ | `project:create` | creates the project, first prompts, and discovery |
 
 ### Command bar
