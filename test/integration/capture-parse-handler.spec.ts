@@ -786,6 +786,21 @@ describe("STORY-135 · capture.parse", () => {
       expect(await tasksFor()).toHaveLength(0);
     });
 
+    it("batch 18 fix - an auxiliary discovery failure (soft-deleted project -> NotFound on the task) does not roll the parse back", async () => {
+      await seedEarlier(9, 3);
+      const resultId = await seedCapture(ANSWER);
+      await db.query("UPDATE projects SET deleted_at = now() WHERE id = $1", [projectId]);
+      await run(handler({ realtime: noop }), job(resultId));
+
+      const capture = await db.query<{ status: string; flags: string[] }>("SELECT status, flags FROM answer_captures WHERE id = $1", [resultId]);
+      expect(capture.rows[0]!.status).toBe("parsed");
+      const facts = await db.query("SELECT 1 FROM mention_facts WHERE result_id = $1", [resultId]);
+      expect(facts.rowCount).toBeGreaterThan(0);
+      // The discovery's own writes were rolled back to the savepoint: no flag, no task.
+      expect(capture.rows[0]!.flags).not.toContain("candidate_competitor_detected");
+      expect(await tasksFor()).toHaveLength(0);
+    });
+
     it("STORY-036 AC9 - a re-parse that no longer crosses CLEARS the flag it had set", async () => {
       await seedEarlier(9, 3);
       const resultId = await seedCapture(ANSWER);

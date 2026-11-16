@@ -166,6 +166,28 @@ export function createCaptureParseHandler(_context: QueueHandlerContext, deps?: 
    * idempotent by fingerprint, so a redelivered job or a second capture of the same candidate creates nothing new.
    */
   const discoverCandidates = async (tx: ClientBase, capture: CaptureRow, tracked: ParseContext["aliases"]): Promise<void> => {
+    // AUXILIARY: the facts are already written in this transaction. A discovery failure (a soft-deleted project, a lock timeout, a
+    // task insert error) must not roll the parse back, so it runs inside a SAVEPOINT; on error only the discovery's own writes go.
+    await tx.query("SAVEPOINT candidate_discovery");
+    try {
+      await discoverCandidatesInner(tx, capture, tracked);
+      await tx.query("RELEASE SAVEPOINT candidate_discovery");
+    } catch (error) {
+      await tx.query("ROLLBACK TO SAVEPOINT candidate_discovery");
+      await tx.query("RELEASE SAVEPOINT candidate_discovery");
+      incrementCounter("nominara_parser_candidate_discovery_failed_total");
+      // IDs and the error class only: a message can carry engine text.
+      logger.warn({
+        event: "parser.candidate_discovery_failed",
+        workspace_id: capture.workspaceId,
+        project_id: capture.projectId,
+        result_id: capture.resultId,
+        error: error instanceof Error ? error.name : "unknown",
+      });
+    }
+  };
+
+  const discoverCandidatesInner = async (tx: ClientBase, capture: CaptureRow, tracked: ParseContext["aliases"]): Promise<void> => {
     await tracer.startActiveSpan("parser.candidate_discovery", async (span) => {
       try {
         const crossed = await candidatesCrossingThreshold(tx, {
