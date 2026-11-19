@@ -22,6 +22,10 @@ export const auditChainMarks = pgTable("audit_chain_marks", {
 
 export const auditExportWatermarks = pgTable("audit_export_watermarks", {
   id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  seq: bigint("seq", { mode: "bigint" }).notNull(),
+  runId: uuid("run_id").notNull(),
+  phase: text("phase").notNull(),
+  predecessorManifestSha256: bytea("predecessor_manifest_sha256"),
   workspaceId: uuid("workspace_id").notNull(),
   fromSeq: bigint("from_seq", { mode: "bigint" }).notNull(),
   maxSeq: bigint("max_seq", { mode: "bigint" }).notNull(),

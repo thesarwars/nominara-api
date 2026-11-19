@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ClientBase } from "pg";
 import { connect, requireDatabaseUrl } from "../../db/client.js";
@@ -6,8 +7,9 @@ import { LocalDirExportSink } from "../../modules/audit/adapters/local-dir-expor
 import { CHAIN_CHUNK_ROWS, iterateWorkspaceChain, listAuditedWorkspaceIds } from "../../modules/audit/audit-log-reader.js";
 import {
   chainRowStillMatches,
-  readLatestManifestSha256,
+  readExportLinkage,
   readWatermarks,
+  recordIntent,
   recordRun,
   type ExportWatermark,
   type WatermarkAdvance,
@@ -70,7 +72,10 @@ export async function runAuditExport(
   if (options.incremental !== true) {
     const rows = streamEstate(privilegedClient, workspaceIds, chunkRows, null);
     try {
-      return await sink.export(rows, exportOptions);
+      const location = await sink.export(rows, exportOptions);
+      // Null is the incremental "nothing to export" answer; a full export asked for a batch and got none, which is a sink fault.
+      if (location === null) throw new Error("audit export: the sink returned no location for a full export");
+      return location;
     } finally {
       // A sink that stops pulling without finishing the stream or calling return() must not leave the privileged
       // connection idle in a REPEATABLE READ transaction, pinning xmin. A no-op once the stream has completed.
@@ -84,15 +89,33 @@ export async function runAuditExport(
   // would put a link in the manifest chain that proves nothing; a skipped night leaves the chain exactly as long as the exports that happened.
   if (pending.length === 0) return null;
 
-  const previousManifestSha256 = await readLatestManifestSha256(privilegedClient);
+  const { previousManifestSha256, unrecordedRuns } = await readExportLinkage(privilegedClient);
+  const runId = randomUUID();
   const chains = new Map<string, ExportChainRange>();
   let written: AuditExportWritten | null = null;
+  const advancesOf = (): WatermarkAdvance[] =>
+    [...chains].map(([workspaceId, range]) => ({
+      workspaceId,
+      fromSeq: range.fromSeq,
+      maxSeq: range.toSeq,
+      rowHash: Buffer.from(range.toRowHash, "hex"),
+    }));
   const rows = streamEstate(privilegedClient, pending, chunkRows, { watermarks, chains });
-  let location: string;
+  let location: string | null;
   try {
     location = await sink.export(rows, exportOptions, {
       previousManifestSha256,
+      unrecordedRuns,
       chains,
+      // The sink asks once the stream has ended and before it makes anything durable. A pending chain can still turn out to hold no rows (it was
+      // purged between discovery and the snapshot): then there is nothing to commit, and no object, no intent and no watermark is written.
+      beforeCommit: async (planned) => {
+        if (chains.size === 0) return false;
+        // THE INTENT GOES FIRST. If the objects are written and `recordRun` below then fails, this row is how the next run learns that an object
+        // exists that no watermark describes; without it the next manifest would link past it and the object would be an unaccounted-for fork.
+        await recordIntent(privilegedClient, runId, previousManifestSha256, advancesOf(), planned);
+        return true;
+      },
       recordWritten: (w) => {
         written = w;
       },
@@ -102,17 +125,12 @@ export async function runAuditExport(
     // connection idle in a REPEATABLE READ transaction, pinning xmin. A no-op once the stream has completed.
     await rows.return(undefined);
   }
+  if (location === null) return null;
   // FAIL CLOSED on a sink that wrote an object but never said so: moving no watermark means the rows go out again tomorrow, a duplicate. Moving
   // one on trust would be a gap in seven-year evidence.
   const reported = written as AuditExportWritten | null;
   if (reported === null) throw new Error("audit export: the sink did not report the objects it wrote, so no watermark was recorded");
-  const advances: WatermarkAdvance[] = [...chains].map(([workspaceId, range]) => ({
-    workspaceId,
-    fromSeq: range.fromSeq,
-    maxSeq: range.toSeq,
-    rowHash: Buffer.from(range.toRowHash, "hex"),
-  }));
-  await recordRun(privilegedClient, advances, reported);
+  await recordRun(privilegedClient, runId, previousManifestSha256, advancesOf(), reported);
   return location;
 }
 

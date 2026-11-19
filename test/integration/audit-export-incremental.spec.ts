@@ -1,6 +1,6 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "pg";
@@ -27,7 +27,7 @@ function input(workspaceId: string, action: string): AppendAuditRowInput {
 
 interface Manifest {
   rowCount: number;
-  incremental: { previousManifestSha256: string | null; chains: Array<{ workspaceId: string; fromSeq: string; afterRowHash: string | null; toSeq: string; toRowHash: string; rowCount: number; rebased: boolean }> };
+  incremental: { previousManifestSha256: string | null; unrecordedRuns: Array<{ runId: string; manifestSha256: string; dataSha256: string }>; chains: Array<{ workspaceId: string; fromSeq: string; afterRowHash: string | null; toSeq: string; toRowHash: string; rowCount: number; rebased: boolean }> };
 }
 
 describe("batch 19 - incremental audit export", () => {
@@ -97,7 +97,7 @@ describe("batch 19 - incremental audit export", () => {
     expect(third.manifest!.incremental.previousManifestSha256).not.toBeNull();
     // The previous run is the SECOND one, whose manifest we did not keep; it is not the first.
     expect(third.manifest!.incremental.previousManifestSha256).not.toBe(sha(firstManifestText));
-    const stored = await db.query<{ manifest_sha256: Buffer }>("SELECT manifest_sha256 FROM audit_export_watermarks ORDER BY exported_at ASC, id ASC");
+    const stored = await db.query<{ manifest_sha256: Buffer }>("SELECT manifest_sha256 FROM audit_export_watermarks WHERE phase = 'recorded' ORDER BY seq ASC");
     const distinct = [...new Set(stored.rows.map((r) => r.manifest_sha256.toString("hex")))];
     // First run's manifest is recorded as exactly the hash of its bytes, and the third links to the second.
     expect(distinct[0]).toBe(sha(firstManifestText));
@@ -112,7 +112,7 @@ describe("batch 19 - incremental audit export", () => {
     const after = await db.query("SELECT count(*)::int AS n FROM audit_export_watermarks");
     expect(after.rows[0]).toEqual(before.rows[0]);
 
-    const latest = await db.query<{ manifest_sha256: Buffer }>("SELECT manifest_sha256 FROM audit_export_watermarks ORDER BY exported_at DESC, id DESC LIMIT 1");
+    const latest = await db.query<{ manifest_sha256: Buffer }>("SELECT manifest_sha256 FROM audit_export_watermarks WHERE phase = 'recorded' ORDER BY seq DESC LIMIT 1");
     await chain.append(db, input(WS_A, "a.4"));
     const next = await run();
     expect(next.manifest!.incremental.previousManifestSha256).toBe(latest.rows[0]!.manifest_sha256.toString("hex"));
@@ -139,7 +139,7 @@ describe("batch 19 - incremental audit export", () => {
     const head = await db.query<{ seq: string }>("SELECT max(seq)::text AS seq FROM audit_log WHERE workspace_id = $1", [WS_B]);
     const bogus = Buffer.alloc(32, 7);
     await db.query(
-      "INSERT INTO audit_export_watermarks (workspace_id, from_seq, max_seq, row_hash, object_sha256, manifest_sha256) VALUES ($1, 0, $2::int8 + 1000, $3, $3, $3)",
+      "INSERT INTO audit_export_watermarks (run_id, phase, workspace_id, from_seq, max_seq, row_hash, object_sha256, manifest_sha256) VALUES (gen_random_uuid(), 'recorded', $1, 0, $2::int8 + 1000, $3, $3, $3)",
       [WS_B, head.rows[0]!.seq, bogus],
     );
     const rebased = await run();
@@ -149,6 +149,27 @@ describe("batch 19 - incremental audit export", () => {
     expect(rebased.rows.filter((r) => r.workspace_id === WS_B).length).toBe(b.rowCount);
     // The rebase's own (lower) watermark supersedes the stale one: the chain is not rebased again, and with nothing new there is no object.
     expect((await run()).location).toBeNull();
+  });
+
+  it("STORY-020: objects written but recordRun failed - the next manifest links to the last RECORDED manifest, lists the orphan explicitly, and re-exports its rows (one verifiable chain, no gap)", async () => {
+    await chain.append(db, input(WS_A, "a.orphan"));
+    const lastRecorded = (await db.query<{ manifest_sha256: Buffer }>("SELECT manifest_sha256 FROM audit_export_watermarks WHERE phase = 'recorded' ORDER BY seq DESC LIMIT 1")).rows[0]!.manifest_sha256.toString("hex");
+    // A real sink writes real objects; the recording is what fails. Poison it by making the 'recorded' insert throw for this one run.
+    await db.query(`CREATE OR REPLACE FUNCTION app_test_fail_recorded() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase = 'recorded' THEN RAISE EXCEPTION 'recording down'; END IF; RETURN NEW; END $$`);
+    await db.query("CREATE TRIGGER test_fail_recorded BEFORE INSERT ON audit_export_watermarks FOR EACH ROW EXECUTE FUNCTION app_test_fail_recorded()");
+    const orphanDir = join(dir, "orphan-run");
+    await expect(runAuditExport(db, new LocalDirExportSink(orphanDir), { incremental: true })).rejects.toThrow(/recording down/);
+    await db.query("DROP TRIGGER test_fail_recorded ON audit_export_watermarks");
+    const orphanManifestSha = sha(await readFile(join(orphanDir, (await readdir(orphanDir)).find((f) => f.endsWith(".manifest.json"))!), "utf8"));
+
+    const next = await run();
+    expect(next.manifest!.incremental.previousManifestSha256).toBe(lastRecorded);
+    expect(next.manifest!.incremental.unrecordedRuns.map((r) => r.manifestSha256)).toEqual([orphanManifestSha]);
+    // The orphan's rows were never recorded, so they are in this export again.
+    expect(next.rows.map((r) => r.workspace_id)).toContain(WS_A);
+    // Once a run is recorded the orphan is accounted for and is not listed again.
+    await chain.append(db, input(WS_A, "a.after-orphan"));
+    expect((await run()).manifest!.incremental.unrecordedRuns).toEqual([]);
   });
 
   it("the watermark table is owner-only: no runtime role can read or write it, and it cannot be updated or deleted even by its owner", async () => {

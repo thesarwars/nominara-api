@@ -66,7 +66,9 @@ export class S3ObjectLockExportSink implements AuditExportSink {
     });
   }
 
-  async export(rows: AuditExportRows, options: AuditExportOptions, increment?: AuditExportIncrement): Promise<string> {
+  export(rows: AuditExportRows, options: AuditExportOptions): Promise<string>;
+  export(rows: AuditExportRows, options: AuditExportOptions, increment: AuditExportIncrement): Promise<string | null>;
+  async export(rows: AuditExportRows, options: AuditExportOptions, increment?: AuditExportIncrement): Promise<string | null> {
     if (!Number.isFinite(options.retentionDays) || options.retentionDays <= 0) {
       throw new RangeError(`audit export retention must be a positive number of days, got ${String(options.retentionDays)}`);
     }
@@ -84,13 +86,17 @@ export class S3ObjectLockExportSink implements AuditExportSink {
         "utf8",
       );
 
+      const manifestSha256Hex = createHash("sha256").update(manifest).digest("hex");
+      // The caller records its intent (the hashes are known: the bytes are spooled) before anything is durable; false = nothing to export.
+      if (increment !== undefined && !(await increment.beforeCommit({ dataSha256: spooled.sha256Hex, manifestSha256: manifestSha256Hex }))) return null;
+
       // Data first, manifest second: a manifest never names an object that is not there. If the manifest fails the data object stays (it
       // cannot be deleted under COMPLIANCE anyway) and the failed job's retry writes a complete pair under a new stamp.
       await this.putLocked(`${base}.jsonl`, () => createReadStream(dataPath), spooled.bytes, spooled.sha256Base64, retainUntil);
       const manifestSha = createHash("sha256").update(manifest).digest("base64");
       await this.putLocked(`${base}.manifest.json`, () => manifest, manifest.byteLength, manifestSha, retainUntil, "application/json");
       // Only now, with both objects durable: the caller moves its watermark on this and on nothing earlier.
-      increment?.recordWritten({ dataSha256: spooled.sha256Hex, manifestSha256: createHash("sha256").update(manifest).digest("hex") });
+      increment?.recordWritten({ dataSha256: spooled.sha256Hex, manifestSha256: manifestSha256Hex });
       return `s3://${this.config.bucket}/${base}.jsonl`;
     } finally {
       await rm(dir, { recursive: true, force: true });

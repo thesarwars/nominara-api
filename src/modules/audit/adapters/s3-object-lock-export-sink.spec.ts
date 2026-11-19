@@ -156,7 +156,9 @@ describe("STORY-020 AC8 - S3ObjectLockExportSink", () => {
 describe("batch 19 (STORY-020 follow-up) - the incremental manifest", () => {
   const increment = (previous: string | null, recorded: Array<{ dataSha256: string; manifestSha256: string }>): AuditExportIncrement => ({
     previousManifestSha256: previous,
+    unrecordedRuns: [],
     chains: new Map([["ws-1", { fromSeq: "1", afterRowHash: "deadbeef", toSeq: "2", toRowHash: "cafe", rowCount: 1, rebased: false }]]),
+    beforeCommit: async () => true,
     recordWritten: (written) => recorded.push(written),
   });
 
@@ -201,5 +203,30 @@ describe("batch 19 (STORY-020 follow-up) - the incremental manifest", () => {
     await new S3ObjectLockExportSink(CONFIG).export([row("1")], { retentionDays: 30 });
     const manifest = puts.find((p) => String(p.input.Key).endsWith(".manifest.json"))!;
     expect(JSON.parse(manifest.body)).not.toHaveProperty("incremental");
+  });
+
+  it("STORY-020: beforeCommit answering false uploads nothing, reports nothing and returns null", async () => {
+    const { puts } = captureSends();
+    const recorded: Array<{ dataSha256: string; manifestSha256: string }> = [];
+    const location = await new S3ObjectLockExportSink(CONFIG).export([row("2")], { retentionDays: 30 }, { ...increment(null, recorded), beforeCommit: async () => false });
+    expect(location).toBeNull();
+    expect(puts).toHaveLength(0);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("STORY-020: beforeCommit is asked with the exact hashes, before the first upload", async () => {
+    const { puts } = captureSends();
+    const asked: Array<{ dataSha256: string; manifestSha256: string; putsSoFar: number }> = [];
+    await new S3ObjectLockExportSink(CONFIG).export([row("2")], { retentionDays: 30 }, {
+      ...increment(null, []),
+      beforeCommit: async (planned) => {
+        asked.push({ ...planned, putsSoFar: puts.length });
+        return true;
+      },
+    });
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.putsSoFar).toBe(0);
+    const manifest = puts.find((p) => String(p.input.Key).endsWith(".manifest.json"))!;
+    expect(asked[0]!.manifestSha256).toBe(createHash("sha256").update(manifest.body).digest("hex"));
   });
 });

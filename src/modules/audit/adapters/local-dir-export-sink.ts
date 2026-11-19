@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, open, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditChainRow } from "../../../lib/crypto/audit-chain.js";
 import { incrementalManifestBlock, type AuditExportIncrement, type AuditExportOptions, type AuditExportRows, type AuditExportSink } from "../ports/export-sink.js";
@@ -27,7 +27,9 @@ function toExportLine(row: AuditChainRow): string {
 export class LocalDirExportSink implements AuditExportSink {
   constructor(private readonly baseDir: string) {}
 
-  async export(rows: AuditExportRows, options: AuditExportOptions, increment?: AuditExportIncrement): Promise<string> {
+  export(rows: AuditExportRows, options: AuditExportOptions): Promise<string>;
+  export(rows: AuditExportRows, options: AuditExportOptions, increment: AuditExportIncrement): Promise<string | null>;
+  async export(rows: AuditExportRows, options: AuditExportOptions, increment?: AuditExportIncrement): Promise<string | null> {
     await mkdir(this.baseDir, { recursive: true });
 
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -39,7 +41,9 @@ export class LocalDirExportSink implements AuditExportSink {
     let rowCount = 0;
     const dataHash = createHash("sha256");
     const workspaceIds = new Set<string>();
-    const handle = await open(dataPath, "w");
+    // Spooled under a name that is not an export; it takes the export name only at commit, so a skipped or failed run leaves nothing named like one.
+    const spoolPath = `${dataPath}.part`;
+    const handle = await open(spoolPath, "w");
     try {
       let batch: string[] = [];
       for await (const row of rows) {
@@ -61,7 +65,7 @@ export class LocalDirExportSink implements AuditExportSink {
     } catch (error) {
       // A half-written file, once made read-only and named like an export, would be taken for a complete one.
       await handle.close().catch(() => undefined);
-      await unlink(dataPath).catch(() => undefined);
+      await unlink(spoolPath).catch(() => undefined);
       throw error;
     }
     await handle.close();
@@ -75,12 +79,20 @@ export class LocalDirExportSink implements AuditExportSink {
       ...(increment !== undefined ? { incremental: incrementalManifestBlock(increment) } : {}),
     };
     const manifestText = JSON.stringify(manifest, null, 2);
+    const planned = { dataSha256: dataHash.digest("hex"), manifestSha256: createHash("sha256").update(manifestText).digest("hex") };
+
+    // Nothing is durable until the caller has recorded its intent; `false` means there is nothing to export.
+    if (increment !== undefined && !(await increment.beforeCommit(planned))) {
+      await unlink(spoolPath).catch(() => undefined);
+      return null;
+    }
+    await rename(spoolPath, dataPath);
     await writeFile(manifestPath, manifestText, "utf8");
 
     await chmod(dataPath, READ_ONLY_MODE);
     await chmod(manifestPath, READ_ONLY_MODE);
 
-    increment?.recordWritten({ dataSha256: dataHash.digest("hex"), manifestSha256: createHash("sha256").update(manifestText).digest("hex") });
+    increment?.recordWritten(planned);
 
     return dataPath;
   }
