@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CATALOG } from "../../../test/support/aux-rules.js";
 import { parseArgs, runCli, urlPathOf, UsageError } from "./static-audit-cli.js";
 import { runStaticAudit, StaticAuditError, type StaticAuditInput } from "./static-audit.js";
+import { parseHeadersFile, parseVercelJson, robotsHeaderKey, robotsTagsFor } from "./static-host-headers.js";
 
 // STORY-102 AC10 / decision 68(j) - the AUX audit over a directory of built static HTML. Fixture HTML only: no network, no database.
 
@@ -183,7 +184,9 @@ describe("STORY-102 AC10 - the command line", () => {
     expect(urlPathOf("index.html")).toBe("/");
     expect(urlPathOf("about/index.html")).toBe("/about/");
     expect(urlPathOf("docs/page.html")).toBe("/docs/page.html");
-    expect(parseArgs(["out", "--min-score=90"])).toEqual({ dir: "out", minScore: 90, baseUrl: "https://site.invalid" });
+    // Batch 19 fix: `allowPartial` joined the options (--allow-partial), false by default. The other three fields are unchanged.
+    expect(parseArgs(["out", "--min-score=90"])).toEqual({ dir: "out", minScore: 90, baseUrl: "https://site.invalid", allowPartial: false });
+    expect(parseArgs(["out", "--allow-partial"]).allowPartial).toBe(true);
     expect(() => parseArgs(["a", "b"])).toThrow(UsageError);
     expect(() => parseArgs(["a", "--base-url", "ftp://x"])).toThrow(UsageError);
   });
@@ -202,4 +205,174 @@ describe("STORY-102 AC10 - the command line", () => {
     expect(ok.status, ok.stderr).toBe(0);
     expect((JSON.parse(ok.stdout) as { passed: boolean }).passed).toBe(true);
   }, 120_000);
+});
+
+describe("batch 19 fix - AUX-R-006 and response headers", () => {
+  it("without a host headers file AUX-R-006 is PARTIAL with the header reason: a directive delivered by X-Robots-Tag is not seen", async () => {
+    const report = await runStaticAudit(input());
+    const partial = report.rules_partial.find((r) => r.rule_code === "AUX-R-006");
+    expect(partial).toBeDefined();
+    expect(partial!.reason).toMatch(/X-Robots-Tag/);
+    expect(partial!.reason).toMatch(/header/i);
+    expect(report.limitations.join(" ")).toMatch(/header/i);
+  });
+
+  it("a host headers file with X-Robots-Tag: noai makes AUX-R-006 fire on the pages it covers, and the header reason is no longer claimed", async () => {
+    const hostHeaders = parseHeadersFile("/private/*\n  X-Robots-Tag: noai\n");
+    const report = await runStaticAudit(input({ pages: [{ path: "/", html: GOOD }, { path: "/private/a/", html: GOOD }], hostHeaders }));
+    const hits = report.findings.filter((f) => f.rule_code === "AUX-R-006");
+    expect(hits.map((f) => f.url)).toEqual(["https://example.com/private/a/"]);
+    const partial = report.rules_partial.find((r) => r.rule_code === "AUX-R-006");
+    expect(partial?.reason ?? "").not.toMatch(/not seen|no response headers/i);
+    expect(report.limitations.join(" ")).toMatch(/headers file/i);
+  });
+
+  it("a headers file that sets no X-Robots-Tag still counts as read: no finding, and the rule is no longer reported as blind to headers", async () => {
+    const report = await runStaticAudit(input({ hostHeaders: parseHeadersFile("/*\n  X-Frame-Options: DENY\n") }));
+    expect(report.findings.some((f) => f.rule_code === "AUX-R-006")).toBe(false);
+    expect(report.rules_partial.find((r) => r.rule_code === "AUX-R-006")?.reason ?? "").not.toMatch(/not seen|no response headers/i);
+  });
+
+  it("two X-Robots-Tag lines for a page are two values, not one: a scope opened by the first does not swallow the second", async () => {
+    const hostHeaders = parseHeadersFile("/*\n  X-Robots-Tag: otherbot: noindex\n  X-Robots-Tag: noai\n");
+    expect(robotsTagsFor(hostHeaders, "/")).toEqual(["otherbot: noindex", "noai"]);
+    expect(new Set([robotsHeaderKey(0), robotsHeaderKey(1), robotsHeaderKey(2), robotsHeaderKey(3)]).size).toBe(4);
+    for (let i = 0; i < 4; i += 1) expect(robotsHeaderKey(i).toLowerCase()).toBe("x-robots-tag");
+    const report = await runStaticAudit(input({ hostHeaders }));
+    expect(report.findings.some((f) => f.rule_code === "AUX-R-006")).toBe(true);
+  });
+});
+
+describe("batch 19 fix - the host headers readers", () => {
+  it("_headers: comments, CRLF, origin-qualified patterns, header names in any case, and other headers ignored", () => {
+    const rules = parseHeadersFile("# c\r\nhttps://example.com/a/*\r\n  x-robots-tag: noai, noimageai\r\n  Cache-Control: no-cache\r\n/b\r\n  X-Frame-Options: DENY\r\n");
+    expect(rules).toEqual([{ source: "/a/*", robotsTags: ["noai, noimageai"], approximate: false }]);
+  });
+
+  it("vercel.json: reads source and the X-Robots-Tag entries; no `headers` key is null (not a headers file); bad JSON or shape throws", () => {
+    expect(parseVercelJson(JSON.stringify({ headers: [{ source: "/(.*)", headers: [{ key: "X-Robots-Tag", value: "noai" }, { key: "X-Other", value: "1" }] }] }))).toEqual([
+      { source: "/(.*)", robotsTags: ["noai"], approximate: false },
+    ]);
+    expect(parseVercelJson("{}")).toBeNull();
+    expect(() => parseVercelJson("{nope")).toThrow(/valid JSON/);
+    expect(() => parseVercelJson(JSON.stringify({ headers: "x" }))).toThrow(/array/);
+  });
+
+  it("path matching: exact, /*, a folder splat that also covers the folder itself, :placeholders, trailing slash and index.html equivalence", () => {
+    const tags = (source: string, path: string): number => robotsTagsFor([{ source, robotsTags: ["noai"], approximate: false }], path).length;
+    expect(tags("/*", "/")).toBe(1);
+    expect(tags("/*", "/a/b.html")).toBe(1);
+    expect(tags("/about", "/about/")).toBe(1);
+    expect(tags("/about", "/about/index.html")).toBe(1);
+    expect(tags("/about", "/about-us/")).toBe(0);
+    expect(tags("/docs/*", "/docs/")).toBe(1);
+    expect(tags("/docs/*", "/docs/x/y")).toBe(1);
+    expect(tags("/docs/*", "/docsx")).toBe(0);
+    expect(tags("/blog/:slug", "/blog/hello/")).toBe(1);
+    expect(tags("/blog/:slug", "/blog/")).toBe(0);
+    expect(tags("/(.*)", "/anything/here")).toBe(1);
+    expect(tags("/:path*", "/")).toBe(1);
+  });
+
+  it("a pattern it cannot model is flagged approximate and applied to every page (never read as 'not this page')", () => {
+    const [rule] = parseHeadersFile("/blog/(\\d+)\n  X-Robots-Tag: noai\n");
+    expect(rule!.approximate).toBe(true);
+    expect(robotsTagsFor([rule!], "/unrelated/")).toEqual(["noai"]);
+  });
+});
+
+describe("batch 19 fix - the command line reads the host headers file", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "aux-static-hdr-"));
+    await writeFile(join(dir, "index.html"), GOOD);
+    await writeFile(join(dir, "robots.txt"), ROBOTS_OK);
+    await writeFile(join(dir, "llms.txt"), LLMS_OK);
+    await writeFile(join(dir, "sitemap.xml"), SITEMAP_OK);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("_headers in the directory is read, and is not itself audited or listed as skipped", async () => {
+    await writeFile(join(dir, "_headers"), "/*\n  X-Robots-Tag: noai\n");
+    const result = await runCli([dir, "--base-url", BASE], NOW);
+    const report = JSON.parse(result.stdout) as { findings: Array<{ rule_code: string }>; target: { host_headers: string | null } };
+    expect(report.findings.some((f) => f.rule_code === "AUX-R-006")).toBe(true);
+    expect(report.target.host_headers).toBe("_headers");
+  });
+
+  it("vercel.json headers are read the same way", async () => {
+    await writeFile(join(dir, "vercel.json"), JSON.stringify({ headers: [{ source: "/(.*)", headers: [{ key: "X-Robots-Tag", value: "noai" }] }] }));
+    const report = JSON.parse((await runCli([dir, "--base-url", BASE], NOW)).stdout) as { findings: Array<{ rule_code: string }>; target: { host_headers: string | null } };
+    expect(report.findings.some((f) => f.rule_code === "AUX-R-006")).toBe(true);
+    expect(report.target.host_headers).toBe("vercel.json");
+  });
+
+  it("no headers file: host_headers is null and nothing is claimed about headers", async () => {
+    const report = JSON.parse((await runCli([dir, "--base-url", BASE], NOW)).stdout) as { target: { host_headers: string | null } };
+    expect(report.target.host_headers).toBeNull();
+  });
+
+  it("a vercel.json that is not valid JSON is a run that cannot audit: exit 2, error on stderr, nothing on stdout", async () => {
+    await writeFile(join(dir, "vercel.json"), "{nope");
+    const result = await runCli([dir, "--base-url", BASE], NOW);
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(/vercel\.json/);
+  });
+});
+
+describe("batch 19 fix - a gate must not pass on an audit that skipped pages", () => {
+  let dir: string;
+  let outside: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "aux-static-skip-"));
+    outside = await mkdtemp(join(tmpdir(), "aux-static-skip-out-"));
+    await writeFile(join(dir, "index.html"), GOOD);
+    await writeFile(join(dir, "robots.txt"), ROBOTS_OK);
+    await writeFile(join(dir, "llms.txt"), LLMS_OK);
+    await writeFile(join(dir, "sitemap.xml"), SITEMAP_OK);
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it("--min-score with a skipped page (a symlink) exits 2 with passed:false, even though the score is above the minimum", async () => {
+    await writeFile(join(outside, "p.html"), BROKEN_JSONLD);
+    await symlink(join(outside, "p.html"), join(dir, "linked.html"));
+    const result = await runCli([dir, "--min-score", "10", "--base-url", BASE], NOW);
+    expect(result.exitCode).toBe(2);
+    const report = JSON.parse(result.stdout) as { passed: boolean; score: number; incomplete: { pages_skipped: unknown[]; pages_unmodelled: unknown[] } };
+    expect(report.passed).toBe(false);
+    expect(report.score).toBeGreaterThanOrEqual(10);
+    expect(report.incomplete.pages_skipped).toEqual([{ file: "linked.html", reason: "symlink" }]);
+    expect(JSON.parse(result.stderr)).toHaveProperty("error");
+  });
+
+  it("--allow-partial restores the score comparison (0 at or above, 1 below), and the report still lists what was skipped", async () => {
+    await writeFile(join(outside, "p.html"), BROKEN_JSONLD);
+    await symlink(join(outside, "p.html"), join(dir, "linked.html"));
+    const ok = await runCli([dir, "--min-score", "10", "--allow-partial", "--base-url", BASE], NOW);
+    expect(ok.exitCode).toBe(0);
+    const report = JSON.parse(ok.stdout) as { passed: boolean; target: { pages_skipped: unknown[] } };
+    expect(report.passed).toBe(true);
+    expect(report.target.pages_skipped).toHaveLength(1);
+    expect((await runCli([dir, "--min-score", "101", "--allow-partial", "--base-url", BASE], NOW)).exitCode).toBe(2); // 101 is out of range: unchanged
+    expect((await runCli([dir, "--min-score", "100", "--allow-partial", "--base-url", BASE], NOW)).exitCode).toBe(0);
+  });
+
+  it("without --min-score nothing is gated, so skipped pages change no exit code (0, passed null)", async () => {
+    await writeFile(join(outside, "p.html"), BROKEN_JSONLD);
+    await symlink(join(outside, "p.html"), join(dir, "linked.html"));
+    const result = await runCli([dir, "--base-url", BASE], NOW);
+    expect(result.exitCode).toBe(0);
+    expect((JSON.parse(result.stdout) as { passed: unknown }).passed).toBeNull();
+  });
+
+  it("the host's own 404 page is not a skipped PAGE of the site: it does not make a gate incomplete", async () => {
+    await writeFile(join(dir, "404.html"), BROKEN_JSONLD);
+    expect((await runCli([dir, "--min-score", "10", "--base-url", BASE], NOW)).exitCode).toBe(0);
+  });
 });

@@ -7,6 +7,7 @@ import { AuxRuleEvaluationError, evaluateDocument } from "./rules/engine.js";
 import { AUX_RULES, AUX_RULES_NOT_EVALUATED, AUX_RULES_PARTIAL } from "./rules/index.js";
 import { byCodePoint } from "./rules/helpers.js";
 import { evaluateSiteFiles, type SiteFile } from "./site-files.js";
+import { robotsHeaderKey, robotsTagsFor, type HostHeaderRule } from "./static-host-headers.js";
 import { cl100kTokenizer } from "./tokenizer-cl100k.js";
 
 // STORY-102 AC10 / owner decision 68(j) - the AUX audit over a directory of BUILT STATIC HTML, with the real rule engine and document model.
@@ -21,7 +22,9 @@ import { cl100kTokenizer } from "./tokenizer-cl100k.js";
 //   - AUX-R-026 / 027 compare the rendered copy with the plain one: there is no rendered copy (no browser runs here);
 //   - AUX-R-029 judges the response (time to first byte, size): a file on disk has no response;
 //   - the rules in AUX_RULES_NOT_EVALUATED need inputs no single page holds (the cited corpus, brand aliases, the whole domain) or are an owner decision.
-// Response HEADERS are not in a directory either (X-Robots-Tag, a host's `_headers` file), so a noai directive delivered by header is not seen:
+// Response HEADERS are not in a directory either, EXCEPT the ones a static host declares in a file that ships with the build (`_headers`,
+// or `headers` in `vercel.json`; static-host-headers.ts). When one is present its X-Robots-Tag lines are applied to the pages they cover and AUX-R-006
+// sees them; when none is, a noai directive delivered by header is not seen, AUX-R-006 is listed in `rules_partial` with that reason, and
 // `limitations` says so in the output. The score is therefore PARTIAL by the reference's own definition (`partial: true`): it is the same arithmetic
 // as the audit the platform runs (scoring-models.md section 7, owner decisions 38, 52, 55, 57), over the rules that could be decided here.
 
@@ -34,6 +37,11 @@ export interface StaticAuditInput {
   readonly baseUrl: string;
   readonly now: Date;
   readonly catalog: AuxCatalog;
+  /**
+   * The X-Robots-Tag rules of the host's headers file, or null/absent when the directory has none. Null is NOT "no headers": it means headers were not
+   * seen, which is what `rules_partial` and `limitations` then say.
+   */
+  readonly hostHeaders?: readonly HostHeaderRule[] | null;
 }
 
 export interface StaticAuditFinding {
@@ -80,18 +88,26 @@ type Severity = (typeof SEVERITIES)[number];
 /** Findings carry a project id only to build the guidance text this report does not print. */
 const NO_PROJECT = "00000000-0000-7000-8000-000000000000";
 
-const LIMITATIONS: readonly string[] = [
+const NO_HEADERS_LIMITATION = "No response headers: a directive delivered by header (X-Robots-Tag) is not seen. A host headers file (_headers or vercel.json) in the directory would be read.";
+const HEADERS_FILE_LIMITATION =
+  "Response headers come only from the host headers file in the directory (X-Robots-Tag is read from it); a header the host adds any other way is not seen.";
+const limitationsFor = (hostHeaders: readonly HostHeaderRule[] | null): readonly string[] => [
   "No rendered copy: a browser does not run, so AUX-R-026 and AUX-R-027 are not evaluated.",
   "No response: a file on disk has no time to first byte, so AUX-R-029 is not evaluated.",
-  "No response headers: a directive delivered by header (X-Robots-Tag) is not seen.",
+  hostHeaders === null ? NO_HEADERS_LIMITATION : HEADERS_FILE_LIMITATION,
   "The score is partial by definition: it is computed over the rules that could be decided here, and rules that could not are listed, not passed.",
 ];
+
+/** AUX-R-006's reason when no host headers file was read: the header half of the rule is blind, whatever else is true of it. */
+const AUX_R_006_HEADER_REASON =
+  "X-Robots-Tag is a response header and this directory holds no response, so a noai directive delivered by header is not seen; only the robots meta tag is read. A host headers file (_headers or vercel.json) in the directory would be read.";
 
 const siteFile = (text: string | null): SiteFile => (text === null ? { status: 404, body: "" } : { status: 200, body: text });
 
 export async function runStaticAudit(input: StaticAuditInput): Promise<StaticAuditReport> {
   if (input.pages.length === 0) throw new StaticAuditError("no HTML pages to audit");
   const { catalog } = input;
+  const hostHeaders = input.hostHeaders ?? null;
 
   // --- the pages -----------------------------------------------------------------------------------------------------------------------
   const pageFindings: AuxRuleFinding[] = [];
@@ -99,10 +115,14 @@ export async function runStaticAudit(input: StaticAuditInput): Promise<StaticAud
   const unmodelled: Array<{ url: string; reason: string }> = [];
   for (const page of input.pages) {
     const url = `${input.baseUrl}${page.path}`;
+    // One header-record entry per X-Robots-Tag line (the model reads every key that is `x-robots-tag` in any case), so a scope one line opens cannot
+    // swallow the next.
+    const headers: Record<string, string> = {};
+    if (hostHeaders !== null) robotsTagsFor(hostHeaders, page.path).forEach((value, i) => (headers[robotsHeaderKey(i)] = value));
     let document: AuxDocument;
     try {
       document = buildAuxDocument(
-        { url, finalUrl: url, httpStatus: 200, redirectChain: [], headers: {}, rawHtml: page.html, renderedHtml: null, timing: { ttfbMs: null, loadMs: null } },
+        { url, finalUrl: url, httpStatus: 200, redirectChain: [], headers, rawHtml: page.html, renderedHtml: null, timing: { ttfbMs: null, loadMs: null } },
         cl100kTokenizer,
       );
     } catch {
@@ -151,7 +171,7 @@ export async function runStaticAudit(input: StaticAuditInput): Promise<StaticAud
     .sort((a, b) => byCodePoint(a.rule_code, b.rule_code));
   const partialRules = Object.entries(AUX_RULES_PARTIAL)
     .filter(([code]) => decided.has(code))
-    .map(([rule_code, reason]) => ({ rule_code, reason }))
+    .map(([rule_code, reason]) => ({ rule_code, reason: rule_code === "AUX-R-006" && hostHeaders === null ? `${AUX_R_006_HEADER_REASON} ${reason}` : reason }))
     .sort((a, b) => byCodePoint(a.rule_code, b.rule_code));
 
   // --- the score: the platform audit's own arithmetic (crawl-audit.handler.ts `commit`), over what was decided -------------------------------
@@ -238,6 +258,6 @@ export async function runStaticAudit(input: StaticAuditInput): Promise<StaticAud
     rules_evaluated: [...decided].sort(byCodePoint),
     rules_not_evaluated: notEvaluated,
     rules_partial: partialRules,
-    limitations: LIMITATIONS,
+    limitations: limitationsFor(hostHeaders),
   };
 }
