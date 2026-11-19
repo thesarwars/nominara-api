@@ -35,7 +35,7 @@ function harness(script: Script, cacheValue?: string) {
       }
       if (/SELECT 1 FROM refresh_tokens/.test(text)) return { rows: [{ "?column?": 1 }] };
       if (/SET revoked_at = now\(\), revoked_reason = 'reuse_detected'/.test(text)) return { rows: [], rowCount: script.revokeRowCount ?? 1 };
-      if (/FROM audit_log WHERE .*rotation_id/s.test(text)) return { rows: script.graceAlreadyAudited === true ? [{ one: 1 }] : [], rowCount: script.graceAlreadyAudited === true ? 1 : 0 };
+      if (/FROM audit_log WHERE .*request_id/s.test(text)) return { rows: script.graceAlreadyAudited === true ? [{ one: 1 }] : [], rowCount: script.graceAlreadyAudited === true ? 1 : 0 };
       if (/INSERT INTO audit_log/.test(text) && script.auditFails === true) throw new Error("audit insert failed");
       if (/pg_advisory_xact_lock/.test(text)) {
         return { rows: [{ workspace_id: values[0], actor_id: values[1], resource_id: values[2], support_grant_id: null, actor_ip: null }] };

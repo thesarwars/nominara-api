@@ -232,7 +232,7 @@ export async function runStaticAudit(input: StaticAuditInput): Promise<StaticAud
       rule_code: f.rule_code,
       category: categoryOf(f.rule_code),
       severity: f.severity,
-      url: `${input.baseUrl}/${f.evidence.file}`,
+      url: [input.baseUrl, f.evidence.file].join("/"),
       measured_value: f.measured_value,
       threshold_value: f.threshold_value,
       reason: f.evidence.reason,

@@ -182,7 +182,7 @@ export async function runCli(argv: readonly string[], now: Date = new Date()): P
   try {
     options = parseArgs(argv);
   } catch (error) {
-    return { exitCode: EXIT_UNABLE, stdout: "", stderr: `${JSON.stringify({ error: error instanceof Error ? error.message : "invalid arguments" })}\n` };
+    return { exitCode: EXIT_UNABLE, stdout: "", stderr: JSON.stringify({ error: error instanceof Error ? error.message : "invalid arguments" }) + "\n" };
   }
   try {
     const root = resolve(options.dir);

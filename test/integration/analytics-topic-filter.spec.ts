@@ -193,7 +193,9 @@ describe("STORY-090 AC8 · topic-cluster filter on scorecards and the growth map
     const both = await growthMap({ topics: `${clusterA},${clusterB}` });
     for (const n of [1, 2, 3]) {
       expect(brandAt(both, dateOf(n)).cells).toBe(brandAt(whole, dateOf(n)).cells);
-      expect(brandAt(both, dateOf(n)).visibility_score).toBeCloseTo(brandAt(whole, dateOf(n)).visibility_score!, 3);
+      // The stored rollup is numeric(6,3), so it is the computed figure rounded half-up to 3 places; the filtered series is computed unrounded. They
+      // differ by at most HALF a storage unit, and exactly half (39.0625 vs 39.063) is a legitimate tie. toBeCloseTo(_, 3) is strict `< 0.0005`.
+      expect(Math.abs(brandAt(both, dateOf(n)).visibility_score! - brandAt(whole, dateOf(n)).visibility_score!)).toBeLessThanOrEqual(0.0005 + 1e-9);
     }
     expect(await growthMap({ topics: undefined })).toEqual(whole);
   });

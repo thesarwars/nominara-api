@@ -32,7 +32,7 @@ export async function readWatermarks(client: ClientBase): Promise<Map<string, Ex
     `SELECT DISTINCT ON (workspace_id) workspace_id, max_seq::text AS seq, row_hash
        FROM audit_export_watermarks
       WHERE phase = 'recorded'
-      ORDER BY workspace_id, seq DESC`,
+      ORDER BY workspace_id, audit_export_watermarks.seq DESC`,
   );
   return new Map(result.rows.map((row) => [row.workspace_id, { seq: row.seq, rowHash: row.row_hash }]));
 }
@@ -47,7 +47,7 @@ export interface ExportLinkage {
 
 export async function readExportLinkage(client: ClientBase): Promise<ExportLinkage> {
   const latest = await client.query<{ seq: string; manifest_sha256: Buffer }>(
-    "SELECT seq::text, manifest_sha256 FROM audit_export_watermarks WHERE phase = 'recorded' ORDER BY seq DESC LIMIT 1",
+    "SELECT seq::text, manifest_sha256 FROM audit_export_watermarks WHERE phase = 'recorded' ORDER BY audit_export_watermarks.seq DESC LIMIT 1",
   );
   const last = latest.rows[0];
   // Every row of a run is written in one statement batch, so a run's rows are contiguous in seq; DISTINCT ON run_id gives one entry per run.
@@ -81,7 +81,7 @@ export async function chainRowStillMatches(client: ClientBase, workspaceId: stri
 }
 
 const INSERT_SQL = `INSERT INTO audit_export_watermarks
-  (run_id, phase, predecessor_manifest_sha256, workspace_id, from_seq, max_seq, row_hash, object_sha256, manifest_sha256)
+  (run_id, phase, previous_manifest_sha256, workspace_id, from_seq, max_seq, row_hash, object_sha256, manifest_sha256)
   VALUES ($1, $2, $3, $4, $5::int8, $6::int8, $7, $8, $9)`;
 
 async function insertRows(

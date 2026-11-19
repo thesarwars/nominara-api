@@ -48,11 +48,15 @@ interface PendingSecurityAudit {
   readonly afterState: Record<string, string>;
   /**
    * Set for an event that must be written once per rotation (the grace-window reuse: every racing or retrying caller inside one window hits the
-   * same branch, and each would otherwise add a row). The id of the consumed refresh-token row, which is the rotation; it is stored in after_state as
-   * `rotation_id` (not a secret: a row id, never the token or its hash) and is what the lookup keys on.
+   * same branch, and each would otherwise add a row). The id of the consumed refresh-token row, which is the rotation. It is stored as the row's
+   * `request_id` (`auth.refresh.grace:<id>`; a row id, never the token or its hash) and the lookup keys on that column. NOT on after_state: the
+   * audit redactor masks any long unbroken high-entropy string, which is 95% of UUIDs, so a UUID there is mostly "[redacted]" and cannot be matched.
    */
   readonly oncePerRotation?: string;
 }
+
+/** The request id a once-per-rotation security row carries: deterministic, so the row's own presence is the dedup record. */
+const graceRequestId = (rotationId: string): string => `auth.refresh.grace:${rotationId}`;
 
 // STORY-017 — dangerous area: rotation and reuse-detection logic. Full
 // history is checked (each refresh_tokens row is a distinct issued
@@ -393,7 +397,7 @@ export class SessionService {
             sessionId: graceSession.id,
             userId: graceSession.user_id,
             workspaceId: active.ws,
-            afterState: { outcome: "same_successor_returned", session_owner_user_id: graceSession.user_id, rotation_id: tokenRow.id },
+            afterState: { outcome: "same_successor_returned", session_owner_user_id: graceSession.user_id },
             oncePerRotation: tokenRow.id,
           };
 
@@ -565,8 +569,8 @@ export class SessionService {
               // the chain's own lock (append) and by nothing else, so the order cannot deadlock.
               await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${event.action}:${event.oncePerRotation}`]);
               const existing = await tx.query(
-                `SELECT 1 FROM audit_log WHERE workspace_id = $1 AND action = $2 AND resource_id = $3 AND after_state->>'rotation_id' = $4 LIMIT 1`,
-                [workspaceId, event.action, event.sessionId, event.oncePerRotation],
+                `SELECT 1 FROM audit_log WHERE workspace_id = $1 AND action = $2 AND resource_id = $3 AND request_id = $4 LIMIT 1`,
+                [workspaceId, event.action, event.sessionId, graceRequestId(event.oncePerRotation)],
               );
               if ((existing.rowCount ?? existing.rows.length) > 0) return false;
             }
@@ -584,7 +588,7 @@ export class SessionService {
               resourceId: event.sessionId,
               beforeState: null,
               afterState: event.afterState,
-              requestId: `auth.refresh:${uuidV7()}`,
+              requestId: event.oncePerRotation !== undefined ? graceRequestId(event.oncePerRotation) : `auth.refresh:${uuidV7()}`,
               supportGrantId: null,
               severity: event.severity,
             });

@@ -7,7 +7,7 @@ import { migrateUp } from "../../src/db/migrate-runner.js";
 import type { AuditChainRow } from "../../src/lib/crypto/audit-chain.js";
 import { createAuditExportHandler } from "../../src/lib/queue/handlers/audit-export.handler.js";
 import { AuditChainService } from "../../src/modules/audit/audit-chain.service.js";
-import type { AuditExportRows, AuditExportSink } from "../../src/modules/audit/ports/export-sink.js";
+import type { AuditExportIncrement, AuditExportRows, AuditExportSink } from "../../src/modules/audit/ports/export-sink.js";
 
 // batch 18 fix - `audit_log` is FORCE ROW LEVEL SECURITY. The unit spec for this handler injects a fake runExport and
 // audit-export.spec.ts drives runAuditExport on the owner client directly, so nothing proved the JOB, with the connection it opens
@@ -28,8 +28,12 @@ vi.mock("../../src/db/client.js", async () => {
 
 class RecordingSink implements AuditExportSink {
   rows: AuditChainRow[] = [];
-  async export(rows: AuditExportRows): Promise<string> {
+  // Follows the port: the handler's export is incremental, so the sink asks before committing and reports what it wrote.
+  async export(rows: AuditExportRows, _options: unknown, increment?: AuditExportIncrement): Promise<string | null> {
     for await (const row of rows) this.rows.push(row);
+    const written = { dataSha256: "aa".repeat(32), manifestSha256: "bb".repeat(32) };
+    if (increment !== undefined && !(await increment.beforeCommit(written))) return null;
+    increment?.recordWritten(written);
     return "recorded";
   }
 }

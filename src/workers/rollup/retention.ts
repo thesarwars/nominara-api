@@ -398,7 +398,7 @@ export class WorkspaceObjectsLeftBehindError extends Error {
  * and source_domains; the first four deleted nothing before this and left the rows behind.
  *
  * `audit_log` (exported, then deleted explicitly), `legal_holds` (deleted explicitly) and `audit_chain_marks` (the tombstone that records the
- * deletion, STORY-143: identifiers only) are not in the result; they have their own handling.
+ * deletion, STORY-143: identifiers only) and `audit_export_watermarks` (migration 0215: workspace id, sequence numbers and SHA-256s of export objects that outlive the workspace in Object Lock storage; append-only, a trigger rejects DELETE, so listing it would fail every workspace purge) are not in the result; they have their own handling.
  */
 export async function workspaceTablesWithoutCascade(client: ClientBase): Promise<string[]> {
   const rows = await client.query<{ relname: string }>(
@@ -413,7 +413,7 @@ export async function workspaceTablesWithoutCascade(client: ClientBase): Promise
        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'workspace_id' AND NOT a.attisdropped
       WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
         AND c.oid NOT IN (SELECT oid FROM reach)
-        AND c.relname NOT IN ('audit_log', 'audit_chain_marks', 'legal_holds')
+        AND c.relname NOT IN ('audit_log', 'audit_chain_marks', 'audit_export_watermarks', 'legal_holds')
       ORDER BY c.relname`,
   );
   return rows.rows.map((r) => r.relname);

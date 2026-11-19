@@ -32,7 +32,7 @@ CREATE TABLE audit_export_watermarks (
   seq             bigint      GENERATED ALWAYS AS IDENTITY,
   run_id          uuid        NOT NULL,
   phase           text        NOT NULL,
-  predecessor_manifest_sha256 bytea,
+  previous_manifest_sha256 bytea,
   workspace_id    uuid        NOT NULL,
   from_seq        bigint      NOT NULL,
   max_seq         bigint      NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE audit_export_watermarks (
   manifest_sha256 bytea       NOT NULL,
   exported_at     timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT ck_audit_export_watermarks_phase CHECK (phase IN ('intent', 'recorded')),
-  CONSTRAINT ck_audit_export_watermarks_predecessor CHECK (predecessor_manifest_sha256 IS NULL OR octet_length(predecessor_manifest_sha256) = 32),
+  CONSTRAINT ck_audit_export_watermarks_previous CHECK (previous_manifest_sha256 IS NULL OR octet_length(previous_manifest_sha256) = 32),
   CONSTRAINT ck_audit_export_watermarks_range CHECK (from_seq >= 0 AND max_seq > from_seq),
   CONSTRAINT ck_audit_export_watermarks_hashes CHECK (
     octet_length(row_hash) = 32 AND octet_length(object_sha256) = 32 AND octet_length(manifest_sha256) = 32
