@@ -4,6 +4,7 @@ import { Client } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrateUp } from "../../src/db/migrate-runner.js";
 import { uuidV7 } from "../../src/lib/ids/uuidv7.js";
+import { aggregateRange, aggregateRangeByDay } from "../../src/lib/rollup/aggregate-day.js";
 import { rollUpDay } from "../../src/lib/rollup/roll-up-day.js";
 import { GrowthMapService } from "../../src/modules/analytics/growth-map.service.js";
 import { ScorecardsService } from "../../src/modules/analytics/scorecards.service.js";
@@ -195,6 +196,33 @@ describe("STORY-090 AC8 · topic-cluster filter on scorecards and the growth map
       expect(brandAt(both, dateOf(n)).visibility_score).toBeCloseTo(brandAt(whole, dateOf(n)).visibility_score!, 3);
     }
     expect(await growthMap({ topics: undefined })).toEqual(whole);
+  });
+
+  it("batch 19 fix · aggregateRangeByDay is, per day, exactly aggregateRange over that day (one SQL, grouped) - and keeps two scoring versions apart", async () => {
+    await seed();
+    // A cell of an OLDER scoring version on day -2 of cluster A: it must land in its own (day, version) group, never in v1's figures.
+    const resultId = randomUUID();
+    await db.query(
+      `INSERT INTO answer_captures
+         (id,workspace_id,project_id,run_id,prompt_id,engine_key,captured_at,capture_mode,adapter_version,normalizer_version,content_hash,payload,flags,cache_layer,status,brand_present,scoring_version)
+       VALUES ($1,$2,$3,$4,$5,'chatgpt',$6::timestamptz,'api','1.0.0','n1',$7,'{}'::jsonb,'{}','live','parsed',false,'v0')`,
+      [resultId, workspaceId, projectId, uuidV7(), promptA, daysAgo(2), createHash("sha256").update(resultId).digest()],
+    );
+    await withTenantContext(db, ctx(), async (tx) => {
+      const grouped = await aggregateRangeByDay(tx, projectId, dateOf(5), dateOf(0), "UTC", clusterA);
+      const key = (a: { metricDate: string; engineKey: string; entityType: string; entityId: string }): string => `${a.metricDate}|${a.engineKey}|${a.entityType}|${a.entityId}`;
+      for (const n of [1, 2, 3]) {
+        const perDay = await aggregateRange(tx, projectId, dateOf(n), dateOf(n), "UTC", "v1", undefined, clusterA);
+        const fromGroup = grouped.filter((g) => g.metricDate === dateOf(n) && g.scoringVersion === "v1");
+        const strip = <T extends object>(rows: T[]) => rows.map((r) => ({ ...r })).sort((l, r) => (key(l as never) < key(r as never) ? -1 : 1));
+        expect(strip(fromGroup.map(({ metricDate: _day, scoringVersion: _version, newestCaptureMs: _newest, ...rest }) => ({ metricDate: dateOf(n), ...rest })))).toEqual(
+          strip(perDay.map((a) => ({ metricDate: dateOf(n), ...a }))),
+        );
+      }
+      const old = grouped.filter((g) => g.scoringVersion === "v0");
+      expect(old).toHaveLength(1);
+      expect(old[0]).toMatchObject({ metricDate: dateOf(2), engineKey: "chatgpt", cellsTotal: 1 });
+    });
   });
 
   it("STORY-090 AC8 · growth map: topics, engines and a custom range together", async () => {

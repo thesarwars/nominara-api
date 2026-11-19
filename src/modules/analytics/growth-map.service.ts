@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import { aggregateRange, nonMeasurementStatusSql } from "../../lib/rollup/aggregate-day.js";
+import { aggregateRange, aggregateRangeByDay, nonMeasurementStatusSql, type DayVersionAggregate } from "../../lib/rollup/aggregate-day.js";
 import type { ClientBase } from "pg";
 import {
   GROWTH_MAP_GRANULARITY,
@@ -253,11 +253,17 @@ export class GrowthMapService {
   }
 
   /**
-   * STORY-090 AC8 - the day-granularity series for a topic selection: per workspace-local day, `aggregateRange` over the selected clusters' member prompts,
+   * STORY-090 AC8 - the day-granularity series for a topic selection: per workspace-local day, the aggregation over the selected clusters' member prompts,
    * each entity blended across engines by `blendEngineParts` with the engines' weights - what `roll-up-day` writes, over a narrower set of cells. A day
    * with no cell for these topics has no row, which the plot draws as a gap (null), never a zero.
    *
-   * One aggregation per day of the window, serially on the request's transaction (at most 366). The rollup cannot answer this: it is not cut by cluster.
+   * ONE grouped query for the whole window (`aggregateRangeByDay`: the rollup's own aggregation SQL with a day-and-version group key), so the number of
+   * queries does not depend on the window's length (it was one per day, up to 366). The rollup cannot answer this: it is not cut by cluster. The
+   * scores are still `toMetricRow` and `blendEngineParts` over those counts; there is no second formula.
+   *
+   * SCORING VERSIONS: the same as the unfiltered series (AC12). Cells are grouped under their own capture's version and each (entity, day) takes the
+   * current version where it has cells, else the version of its most recent cell, so a day measured under an older version is plotted with its
+   * version and the change is announced, not drawn as a gap.
    */
   private async topicSeries(
     tx: ClientBase,
@@ -276,42 +282,64 @@ export class GrowthMapService {
     const competitorNames = new Map(
       (await tx.query<{ id: string; name: string }>("SELECT id::text, name FROM competitors WHERE project_id = $1", [projectId])).rows.map((row) => [row.id, row.name]),
     );
+    // ONE grouped query for the whole window (day x scoring version), not one per day: the request's cost no longer grows with the window.
+    const aggregates =
+      days.length === 0
+        ? []
+        : (await aggregateRangeByDay(tx, projectId, days[0]!, days[days.length - 1]!, timezone, topics)).filter(
+            (aggregate) => selected === null || selected.includes(aggregate.engineKey),
+          );
+    // AC12, as the unfiltered series: ONE scoring version per (entity, day) - the current version where the day has it, otherwise the one whose newest cell is
+    // the most recent (the live analogue of "most recently computed") - chosen BEFORE blending, so two versions are never averaged together.
+    const chosen = new Map<string, DayVersionAggregate[]>();
+    const versionOf = new Map<string, DayVersionAggregate>();
+    for (const aggregate of aggregates) {
+      const key = `${aggregate.entityType}|${aggregate.entityId}|${aggregate.metricDate}`;
+      const held = versionOf.get(key);
+      const aggregateCurrent = aggregate.scoringVersion === SCORING_VERSION;
+      const heldCurrent = held?.scoringVersion === SCORING_VERSION;
+      if (held === undefined || (aggregateCurrent && !heldCurrent) || (aggregateCurrent === heldCurrent && aggregate.newestCaptureMs > held.newestCaptureMs)) {
+        versionOf.set(key, aggregate);
+      }
+    }
+    for (const aggregate of aggregates) {
+      const key = `${aggregate.entityType}|${aggregate.entityId}|${aggregate.metricDate}`;
+      if (versionOf.get(key)!.scoringVersion !== aggregate.scoringVersion) continue;
+      chosen.set(key, [...(chosen.get(key) ?? []), aggregate]);
+    }
     const rows: SeriesRow[] = [];
     const engineTotals = new Map<string, { weighted: number; cells: number }>();
-    for (const day of days) {
-      const aggregates = (await aggregateRange(tx, projectId, day, day, timezone, SCORING_VERSION, undefined, topics)).filter(
-        (aggregate) => selected === null || selected.includes(aggregate.engineKey),
-      );
-      const parts = new Map<string, EnginePart[]>();
-      for (const aggregate of aggregates) {
+    // Day order, then entity: the order the per-day loop produced.
+    const dayThenEntity = (key: string): string => {
+      const [entityType, entityId, day] = key.split("|");
+      return `${day!}|${entityType!}|${entityId!}`;
+    };
+    for (const key of [...chosen.keys()].sort((left, right) => (dayThenEntity(left) < dayThenEntity(right) ? -1 : 1))) {
+      const [entityType, entityId, day] = key.split("|") as ["brand" | "competitor", string, string];
+      const entityParts: EnginePart[] = [];
+      for (const aggregate of chosen.get(key)!) {
         const metric = toMetricRow(aggregate);
         const weight = weights.get(aggregate.engineKey) ?? 1;
-        const key = `${aggregate.entityType}|${aggregate.entityId}`;
-        parts.set(key, [
-          ...(parts.get(key) ?? []),
-          { weight, cellsTotal: metric.cellsTotal, sovWeighted: metric.sov * weight, visibilityScore: metric.visibilityScore, liveCells: aggregate.liveCells },
-        ]);
-        if (aggregate.entityType === "brand") {
+        entityParts.push({ weight, cellsTotal: metric.cellsTotal, sovWeighted: metric.sov * weight, visibilityScore: metric.visibilityScore, liveCells: aggregate.liveCells });
+        if (entityType === "brand") {
           const total = engineTotals.get(aggregate.engineKey) ?? { weighted: 0, cells: 0 };
           engineTotals.set(aggregate.engineKey, { weighted: total.weighted + metric.visibilityScore * metric.cellsTotal, cells: total.cells + metric.cellsTotal });
         }
       }
-      for (const [key, entityParts] of parts) {
-        const [entityType, entityId] = key.split("|") as ["brand" | "competitor", string];
-        const blended = blendEngineParts(entityParts);
-        rows.push({
-          entityType,
-          entityId,
-          label: entityType === "brand" ? brandLabel : (competitorNames.get(entityId) ?? entityId),
-          metricDate: day,
-          visibilityScore: blended.visibilityScore,
-          sov: blended.sov,
-          cellsTotal: blended.cellsTotal,
-          liveCaptureRatio: blended.liveCaptureRatio,
-          scoringVersion: SCORING_VERSION,
-          computedAt: 0,
-        });
-      }
+      const blended = blendEngineParts(entityParts);
+      const stamp = versionOf.get(key)!;
+      rows.push({
+        entityType,
+        entityId,
+        label: entityType === "brand" ? brandLabel : (competitorNames.get(entityId) ?? entityId),
+        metricDate: day,
+        visibilityScore: blended.visibilityScore,
+        sov: blended.sov,
+        cellsTotal: blended.cellsTotal,
+        liveCaptureRatio: blended.liveCaptureRatio,
+        scoringVersion: stamp.scoringVersion,
+        computedAt: stamp.newestCaptureMs,
+      });
     }
     // The same rule as `bestAndWorstEngine`: cells-weighted, and ONE ENGINE IS NEITHER BEST NOR WORST.
     const ranked = [...engineTotals]

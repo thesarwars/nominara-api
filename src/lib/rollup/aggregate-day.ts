@@ -285,10 +285,64 @@ export async function aggregateRange(
    */
   clusterId?: string | readonly string[],
 ): Promise<DayAggregate[]> {
+  const rows = await runAggregate(tx, false, projectId, fromDate, toDate, timezone, scoringVersion, instants, clusterId);
+  return rows.map(({ metricDate: _metricDate, scoringVersion: _scoringVersion, newestCaptureMs: _newest, ...aggregate }) => aggregate);
+}
+
+/** A group of `aggregateRangeByDay`: the day's aggregate under ONE scoring version, with the time of its newest cell. */
+export interface DayVersionAggregate extends DayAggregate {
+  /** The workspace-local day, `YYYY-MM-DD`. */
+  readonly metricDate: string;
+  /** The `answer_captures.scoring_version` of the cells (and, for each cell, of its mention and citation facts). */
+  readonly scoringVersion: string;
+  /** Epoch ms of the newest cell in the group: which of two older versions is the more recent, as `computed_at` is for a stored row. */
+  readonly newestCaptureMs: number;
+}
+
+/**
+ * `aggregateRange`, GROUPED BY WORKSPACE-LOCAL DAY AND SCORING VERSION, in ONE query: the same SQL (one body, `runAggregate`) with a `(day, version)`
+ * group key where the range query has none, so a window of N days is one round trip and not N, and there is no second aggregation to drift from the first.
+ * Every cell, mention and citation lands in exactly the group its own day and its own capture's version name, so two versions are never summed together.
+ * Callers choose a version per day themselves; the scores are still the scoring library's, from these counts.
+ */
+export async function aggregateRangeByDay(
+  tx: ClientBase,
+  projectId: string,
+  fromDate: string,
+  toDate: string,
+  timezone: string,
+  clusterId?: string | readonly string[],
+): Promise<DayVersionAggregate[]> {
+  return runAggregate(tx, true, projectId, fromDate, toDate, timezone, null, undefined, clusterId);
+}
+
+/**
+ * `grouped` adds ONE more key to every group - the cell's (local day, scoring version) - and nothing else changes: the same predicates, the same
+ * subqueries, each now also matched on that key. Ungrouped, the key is a constant NULL and every fragment below is empty, so the range query is the
+ * query it was before.
+ */
+async function runAggregate(
+  tx: ClientBase,
+  grouped: boolean,
+  projectId: string,
+  fromDate: string,
+  toDate: string,
+  timezone: string,
+  scoringVersion: string | null,
+  instants: { readonly from: string; readonly to: string } | undefined,
+  clusterId: string | readonly string[] | undefined,
+): Promise<Array<DayVersionAggregate>> {
+  const GRP = grouped ? "(c.captured_at AT TIME ZONE $3)::date::text || '|' || c.scoring_version" : "NULL::text";
+  /** "the same group" for a subquery over day_cells `dc` and an entity row `e`; empty when ungrouped. */
+  const sameGroup = grouped ? "AND dc.grp = e.grp" : "";
+  /** A mention is read under its own cell's version when grouped (the range query's `$5` does that job ungrouped). */
+  const mentionVersion = grouped ? "AND m.scoring_version = dc.scoring_version" : "";
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (
        SELECT c.id, c.engine_key, c.status, c.cache_layer, c.brand_present, c.sov,
-              COALESCE(pe.weight, 1.0)::real AS engine_weight
+              COALESCE(pe.weight, 1.0)::real AS engine_weight,
+              c.scoring_version, c.captured_at,
+              ${GRP} AS grp
          FROM answer_captures c
          -- ⚠ project_engines, NOT the entitled view, AND THAT IS DELIBERATE.
          -- STORY-152 moved the entitlement reads onto project_entitled_engines;
@@ -327,11 +381,13 @@ export async function aggregateRange(
        -- alone.
        SELECT DISTINCT m.engine_key,
               m.entity_type,
-              COALESCE(m.entity_id, $1::uuid) AS entity_id
+              COALESCE(m.entity_id, $1::uuid) AS entity_id,
+              dc.grp
          FROM mention_facts m
          JOIN day_cells dc ON dc.id = m.result_id
         WHERE m.entity_type IN ('brand', 'competitor')
           AND ($5::text IS NULL OR m.scoring_version = $5::text)
+          ${mentionVersion}
        UNION
        -- ⚠ THE BRAND ALWAYS HAS A ROW WHEREVER THERE ARE CELLS, mentioned or
        -- not. Found by STORY-136.
@@ -350,20 +406,24 @@ export async function aggregateRange(
        -- anywhere in the range is not being tracked in it, and inventing a
        -- zero row for every competitor on every engine would multiply the
        -- table by the competitor count for no finding.
-       SELECT DISTINCT dc.engine_key, 'brand'::text AS entity_type, $1::uuid AS entity_id
+       SELECT DISTINCT dc.engine_key, 'brand'::text AS entity_type, $1::uuid AS entity_id, dc.grp
          FROM day_cells dc
      ),
      per_engine AS (
-       SELECT dc.engine_key,
+       SELECT dc.engine_key, dc.grp,
               count(*)::int                                              AS cells_total,
               count(*) FILTER (WHERE dc.cache_layer = 'live')::int        AS live_cells,
-              sum(dc.engine_weight)::double precision                     AS weight_total
+              sum(dc.engine_weight)::double precision                     AS weight_total,
+              (extract(epoch FROM max(dc.captured_at)) * 1000)::text      AS newest_ms
          FROM day_cells dc
-        GROUP BY dc.engine_key
+        GROUP BY dc.engine_key, dc.grp
      )
      SELECT e.engine_key,
             e.entity_type,
             e.entity_id::text,
+            split_part(e.grp, '|', 1) AS metric_date,
+            split_part(e.grp, '|', 2) AS scoring_version,
+            pe.newest_ms,
             pe.cells_total::text,
             pe.live_cells::text,
             pe.weight_total::text,
@@ -371,8 +431,9 @@ export async function aggregateRange(
             -- the cell had any mention at all.
             (SELECT count(DISTINCT m.result_id) FROM mention_facts m
                JOIN day_cells dc ON dc.id = m.result_id
-              WHERE dc.engine_key = e.engine_key AND m.entity_type = e.entity_type
+              WHERE dc.engine_key = e.engine_key ${sameGroup} AND m.entity_type = e.entity_type
                 AND COALESCE(m.entity_id, $1::uuid) = e.entity_id
+                ${mentionVersion}
                 -- STORY-036 AC5: an occurrence inside a URL, a code span or a link target is a citation, not a mention. The parse
                 -- already leaves it out of brand_present and prominence; counting it here made the rollup disagree with the cell.
                 AND NOT m.in_link
@@ -382,14 +443,14 @@ export async function aggregateRange(
             -- window is EPIC-08's competitive panel, not this rollup.
             (SELECT COALESCE(sum(dc.engine_weight * COALESCE(dc.sov, 0)), 0)
                FROM day_cells dc
-              WHERE dc.engine_key = e.engine_key
+              WHERE dc.engine_key = e.engine_key ${sameGroup}
                 AND e.entity_type = 'brand')::text                        AS sov_weighted,
             agg.prominence_sum, agg.mention_rows, agg.rank_sum, agg.rank_rows,
             agg.mentions_total, agg.pos, agg.neu, agg.neg, agg.sent_weighted,
             agg.render_weighted, agg.render_weight_total, agg.render_mention_rows,
             cit.cit_total, cit.cit_owned, cit.cit_owned_pw, cit.cit_pw_total
        FROM entities e
-       JOIN per_engine pe ON pe.engine_key = e.engine_key
+       JOIN per_engine pe ON pe.engine_key = e.engine_key ${grouped ? "AND pe.grp = e.grp" : ""}
        CROSS JOIN LATERAL (
          SELECT COALESCE(sum(m.prominence), 0)::text                       AS prominence_sum,
                 count(*)::text                                             AS mention_rows,
@@ -407,9 +468,10 @@ export async function aggregateRange(
                 count(*) FILTER (WHERE m.engine_key IN ${ATTRIBUTE_CAPABLE})::text     AS render_mention_rows
            FROM mention_facts m
            JOIN day_cells dc ON dc.id = m.result_id
-          WHERE dc.engine_key = e.engine_key
+          WHERE dc.engine_key = e.engine_key ${sameGroup}
             AND m.entity_type = e.entity_type
             AND COALESCE(m.entity_id, $1::uuid) = e.entity_id
+            ${mentionVersion}
             -- Same rule as cells_present above: a link-internal occurrence is no mention, so it is not counted, weighted or ranked.
             AND NOT m.in_link
             AND ($5::text IS NULL OR m.scoring_version = $5::text)
@@ -424,7 +486,7 @@ export async function aggregateRange(
                 COALESCE(sum(f.position_weight), 0)::text                   AS cit_pw_total
            FROM citation_facts f
            JOIN day_cells dc ON dc.id = f.result_id
-          WHERE dc.engine_key = e.engine_key
+          WHERE dc.engine_key = e.engine_key ${sameGroup}
             -- §4 — an unresolved citation is excluded from share, counted as
             -- neither owned nor foreign.
             AND f.http_status IS NOT NULL
@@ -433,6 +495,10 @@ export async function aggregateRange(
   );
 
   return result.rows.map((row) => ({
+    // Empty/0 when ungrouped (the key is NULL): `aggregateRange` drops them.
+    metricDate: row.metric_date ?? "",
+    scoringVersion: row.scoring_version ?? "",
+    newestCaptureMs: Number(row.newest_ms),
     engineKey: String(row.engine_key),
     entityType: row.entity_type as "brand" | "competitor",
     entityId: String(row.entity_id),
