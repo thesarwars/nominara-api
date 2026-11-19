@@ -319,7 +319,7 @@ export function createMaintenanceIntegrityHandler(
         });
         continue;
       }
-      observeValue("nominara_maintenance_vector_recall_ratio_total", recall, {
+      observeValue("nominara_maintenance_vector_recall_ratio", recall, {
         table,
       });
       if (recall < VECTOR_RECALL_THRESHOLD) {

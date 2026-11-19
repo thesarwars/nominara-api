@@ -5,7 +5,7 @@ import metricNameConvention from "../../eslint-rules/metric-name-convention.js";
 
 // STORY-005 AC8 / scenario 5: "Emit a metric with no unit suffix - the lint rule rejects it."
 // coding-standards.md section 7: metrics are `nominara_<subsystem>_<measure>` with the units in the name (_ms, _bytes, _total);
-// `_seconds` is the unit edge-cases-and-slos.md uses for lag. The rule checks every name handed to the two metric helpers.
+// `_seconds` is the unit edge-cases-and-slos.md uses for lag; `_ratio` and `_rows` are units by decision 110(c). The rule checks every name handed to the two metric helpers.
 RuleTester.describe = describe;
 RuleTester.it = it;
 
@@ -17,6 +17,8 @@ describe("STORY-005 AC8 - eslint-rules/metric-name-convention", () => {
       { name: "a counter with _total", code: `incrementCounter("nominara_billing_addon_change_total", { outcome: "ok" });` },
       { name: "a histogram with _ms", code: `observeValue("nominara_api_request_duration_ms", 12);` },
       { name: "_bytes", code: `observeValue("nominara_reports_artifact_size_bytes", 12);` },
+      { name: "_ratio (decision 110(c): a gauge that is a ratio does not wear _total)", code: `observeValue("nominara_maintenance_vector_recall_ratio", 0.99);` },
+      { name: "_rows (decision 110(c): a gauge counting rows does not wear _total)", code: `observeValue("nominara_embed_reembed_pending_rows", 3);` },
       { name: "_seconds", code: `observeValue("nominara_rollup_attribution_lag_seconds", 12);` },
       { name: "a const resolved in the same file", code: `const LAG_METRIC = "nominara_rollup_attribution_lag_seconds"; observeValue(LAG_METRIC, 1);` },
       { name: "a template whose static parts satisfy the convention", code: "incrementCounter(`nominara_billing_${what}_session_total`);" },
@@ -29,6 +31,8 @@ describe("STORY-005 AC8 - eslint-rules/metric-name-convention", () => {
       { name: "no subsystem (prefix, then straight to the unit)", code: `incrementCounter("nominara_total");`, errors: [{ messageId: "badName" }] },
       { name: "no measure (prefix, one word, unit)", code: `incrementCounter("nominara_billing_total");`, errors: [{ messageId: "badName" }] },
       { name: "uppercase and hyphens", code: `observeValue("Nominara-Billing-Latency_ms", 1);`, errors: [{ messageId: "badName" }] },
+      { name: "a unit that is not on the list (_percent)", code: `observeValue("nominara_billing_fill_percent", 1);`, errors: [{ messageId: "badName" }] },
+      { name: "_ratio or _rows alone is not enough: the subsystem and a measure are still required", code: `observeValue("nominara_billing_ratio", 1);`, errors: [{ messageId: "badName" }] },
       { name: "an ambiguous unit (_count)", code: `observeValue("nominara_billing_rows_count", 1);`, errors: [{ messageId: "badName" }] },
       { name: "a const that resolves to a bad name", code: `const M = "nominara_billing_lag"; observeValue(M, 1);`, errors: [{ messageId: "badName" }] },
       { name: "a template whose tail has no unit", code: "incrementCounter(`nominara_billing_${what}_session`);", errors: [{ messageId: "badName" }] },
@@ -50,7 +54,7 @@ describe("batch 19 - the legacy baseline is empty and nothing relies on it", () 
     const files = (readdirSync(new URL("../../src", import.meta.url), { recursive: true }) as string[]).filter((f) => f.endsWith(".ts") && !/\.(?:spec|test)\.ts$/u.test(f));
     // The rule's own definition: nominara_<subsystem>_<measure>..., with the unit as the final word (so the unit counts toward the minimum).
     const conforming = /^nominara_[a-z0-9]+(?:_[a-z0-9]+){2,}$/u;
-    const hasUnit = (name: string): boolean => ["total", "ms", "seconds", "bytes"].some((unit) => name.endsWith(`_${unit}`));
+    const hasUnit = (name: string): boolean => ["total", "ms", "seconds", "bytes", "ratio", "rows"].some((unit) => name.endsWith(`_${unit}`));
     // A literal first argument of either helper, read statically like the rule does. Template names are skipped here (the rule checks those).
     const call = /\b(?:incrementCounter|observeValue)\(\s*"([^"]+)"/gu;
     const offenders: string[] = [];
@@ -66,15 +70,18 @@ describe("batch 19 - the legacy baseline is empty and nothing relies on it", () 
     const retired = [
       "credit_reconcile_yielded_total", "nominara_alerts_total", "nominara_aux_pages_evaluated_count", "nominara_aux_rules_evaluated_count",
       "nominara_discovery_category_embed_tokens", "nominara_displacement_citation_gap_entries", "nominara_displacement_concept_gap_entries",
-      "nominara_embed_reembed_pending_rows", "nominara_embed_tokens_spent", "nominara_embed_vectors_written", "nominara_geo_alignment_nodes_collapsed",
+      "nominara_embed_tokens_spent", "nominara_embed_vectors_written", "nominara_geo_alignment_nodes_collapsed",
       "nominara_geo_corpus_passages_written", "nominara_geo_name_match_judge_tokens_spent", "nominara_gsc_sync_rows_per_run",
-      "nominara_maintenance_orphan_fact_rows", "nominara_maintenance_vector_recall_ratio", "nominara_partition_default_rows",
+      "nominara_maintenance_orphan_fact_rows", "nominara_partition_default_rows",
       "nominara_prompts_naturalise_tokens_spent", "nominara_retention_purge_failures_unresolved", "nominara_rollup_attribution_seconds_since_last_commit",
       "nominara_tools_runs_reaped_rows", "nominara_tools_snapshots_expired_rows", "nominara_topic_cluster_clusters_written",
       "nominara_topic_cluster_outlier_prompts", "nominara_topic_cluster_prompts_dropped_by_cap", "partition_create_failed",
       "partition_default_rows_detected", "queue_schedule_reconcile_failed",
     ];
-    expect(retired).toHaveLength(28);
+    // 26, not 28: decision 110(c) (batch 19) gives two of the 28 back to the convention under their gauge names, now that `_ratio` and `_rows` are
+    // units - nominara_embed_reembed_pending_rows and nominara_maintenance_vector_recall_ratio. They are emitted again on purpose, so they are no
+    // longer in this list. Replaces the previous assertion `toHaveLength(28)`.
+    expect(retired).toHaveLength(26);
     const files = (readdirSync(new URL("../../src", import.meta.url), { recursive: true }) as string[]).filter((f) => f.endsWith(".ts"));
     const source = files.map((f) => readFileSync(new URL(`../../src/${f}`, import.meta.url), "utf8")).join("\n");
     for (const name of retired) expect(source.includes(`"${name}"`), `${name} is still emitted`).toBe(false);

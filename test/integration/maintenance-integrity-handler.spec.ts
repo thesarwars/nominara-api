@@ -233,7 +233,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
   it("AC6 · a vector index with too few rows to measure is SKIPPED (no recall observation, no alert): null is not 0", async () => {
     captureAlerts();
     await expect(run()).resolves.toBeUndefined();
-    expect(metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio_total")).toEqual([]);
+    expect(metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio")).toEqual([]);
     expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_skipped_total" && m.labels.table === "tracked_prompts")).toBe(true);
     expect(alerts).toEqual([]);
   }, 60_000);
@@ -245,7 +245,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
 
     await expect(run()).resolves.toBeUndefined();
 
-    const recall = metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio_total" && m.labels.table === "tracked_prompts");
+    const recall = metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts");
     expect(recall).toHaveLength(1);
     expect(recall[0]!.value).toBeGreaterThanOrEqual(VECTOR_RECALL_THRESHOLD);
     expect(alerts.some((a) => a.context.alertName === "maintenance_vector_recall_below_threshold")).toBe(false);
@@ -264,7 +264,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
       const { lines, result } = await captureErrorLogs(run);
       expect(result.status).toBe("fulfilled");
 
-      const recall = metrics.find((m) => m.name === "nominara_maintenance_vector_recall_ratio_total" && m.labels.table === "tracked_prompts");
+      const recall = metrics.find((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts");
       expect(recall!.value).toBeLessThan(VECTOR_RECALL_THRESHOLD);
       expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_findings_total" && m.labels.check === "vector_recall")).toBe(true);
       expect(lines.some((l) => l.includes("ix_prompts_embedding"))).toBe(true);
@@ -390,7 +390,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
       expect((result as PromiseRejectedResult).reason).toBeInstanceOf(UnrecoverableError);
       expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows_total").reduce((sum, m) => sum + m.value, 0)).toBe(3);
       // The recall check read the tenant's vectors too: an observation, not a skip.
-      expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_ratio_total" && m.labels.table === "tracked_prompts")).toBe(true);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts")).toBe(true);
       expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total")).toBe(false);
     }, 120_000);
 

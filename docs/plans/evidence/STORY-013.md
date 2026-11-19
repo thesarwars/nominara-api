@@ -15,7 +15,7 @@ choice, not a transcription (same caveat as every row in `schedule.ts`); the own
 |---|---|---|
 | 14 | `scanForOrphans` (per partition) | metric `nominara_maintenance_orphan_fact_rows_total` (0 is observed), error log with table/partition/count, alert email, job FAILS with `UnrecoverableError` (one page per night) |
 | 16 | new `findUnresolvedPurgeFailures` (`src/db/purge-check.ts`) | metric `nominara_retention_purge_failures_unresolved_total`; any unresolved failure alerts; past the 7-day grace the job FAILS (the runtime hook of "blocks the release train"). `reason` is never logged or mailed. |
-| 6 | `computeRecallAtK` over `HNSW_INDEXED_TABLES` | metric `nominara_maintenance_vector_recall_ratio_total`; below 0.98 an error log + alert email + finding counter; a table with too few rows is a counted skip (null is not 0). NOT a failed job. |
+| 6 | `computeRecallAtK` over `HNSW_INDEXED_TABLES` | metric `nominara_maintenance_vector_recall_ratio`; below 0.98 an error log + alert email + finding counter; a table with too few rows is a counted skip (null is not 0). NOT a failed job. |
 
 A check that cannot run fails the job with an ordinary error after the others have reported; an errored scan never reads as clean.
 

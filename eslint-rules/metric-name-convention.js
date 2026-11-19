@@ -7,7 +7,8 @@
 // read as one word), or an identifier that resolves to a `const` string literal in this file. A name it cannot read is
 // REPORTED (`notStatic`), never waved through: an allow-list that lets the unreadable pass is the gap the next metric
 // falls through. `_seconds` is accepted beside the three in the standard because edge-cases-and-slos.md names its lag
-// metrics in seconds.
+// metrics in seconds. `_ratio` (a 0..1 or 0..100 ratio) and `_rows` (a gauge counting rows) are accepted by owner decision 110(c): `_total` means a
+// monotonic counter, so a gauge or a ratio must not wear it.
 
 // LEGACY BASELINE - EMPTY. It held the 28 names that predated this rule and broke it, each grandfathered by exact name
 // (owner decision 108, "28 legacy metric names are grandfathered"). Batch 19 renamed all 28 to the convention while there were
@@ -17,7 +18,7 @@
 export const LEGACY_METRIC_NAMES = new Set([]);
 
 const HELPERS = new Set(["incrementCounter", "observeValue"]);
-const UNITS = ["total", "ms", "seconds", "bytes"];
+const UNITS = ["total", "ms", "seconds", "bytes", "ratio", "rows"];
 // nominara_ + subsystem + at least one measure word + unit.
 const NAME = new RegExp(`^nominara_[a-z0-9]+(?:_[a-z0-9]+){2,}$`);
 
@@ -70,7 +71,7 @@ const metricNameConvention = {
     schema: [],
     messages: {
       badName:
-        'Metric name "{{name}}" breaks the convention: nominara_<subsystem>_<measure> with a unit suffix (_total, _ms, _seconds, _bytes) (coding-standards.md section 7).',
+        'Metric name "{{name}}" breaks the convention: nominara_<subsystem>_<measure> with a unit suffix (_total, _ms, _seconds, _bytes, _ratio, _rows) (coding-standards.md section 7).',
       notStatic:
         "A metric name must be a string literal, a template literal, or a const string literal in this file, so the naming convention can be checked.",
     },
