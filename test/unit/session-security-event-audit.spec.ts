@@ -17,6 +17,8 @@ interface Script {
   readonly verified: boolean;
   readonly revokeRowCount?: number;
   readonly auditFails?: boolean;
+  /** A grace_reuse row for this rotation already exists in the workspace's chain. */
+  readonly graceAlreadyAudited?: boolean;
 }
 
 function harness(script: Script, cacheValue?: string) {
@@ -33,6 +35,7 @@ function harness(script: Script, cacheValue?: string) {
       }
       if (/SELECT 1 FROM refresh_tokens/.test(text)) return { rows: [{ "?column?": 1 }] };
       if (/SET revoked_at = now\(\), revoked_reason = 'reuse_detected'/.test(text)) return { rows: [], rowCount: script.revokeRowCount ?? 1 };
+      if (/FROM audit_log WHERE .*rotation_id/s.test(text)) return { rows: script.graceAlreadyAudited === true ? [{ one: 1 }] : [], rowCount: script.graceAlreadyAudited === true ? 1 : 0 };
       if (/INSERT INTO audit_log/.test(text) && script.auditFails === true) throw new Error("audit insert failed");
       if (/pg_advisory_xact_lock/.test(text)) {
         return { rows: [{ workspace_id: values[0], actor_id: values[1], resource_id: values[2], support_grant_id: null, actor_ip: null }] };
@@ -63,6 +66,8 @@ function harness(script: Script, cacheValue?: string) {
 afterEach(() => vi.restoreAllMocks());
 
 const insertedAction = (s: { values: unknown[] }): unknown => s.values[6];
+const insertedActor = (s: { values: unknown[] }): { type: unknown; id: unknown } => ({ type: s.values[2], id: s.values[3] });
+const insertedAfterState = (s: { values: unknown[] }): Record<string, unknown> => JSON.parse(String(s.values[10])) as Record<string, unknown>;
 
 describe("batch 19 / decision 108(a) - session security events are audited", () => {
   it("session.reuse_detected is written to the audit chain of the session's workspace, on a tenant-context transaction, naming the session and never the token", async () => {
@@ -133,5 +138,41 @@ describe("batch 19 / decision 108(a) - session security events are audited", () 
     const error = vi.spyOn((await import("@nestjs/common")).Logger.prototype, "error").mockImplementation(() => undefined);
     expect((await h.service.refresh(predecessor)).refreshToken).toBe(successor);
     expect(error).toHaveBeenCalled();
+  });
+
+  it("session.reuse_detected does not name the victim as the actor: actor is the system, no actor id, and the session's owner is in after_state", async () => {
+    const h = harness({ activeWorkspaceId: WS, verified: true });
+    await expect(h.service.refresh(generateRefreshToken())).rejects.toThrow("refresh token already used");
+    const row = h.audited()[0]!;
+    // The REPLAYER is whoever holds the stolen token and is unknown; the session's owner is the victim, so writing them as actor would
+    // attribute the attacker's act to the user it was done to.
+    expect(insertedActor(row)).toEqual({ type: "system", id: null });
+    expect(row.values[8]).toBe(SID);
+    expect(insertedAfterState(row)).toMatchObject({ revoked_reason: "reuse_detected", session_owner_user_id: USER });
+  });
+
+  it("session.refresh_grace_reuse is attributed the same way: system actor, no actor id, owner in after_state", async () => {
+    const predecessor = generateRefreshToken();
+    const successor = generateRefreshToken();
+    const slot = serializeGraceSlot({ predecessorHash: hashRefreshToken(predecessor), successorCiphertext: encryptGraceSuccessor(SID, predecessor, successor) });
+    const h = harness({ activeWorkspaceId: WS, verified: true }, slot);
+    await h.service.refresh(predecessor);
+    const row = h.audited()[0]!;
+    expect(insertedActor(row)).toEqual({ type: "system", id: null });
+    expect(insertedAfterState(row)).toMatchObject({ outcome: "same_successor_returned", session_owner_user_id: USER });
+  });
+
+  it("session.refresh_grace_reuse is written once per session per grace window: a second hit on the same rotation adds no row", async () => {
+    const predecessor = generateRefreshToken();
+    const successor = generateRefreshToken();
+    const slot = serializeGraceSlot({ predecessorHash: hashRefreshToken(predecessor), successorCiphertext: encryptGraceSuccessor(SID, predecessor, successor) });
+    const first = harness({ activeWorkspaceId: WS, verified: true }, slot);
+    await first.service.refresh(predecessor);
+    expect(first.audited()).toHaveLength(1);
+    const second = harness({ activeWorkspaceId: WS, verified: true, graceAlreadyAudited: true }, slot);
+    expect((await second.service.refresh(predecessor)).refreshToken).toBe(successor);
+    expect(second.audited()).toHaveLength(0);
+    // The dedup is the rotation (the consumed token row), taken under a lock so two racing hits cannot both pass the check.
+    expect(second.statements.some((s) => /pg_advisory_xact_lock/.test(s.text) && /rotation|hashtext/i.test(s.text))).toBe(true);
   });
 });

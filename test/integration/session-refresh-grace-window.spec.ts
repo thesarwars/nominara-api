@@ -368,6 +368,26 @@ describe("STORY-170 · refresh-token reuse grace window", () => {
     expect(await sessionAuditActions(s.workspaceId, s.userId)).toEqual(["session.refresh_grace_reuse"]);
   });
 
+  it("batch 19 fix · repeated grace-window hits on one rotation write ONE row, attributed to the system (no actor id), the owner in after_state", async () => {
+    const s = await sessionInWorkspace();
+    const sessions = harness.app().get(SessionService);
+    await sessions.refresh(s.refreshToken);
+    await sessions.refresh(s.refreshToken);
+    await sessions.refresh(s.refreshToken);
+    await Promise.all([sessions.refresh(s.refreshToken), sessions.refresh(s.refreshToken)]);
+    expect(await sessionAuditActions(s.workspaceId, s.userId)).toEqual(["session.refresh_grace_reuse"]);
+    const client = await pool.connect();
+    const rows = await withTenantContext(client, { workspaceId: s.workspaceId, actorId: s.userId }, (tx) =>
+      tx.query<{ actor_type: string; actor_id: string | null; resource_id: string; after_state: Record<string, string> }>(
+        "SELECT actor_type, actor_id, resource_id, after_state FROM audit_log WHERE workspace_id = $1 AND action = 'session.refresh_grace_reuse'",
+        [s.workspaceId],
+      ),
+    ).finally(() => client.release());
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]).toMatchObject({ actor_type: "system", actor_id: null, resource_id: s.sid });
+    expect(rows.rows[0]!.after_state.outcome).toBe("same_successor_returned");
+  });
+
   it("batch 19 · a reuse outside the window writes ONE session.reuse_detected row, and a second replay of the dead family adds none", async () => {
     const s = await sessionInWorkspace();
     const sessions = harness.app().get(SessionService);

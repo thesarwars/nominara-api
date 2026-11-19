@@ -46,6 +46,12 @@ interface PendingSecurityAudit {
   /** The workspace whose chain the row goes into; null when the session has none that still verifies, in which case NO row is written. */
   readonly workspaceId: string | null;
   readonly afterState: Record<string, string>;
+  /**
+   * Set for an event that must be written once per rotation (the grace-window reuse: every racing or retrying caller inside one window hits the
+   * same branch, and each would otherwise add a row). The id of the consumed refresh-token row, which is the rotation; it is stored in after_state as
+   * `rotation_id` (not a secret: a row id, never the token or its hash) and is what the lookup keys on.
+   */
+  readonly oncePerRotation?: string;
 }
 
 // STORY-017 — dangerous area: rotation and reuse-detection logic. Full
@@ -387,7 +393,8 @@ export class SessionService {
             sessionId: graceSession.id,
             userId: graceSession.user_id,
             workspaceId: active.ws,
-            afterState: { outcome: "same_successor_returned" },
+            afterState: { outcome: "same_successor_returned", session_owner_user_id: graceSession.user_id, rotation_id: tokenRow.id },
+            oncePerRotation: tokenRow.id,
           };
 
           const { accessToken, csrfToken } = await this.mintAccessAndCsrf(
@@ -424,7 +431,7 @@ export class SessionService {
               preVerified !== null
                 ? graceSession.active_workspace_id
                 : null,
-            afterState: { revoked_reason: "reuse_detected" },
+            afterState: { revoked_reason: "reuse_detected", session_owner_user_id: graceSession.user_id },
           };
         }
         this.logger.warn(`refresh token reuse detected — session family revoked session_id=${tokenRow.session_id}`);
@@ -551,11 +558,25 @@ export class SessionService {
       try {
         const client = await this.pool.connect();
         try {
-          await withTenantContext(client, { workspaceId, actorId: event.userId }, (tx) =>
-            auditChain.append(tx, {
+          // The tenant context's actor GUC is transient session state, not part of the row; the ROW names no actor (below).
+          const written = await withTenantContext(client, { workspaceId, actorId: event.userId }, async (tx) => {
+            if (event.oncePerRotation !== undefined) {
+              // Serialise on the rotation, THEN look: two hits racing on one window would otherwise both find nothing and both write. Taken before
+              // the chain's own lock (append) and by nothing else, so the order cannot deadlock.
+              await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${event.action}:${event.oncePerRotation}`]);
+              const existing = await tx.query(
+                `SELECT 1 FROM audit_log WHERE workspace_id = $1 AND action = $2 AND resource_id = $3 AND after_state->>'rotation_id' = $4 LIMIT 1`,
+                [workspaceId, event.action, event.sessionId, event.oncePerRotation],
+              );
+              if ((existing.rowCount ?? existing.rows.length) > 0) return false;
+            }
+            await auditChain.append(tx, {
               workspaceId,
-              actorType: "user",
-              actorId: event.userId,
+              // NOT "user". The session's owner is the VICTIM of a reuse (or the legitimate refresher of a grace hit), and the party presenting
+              // the consumed token is unknown: attributing the act to the owner would put the attacker's request on the victim's record. The
+              // system detected it; the owner is named as the subject, in after_state, and the session is the resource.
+              actorType: "system",
+              actorId: null,
               actorIp: null,
               actorUa: null,
               action: event.action,
@@ -566,8 +587,13 @@ export class SessionService {
               requestId: `auth.refresh:${uuidV7()}`,
               supportGrantId: null,
               severity: event.severity,
-            }),
-          );
+            });
+            return true;
+          });
+          if (!written) {
+            incrementCounter("nominara_identity_session_security_event_deduplicated_total", { event: event.action });
+            return;
+          }
         } finally {
           client.release();
         }
