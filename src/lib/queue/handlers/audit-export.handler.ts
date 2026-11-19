@@ -31,7 +31,7 @@ import type { JobProcessor } from "../worker-factory.js";
 export interface AuditExportHandlerDeps {
   readonly connect?: (url: string) => Promise<ClientBase & { end(): Promise<void> }>;
   readonly sinkFor?: (env: Env) => AuditExportSink | null;
-  readonly runExport?: (client: ClientBase, sink: AuditExportSink) => Promise<string>;
+  readonly runExport?: (client: ClientBase, sink: AuditExportSink) => Promise<string | null>;
 }
 
 /** The sink the environment selects: the Object Lock bucket first, else the local-directory approximation (AUDIT_EXPORT_DIR), else none. */
@@ -57,7 +57,7 @@ export function createAuditExportHandler(context: QueueHandlerContext, deps: Aud
   const logger = new Logger("audit.export");
   const open = deps.connect ?? connect;
   const sinkFor = deps.sinkFor ?? ((env: Env) => selectAuditExportSink(env));
-  const runExport = deps.runExport ?? ((client: ClientBase, sink: AuditExportSink) => runAuditExport(client, sink));
+  const runExport = deps.runExport ?? ((client: ClientBase, sink: AuditExportSink) => runAuditExport(client, sink, { incremental: true }));
 
   return async (_client: ClientBase, _job: Job): Promise<void> => {
     const sink = sinkFor(context.env);
@@ -83,6 +83,12 @@ export function createAuditExportHandler(context: QueueHandlerContext, deps: Aud
         return;
       }
       const location = await runExport(client, sink);
+      if (location === null) {
+        // Batch 19 - the export is incremental: no chain has a row past its watermark, so there is nothing to write and no object is written.
+        incrementCounter("nominara_audit_export_skipped_total", { reason: "no_new_rows" });
+        logger.log({ event: "audit_export_skipped", reason: "no_new_rows" });
+        return;
+      }
       incrementCounter("nominara_audit_export_runs_total");
       observeValue("nominara_audit_export_duration_seconds", (Date.now() - startedAt) / 1000);
       // The location names a bucket and a key (a date and a stamp), never a row; no workspace is named.

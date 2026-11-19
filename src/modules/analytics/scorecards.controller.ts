@@ -30,7 +30,7 @@ export class ScorecardsController {
   @Get()
   @RequirePermission("tracking:read")
   @ProjectParam("id")
-  @ApiContract({ operationId: "getProjectScorecards", responseSchema: scorecardsResponseSchema })
+  @ApiContract({ operationId: "getProjectScorecards", querySchema: scorecardsQuerySchema, responseSchema: scorecardsResponseSchema })
   scorecard(
     @Param("id") projectId: string,
     @Query(new ZodValidationPipe(scorecardsQuerySchema)) query: ScorecardsQuery,

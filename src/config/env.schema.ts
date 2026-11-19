@@ -356,6 +356,11 @@ export const envSchema = z
     // when nothing sits in front and merely coarse when something does.
     TRUST_PROXY_HOPS: z.coerce.number().int().nonnegative().optional(),
 
+    // Batch 19 (follow-up to owner decision 108(k)) - OPTIONAL allow-list of proxy ranges: comma-separated addresses or CIDRs. When set, a forwarded
+    // hop is trusted only if it comes from one of these ranges, and it TAKES PRECEDENCE over TRUST_PROXY_HOPS. A plain string here on purpose: the
+    // value is parsed leniently in src/api/fastify-options.ts (bad entries are dropped, never a boot failure; nothing valid means nobody is trusted).
+    TRUSTED_PROXY_CIDRS: z.string().optional(),
+
     // STORY-024 — tracing. Every request gets a server span regardless (its
     // trace id IS `meta.request_id`), so ids exist with no collector. An OTLP
     // exporter is wired ONLY when this endpoint is set; unset (the default)

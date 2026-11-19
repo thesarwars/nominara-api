@@ -97,7 +97,7 @@ export function createCreditReconcileHandler(context: QueueHandlerContext): JobP
         // COMPLETES, so the DLQ stays empty and every existing alarm reads
         // green while no orphaned reservation in any workspace is being
         // returned to anyone. An INFO line nobody greps is not a signal.
-        incrementCounter("credit_reconcile_yielded_total");
+        incrementCounter("nominara_credit_reconcile_yielded_total");
         logger.warn("another replica holds the reconcile lock; yielding this tick");
         return;
       }

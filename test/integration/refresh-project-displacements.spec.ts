@@ -1035,7 +1035,7 @@ describe("NEW-C-3 · refreshProjectDisplacements", () => {
     await analysed();
     await lossWithConcepts();
     spy.mockRestore();
-    const line = lines.find((l) => l.includes("nominara_displacement_concept_gap_entries"));
+    const line = lines.find((l) => l.includes("nominara_displacement_concept_gap_entries_total"));
     expect(line).toBeDefined();
     const all = lines.join("\n");
     expect(all).toContain("dropped_below_threshold");

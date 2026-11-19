@@ -310,7 +310,7 @@ async function run(tx: ClientBase, sessionId: string, tokenizer: TokenCounter, d
     lowConfidence,
   };
   incrementCounter("nominara_geo_alignment_nodes_analysed_total", { low_confidence: String(lowConfidence) });
-  observeValue("nominara_geo_alignment_nodes_collapsed", collapsed);
+  observeValue("nominara_geo_alignment_nodes_collapsed_total", collapsed);
   logger.log({ event: "geo.alignment.nodes_analysed", workspace_id: s.workspace_id, nodes: summary.nodes, collapsed, present: summary.present, ranked: summary.ranked, shown: shown.length, low_confidence: lowConfidence });
   return summary;
 }

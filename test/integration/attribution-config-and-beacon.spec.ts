@@ -339,6 +339,44 @@ describe("STORY-113 - attribution configuration and beacon", () => {
     expect(res.headers["set-cookie"]).toBeUndefined();
   }, 120_000);
 
+  // STORY-111 AC9 (carried as STORY-205): "The beacon aggregates at ingest: no per-visitor row, no cookie, no full address, so the customer's own
+  // visitors create no subject-request surface here." The cookie and address halves are S3h, S4 and S4b above; these two are the per-visitor half.
+  it("STORY-111 AC9 - three different visitors (other address, agent and cookie each) become ONE counter row: the beacon stores a count, not a visit", async () => {
+    const { actor, token } = await connected();
+    const visitors = [
+      { "x-forwarded-for": "203.0.113.10", "user-agent": DESKTOP_UA, cookie: "sid=VISITOR-ONE" },
+      { "x-forwarded-for": "198.51.100.20", "user-agent": DESKTOP_UA, cookie: "sid=VISITOR-TWO" },
+      { "x-forwarded-for": "192.0.2.30", "user-agent": DESKTOP_UA, cookie: "sid=VISITOR-THREE" },
+    ];
+    for (const headers of visitors) expect((await beacon(event(token), headers)).statusCode).toBe(202);
+    const rows = await dailyRows(actor.projectId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ referrer_class: "chatgpt", sessions: 3 });
+    // No stored value of the row is an address, an agent string or a cookie.
+    const stored = JSON.stringify(rows[0]);
+    for (const forbidden of ["203.0.113.10", "198.51.100.20", "192.0.2.30", "VISITOR-", "Mozilla"]) expect(stored).not.toContain(forbidden);
+  }, 120_000);
+
+  it("STORY-111 AC9 - the tables the beacon writes have no column that could hold a visitor: an added per-visitor column fails here and gets a decision", async () => {
+    const columns = async (table: string): Promise<string[]> =>
+      (await db().query<{ column_name: string }>("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY column_name", [table])).rows.map((r) => r.column_name);
+    // attribution_daily: dimensions (day, landing page, source class, country, device), counters, and the ingest stamp. Nothing keyed to a person.
+    expect(await columns("attribution_daily")).toEqual(
+      ["bounce_sessions", "conversion_value", "conversions", "country", "device", "ingested_at", "landing_url", "landing_url_hash", "metric_date", "project_id", "referrer_class", "sessions", "workspace_id"],
+    );
+    // Its key is the dimensions, so a row is a bucket by construction.
+    const key = await db().query<{ column_name: string }>(
+      `SELECT a.attname AS column_name FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+        WHERE i.indrelid = 'attribution_daily'::regclass AND i.indisprimary ORDER BY a.attname`,
+    );
+    expect(key.rows.map((r) => r.column_name)).toEqual(["country", "device", "landing_url_hash", "metric_date", "project_id", "referrer_class"]);
+    // The two-letter country and the three device categories are CHECK- or width-bound, so a full address or agent string cannot be stored in them.
+    const widths = await db().query<{ column_name: string; character_maximum_length: number | null }>(
+      "SELECT column_name, character_maximum_length FROM information_schema.columns WHERE table_name = 'attribution_daily' AND column_name = 'country'",
+    );
+    expect(widths.rows[0]!.character_maximum_length).toBe(2);
+  }, 120_000);
+
   it("STORY-113 S4b - a direct visit to a URL carrying a secret or an address in its query stores neither: the query and fragment are dropped at ingest", async () => {
     const { actor, token } = await connected();
     const statements: Array<{ values: unknown[] }> = [];

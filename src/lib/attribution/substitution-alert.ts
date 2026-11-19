@@ -56,7 +56,7 @@ export async function raiseSubstitutionAlerts(tx: ClientBase, ctx: SubstitutionA
     );
     if ((inCooldown.rowCount ?? 0) > 0) {
       summary.cooledDown += 1;
-      incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: "cooldown" });
+      incrementCounter("nominara_alerts_outcomes_total", { rule: rule.code, outcome: "cooldown" });
       continue;
     }
     const outcome = await writeNotification(
@@ -76,7 +76,7 @@ export async function raiseSubstitutionAlerts(tx: ClientBase, ctx: SubstitutionA
       options,
     );
     summary[outcome.created ? "raised" : "duplicate"] += 1;
-    incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: outcome.created ? "raised" : "duplicate" });
+    incrementCounter("nominara_alerts_outcomes_total", { rule: rule.code, outcome: outcome.created ? "raised" : "duplicate" });
   }
   if (summary.raised > 0) logger.log({ event: "attribution.substitution_alert_raised", workspace_id: ctx.workspaceId, project_id: ctx.projectId, raised: summary.raised });
   return summary;

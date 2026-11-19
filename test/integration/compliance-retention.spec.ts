@@ -13,6 +13,8 @@ import { COMPLIANCE_EXPORT_CLASSES, writeComplianceExports } from "../../src/lib
 import { SUBJECT_INVENTORY } from "../../src/lib/compliance/subject-inventory.js";
 import { ERASURE_QUEUE_LOCK, executePendingErasures, processAccessRequest, processErasureRequest, releaseLegalHoldAndRunQueue, subjectColumnsFor } from "../../src/lib/compliance/subject-request.js";
 import type { ObjectStoragePort, PutObjectRequest } from "../../src/lib/storage/storage.port.js";
+import { deleteWorkspaceObjectsEverywhere } from "../../src/lib/storage/workspace-purge.js";
+import { InMemoryObjectStore } from "../support/in-memory-object-store.js";
 import { runHoldCommand } from "../../src/db/hold-cli.js";
 import { LEGAL_DELAY_NOTICE_DRAFT } from "../../src/lib/compliance/legal-delay-notice.js";
 import { runSubjectCommand } from "../../src/db/subject-cli.js";
@@ -251,7 +253,7 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       expect((await db.query("SELECT 1 FROM purge_failures WHERE scope_id = $1 AND resolved_at IS NULL", [proj])).rowCount).toBe(1);
     });
 
-    it("S17 after a workspace hard delete, no TABLE still holds its content and the reports objects are gone (raw/crawl objects are STORY-182); only identifiers in the three record sets remain", async () => {
+    it("S17 after a workspace hard delete, no TABLE and no OBJECT under any of its prefixes (raw, crawl, reports) still holds its content; only identifiers in the three record sets remain", async () => {
       const ws = await workspace();
       const u = await user();
       await member(ws, u, "owner");
@@ -263,20 +265,26 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
       await seedRow("source_domains", { workspace_id: ws, domain: "SENTINEL-17.example" });
       await seedRow("notifications", { workspace_id: ws, severity: "info", title: "SENTINEL-NOTE-17" });
       await seedRow("report_artifacts", { workspace_id: ws, object_key: "SENTINEL-OBJECT-17.pdf" });
+      // The audit export's watermark for this workspace (migration 0215). It is an EXPECTED identifier-only survivor, asserted below.
+      await db.query(
+        "INSERT INTO audit_export_watermarks (run_id, phase, workspace_id, from_seq, max_seq, row_hash, object_sha256, manifest_sha256) VALUES (gen_random_uuid(), 'recorded', $1, 0, 1, $2, $2, $2)",
+        [ws, Buffer.alloc(32, 9)],
+      );
       await db.query("UPDATE workspaces SET status = 'pending_deletion', deletion_execute_at = now() - interval '1 day' WHERE id = $1", [ws]);
 
-      const bucket = new Map<string, string>([[`test/${ws}/raw/a.json`, "SENTINEL-ANSWER-17"], [`test/${ws}/reports/r.pdf`, "SENTINEL-PROJECTNAME-17"]]);
+      // Batch 19 (STORY-111 AC15): the stub is now the three-prefix delete the stack wires (`deleteWorkspaceObjectsEverywhere`, STORY-182) over a model of
+      // BOTH buckets, with an object under every prefix the workspace used. It used to model the reports prefix only and leave the raw object standing.
+      const objects = new InMemoryObjectStore();
+      objects.put("raw", `test/${ws}/2026/11/a.json.gz`, 2);
+      objects.put("raw", `test/${ws}/crawl/audit-1/dom.gz`);
+      objects.put("reports", `test/${ws}/r.pdf`);
       const store = new InMemoryJournalStore();
       const exports: string[] = [];
       const result = await runDailyPurgeCycle(db, {
         journal: new PurgeJournal(store, "n"),
         exporterFor: () => async (records) => void exports.push(...records.map((r) => r.table)),
-        // PRODUCTION-FAITHFUL: retention-purge.handler.ts wires deleteWorkspaceReports ONLY (the reports bucket). The raw and crawl prefixes are
-        // STORY-182's, so the stub removes the reports prefix and nothing else.
-        deleteWorkspaceObjects: (w) => {
-          for (const k of [...bucket.keys()]) if (k.includes(`/${w}/reports/`)) bucket.delete(k);
-          return Promise.resolve();
-        },
+        // PRODUCTION-FAITHFUL: retention-purge.handler.ts wires deleteWorkspaceObjectsEverywhere - the reports, raw and crawl prefixes.
+        deleteWorkspaceObjects: (w) => deleteWorkspaceObjectsEverywhere(objects, "test", w).then(() => undefined),
       });
       expect(result.workspacesPurged).toContain(ws);
       expect(exports.sort()).toEqual(["audit_log", "credit_ledger", "credit_purchases", "invoices", "subscription_addons", "subscriptions"]);
@@ -288,12 +296,17 @@ describe("STORY-111 · compliance mechanics against a real database", () => {
         const hit = await db.query(`SELECT count(*)::int AS n FROM "${t}" x WHERE x::text LIKE '%SENTINEL-%' OR x::text LIKE $1`, [`%${ws}%`]);
         if ((hit.rows[0]!.n as number) > 0) offenders.push(t);
       }
-      // audit_chain_marks keeps a TOMBSTONE: the workspace id and a reason, no content (STORY-143). That is the only database row that names it.
-      expect(offenders).toEqual(["audit_chain_marks"]);
+      // Two tables keep a row that names the workspace, both GLOBAL, owner-only and append-only, both holding identifiers and hashes and no content:
+      //  - audit_chain_marks keeps a TOMBSTONE: the workspace id and a reason (STORY-143);
+      //  - audit_export_watermarks keeps the watermark of the workspace's already-exported chain (workspace id, sequence numbers, SHA-256s of the
+      //    export objects; migration 0215). It has no FK to workspaces ON PURPOSE: the object it describes lives in seven-year Object Lock storage
+      //    and outlives the workspace, and deleting the row would only make the next full export re-write that chain. It is immutable (a trigger
+      //    rejects UPDATE and DELETE), so a hard delete CANNOT remove it; it is accounted for here rather than skipped.
+      expect(offenders.sort()).toEqual(["audit_chain_marks", "audit_export_watermarks"]);
+      expect((await db.query("SELECT phase, octet_length(row_hash) AS hash_len FROM audit_export_watermarks WHERE workspace_id = $1", [ws])).rows).toEqual([{ phase: "recorded", hash_len: 32 }]);
       expect((await db.query("SELECT reason FROM audit_chain_marks WHERE workspace_id = $1", [ws])).rows.map((r) => r.reason)).toEqual(["tombstone"]);
-      // The reports object is gone. The RAW object is NOT (STORY-182 owns the raw and crawl prefixes): stated, not hidden - the AC "no purge path
-      // leaves content behind" is Partial for objects until that story wires the prefix deletes.
-      expect([...bucket.keys()]).toEqual([`test/${ws}/raw/a.json`]);
+      // The object half of the AC: a search of EVERY bucket for the purged workspace returns nothing (raw, crawl and reports).
+      expect(objects.search(ws)).toEqual([]);
       expect([...store.objects.values()].join("")).not.toMatch(/SENTINEL/);
     });
 

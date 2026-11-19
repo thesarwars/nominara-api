@@ -157,12 +157,14 @@ export async function* iterateWorkspaceChain(
   client: ClientBase,
   workspaceId: string,
   chunkRows: number = CHAIN_CHUNK_ROWS,
+  /** Start after this seq (exclusive) instead of from the chain's first row: the incremental export's watermark. */
+  startAfterSeq: string | null = null,
 ): AsyncGenerator<AuditChainRow[]> {
   // `LIMIT 0` would read an empty chunk and call the chain finished, which for an export is a silently empty copy.
   if (!Number.isInteger(chunkRows) || chunkRows < 1) {
     throw new RangeError(`chain chunk size must be a positive integer, got ${String(chunkRows)}`);
   }
-  let afterSeq: string | null = null;
+  let afterSeq: string | null = startAfterSeq;
   for (;;) {
     const chunk: AuditChainRow[] = await readChainChunk(client, workspaceId, afterSeq, chunkRows);
     if (chunk.length === 0) return;

@@ -132,7 +132,7 @@ describe("STORY-045 AC3 - GeminiNaturaliser", () => {
   it("observability - a counter per outcome, the provider-reported tokens (0 stays 0, absent is not observed), and no text in either", async () => {
     await adapter(vi.fn().mockResolvedValue(reply(["a", "b"], { promptTokenCount: 100, candidatesTokenCount: 0 })) as unknown as typeof fetch).naturalise({ lines: LINES, temperature: 0 });
     expect(incrementCounter).toHaveBeenCalledWith("nominara_prompts_naturalise_calls_total", { outcome: "ok" });
-    expect(observeValue).toHaveBeenCalledWith("nominara_prompts_naturalise_tokens_spent", 100, expect.anything());
+    expect(observeValue).toHaveBeenCalledWith("nominara_prompts_naturalise_tokens_spent_total", 100, expect.anything());
 
     vi.mocked(observeValue).mockClear();
     await adapter(vi.fn().mockResolvedValue(reply(["a", "b"], "absent")) as unknown as typeof fetch).naturalise({ lines: LINES, temperature: 0 });

@@ -44,6 +44,7 @@
     "audit:verify": "tsx src/workers/rollup/audit-verify.ts",
     "audit:export": "tsx src/workers/rollup/audit-export.ts",
     "db:purge-check": "tsx src/db/purge-check.ts",
+    "aux:audit-static": "tsx src/lib/aux/static-audit-cli.ts",
     "db:subject:export": "tsx src/db/subject-cli.ts export",
     "db:subject:erase": "tsx src/db/subject-cli.ts erase",
     "db:hold:place": "tsx src/db/hold-cli.ts place",

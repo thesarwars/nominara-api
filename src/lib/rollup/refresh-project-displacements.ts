@@ -291,9 +291,9 @@ async function refreshProjectDisplacementsInner(
 
   incrementCounter("nominara_rollup_displacements_persisted_total", { outcome: "ok" });
   // STORY-057 AC3 - counts only. Zero is a measurement and is emitted.
-  observeValue("nominara_displacement_citation_gap_entries", scopes.passage, { scope: "passage" });
-  observeValue("nominara_displacement_citation_gap_entries", scopes.outside_passage, { scope: "outside_passage" });
-  observeValue("nominara_displacement_citation_gap_entries", scopes.answer, { scope: "answer" });
+  observeValue("nominara_displacement_citation_gap_entries_total", scopes.passage, { scope: "passage" });
+  observeValue("nominara_displacement_citation_gap_entries_total", scopes.outside_passage, { scope: "outside_passage" });
+  observeValue("nominara_displacement_citation_gap_entries_total", scopes.answer, { scope: "answer" });
   logger.log({ event: "displacements_refreshed", workspaceId, projectId, date, events: persisted, passage_scoped_gaps: scopes.passage, outside_passage_gaps: scopes.outside_passage, answer_scoped_gaps: scopes.answer });
   return persisted;
 }
@@ -671,11 +671,11 @@ function conceptGapFor(loaded: ConceptNodes, citedUrls: readonly string[]): Conc
   const suppressed = loaded.nodes.length - kept.length;
   const result = deriveConceptGap(kept, citedUrls);
   // Counts only: never a phrase or a URL (log hygiene). Zero is a measurement and is emitted.
-  observeValue("nominara_displacement_concept_gap_entries", result.entries.length, { outcome: "kept" });
-  observeValue("nominara_displacement_concept_gap_entries", result.droppedBelowThreshold, { outcome: "dropped_below_threshold" });
-  observeValue("nominara_displacement_concept_gap_entries", result.droppedNoEvidence, { outcome: "dropped_no_evidence" });
-  observeValue("nominara_displacement_concept_gap_entries", result.droppedNotCited, { outcome: "dropped_not_cited" });
-  observeValue("nominara_displacement_concept_gap_entries", suppressed, { outcome: "suppressed_low_confidence" });
+  observeValue("nominara_displacement_concept_gap_entries_total", result.entries.length, { outcome: "kept" });
+  observeValue("nominara_displacement_concept_gap_entries_total", result.droppedBelowThreshold, { outcome: "dropped_below_threshold" });
+  observeValue("nominara_displacement_concept_gap_entries_total", result.droppedNoEvidence, { outcome: "dropped_no_evidence" });
+  observeValue("nominara_displacement_concept_gap_entries_total", result.droppedNotCited, { outcome: "dropped_not_cited" });
+  observeValue("nominara_displacement_concept_gap_entries_total", suppressed, { outcome: "suppressed_low_confidence" });
   return result.entries;
 }
 

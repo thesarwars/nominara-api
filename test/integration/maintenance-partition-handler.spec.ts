@@ -227,7 +227,7 @@ describe("STORY-142 · maintenance.partition handler", () => {
 
     // The blocked month is reported rather than swallowed...
     expect(errors.some((line) => line.includes("could not create"))).toBe(true);
-    expect(counters.some((c) => c.name === "partition_create_failed")).toBe(true);
+    expect(counters.some((c) => c.name === "nominara_partition_create_failed_total")).toBe(true);
     // ...the alert still fired, because detection now runs BEFORE creation...
     expect(warnings.some((line) => line.includes("DEFAULT partition"))).toBe(true);
     // ...and the other two tables got their partitions anyway.
@@ -259,7 +259,7 @@ describe("STORY-142 · maintenance.partition handler", () => {
     // ⚠ AND THE COUNTER, which the handler's own comment calls the substitute
     // for the ops script's non-zero exit — i.e. the alerting mechanism. It was
     // untested: deleting it and keeping the log passed every test here.
-    const alerted = counters.filter((c) => c.name === "partition_default_rows_detected");
+    const alerted = counters.filter((c) => c.name === "nominara_partition_default_rows_detected_total");
     expect(alerted).toHaveLength(1);
     expect(alerted[0]!.labels.table).toBe("answer_captures");
   }, 60_000);
@@ -282,12 +282,12 @@ describe("STORY-142 · maintenance.partition handler", () => {
 
       await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).resolves.toBeUndefined();
 
-      const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
+      const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows_total" && o.labels.table === "answer_captures");
       expect(gauge).toHaveLength(1);
       expect(gauge[0]!.value).toBeGreaterThanOrEqual(1);
       // 0 is an observation, not absence: EVERY fact table reports exactly once, and the clean ones report 0.
       for (const table of PARTITIONED_FACT_TABLES) {
-        const perTable = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === table);
+        const perTable = observations.filter((o) => o.name === "nominara_partition_default_rows_total" && o.labels.table === table);
         expect(perTable, table).toHaveLength(1);
         if (table !== "answer_captures") expect(perTable[0]!.value, table).toBe(0);
       }
@@ -313,7 +313,7 @@ describe("STORY-142 · maintenance.partition handler", () => {
 
     await expect(createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick())).resolves.toBeUndefined();
 
-    const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows" && o.labels.table === "answer_captures");
+    const gauge = observations.filter((o) => o.name === "nominara_partition_default_rows_total" && o.labels.table === "answer_captures");
     expect(gauge.length).toBeGreaterThan(0);
     expect(gauge.at(-1)!.value).toBeGreaterThanOrEqual(1);
     expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total")).toBe(false);
@@ -333,7 +333,7 @@ describe("STORY-142 · maintenance.partition handler", () => {
       createMaintenancePartitionHandler({ pool: noPool, env: { DATABASE_URL: url.toString() } as unknown as Env })(db, tick()),
     ).rejects.toThrow(/definer/);
 
-    expect(observations.some((o) => o.name === "nominara_partition_default_rows")).toBe(false);
+    expect(observations.some((o) => o.name === "nominara_partition_default_rows_total")).toBe(false);
     expect(counters.some((c) => c.name === "nominara_maintenance_integrity_check_errors_total" && c.labels.check === "definer_function")).toBe(true);
   }, 60_000);
 
@@ -366,7 +366,7 @@ describe("STORY-142 · maintenance.partition handler", () => {
       const started = Date.now();
       await expect(createMaintenancePartitionHandler({ pool: noPool, env })(db, tick())).resolves.toBeUndefined();
       expect(Date.now() - started).toBeLessThan(30_000);
-      expect(counters.some((c) => c.name === "partition_create_failed" && c.labels.partition === `mention_facts_${suffix}`)).toBe(true);
+      expect(counters.some((c) => c.name === "nominara_partition_create_failed_total" && c.labels.partition === `mention_facts_${suffix}`)).toBe(true);
     } finally {
       await reader.query("ROLLBACK");
       await reader.end();

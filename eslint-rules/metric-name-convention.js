@@ -7,45 +7,18 @@
 // read as one word), or an identifier that resolves to a `const` string literal in this file. A name it cannot read is
 // REPORTED (`notStatic`), never waved through: an allow-list that lets the unreadable pass is the gap the next metric
 // falls through. `_seconds` is accepted beside the three in the standard because edge-cases-and-slos.md names its lag
-// metrics in seconds.
+// metrics in seconds. `_ratio` (a 0..1 or 0..100 ratio) and `_rows` (a gauge counting rows) are accepted by owner decision 110(c): `_total` means a
+// monotonic counter, so a gauge or a ratio must not wear it.
 
-// LEGACY BASELINE - the names that predate this rule and break it. They are NOT exempt by pattern: each is named here
-// exactly, so a new metric with a similar shape is still reported. The list may only SHRINK - renaming a metric removes
-// its entry (test/unit/metric-name-convention.spec.ts fails on an entry that is unused or already conforms). Renaming
-// changes a name dashboards and alert rules may already query, so each rename is its own owner decision, not this rule's.
-export const LEGACY_METRIC_NAMES = new Set([
-  "credit_reconcile_yielded_total",
-  "nominara_alerts_total",
-  "nominara_aux_pages_evaluated_count",
-  "nominara_aux_rules_evaluated_count",
-  "nominara_discovery_category_embed_tokens",
-  "nominara_displacement_citation_gap_entries",
-  "nominara_displacement_concept_gap_entries",
-  "nominara_embed_reembed_pending_rows",
-  "nominara_embed_tokens_spent",
-  "nominara_embed_vectors_written",
-  "nominara_geo_alignment_nodes_collapsed",
-  "nominara_geo_corpus_passages_written",
-  "nominara_geo_name_match_judge_tokens_spent",
-  "nominara_gsc_sync_rows_per_run",
-  "nominara_maintenance_orphan_fact_rows",
-  "nominara_maintenance_vector_recall_ratio",
-  "nominara_partition_default_rows",
-  "nominara_prompts_naturalise_tokens_spent",
-  "nominara_retention_purge_failures_unresolved",
-  "nominara_rollup_attribution_seconds_since_last_commit",
-  "nominara_tools_runs_reaped_rows",
-  "nominara_tools_snapshots_expired_rows",
-  "nominara_topic_cluster_clusters_written",
-  "nominara_topic_cluster_outlier_prompts",
-  "nominara_topic_cluster_prompts_dropped_by_cap",
-  "partition_create_failed",
-  "partition_default_rows_detected",
-  "queue_schedule_reconcile_failed",
-]);
+// LEGACY BASELINE - EMPTY. It held the 28 names that predated this rule and broke it, each grandfathered by exact name
+// (owner decision 108, "28 legacy metric names are grandfathered"). Batch 19 renamed all 28 to the convention while there were
+// no external dashboards or alert rules to break, so the set is empty and stays that way: a name that breaks the rule is
+// reported, with no list to add it to. The set and its check below remain only so that a future entry fails
+// test/unit/metric-name-convention.spec.ts, which pins the set as empty.
+export const LEGACY_METRIC_NAMES = new Set([]);
 
 const HELPERS = new Set(["incrementCounter", "observeValue"]);
-const UNITS = ["total", "ms", "seconds", "bytes"];
+const UNITS = ["total", "ms", "seconds", "bytes", "ratio", "rows"];
 // nominara_ + subsystem + at least one measure word + unit.
 const NAME = new RegExp(`^nominara_[a-z0-9]+(?:_[a-z0-9]+){2,}$`);
 
@@ -98,7 +71,7 @@ const metricNameConvention = {
     schema: [],
     messages: {
       badName:
-        'Metric name "{{name}}" breaks the convention: nominara_<subsystem>_<measure> with a unit suffix (_total, _ms, _seconds, _bytes) (coding-standards.md section 7).',
+        'Metric name "{{name}}" breaks the convention: nominara_<subsystem>_<measure> with a unit suffix (_total, _ms, _seconds, _bytes, _ratio, _rows) (coding-standards.md section 7).',
       notStatic:
         "A metric name must be a string literal, a template literal, or a const string literal in this file, so the naming convention can be checked.",
     },

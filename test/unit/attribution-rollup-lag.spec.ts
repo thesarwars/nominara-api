@@ -69,7 +69,7 @@ describe("STORY-114-AC6 · the handler measures the oldest pending row at the st
     }) as unknown as ClientBase;
 
   const lagCalls = () => vi.mocked(observeValue).mock.calls.filter(([name]) => name === "nominara_rollup_attribution_lag_seconds");
-  const sinceCalls = () => vi.mocked(observeValue).mock.calls.filter(([name]) => name === "nominara_rollup_attribution_seconds_since_last_commit");
+  const sinceCalls = () => vi.mocked(observeValue).mock.calls.filter(([name]) => name === "nominara_rollup_attribution_since_last_commit_seconds");
   const run = async (tx: ClientBase) => {
     await createAttributionRollupHandler({ pool: {} as never, env: {} as never })(tx, job);
     deferred.forEach((t) => t());

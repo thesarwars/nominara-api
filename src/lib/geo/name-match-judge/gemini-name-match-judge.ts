@@ -158,7 +158,7 @@ export class GeminiNameMatchJudge implements NameMatchJudge {
     const usage = parsed.data.usageMetadata;
     if (usage !== undefined && (usage.promptTokenCount !== undefined || usage.candidatesTokenCount !== undefined)) {
       // What the provider reported, never an estimate: the spend the monthly cap bounds, made visible.
-      observeValue("nominara_geo_name_match_judge_tokens_spent", (usage.promptTokenCount ?? 0) + (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0), { model: this.model });
+      observeValue("nominara_geo_name_match_judge_tokens_spent_total", (usage.promptTokenCount ?? 0) + (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0), { model: this.model });
     }
 
     const text = parsed.data.candidates[0]!.content.parts.map((part) => part.text ?? "").join("");

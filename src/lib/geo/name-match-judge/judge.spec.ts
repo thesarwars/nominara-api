@@ -182,7 +182,7 @@ describe("STORY-191 AC6 · the Gemini adapter sends only the span and a bounded 
       await judge.judge([{ alias: "Notion", span: "Notion", before: "PRIVATE-TEXT ", after: "" }]);
       const text = JSON.stringify(lines);
       expect(text).toContain("nominara_geo_name_match_judge_calls_total");
-      expect(text).toContain("nominara_geo_name_match_judge_tokens_spent");
+      expect(text).toContain("nominara_geo_name_match_judge_tokens_spent_total");
       expect(text).toContain("128");
       expect(text).not.toContain("PRIVATE-TEXT");
     });

@@ -2,8 +2,10 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GENESIS_HASH, type AuditChainRow } from "../../../lib/crypto/audit-chain.js";
+import type { AuditExportIncrement } from "../ports/export-sink.js";
 import { S3ObjectLockExportSink } from "./s3-object-lock-export-sink.js";
 
 // STORY-020 AC8 - the Object Lock COMPLIANCE sink. No bucket: what the sink ASKS S3 to do is asserted on the PutObject input
@@ -148,5 +150,83 @@ describe("STORY-020 AC8 - S3ObjectLockExportSink", () => {
     const { puts } = captureSends();
     await expect(new S3ObjectLockExportSink(CONFIG).export([row("1")], { retentionDays: 0 })).rejects.toThrow(RangeError);
     expect(puts).toHaveLength(0);
+  });
+});
+
+describe("batch 19 (STORY-020 follow-up) - the incremental manifest", () => {
+  const increment = (previous: string | null, recorded: Array<{ dataSha256: string; manifestSha256: string }>): AuditExportIncrement => ({
+    previousManifestSha256: previous,
+    unrecordedRuns: [],
+    chains: new Map([["ws-1", { fromSeq: "1", afterRowHash: "deadbeef", toSeq: "2", toRowHash: "cafe", rowCount: 1, rebased: false }]]),
+    beforeCommit: async () => true,
+    recordWritten: (written) => recorded.push(written),
+  });
+
+  it("the manifest carries the previous manifest's hash and each chain's range, so increments chain verifiably", async () => {
+    const { puts } = captureSends();
+    const recorded: Array<{ dataSha256: string; manifestSha256: string }> = [];
+    await new S3ObjectLockExportSink(CONFIG).export([row("2")], { retentionDays: 30 }, increment("ab".repeat(32), recorded));
+
+    const manifest = puts.find((p) => String(p.input.Key).endsWith(".manifest.json"))!;
+    expect(JSON.parse(manifest.body)).toMatchObject({
+      incremental: {
+        previousManifestSha256: "ab".repeat(32),
+        chains: [{ workspaceId: "ws-1", fromSeq: "1", afterRowHash: "deadbeef", toSeq: "2", toRowHash: "cafe", rowCount: 1, rebased: false }],
+      },
+    });
+  });
+
+  it("reports the SHA-256 of the exact manifest and data bytes it wrote, once both objects are written", async () => {
+    const { puts } = captureSends();
+    const recorded: Array<{ dataSha256: string; manifestSha256: string }> = [];
+    await new S3ObjectLockExportSink(CONFIG).export([row("2")], { retentionDays: 30 }, increment(null, recorded));
+
+    expect(recorded).toHaveLength(1);
+    const manifest = puts.find((p) => String(p.input.Key).endsWith(".manifest.json"))!;
+    const data = puts.find((p) => String(p.input.Key).endsWith(".jsonl"))!;
+    expect(recorded[0]!.manifestSha256).toBe(createHash("sha256").update(manifest.body).digest("hex"));
+    expect(recorded[0]!.dataSha256).toBe(createHash("sha256").update(data.body).digest("hex"));
+    expect(JSON.parse(manifest.body)).toMatchObject({ incremental: { previousManifestSha256: null } });
+  });
+
+  it("records nothing when an upload fails, so the watermark cannot move past an object that is not there", async () => {
+    captureSends((n) => (n >= 2 ? new Error("manifest upload down") : undefined));
+    const recorded: Array<{ dataSha256: string; manifestSha256: string }> = [];
+    await expect(
+      new S3ObjectLockExportSink(CONFIG, { retryDelayMs: 0 }).export([row("2")], { retentionDays: 30 }, increment(null, recorded)),
+    ).rejects.toThrow();
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("a full (non-incremental) export has no incremental block in its manifest", async () => {
+    const { puts } = captureSends();
+    await new S3ObjectLockExportSink(CONFIG).export([row("1")], { retentionDays: 30 });
+    const manifest = puts.find((p) => String(p.input.Key).endsWith(".manifest.json"))!;
+    expect(JSON.parse(manifest.body)).not.toHaveProperty("incremental");
+  });
+
+  it("STORY-020: beforeCommit answering false uploads nothing, reports nothing and returns null", async () => {
+    const { puts } = captureSends();
+    const recorded: Array<{ dataSha256: string; manifestSha256: string }> = [];
+    const location = await new S3ObjectLockExportSink(CONFIG).export([row("2")], { retentionDays: 30 }, { ...increment(null, recorded), beforeCommit: async () => false });
+    expect(location).toBeNull();
+    expect(puts).toHaveLength(0);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("STORY-020: beforeCommit is asked with the exact hashes, before the first upload", async () => {
+    const { puts } = captureSends();
+    const asked: Array<{ dataSha256: string; manifestSha256: string; putsSoFar: number }> = [];
+    await new S3ObjectLockExportSink(CONFIG).export([row("2")], { retentionDays: 30 }, {
+      ...increment(null, []),
+      beforeCommit: async (planned) => {
+        asked.push({ ...planned, putsSoFar: puts.length });
+        return true;
+      },
+    });
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.putsSoFar).toBe(0);
+    const manifest = puts.find((p) => String(p.input.Key).endsWith(".manifest.json"))!;
+    expect(asked[0]!.manifestSha256).toBe(createHash("sha256").update(manifest.body).digest("hex"));
   });
 });

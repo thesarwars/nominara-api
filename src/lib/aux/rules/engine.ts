@@ -77,7 +77,7 @@ export async function evaluateDocument(
       const batches = await Promise.all(rules.map((r) => runOne(r, document, catalog, ctx)));
       const findings = batches.flat().sort((a, b) => byCodePoint(a.rule_code, b.rule_code) || byCodePoint(a.evidence.locator, b.evidence.locator));
       for (const f of findings) incrementCounter("nominara_aux_rule_findings_total", { rule_code: f.rule_code, severity: f.severity });
-      observeValue("nominara_aux_rules_evaluated_count", rules.length);
+      observeValue("nominara_aux_rules_evaluated_total", rules.length);
       span.setAttribute("nominara.aux.rules", rules.length);
       span.setAttribute("nominara.aux.findings", findings.length);
       // Counts and the project ID only: no URL, no page text, no workspace name.

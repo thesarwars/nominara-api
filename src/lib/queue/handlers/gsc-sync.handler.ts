@@ -229,7 +229,7 @@ export function createGscSyncHandler(context: QueueHandlerContext, deps: GscSync
             ],
           );
         }
-        observeValue("nominara_gsc_sync_rows_per_run", rows.length, { report, dimension });
+        observeValue("nominara_gsc_sync_rows_per_run_total", rows.length, { report, dimension });
       }
 
       let sealedAccess: string | null = null;

@@ -28,6 +28,7 @@ import { dataOf } from "../support/envelope.js";
 import { HARNESS_PUBLIC_KEY_DER, useApiHarness } from "../support/api-harness.js";
 import { FAULT_ERROR_SECRET, FaultInjectingCache, type CacheOperation } from "../support/fault-injecting-cache.js";
 import { MembershipCacheService } from "../../src/tenancy/membership-cache.js";
+import { withTenantContext } from "../../src/tenancy/tenant-context.js";
 import * as metrics from "../../src/lib/telemetry/metrics.js";
 
 // STORY-170 (grace-window revision) — security-and-tenancy.md §5 "Session
@@ -330,6 +331,82 @@ describe("STORY-170 · refresh-token reuse grace window", () => {
     const graceHit = await owner.refresh(memberInitial.refreshToken);
     expect(graceHit.refreshToken).toBe(rotated.refreshToken);
     expect((await decode(graceHit.accessToken)).role).toBe("viewer");
+  });
+
+  // Batch 19 (decision 108(a)) - the two security events are audit rows in the session's workspace chain.
+  async function sessionAuditActions(workspaceId: string, userId: string): Promise<string[]> {
+    const client = await pool.connect();
+    try {
+      return await withTenantContext(client, { workspaceId, actorId: userId }, async (tx) => {
+        const rows = await tx.query<{ action: string }>(
+          `SELECT action FROM audit_log WHERE workspace_id = $1 AND action IN ('session.reuse_detected', 'session.refresh_grace_reuse') ORDER BY seq`,
+          [workspaceId],
+        );
+        return rows.rows.map((r) => r.action);
+      });
+    } finally {
+      client.release();
+    }
+  }
+
+  async function sessionInWorkspace(): Promise<{ userId: string; workspaceId: string; sid: string; refreshToken: string }> {
+    const ownerId = await createUser();
+    const sessions = harness.app().get(SessionService);
+    const ownerTokens = await sessions.createSession(ownerId);
+    const workspaceId = await createWorkspace({ access: ownerTokens.accessToken, refresh: ownerTokens.refreshToken, csrf: ownerTokens.csrfToken });
+    const tokens = await sessions.createSession(ownerId);
+    await sessions.switchWorkspace(tokens.sid, ownerId, workspaceId, "owner", null, 1);
+    await pool.query(`UPDATE sessions SET active_workspace_id = $2 WHERE id = $1`, [tokens.sid, workspaceId]);
+    return { userId: ownerId, workspaceId, sid: tokens.sid, refreshToken: tokens.refreshToken };
+  }
+
+  it("batch 19 · a grace-window hit writes session.refresh_grace_reuse into the session's workspace chain", async () => {
+    const s = await sessionInWorkspace();
+    const sessions = harness.app().get(SessionService);
+    await sessions.refresh(s.refreshToken);
+    await sessions.refresh(s.refreshToken);
+    expect(await sessionAuditActions(s.workspaceId, s.userId)).toEqual(["session.refresh_grace_reuse"]);
+  });
+
+  it("batch 19 fix · repeated grace-window hits on one rotation write ONE row, attributed to the system (no actor id), the owner in after_state", async () => {
+    const s = await sessionInWorkspace();
+    const sessions = harness.app().get(SessionService);
+    await sessions.refresh(s.refreshToken);
+    await sessions.refresh(s.refreshToken);
+    await sessions.refresh(s.refreshToken);
+    await Promise.all([sessions.refresh(s.refreshToken), sessions.refresh(s.refreshToken)]);
+    expect(await sessionAuditActions(s.workspaceId, s.userId)).toEqual(["session.refresh_grace_reuse"]);
+    const client = await pool.connect();
+    const rows = await withTenantContext(client, { workspaceId: s.workspaceId, actorId: s.userId }, (tx) =>
+      tx.query<{ actor_type: string; actor_id: string | null; resource_id: string; after_state: Record<string, string> }>(
+        "SELECT actor_type, actor_id, resource_id, after_state FROM audit_log WHERE workspace_id = $1 AND action = 'session.refresh_grace_reuse'",
+        [s.workspaceId],
+      ),
+    ).finally(() => client.release());
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]).toMatchObject({ actor_type: "system", actor_id: null, resource_id: s.sid });
+    expect(rows.rows[0]!.after_state.outcome).toBe("same_successor_returned");
+  });
+
+  it("batch 19 · a reuse outside the window writes ONE session.reuse_detected row, and a second replay of the dead family adds none", async () => {
+    const s = await sessionInWorkspace();
+    const sessions = harness.app().get(SessionService);
+    await sessions.refresh(s.refreshToken);
+    closeWindow();
+    await expect(sessions.refresh(s.refreshToken)).rejects.toThrow("refresh token already used");
+    await expect(sessions.refresh(s.refreshToken)).rejects.toThrow("refresh token already used");
+    expect(await sessionAuditActions(s.workspaceId, s.userId)).toEqual(["session.reuse_detected"]);
+  });
+
+  it("batch 19 · a session with no active workspace raises the event as before and writes no audit row anywhere", async () => {
+    const userId = await createUser();
+    const sessions = harness.app().get(SessionService);
+    const initial = await sessions.createSession(userId);
+    const counterSpy = vi.spyOn(metrics, "incrementCounter");
+    await sessions.refresh(initial.refreshToken);
+    closeWindow();
+    await expect(sessions.refresh(initial.refreshToken)).rejects.toThrow("refresh token already used");
+    expect(counterSpy).toHaveBeenCalledWith("nominara_identity_session_security_event_unaudited_total", { event: "session.reuse_detected", reason: "no_verified_workspace" });
   });
 
   it("real HTTP chain · two POST /auth/refresh calls presenting the same cookie, milliseconds apart, both return 200 with the identical refresh cookie", async () => {

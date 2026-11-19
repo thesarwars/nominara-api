@@ -101,6 +101,7 @@ const NOT_A_GATE: Readonly<Record<string, string>> = {
   "billing:invoices-resync": "the operator CLI; it re-fetches recorded invoices from live Stripe",
   "support:grant": "the operator CLI; it issues a time-boxed support access grant",
   "support:revoke": "the operator CLI; it revokes a support access grant",
+  "aux:audit-static": "the CLI nominara-web runs against its built site (STORY-102 AC10, decision 68j); it needs a directory of built HTML, and its own tests (src/lib/aux/static-audit.test.ts) run in test:unit",
   "db:subject:export": "the operator CLI (STORY-111, decision 68a); it exports one person's data from the owner connection",
   "db:subject:erase": "the operator CLI (STORY-111, decision 68a); it erases one person, irreversibly, from the owner connection",
   "db:hold:place": "the operator CLI (STORY-111, decision 70e); it places a legal hold from the owner connection",

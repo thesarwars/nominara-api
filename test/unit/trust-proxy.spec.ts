@@ -1,8 +1,9 @@
 import { Controller, Get, Req } from "@nestjs/common";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Test } from "@nestjs/testing";
-import { afterEach, describe, expect, it } from "vitest";
-import { fastifyServerOptions } from "../../src/api/fastify-options.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Logger } from "@nestjs/common";
+import { fastifyServerOptions, parseTrustedProxyCidrs } from "../../src/api/fastify-options.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
 // STORY-026 audit fix — BOTH DIRECTIONS, because getting this wrong in either
@@ -30,10 +31,12 @@ class IpProbeController {
   }
 }
 
-async function appWith(hops: string | undefined): Promise<NestFastifyApplication> {
+async function appWith(hops: string | undefined, cidrs?: string): Promise<NestFastifyApplication> {
   applyFakeApiEnv();
   if (hops === undefined) delete process.env.TRUST_PROXY_HOPS;
   else process.env.TRUST_PROXY_HOPS = hops;
+  if (cidrs === undefined) delete process.env.TRUSTED_PROXY_CIDRS;
+  else process.env.TRUSTED_PROXY_CIDRS = cidrs;
 
   const moduleRef = await Test.createTestingModule({ controllers: [IpProbeController] }).compile();
   const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter(fastifyServerOptions()));
@@ -163,5 +166,109 @@ describe("STORY-026 · request.ip behind a proxy", () => {
     expect(typeof trustProxy).toBe("function");
     const trusts = trustProxy as (address: string, hop: number) => boolean;
     expect([0, 1, 2, 3].map((hop) => trusts("10.0.0.5", hop))).toEqual([true, true, false, false]);
+  });
+
+  // Batch 19 (follow-up to owner decision 108(k)) - TRUSTED_PROXY_CIDRS: trust a forwarded hop only when it comes from a listed range. This removes
+  // the "only the proxy can reach the API" precondition for the address check itself: a direct caller outside the ranges is not believed.
+  describe("TRUSTED_PROXY_CIDRS - an allow-list of proxy ranges", () => {
+    it("a peer inside a listed range is trusted: the forwarded client address is used", async () => {
+      app = await appWith(undefined, "10.0.0.0/8");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("203.0.113.9");
+    });
+
+    it("a peer OUTSIDE every listed range is not trusted: X-Forwarded-For is ignored, and the peer address is the client", async () => {
+      app = await appWith(undefined, "192.168.0.0/16");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("10.0.0.5");
+    });
+
+    it("a caller cannot prepend an address to reach a fresh bucket: only the right-hand run of listed hops is skipped", async () => {
+      app = await appWith(undefined, "10.0.0.0/8");
+      expect(await observedIp(app)({ "x-forwarded-for": "198.51.100.99, 203.0.113.7" })).toBe("203.0.113.7");
+    });
+
+    it("a listed hop further left in the chain is walked past, an unlisted one stops the walk", async () => {
+      app = await appWith(undefined, "10.0.0.0/8, 172.16.0.0/12");
+      const ip = observedIp(app);
+      expect(await ip({ "x-forwarded-for": "203.0.113.9, 172.16.4.4" })).toBe("203.0.113.9");
+      expect(await ip({ "x-forwarded-for": "198.51.100.99, 203.0.113.9, 172.16.4.4" })).toBe("203.0.113.9");
+    });
+
+    it("takes precedence over TRUST_PROXY_HOPS: the hop count would have trusted this peer, the allow-list does not", async () => {
+      app = await appWith("1", "192.168.0.0/16");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("10.0.0.5");
+    });
+
+    it("a single address (no prefix) is a valid entry, and surrounding whitespace is ignored", async () => {
+      app = await appWith(undefined, "  10.0.0.5  ");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("203.0.113.9");
+    });
+
+    it("a bad entry is dropped and the good ones still apply - boot is not broken", async () => {
+      app = await appWith(undefined, "not-a-cidr, 10.0.0.0/33, 10.0.0.0/8, 300.1.1.1/8");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("203.0.113.9");
+    });
+
+    it("EVERY entry bad: nobody is trusted (fail closed), even when TRUST_PROXY_HOPS is set - it does not fall back to the broader rule", async () => {
+      app = await appWith("1", "garbage, 10.0.0.0/99");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("10.0.0.5");
+    });
+
+    it("blank or whitespace-only is the same as unset: the hop rule applies as before", async () => {
+      app = await appWith("1", "   ");
+      expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("203.0.113.9");
+      await app.close();
+      app = await appWith(undefined, "");
+      expect(fastifyServerOptions()).toEqual({});
+    });
+
+    it("never throws on any value, so a mistyped variable cannot stop the API booting", () => {
+      applyFakeApiEnv();
+      for (const value of ["", ",", ",,,", "/", "::/129", "1.2.3.4/-1", "1.2.3.4/8/8", "\u0000", "fe80::1%eth0/10", "10.0.0.0/8,"]) {
+        process.env.TRUSTED_PROXY_CIDRS = value;
+        expect(() => fastifyServerOptions()).not.toThrow();
+      }
+    });
+
+    // Batch 19 fix - a catch-all range makes every peer a trusted proxy, which is `trustProxy: true` by another spelling: any caller can forge
+    // X-Forwarded-For and choose their own rate-limit bucket. It is refused, loudly, and the rest of the list still applies.
+    it("0.0.0.0/0 and ::/0 are refused as catch-all ranges (and counted apart from malformed entries); any other prefix, including /1, is not", () => {
+      expect(parseTrustedProxyCidrs("0.0.0.0/0")).toEqual({ valid: [], dropped: 0, catchAll: 1 });
+      expect(parseTrustedProxyCidrs("::/0")).toEqual({ valid: [], dropped: 0, catchAll: 1 });
+      expect(parseTrustedProxyCidrs("10.1.2.3/0, ::/00, 0.0.0.0/000")).toEqual({ valid: [], dropped: 0, catchAll: 3 });
+      expect(parseTrustedProxyCidrs("0.0.0.0/1, ::/1, 0.0.0.0, 10.0.0.0/8")).toEqual({ valid: ["0.0.0.0/1", "::/1", "0.0.0.0", "10.0.0.0/8"], dropped: 0, catchAll: 0 });
+      expect(parseTrustedProxyCidrs("0.0.0.0/0, junk, 10.0.0.0/8")).toEqual({ valid: ["10.0.0.0/8"], dropped: 1, catchAll: 1 });
+    });
+
+    it("a catch-all entry alone trusts nobody (the peer is the client), warns, and does not fall back to TRUST_PROXY_HOPS", async () => {
+      const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      try {
+        app = await appWith("1", "0.0.0.0/0");
+        expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("10.0.0.5");
+        expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "trusted_proxy_cidrs_catch_all_refused", refused: 1 }));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("a catch-all entry beside a real range: the catch-all is refused, the real range still applies, and the warning names the count only", async () => {
+      const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      try {
+        app = await appWith(undefined, "::/0, 10.0.0.0/8");
+        expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("203.0.113.9");
+        expect(fastifyServerOptions().trustProxy).toEqual(["10.0.0.0/8"]);
+        const logged = JSON.stringify(warn.mock.calls);
+        expect(logged).toContain("trusted_proxy_cidrs_catch_all_refused");
+        expect(logged).not.toContain("::/0");
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("IPv6 ranges are accepted", async () => {
+      process.env.TRUSTED_PROXY_CIDRS = "fd00::/8,10.0.0.0/8";
+      app = await appWith(undefined, "fd00::/8,10.0.0.0/8");
+      expect(Array.isArray(fastifyServerOptions().trustProxy)).toBe(true);
+      expect(fastifyServerOptions().trustProxy).toEqual(["fd00::/8", "10.0.0.0/8"]);
+    });
   });
 });
