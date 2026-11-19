@@ -11,10 +11,15 @@ const logger = new Logger("fastify-options");
  * text), because a mistyped variable must not stop the API booting and an entry dropped can only mean LESS is trusted, never more. Deliberately stricter
  * than the library that will receive the result (zone ids, a second slash, a sign, a prefix past the family's width are all refused here), so what
  * reaches Fastify is always something it can compile.
+ *
+ * A CATCH-ALL RANGE IS REFUSED, not trusted (any entry whose prefix length is 0: `0.0.0.0/0`, `::/0`, and `x/0` for any x, which masks to everything).
+ * Trusting every peer is `trustProxy: true` under another spelling: any caller could put a forged address in X-Forwarded-For and pick their own
+ * per-IP rate-limit bucket, silently and for free. It is well-formed, so it is counted apart from `dropped` (malformed), and the caller warns on it.
  */
-export function parseTrustedProxyCidrs(raw: string): { readonly valid: string[]; readonly dropped: number } {
+export function parseTrustedProxyCidrs(raw: string): { readonly valid: string[]; readonly dropped: number; readonly catchAll: number } {
   const valid: string[] = [];
   let dropped = 0;
+  let catchAll = 0;
   for (const part of raw.split(",")) {
     const entry = part.trim();
     if (entry === "") continue;
@@ -26,9 +31,13 @@ export function parseTrustedProxyCidrs(raw: string): { readonly valid: string[];
       dropped += 1;
       continue;
     }
+    if (prefix !== undefined && Number(prefix) === 0) {
+      catchAll += 1;
+      continue;
+    }
     valid.push(entry);
   }
-  return { valid, dropped };
+  return { valid, dropped, catchAll };
 }
 
 // STORY-026 audit fix — the Fastify options every process that serves HTTP
@@ -71,11 +80,13 @@ export function fastifyServerOptions(): FastifyServerOptions {
   // the list, so a direct caller outside the ranges cannot have a header believed; this removes the "only the proxy can reach the API" precondition
   // the hop rule carries (decision 108(k)). Blank is the same as unset. Set but with NO valid entry: trust NOBODY (the peer address is the client),
   // and do NOT fall back to TRUST_PROXY_HOPS - an operator who wrote an allow-list asked for the narrower rule, and the broader one is not a safe
-  // answer to a typo. Coarse rate-limit buckets are the cost, and the warning says why.
+  // answer to a typo. Coarse rate-limit buckets are the cost, and the warning says why. A catch-all (/0) entry is refused the same way (see the parser).
   const cidrs = env.TRUSTED_PROXY_CIDRS?.trim();
   if (cidrs !== undefined && cidrs !== "") {
-    const { valid, dropped } = parseTrustedProxyCidrs(cidrs);
+    const { valid, dropped, catchAll } = parseTrustedProxyCidrs(cidrs);
     if (dropped > 0) logger.warn({ event: "trusted_proxy_cidrs_entries_dropped", dropped, kept: valid.length });
+    // The count only, never the text: the entry is operator input, and what matters is that it was refused and that the rest of the list still applies.
+    if (catchAll > 0) logger.warn({ event: "trusted_proxy_cidrs_catch_all_refused", refused: catchAll, kept: valid.length, effect: "a /0 range would trust every peer" });
     if (valid.length === 0) {
       logger.warn({ event: "trusted_proxy_cidrs_none_valid", effect: "no proxy trusted; request.ip is the socket peer" });
       return {};

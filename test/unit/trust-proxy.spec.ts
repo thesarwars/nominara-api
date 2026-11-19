@@ -1,8 +1,9 @@
 import { Controller, Get, Req } from "@nestjs/common";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { Test } from "@nestjs/testing";
-import { afterEach, describe, expect, it } from "vitest";
-import { fastifyServerOptions } from "../../src/api/fastify-options.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Logger } from "@nestjs/common";
+import { fastifyServerOptions, parseTrustedProxyCidrs } from "../../src/api/fastify-options.js";
 import { applyFakeApiEnv } from "../support/fake-env.js";
 
 // STORY-026 audit fix — BOTH DIRECTIONS, because getting this wrong in either
@@ -225,6 +226,41 @@ describe("STORY-026 · request.ip behind a proxy", () => {
       for (const value of ["", ",", ",,,", "/", "::/129", "1.2.3.4/-1", "1.2.3.4/8/8", "\u0000", "fe80::1%eth0/10", "10.0.0.0/8,"]) {
         process.env.TRUSTED_PROXY_CIDRS = value;
         expect(() => fastifyServerOptions()).not.toThrow();
+      }
+    });
+
+    // Batch 19 fix - a catch-all range makes every peer a trusted proxy, which is `trustProxy: true` by another spelling: any caller can forge
+    // X-Forwarded-For and choose their own rate-limit bucket. It is refused, loudly, and the rest of the list still applies.
+    it("0.0.0.0/0 and ::/0 are refused as catch-all ranges (and counted apart from malformed entries); any other prefix, including /1, is not", () => {
+      expect(parseTrustedProxyCidrs("0.0.0.0/0")).toEqual({ valid: [], dropped: 0, catchAll: 1 });
+      expect(parseTrustedProxyCidrs("::/0")).toEqual({ valid: [], dropped: 0, catchAll: 1 });
+      expect(parseTrustedProxyCidrs("10.1.2.3/0, ::/00, 0.0.0.0/000")).toEqual({ valid: [], dropped: 0, catchAll: 3 });
+      expect(parseTrustedProxyCidrs("0.0.0.0/1, ::/1, 0.0.0.0, 10.0.0.0/8")).toEqual({ valid: ["0.0.0.0/1", "::/1", "0.0.0.0", "10.0.0.0/8"], dropped: 0, catchAll: 0 });
+      expect(parseTrustedProxyCidrs("0.0.0.0/0, junk, 10.0.0.0/8")).toEqual({ valid: ["10.0.0.0/8"], dropped: 1, catchAll: 1 });
+    });
+
+    it("a catch-all entry alone trusts nobody (the peer is the client), warns, and does not fall back to TRUST_PROXY_HOPS", async () => {
+      const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      try {
+        app = await appWith("1", "0.0.0.0/0");
+        expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("10.0.0.5");
+        expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "trusted_proxy_cidrs_catch_all_refused", refused: 1 }));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("a catch-all entry beside a real range: the catch-all is refused, the real range still applies, and the warning names the count only", async () => {
+      const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+      try {
+        app = await appWith(undefined, "::/0, 10.0.0.0/8");
+        expect(await observedIp(app)({ "x-forwarded-for": "203.0.113.9" })).toBe("203.0.113.9");
+        expect(fastifyServerOptions().trustProxy).toEqual(["10.0.0.0/8"]);
+        const logged = JSON.stringify(warn.mock.calls);
+        expect(logged).toContain("trusted_proxy_cidrs_catch_all_refused");
+        expect(logged).not.toContain("::/0");
+      } finally {
+        warn.mockRestore();
       }
     });
 
