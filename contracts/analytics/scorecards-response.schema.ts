@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { customRangeFields, refineCustomRange } from "./custom-range.schema.js";
+import { topicsFilterSchema } from "./topics-filter.schema.js";
 import { blendDisclosureSchema, dataSourceSchema } from "./data-source.schema.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`, `api-specification.md` §3's
@@ -24,6 +25,8 @@ export const scorecardsQuerySchema = z
     engines: z.string().min(1).optional(),
     /** STORY-090: with `timeframe=custom`, the workspace-local days measured (both inclusive) - see custom-range.schema.ts. */
     ...customRangeFields,
+    /** STORY-090 AC8: comma-separated topic cluster ids of THIS project - the figures cover those clusters' member prompts. See topics-filter.schema.ts. */
+    topics: topicsFilterSchema.optional(),
   })
   .strict()
   .superRefine(refineCustomRange);

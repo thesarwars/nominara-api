@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { measuredImpactSchema as writtenMeasuredImpactSchema } from "../tasks/task-verification.schema.js";
 import { customRangeDays, customRangeFields, customRangeGranularity, refineCustomRange } from "./custom-range.schema.js";
+import { topicsFilterSchema } from "./topics-filter.schema.js";
 import { dataSourceSchema, engineDataSourceSchema } from "./data-source.schema.js";
 
 // STORY-137 — `GET /v1/projects/{id}/growth-map`, `api-specification.md` §7.
@@ -56,6 +57,8 @@ export const growthMapQuerySchema = z
     granularity: growthMapGranularitySchema.optional(),
     /** STORY-090: with `timeframe=custom`, the workspace-local days plotted (both inclusive) - see custom-range.schema.ts. */
     ...customRangeFields,
+    /** STORY-090 AC8: comma-separated topic cluster ids of THIS project - the series cover those clusters' member prompts. See topics-filter.schema.ts. */
+    topics: topicsFilterSchema.optional(),
   })
   .strict()
   .superRefine((query, ctx) => {
