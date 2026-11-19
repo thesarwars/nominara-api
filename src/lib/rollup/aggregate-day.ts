@@ -279,10 +279,11 @@ export async function aggregateRange(
   scoringVersion: string | null,
   instants?: { readonly from: string; readonly to: string },
   /**
-   * STORY-188 - restrict the cells to the member prompts of ONE topic cluster (a live prompt whose `cluster_id` is this). The same
-   * query and the same scoring path as the project's figure, over a narrower set of cells: a cluster's score is never a second formula.
+   * STORY-188 - restrict the cells to the member prompts of one topic cluster (a live prompt whose `cluster_id` is this), or of any of several
+   * (STORY-090 AC8, the Overview's topic multi-select). The same query and the same scoring path as the project's figure, over a narrower set of cells:
+   * a cluster's score is never a second formula. An empty list reads no cells (it never widens to the whole project).
    */
-  clusterId?: string,
+  clusterId?: string | readonly string[],
 ): Promise<DayAggregate[]> {
   const result = await tx.query<Record<string, string | null>>(
     `WITH day_cells AS (
@@ -314,9 +315,9 @@ export async function aggregateRange(
           AND ${measurementStatusSql()}
           AND ($5::text IS NULL OR c.scoring_version = $5::text)
           -- STORY-188 - one topic cluster's member prompts. Unbound (NULL) for every other caller.
-          AND ($8::uuid IS NULL OR c.prompt_id IN (
+          AND ($8::uuid[] IS NULL OR c.prompt_id IN (
                 SELECT tp.id FROM tracked_prompts tp
-                 WHERE tp.cluster_id = $8::uuid AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL))
+                 WHERE tp.cluster_id = ANY($8::uuid[]) AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL))
      ),
      entities AS (
        -- Every (engine, entity) pair that appears in the range, so a
@@ -428,7 +429,7 @@ export async function aggregateRange(
             -- neither owned nor foreign.
             AND f.http_status IS NOT NULL
        ) cit`,
-    [projectId, fromDate, timezone, toDate, scoringVersion, instants?.from ?? null, instants?.to ?? null, clusterId ?? null],
+    [projectId, fromDate, timezone, toDate, scoringVersion, instants?.from ?? null, instants?.to ?? null, clusterId === undefined ? null : typeof clusterId === "string" ? [clusterId] : [...clusterId]],
   );
 
   return result.rows.map((row) => ({

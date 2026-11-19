@@ -17,6 +17,7 @@ import { aggregateRange, answeredStatusSql, measurementStatusSql } from "../../l
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import type { PortalProjectEngines, PortalProjectFacts } from "../../lib/portal/portal-facts.js";
 import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
+import { resolveTopicFilter } from "../../lib/analytics/topic-filter.js";
 import { customRangeDays } from "../../../contracts/analytics/custom-range.schema.js";
 
 // STORY-136 — `GET /v1/projects/{id}/scorecards`.
@@ -70,6 +71,8 @@ export class ScorecardsService {
       custom,
     );
     const requested = parseEngineFilter(query.engines);
+    // STORY-090 AC8 - after the window, so a missing project is still the 404. Null = no narrowing; ids the project lacks are a 400 naming `topics`.
+    const topics = await resolveTopicFilter(tx, projectId, query.topics);
     // ⚠ `priorFrom`, NOT `from` — THE MEMBERSHIP SPAN COVERS BOTH LEGS.
     //
     // `blendScorecards` builds the current AND prior blends from this one
@@ -97,8 +100,8 @@ export class ScorecardsService {
     // the whole window costs one scan per period however many engines the
     // project has.
     const [current, prior] = await Promise.all([
-      this.brandMetricsByEngine(tx, projectId, window.from, window.to, window.timezone),
-      this.brandMetricsByEngine(tx, projectId, window.priorFrom, window.priorTo, window.timezone),
+      this.brandMetricsByEngine(tx, projectId, window.from, window.to, window.timezone, topics),
+      this.brandMetricsByEngine(tx, projectId, window.priorFrom, window.priorTo, window.timezone, topics),
     ]);
 
     // AN ENABLED ENGINE WITH NO ROWS IS STILL AN ENTRY. Omitting it would
@@ -346,8 +349,10 @@ export class ScorecardsService {
     from: string,
     to: string,
     timezone: string,
+    /** STORY-090 AC8 - the topic clusters whose member prompts the figures cover; null is the whole project. */
+    topics: readonly string[] | null,
   ): Promise<Map<string, WindowMetrics>> {
-    const aggregates = await aggregateRange(tx, projectId, from, to, timezone, SCORING_VERSION);
+    const aggregates = await aggregateRange(tx, projectId, from, to, timezone, SCORING_VERSION, undefined, topics ?? undefined);
     const byEngine = new Map<string, WindowMetrics>();
     for (const aggregate of aggregates) {
       if (aggregate.entityType !== "brand") continue;

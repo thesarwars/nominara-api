@@ -16,6 +16,7 @@ import {
 } from "../../../contracts/analytics/index.js";
 import { NotFoundError } from "../../api/errors/domain-errors.js";
 import { customRangeDays, customRangeGranularity } from "../../../contracts/analytics/custom-range.schema.js";
+import { resolveTopicFilter } from "../../lib/analytics/topic-filter.js";
 import { assertCustomRangeAllowed } from "../../lib/analytics/custom-range.js";
 import { MEASURED_IMPACT_CAVEAT } from "../../../contracts/tasks/task-verification.schema.js";
 import { currentTenantStore, type TenantContextStore } from "../../tenancy/tenant-context.js";
@@ -134,7 +135,7 @@ export class GrowthMapService {
     const requested = parseEngineFilter(query.engines);
     const selected = requested === null ? null : narrowToEntitled(requested, await this.entitledEngines(tx, projectId));
 
-    if (granularity === "hour") return this.hourly(tx, store, projectId, wanted, selected, opts.portal);
+    if (granularity === "hour") return this.hourly(tx, store, projectId, wanted, selected, query.topics, opts.portal);
     return this.fromRollup(
       tx,
       store,
@@ -142,6 +143,7 @@ export class GrowthMapService {
       wanted,
       selected,
       granularity,
+      query.topics,
       opts.days ?? (custom !== undefined ? customRangeDays(custom.from, custom.to) : TIMEFRAME_DAYS[query.timeframe as Exclude<GrowthMapTimeframe, "custom">]),
       opts.portal,
       custom,
@@ -156,11 +158,14 @@ export class GrowthMapService {
     wanted: ReadonlySet<string>,
     selected: readonly string[] | null,
     granularity: "day" | "week",
+    rawTopics: string | undefined,
     windowDays: number,
     portal: GrowthMapOptions["portal"],
     custom?: { readonly from: string; readonly to: string },
   ): Promise<GrowthMapResponse> {
     const { from, to, timezone, brandLabel } = await this.resolveWindow(tx, projectId, windowDays, portal?.timezone, custom === undefined ? undefined : { ...custom, workspaceId: store.context.workspaceId });
+    // STORY-090 AC8 - after the window, so a missing project is still the 404.
+    const topics = await resolveTopicFilter(tx, projectId, rawTopics);
     const days = calendarDays(from, to);
     const buckets: readonly WeekBucket[] | null = granularity === "week" ? weekBuckets(days) : null;
     const labels = buckets === null ? days : buckets.map((bucket) => bucket.label);
@@ -172,7 +177,10 @@ export class GrowthMapService {
       buckets === null ? points : resampleWeekly(buckets, points, versionOf);
     const labelOfDay = (day: string): string => (buckets === null ? day : weekLabelFor(buckets, day));
 
-    const rows = await this.seriesRows(tx, projectId, from, to, selected);
+    // A topic filter has no stored rollup (`metric_daily` is not cut by cluster), so the series are scored live from the member prompts' cells by the
+    // rollup's own aggregation and blend - the same formula the stored rows come from, over fewer cells.
+    const topicScored = topics === null ? null : await this.topicSeries(tx, projectId, days, timezone, selected, topics, brandLabel);
+    const rows = topicScored === null ? await this.seriesRows(tx, projectId, from, to, selected) : topicScored.rows;
     // NEW-A-5 — the series are the cross-engine blend, so each one carries the
     // combination of every measured engine's provenance in the window.
     // AC12 — every scoring version's captures: the series plots older-version days, so their provenance is counted too.
@@ -240,8 +248,77 @@ export class GrowthMapService {
       dataGaps: dataGapsPlotted,
       cadenceChanges: cadence.map((pin) => ({ at: labelOfDay(pin.day), from: pin.from, to: pin.to })),
       scoringVersionChanges,
-      bestAndWorst: await this.bestAndWorstEngine(tx, projectId, from, to, selected),
+      bestAndWorst: topicScored === null ? await this.bestAndWorstEngine(tx, projectId, from, to, selected) : topicScored.bestAndWorst,
     });
+  }
+
+  /**
+   * STORY-090 AC8 - the day-granularity series for a topic selection: per workspace-local day, `aggregateRange` over the selected clusters' member prompts,
+   * each entity blended across engines by `blendEngineParts` with the engines' weights - what `roll-up-day` writes, over a narrower set of cells. A day
+   * with no cell for these topics has no row, which the plot draws as a gap (null), never a zero.
+   *
+   * One aggregation per day of the window, serially on the request's transaction (at most 366). The rollup cannot answer this: it is not cut by cluster.
+   */
+  private async topicSeries(
+    tx: ClientBase,
+    projectId: string,
+    days: readonly string[],
+    timezone: string,
+    selected: readonly string[] | null,
+    topics: readonly string[],
+    brandLabel: string,
+  ): Promise<{ rows: SeriesRow[]; bestAndWorst: { best_engine: string | null; worst_engine: string | null } }> {
+    const weights = new Map(
+      (await tx.query<{ engine_key: string; weight: string | null }>("SELECT engine_key, weight::text FROM project_engines WHERE project_id = $1", [projectId])).rows.map(
+        (row) => [row.engine_key, row.weight === null ? 1 : Number(row.weight)],
+      ),
+    );
+    const competitorNames = new Map(
+      (await tx.query<{ id: string; name: string }>("SELECT id::text, name FROM competitors WHERE project_id = $1", [projectId])).rows.map((row) => [row.id, row.name]),
+    );
+    const rows: SeriesRow[] = [];
+    const engineTotals = new Map<string, { weighted: number; cells: number }>();
+    for (const day of days) {
+      const aggregates = (await aggregateRange(tx, projectId, day, day, timezone, SCORING_VERSION, undefined, topics)).filter(
+        (aggregate) => selected === null || selected.includes(aggregate.engineKey),
+      );
+      const parts = new Map<string, EnginePart[]>();
+      for (const aggregate of aggregates) {
+        const metric = toMetricRow(aggregate);
+        const weight = weights.get(aggregate.engineKey) ?? 1;
+        const key = `${aggregate.entityType}|${aggregate.entityId}`;
+        parts.set(key, [
+          ...(parts.get(key) ?? []),
+          { weight, cellsTotal: metric.cellsTotal, sovWeighted: metric.sov * weight, visibilityScore: metric.visibilityScore, liveCells: aggregate.liveCells },
+        ]);
+        if (aggregate.entityType === "brand") {
+          const total = engineTotals.get(aggregate.engineKey) ?? { weighted: 0, cells: 0 };
+          engineTotals.set(aggregate.engineKey, { weighted: total.weighted + metric.visibilityScore * metric.cellsTotal, cells: total.cells + metric.cellsTotal });
+        }
+      }
+      for (const [key, entityParts] of parts) {
+        const [entityType, entityId] = key.split("|") as ["brand" | "competitor", string];
+        const blended = blendEngineParts(entityParts);
+        rows.push({
+          entityType,
+          entityId,
+          label: entityType === "brand" ? brandLabel : (competitorNames.get(entityId) ?? entityId),
+          metricDate: day,
+          visibilityScore: blended.visibilityScore,
+          sov: blended.sov,
+          cellsTotal: blended.cellsTotal,
+          liveCaptureRatio: blended.liveCaptureRatio,
+          scoringVersion: SCORING_VERSION,
+          computedAt: 0,
+        });
+      }
+    }
+    // The same rule as `bestAndWorstEngine`: cells-weighted, and ONE ENGINE IS NEITHER BEST NOR WORST.
+    const ranked = [...engineTotals]
+      .filter(([, total]) => total.cells > 0)
+      .sort(([leftEngine, left], [rightEngine, right]) => right.weighted / right.cells - left.weighted / left.cells || leftEngine.localeCompare(rightEngine))
+      .map(([engine]) => engine);
+    return { rows, bestAndWorst: ranked.length < 2 ? { best_engine: null, worst_engine: null } : { best_engine: ranked[0]!, worst_engine: ranked[ranked.length - 1]! } };
   }
 
   /**
@@ -264,9 +341,12 @@ export class GrowthMapService {
     projectId: string,
     wanted: ReadonlySet<string>,
     selected: readonly string[] | null,
+    rawTopics: string | undefined,
     portal: GrowthMapOptions["portal"],
   ): Promise<GrowthMapResponse> {
     const { timezone, brandLabel } = await this.projectSettings(tx, projectId, portal?.timezone);
+    // STORY-090 AC8 - null is the whole project; ids the project lacks are a 400 naming `topics`.
+    const topics = await resolveTopicFilter(tx, projectId, rawTopics);
     const hours = hourBuckets(Date.now());
     const fromInstant = hours[0]!;
     const toInstant = hourLabel(Date.parse(hours[hours.length - 1]!) + HOUR_MS);
@@ -291,7 +371,7 @@ export class GrowthMapService {
     for (const hour of hours) {
       const hourEnd = hourLabel(Date.parse(hour) + HOUR_MS);
       const day = hour.slice(0, 10);
-      const aggregates = (await aggregateRange(tx, projectId, day, day, "UTC", SCORING_VERSION, { from: hour, to: hourEnd })).filter(
+      const aggregates = (await aggregateRange(tx, projectId, day, day, "UTC", SCORING_VERSION, { from: hour, to: hourEnd }, topics ?? undefined)).filter(
         (aggregate) => selected === null || selected.includes(aggregate.engineKey),
       );
       const parts = new Map<string, EnginePart[]>();
