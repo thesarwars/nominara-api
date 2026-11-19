@@ -112,6 +112,9 @@ export const GLOBAL_TABLES = [
   // table is reachable and merely filtered, and no FK to workspaces so a
   // tombstone outlives its workspace. Migration 0123_audit_chain_marks.up.sql.
   "audit_chain_marks",
+  // Batch 19 - the incremental audit export's per-chain watermark: owner-only like audit_chain_marks, no RLS, no FK to workspaces.
+  // Migration 0215_audit_export_watermarks.up.sql.
+  "audit_export_watermarks",
   // STORY-178 — addresses that must not be mailed (a permanent bounce, a complaint), platform-wide: a bounce is a property
   // of the address and the sending reputation it protects is shared. Holds the peppered hash only, no address and no
   // workspace; the Resend webhook that writes it resolves no tenant. Migration 0141_email_suppressions.up.sql.
@@ -500,7 +503,7 @@ export function expectedTablePrivileges(role: string, table: string): readonly T
   }
   // STORY-143 AC7 — owner-only: not even SELECT. A mark readable by the
   // application is a mark the application can learn how to forge around.
-  if (table === "audit_chain_marks") return NO_PRIVILEGES;
+  if (table === "audit_chain_marks" || table === "audit_export_watermarks") return NO_PRIVILEGES;
   // STORY-111 - owner-only, like the chain marks: a hold the application could write is a hold a request handler could place or lift.
   if (table === "legal_holds" || table === "purge_runs" || table === "subject_erasure_queue") return NO_PRIVILEGES;
   // STORY-178 — the webhook route (nominara_app) appends and every sender reads; a worker only reads (it sends reports and

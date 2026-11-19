@@ -7,6 +7,9 @@ import { QUEUE_HANDLERS } from "../../../src/lib/queue/handlers.js";
 import { S3ObjectLockExportSink } from "../../../src/modules/audit/adapters/s3-object-lock-export-sink.js";
 import { LocalDirExportSink } from "../../../src/modules/audit/adapters/local-dir-export-sink.js";
 import type { AuditExportSink } from "../../../src/modules/audit/ports/export-sink.js";
+import { incrementCounter } from "../../../src/lib/telemetry/metrics.js";
+
+vi.mock("../../../src/lib/telemetry/metrics.js", () => ({ incrementCounter: vi.fn(), observeValue: vi.fn() }));
 
 // STORY-020 AC8 - the `audit.export` job: nightly, through the export sink port, single-flight, and loud when it cannot run.
 
@@ -45,6 +48,20 @@ describe("STORY-020 AC8 - audit.export handler", () => {
     await handler(undefined as never, job);
     expect(runExport).toHaveBeenCalledWith(f.client, sink);
     expect(f.queries.some((q) => q.includes("pg_advisory_unlock"))).toBe(true);
+    expect(f.ended()).toBe(true);
+  });
+
+  it("batch 19 - a night with no new audit rows writes no object: it is a counted skip, not a run and not a failure", async () => {
+    vi.mocked(incrementCounter).mockClear();
+    const f = fakeClient();
+    const handler = createAuditExportHandler({ env: env() } as never, {
+      connect: () => Promise.resolve(f.client),
+      sinkFor: () => sink,
+      runExport: vi.fn().mockResolvedValue(null),
+    });
+    await handler(undefined as never, job);
+    expect(incrementCounter).toHaveBeenCalledWith("nominara_audit_export_skipped_total", { reason: "no_new_rows" });
+    expect(incrementCounter).not.toHaveBeenCalledWith("nominara_audit_export_runs_total");
     expect(f.ended()).toBe(true);
   });
 

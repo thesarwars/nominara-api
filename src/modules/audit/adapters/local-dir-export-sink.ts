@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { chmod, mkdir, open, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AuditChainRow } from "../../../lib/crypto/audit-chain.js";
-import type { AuditExportOptions, AuditExportRows, AuditExportSink } from "../ports/export-sink.js";
+import { incrementalManifestBlock, type AuditExportIncrement, type AuditExportOptions, type AuditExportRows, type AuditExportSink } from "../ports/export-sink.js";
 
 // STORY-020 D-1 — local-filesystem approximation of S3 Object Lock
 // (COMPLIANCE mode). Disclosed as STORY-020-E-3: chmod 0o444 only prevents
@@ -26,7 +27,7 @@ function toExportLine(row: AuditChainRow): string {
 export class LocalDirExportSink implements AuditExportSink {
   constructor(private readonly baseDir: string) {}
 
-  async export(rows: AuditExportRows, options: AuditExportOptions): Promise<string> {
+  async export(rows: AuditExportRows, options: AuditExportOptions, increment?: AuditExportIncrement): Promise<string> {
     await mkdir(this.baseDir, { recursive: true });
 
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -36,6 +37,7 @@ export class LocalDirExportSink implements AuditExportSink {
     // STORY-144 AC7 — written as it arrives, in batches, with the manifest accumulated alongside. Nothing here holds
     // more than one batch of lines, whatever the estate's size.
     let rowCount = 0;
+    const dataHash = createHash("sha256");
     const workspaceIds = new Set<string>();
     const handle = await open(dataPath, "w");
     try {
@@ -45,11 +47,17 @@ export class LocalDirExportSink implements AuditExportSink {
         rowCount += 1;
         workspaceIds.add(row.workspace_id);
         if (batch.length >= WRITE_BATCH_ROWS) {
-          await handle.write(`${batch.join("\n")}\n`);
+          const text = `${batch.join("\n")}\n`;
+          dataHash.update(text);
+          await handle.write(text);
           batch = [];
         }
       }
-      if (batch.length > 0) await handle.write(`${batch.join("\n")}\n`);
+      if (batch.length > 0) {
+        const text = `${batch.join("\n")}\n`;
+        dataHash.update(text);
+        await handle.write(text);
+      }
     } catch (error) {
       // A half-written file, once made read-only and named like an export, would be taken for a complete one.
       await handle.close().catch(() => undefined);
@@ -64,11 +72,15 @@ export class LocalDirExportSink implements AuditExportSink {
       workspaceIds: [...workspaceIds],
       retentionDays: options.retentionDays,
       lockedUntil,
+      ...(increment !== undefined ? { incremental: incrementalManifestBlock(increment) } : {}),
     };
-    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    const manifestText = JSON.stringify(manifest, null, 2);
+    await writeFile(manifestPath, manifestText, "utf8");
 
     await chmod(dataPath, READ_ONLY_MODE);
     await chmod(manifestPath, READ_ONLY_MODE);
+
+    increment?.recordWritten({ dataSha256: dataHash.digest("hex"), manifestSha256: createHash("sha256").update(manifestText).digest("hex") });
 
     return dataPath;
   }

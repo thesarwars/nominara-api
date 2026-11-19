@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -155,5 +156,39 @@ describe("STORY-144 AC7 · LocalDirExportSink streams", () => {
     await expect(new LocalDirExportSink(dir).export(failing(), { retentionDays: 30 })).rejects.toThrow("snapshot lost");
     // A half-written file chmod'd read-only and named like a complete export would be taken for one.
     expect(await readdir(dir)).toEqual([]);
+  });
+});
+
+describe("batch 19 (STORY-020 follow-up) · LocalDirExportSink incremental manifest", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "audit-export-incr-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("the manifest carries the previous manifest's hash and each chain's range, and the sink reports the real hashes", async () => {
+    const recorded: Array<{ dataSha256: string; manifestSha256: string }> = [];
+    const dataPath = await new LocalDirExportSink(dir).export([row({ seq: "2" })], { retentionDays: 30 }, {
+      previousManifestSha256: "cd".repeat(32),
+      chains: new Map([["ws-1", { fromSeq: "1", afterRowHash: "deadbeef", toSeq: "2", toRowHash: "cafe", rowCount: 1, rebased: false }]]),
+      recordWritten: (written) => recorded.push(written),
+    });
+    const manifestText = await readFile(dataPath.replace(/\.jsonl$/, ".manifest.json"), "utf8");
+    expect(JSON.parse(manifestText)).toMatchObject({
+      incremental: { previousManifestSha256: "cd".repeat(32), chains: [{ workspaceId: "ws-1", fromSeq: "1", toSeq: "2" }] },
+    });
+    expect(recorded).toEqual([
+      {
+        manifestSha256: createHash("sha256").update(manifestText).digest("hex"),
+        dataSha256: createHash("sha256").update(await readFile(dataPath)).digest("hex"),
+      },
+    ]);
+  });
+
+  it("a full export has no incremental block", async () => {
+    const dataPath = await new LocalDirExportSink(dir).export([row()], { retentionDays: 30 });
+    expect(JSON.parse(await readFile(dataPath.replace(/\.jsonl$/, ".manifest.json"), "utf8"))).not.toHaveProperty("incremental");
   });
 });

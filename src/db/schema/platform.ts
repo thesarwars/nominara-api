@@ -20,6 +20,17 @@ export const auditChainMarks = pgTable("audit_chain_marks", {
   reason: text("reason").notNull(),
 });
 
+export const auditExportWatermarks = pgTable("audit_export_watermarks", {
+  id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+  workspaceId: uuid("workspace_id").notNull(),
+  fromSeq: bigint("from_seq", { mode: "bigint" }).notNull(),
+  maxSeq: bigint("max_seq", { mode: "bigint" }).notNull(),
+  rowHash: bytea("row_hash").notNull(),
+  objectSha256: bytea("object_sha256").notNull(),
+  manifestSha256: bytea("manifest_sha256").notNull(),
+  exportedAt: timestamp("exported_at", { withTimezone: true }).notNull().default(sql`now()`),
+});
+
 export const auditLog = pgTable("audit_log", {
   seq: bigint("seq", { mode: "bigint" }).primaryKey().default(sql`nextval('audit_log_seq_seq'::regclass)`),
   workspaceId: uuid("workspace_id").notNull(),

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { S3_CONNECTION_TIMEOUT_MS, S3_REQUEST_TIMEOUT_MS } from "../../../lib/storage/s3.adapter.js";
 import type { AuditChainRow } from "../../../lib/crypto/audit-chain.js";
-import type { AuditExportOptions, AuditExportRows, AuditExportSink } from "../ports/export-sink.js";
+import { incrementalManifestBlock, type AuditExportIncrement, type AuditExportOptions, type AuditExportRows, type AuditExportSink } from "../ports/export-sink.js";
 
 // STORY-020 AC8 - security-and-tenancy.md section 12: "Nightly export to S3 with Object Lock in COMPLIANCE mode, 7-year retention."
 // The real counterpart of LocalDirExportSink (which only chmods). It implements the STREAMING port (STORY-144 AC7):
@@ -66,7 +66,7 @@ export class S3ObjectLockExportSink implements AuditExportSink {
     });
   }
 
-  async export(rows: AuditExportRows, options: AuditExportOptions): Promise<string> {
+  async export(rows: AuditExportRows, options: AuditExportOptions, increment?: AuditExportIncrement): Promise<string> {
     if (!Number.isFinite(options.retentionDays) || options.retentionDays <= 0) {
       throw new RangeError(`audit export retention must be a positive number of days, got ${String(options.retentionDays)}`);
     }
@@ -80,7 +80,7 @@ export class S3ObjectLockExportSink implements AuditExportSink {
       const stamp = now.toISOString().replace(/[:.]/g, "-");
       const base = `${this.config.keyPrefix ?? "audit-exports"}/${now.toISOString().slice(0, 10)}/audit-export-${stamp}`;
       const manifest = Buffer.from(
-        JSON.stringify({ rowCount: spooled.rowCount, workspaceIds: [...spooled.workspaceIds], retentionDays: options.retentionDays, lockedUntil: retainUntil.toISOString(), sha256: spooled.sha256Hex }, null, 2),
+        JSON.stringify({ rowCount: spooled.rowCount, workspaceIds: [...spooled.workspaceIds], retentionDays: options.retentionDays, lockedUntil: retainUntil.toISOString(), sha256: spooled.sha256Hex, ...(increment !== undefined ? { incremental: incrementalManifestBlock(increment) } : {}) }, null, 2),
         "utf8",
       );
 
@@ -89,6 +89,8 @@ export class S3ObjectLockExportSink implements AuditExportSink {
       await this.putLocked(`${base}.jsonl`, () => createReadStream(dataPath), spooled.bytes, spooled.sha256Base64, retainUntil);
       const manifestSha = createHash("sha256").update(manifest).digest("base64");
       await this.putLocked(`${base}.manifest.json`, () => manifest, manifest.byteLength, manifestSha, retainUntil, "application/json");
+      // Only now, with both objects durable: the caller moves its watermark on this and on nothing earlier.
+      increment?.recordWritten({ dataSha256: spooled.sha256Hex, manifestSha256: createHash("sha256").update(manifest).digest("hex") });
       return `s3://${this.config.bucket}/${base}.jsonl`;
     } finally {
       await rm(dir, { recursive: true, force: true });
