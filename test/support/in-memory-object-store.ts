@@ -38,8 +38,13 @@ export class InMemoryObjectStore implements PrefixDeletingPort {
     return [...this.buckets[bucket].keys()].sort();
   }
 
-  /** Every `bucket/key` in BOTH buckets that names `needle` anywhere (a workspace id, a project id). The search the AC asks for. */
+  /** The buckets this store models; the test that enumerates the configured buckets checks it against them. */
+  bucketNames(): StorageBucketName[] {
+    return Object.keys(this.buckets) as StorageBucketName[];
+  }
+
+  /** Every `bucket/key` in EVERY bucket the store models that names `needle` anywhere (a workspace id, a project id). The search the AC asks for. */
   search(needle: string): string[] {
-    return (["raw", "reports"] as const).flatMap((bucket) => this.keys(bucket).filter((key) => key.includes(needle)).map((key) => `${bucket}/${key}`));
+    return this.bucketNames().flatMap((bucket) => this.keys(bucket).filter((key) => key.includes(needle)).map((key) => `${bucket}/${key}`));
   }
 }
