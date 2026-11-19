@@ -151,7 +151,7 @@ export class GeminiNaturaliser implements PromptNaturaliser {
     if (usage !== undefined && (usage.promptTokenCount !== undefined || usage.candidatesTokenCount !== undefined)) {
       // What the provider reported, never an estimate. The cost is absorbed (FR-FAN-01g) but visible.
       observeValue(
-        "nominara_prompts_naturalise_tokens_spent",
+        "nominara_prompts_naturalise_tokens_spent_total",
         (usage.promptTokenCount ?? 0) + (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),
         { model: this.model },
       );

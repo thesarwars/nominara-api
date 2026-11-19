@@ -82,7 +82,7 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
       // A month that could not be created is the runway not being extended,
       // which is the one thing this tick exists to do. Loud, and counted.
       for (const failure of result.partitionFailures) {
-        incrementCounter("partition_create_failed", { partition: failure.partition });
+        incrementCounter("nominara_partition_create_failed_total", { partition: failure.partition });
         logger.error(`could not create ${failure.partition}: ${failure.reason}`);
       }
 
@@ -111,7 +111,7 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
       // What is needed is for somebody to see it, which is what the counter is
       // for: the ops script's non-zero exit has no equivalent on a queue.
       for (const alert of result.defaultPartitionAlerts) {
-        incrementCounter("partition_default_rows_detected", { table: alert.table });
+        incrementCounter("nominara_partition_default_rows_detected_total", { table: alert.table });
         logger.warn(
           `rows are sitting in ${alert.table}'s DEFAULT partition (${String(alert.rowCount)}) — ` +
             `a partition covering their range can no longer be attached until they are moved`,
@@ -128,7 +128,7 @@ export function createMaintenancePartitionHandler(context: QueueHandlerContext):
       // ⚠ 0 IS AN OBSERVATION, NOT ABSENCE: every fact table reports each run, so a dashboard can tell "clean" from "did not run".
       for (const table of PARTITIONED_FACT_TABLES) {
         const stranded = result.defaultPartitionAlerts.find((alert) => alert.table === table);
-        observeValue("nominara_partition_default_rows", stranded?.rowCount ?? 0, { table });
+        observeValue("nominara_partition_default_rows_total", stranded?.rowCount ?? 0, { table });
       }
     } finally {
       try {

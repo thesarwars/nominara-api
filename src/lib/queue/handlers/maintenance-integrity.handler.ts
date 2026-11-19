@@ -237,7 +237,7 @@ export function createMaintenanceIntegrityHandler(
     const reports = await withStatementTimeout(client, () => scanForOrphans(client));
     const total = reports.reduce((sum, report) => sum + report.orphanCount, 0);
     // 0 is an observation, not absence.
-    observeValue("nominara_maintenance_orphan_fact_rows", total);
+    observeValue("nominara_maintenance_orphan_fact_rows_total", total);
     if (reports.length === 0) return;
     const detail = reports
       .map(
@@ -267,7 +267,7 @@ export function createMaintenanceIntegrityHandler(
   ): Promise<void> {
     const unresolved = await findUnresolvedPurgeFailures(client);
     observeValue(
-      "nominara_retention_purge_failures_unresolved",
+      "nominara_retention_purge_failures_unresolved_total",
       unresolved.length,
     );
     if (unresolved.length === 0) return;
@@ -319,7 +319,7 @@ export function createMaintenanceIntegrityHandler(
         });
         continue;
       }
-      observeValue("nominara_maintenance_vector_recall_ratio", recall, {
+      observeValue("nominara_maintenance_vector_recall_ratio_total", recall, {
         table,
       });
       if (recall < VECTOR_RECALL_THRESHOLD) {

@@ -427,8 +427,8 @@ export function createEmbedBatchHandler(context: QueueHandlerContext, deps: Embe
     const count = written.rowCount ?? 0;
     await meterTokens(tx, payload.workspaceId, fetched.totalTokens);
     incrementCounter("nominara_embed_batches_total", { outcome: "embedded" });
-    observeValue("nominara_embed_vectors_written", count, { table: payload.table });
-    observeValue("nominara_embed_tokens_spent", fetched.totalTokens, { table: payload.table });
+    observeValue("nominara_embed_vectors_written_total", count, { table: payload.table });
+    observeValue("nominara_embed_tokens_spent_total", fetched.totalTokens, { table: payload.table });
     logger.log({
       event: "embed.batch.committed",
       workspace_id: payload.workspaceId,

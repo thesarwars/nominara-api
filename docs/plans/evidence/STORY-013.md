@@ -13,16 +13,16 @@ choice, not a transcription (same caveat as every row in `schedule.ts`); the own
 
 | AC | check | on a finding |
 |---|---|---|
-| 14 | `scanForOrphans` (per partition) | metric `nominara_maintenance_orphan_fact_rows` (0 is observed), error log with table/partition/count, alert email, job FAILS with `UnrecoverableError` (one page per night) |
-| 16 | new `findUnresolvedPurgeFailures` (`src/db/purge-check.ts`) | metric `nominara_retention_purge_failures_unresolved`; any unresolved failure alerts; past the 7-day grace the job FAILS (the runtime hook of "blocks the release train"). `reason` is never logged or mailed. |
-| 6 | `computeRecallAtK` over `HNSW_INDEXED_TABLES` | metric `nominara_maintenance_vector_recall_ratio`; below 0.98 an error log + alert email + finding counter; a table with too few rows is a counted skip (null is not 0). NOT a failed job. |
+| 14 | `scanForOrphans` (per partition) | metric `nominara_maintenance_orphan_fact_rows_total` (0 is observed), error log with table/partition/count, alert email, job FAILS with `UnrecoverableError` (one page per night) |
+| 16 | new `findUnresolvedPurgeFailures` (`src/db/purge-check.ts`) | metric `nominara_retention_purge_failures_unresolved_total`; any unresolved failure alerts; past the 7-day grace the job FAILS (the runtime hook of "blocks the release train"). `reason` is never logged or mailed. |
+| 6 | `computeRecallAtK` over `HNSW_INDEXED_TABLES` | metric `nominara_maintenance_vector_recall_ratio_total`; below 0.98 an error log + alert email + finding counter; a table with too few rows is a counted skip (null is not 0). NOT a failed job. |
 
 A check that cannot run fails the job with an ordinary error after the others have reported; an errored scan never reads as clean.
 
-AC3: `maintenance-partition.handler.ts` now also observes `nominara_partition_default_rows` per fact table every run (0 included) and
+AC3: `maintenance-partition.handler.ts` now also observes `nominara_partition_default_rows_total` per fact table every run (0 included) and
 sends an alert email per table with stranded rows. It still does not fail the job (retrying cannot move rows).
 
-Existing metrics/log names were left as they were (`partition_default_rows_detected`, the warn line), so no existing assertion changed.
+Existing metrics/log names were left as they were at the time (`partition_default_rows_detected`, the warn line), so no existing assertion changed. (Batch 19 later renamed the 28 grandfathered metric names to the convention, this one `nominara_partition_default_rows_detected_total`.)
 Spans: `maintenance.integrity` with outcome and finding-count attributes; not asserted, because no in-memory span exporter exists in the repo.
 
 ## Review round 1 — what changed, and what is NOT working in production yet

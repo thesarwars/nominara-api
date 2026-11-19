@@ -216,7 +216,7 @@ export function createCrawlDiscoverHandler(context: QueueHandlerContext, deps?: 
       }
       // What the provider reported for this pass. The budget is stated, not metered to the workspace: one site text of at most
       // MAX_CLASSIFICATION_TEXT_CHARS, plus the category vectors once per process and model.
-      if (classification.attempted && classification.tokens > 0) observeValue("nominara_discovery_category_embed_tokens", classification.tokens);
+      if (classification.attempted && classification.tokens > 0) observeValue("nominara_discovery_category_embed_tokens_total", classification.tokens);
       return result;
     },
 

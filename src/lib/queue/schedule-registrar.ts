@@ -238,7 +238,7 @@ export async function reconcileSchedules(
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       failed.push({ queue: name, reason });
-      incrementCounter("queue_schedule_reconcile_failed", { queue: name });
+      incrementCounter("nominara_queue_schedule_reconcile_failed_total", { queue: name });
     }
   }
 

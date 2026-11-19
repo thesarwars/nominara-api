@@ -270,8 +270,8 @@ async function readPending(client: ClientBase, model: string): Promise<ReembedPe
   const pending = found.rows.map((row) => ({ table: row.tbl, model: row.model, rows: Number(row.rows) }));
   for (const table of ["tracked_prompts", "semantic_nodes"] as const) {
     const mine = pending.filter((p) => p.table === table);
-    if (mine.length === 0) observeValue("nominara_embed_reembed_pending_rows", 0, { table, model });
-    for (const p of mine) observeValue("nominara_embed_reembed_pending_rows", p.rows, { table, model: p.model });
+    if (mine.length === 0) observeValue("nominara_embed_reembed_pending_rows_total", 0, { table, model });
+    for (const p of mine) observeValue("nominara_embed_reembed_pending_rows_total", p.rows, { table, model: p.model });
   }
   return pending;
 }

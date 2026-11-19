@@ -389,7 +389,7 @@ async function run(deps: CorpusBuildDeps, input: { readonly projectId: string; r
   for (const [outcome, count] of Object.entries(counts)) {
     for (let i = 0; i < count; i += 1) incrementCounter("nominara_geo_corpus_urls_total", { outcome });
   }
-  observeValue("nominara_geo_corpus_passages_written", written.inserted, { status });
+  observeValue("nominara_geo_corpus_passages_written_total", written.inserted, { status });
   // Workspace ID only; no URL, no passage text, no domain (competitor content is not ours to log).
   logger.log({
     event: "geo.corpus.built",

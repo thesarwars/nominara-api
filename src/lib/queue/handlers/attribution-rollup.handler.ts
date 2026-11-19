@@ -86,7 +86,7 @@ export function createAttributionRollupHandler(_context: QueueHandlerContext): J
           const oldestPending = pending.rows[0]?.oldest_pending ?? null;
           const lastCommitted = pending.rows[0]?.last_committed ?? null;
           const pendingMs = oldestPending === null ? null : new Date(oldestPending).getTime();
-          if (lastCommitted !== null) observeValue("nominara_rollup_attribution_seconds_since_last_commit", Math.max(0, startedAtMs - new Date(lastCommitted).getTime()) / 1000);
+          if (lastCommitted !== null) observeValue("nominara_rollup_attribution_since_last_commit_seconds", Math.max(0, startedAtMs - new Date(lastCommitted).getTime()) / 1000);
           let windows = 0;
           let rows = 0;
           let alertsRaised = 0;

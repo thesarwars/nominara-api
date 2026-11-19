@@ -657,7 +657,7 @@ export function createCrawlAuditHandler(context: QueueHandlerContext, deps: Craw
       }
     });
     pageCopies.clear();
-    observeValue("nominara_aux_pages_evaluated_count", pageRules.evaluated.size, { trigger: payload.trigger });
+    observeValue("nominara_aux_pages_evaluated_total", pageRules.evaluated.size, { trigger: payload.trigger });
     // The rules that ran on at least one page, and of those the ones that ran on an interim reading (AUX_RULES_PARTIAL): they get their own annotation.
     const decidedAnywhere = new Set<string>();
     for (const rules of pageRules.evaluated.values()) for (const code of rules) decidedAnywhere.add(code);

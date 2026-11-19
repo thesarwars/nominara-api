@@ -516,7 +516,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     expect(pendingOf(before, "tracked_prompts", OLD)).toBe(3);
     expect(pendingOf(before, "tracked_prompts", "(none)"), "active prompts never embedded").toBe(2);
     expect(pendingOf(before, "semantic_nodes", "model-older")).toBe(1);
-    const gauge = observed.filter((o) => o.name === "nominara_embed_reembed_pending_rows");
+    const gauge = observed.filter((o) => o.name === "nominara_embed_reembed_pending_rows_total");
     expect(gauge.find((o) => o.labels.table === "tracked_prompts" && o.labels.model === OLD)?.value).toBe(3);
 
     // Drain it: backfill + stage everything, cut over, then the next run reports zero.
@@ -528,7 +528,7 @@ describe("STORY-186 - staged re-embed and the per-project cutover", () => {
     observed.length = 0;
     const after = await reembed(recorder().enqueue);
     expect(after.pending).toEqual([]);
-    const zero = observed.filter((o) => o.name === "nominara_embed_reembed_pending_rows");
+    const zero = observed.filter((o) => o.name === "nominara_embed_reembed_pending_rows_total");
     expect(zero.length, "an empty table still reports").toBeGreaterThan(0);
     expect(zero.every((o) => o.value === 0)).toBe(true);
   }, 180_000);

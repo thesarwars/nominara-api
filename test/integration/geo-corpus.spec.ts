@@ -972,7 +972,7 @@ describe("STORY-058 - corpus passages and centroid", () => {
     log.mockRestore();
     expect(exporter.getFinishedSpans().map((span) => span.name)).toContain("geo.corpus.build");
     expect(entries.filter((entry) => entry.metric === "nominara_geo_corpus_urls_total" && entry.outcome === "fetched")).toHaveLength(2);
-    expect(entries.some((entry) => entry.metric === "nominara_geo_corpus_passages_written")).toBe(true);
+    expect(entries.some((entry) => entry.metric === "nominara_geo_corpus_passages_written_total")).toBe(true);
     const lines = entries.filter((entry) => entry.event === "geo.corpus.built");
     expect(lines).toHaveLength(1);
     expect(lines[0]!.workspace_id).toBe(workspaceId);

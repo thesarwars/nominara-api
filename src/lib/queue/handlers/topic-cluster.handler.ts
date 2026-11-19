@@ -180,9 +180,9 @@ export function createTopicClusterHandler(_context: QueueHandlerContext, deps: T
           const members = plan.flatMap((entry) => entry.memberIds).length;
           const outliers = clusterable - members;
           incrementCounter("nominara_topic_cluster_runs_total", { outcome: "clustered" });
-          observeValue("nominara_topic_cluster_clusters_written", plan.length, { reason: payload.reason });
-          observeValue("nominara_topic_cluster_outlier_prompts", outliers);
-          observeValue("nominara_topic_cluster_prompts_dropped_by_cap", droppedByCap);
+          observeValue("nominara_topic_cluster_clusters_written_total", plan.length, { reason: payload.reason });
+          observeValue("nominara_topic_cluster_outlier_prompts_total", outliers);
+          observeValue("nominara_topic_cluster_prompts_dropped_by_cap_total", droppedByCap);
           for (let i = 0; i < sources.model; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "model" });
           for (let i = 0; i < sources.template; i += 1) incrementCounter("nominara_topic_cluster_labels_total", { source: "template" });
           span.setAttributes({ "nominara.topic_cluster.clusters": plan.length, "nominara.topic_cluster.outliers": outliers });

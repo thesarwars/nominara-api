@@ -85,7 +85,7 @@ export async function raiseAlertsForDrafts(tx: ClientBase, ctx: AlertContext, fi
     const item = rule.code === "negative_spike" ? (spikeLink ?? drafted) : drafted;
     if (await inCooldown(tx, ctx, rule, scope)) {
       summary.cooledDown += 1;
-      incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: "cooldown" });
+      incrementCounter("nominara_alerts_outcomes_total", { rule: rule.code, outcome: "cooldown" });
       continue;
     }
     const eventKey =
@@ -110,7 +110,7 @@ export async function raiseAlertsForDrafts(tx: ClientBase, ctx: AlertContext, fi
       options,
     );
     summary[outcome.created ? "raised" : "duplicate"] += 1;
-    incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: outcome.created ? "raised" : "duplicate" });
+    incrementCounter("nominara_alerts_outcomes_total", { rule: rule.code, outcome: outcome.created ? "raised" : "duplicate" });
   }
   return summary;
 }
@@ -159,7 +159,7 @@ export async function raiseDisplacementAlerts(tx: ClientBase, ctx: AlertContext,
       options,
     );
     summary[outcome.created ? "raised" : "duplicate"] += 1;
-    incrementCounter("nominara_alerts_total", { rule: rule.code, outcome: outcome.created ? "raised" : "duplicate" });
+    incrementCounter("nominara_alerts_outcomes_total", { rule: rule.code, outcome: outcome.created ? "raised" : "duplicate" });
   }
   if (summary.raised > 0) logger.log({ event: "alerts.displacement_raised", workspace_id: ctx.workspaceId, project_id: ctx.projectId, raised: summary.raised });
   return summary;

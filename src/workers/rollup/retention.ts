@@ -912,7 +912,7 @@ export async function expireToolSnapshotsForWorkspace(
     if (expired < batchSize) break;
   }
   if (total > 0) {
-    observeValue("nominara_tools_snapshots_expired_rows", total);
+    observeValue("nominara_tools_snapshots_expired_rows_total", total);
     logger.log({ message: "tool snapshots expired", workspace_id: workspaceId, rows: total });
   }
   return total;
@@ -954,7 +954,7 @@ export async function reapStaleToolRuns(
     return due.rows.length;
   });
   if (reaped > 0) {
-    observeValue("nominara_tools_runs_reaped_rows", reaped);
+    observeValue("nominara_tools_runs_reaped_rows_total", reaped);
     logger.warn({ message: "stale tool runs settled as failed and refunded", workspace_id: workspaceId, rows: reaped });
   }
   return reaped;

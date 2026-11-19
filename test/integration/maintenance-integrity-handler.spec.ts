@@ -144,7 +144,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     captureAlerts();
     await expect(run()).resolves.toBeUndefined();
 
-    const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows");
+    const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows_total");
     expect(orphan).toHaveLength(1);
     expect(orphan[0]!.value).toBe(0);
     expect(alerts).toEqual([]);
@@ -161,7 +161,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     expect((result as PromiseRejectedResult).reason).toBeInstanceOf(UnrecoverableError);
     expect(String((result as PromiseRejectedResult).reason)).toMatch(/orphan fact row/);
 
-    const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows");
+    const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows_total");
     expect(orphan.reduce((sum, m) => sum + m.value, 0)).toBe(1);
     expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_findings_total" && m.labels.check === "orphan_facts")).toBe(true);
 
@@ -181,7 +181,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
 
     await expect(run()).resolves.toBeUndefined();
 
-    const unresolved = metrics.filter((m) => m.name === "nominara_retention_purge_failures_unresolved");
+    const unresolved = metrics.filter((m) => m.name === "nominara_retention_purge_failures_unresolved_total");
     expect(unresolved.at(-1)!.value).toBe(1);
     expect(alerts.some((a) => a.context.alertName === "retention_purge_failure_unresolved")).toBe(true);
     expect(JSON.stringify(alerts)).not.toContain("secret reason text");
@@ -212,7 +212,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     );
     await db.query("UPDATE purge_failures SET resolved_at = now(), resolved_by = NULL WHERE resolved_at IS NULL");
     await expect(run()).resolves.toBeUndefined();
-    expect(metrics.filter((m) => m.name === "nominara_retention_purge_failures_unresolved").at(-1)!.value).toBe(0);
+    expect(metrics.filter((m) => m.name === "nominara_retention_purge_failures_unresolved_total").at(-1)!.value).toBe(0);
   }, 60_000);
 
   it("AC14 · one check failing does not skip the others: an orphan AND a blocking purge failure are both reported", async () => {
@@ -233,7 +233,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
   it("AC6 · a vector index with too few rows to measure is SKIPPED (no recall observation, no alert): null is not 0", async () => {
     captureAlerts();
     await expect(run()).resolves.toBeUndefined();
-    expect(metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio")).toEqual([]);
+    expect(metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio_total")).toEqual([]);
     expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_skipped_total" && m.labels.table === "tracked_prompts")).toBe(true);
     expect(alerts).toEqual([]);
   }, 60_000);
@@ -245,7 +245,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
 
     await expect(run()).resolves.toBeUndefined();
 
-    const recall = metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts");
+    const recall = metrics.filter((m) => m.name === "nominara_maintenance_vector_recall_ratio_total" && m.labels.table === "tracked_prompts");
     expect(recall).toHaveLength(1);
     expect(recall[0]!.value).toBeGreaterThanOrEqual(VECTOR_RECALL_THRESHOLD);
     expect(alerts.some((a) => a.context.alertName === "maintenance_vector_recall_below_threshold")).toBe(false);
@@ -264,7 +264,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
       const { lines, result } = await captureErrorLogs(run);
       expect(result.status).toBe("fulfilled");
 
-      const recall = metrics.find((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts");
+      const recall = metrics.find((m) => m.name === "nominara_maintenance_vector_recall_ratio_total" && m.labels.table === "tracked_prompts");
       expect(recall!.value).toBeLessThan(VECTOR_RECALL_THRESHOLD);
       expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_findings_total" && m.labels.check === "vector_recall")).toBe(true);
       expect(lines.some((l) => l.includes("ix_prompts_embedding"))).toBe(true);
@@ -349,7 +349,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
     const { result } = await captureErrorLogs(run);
     expect(result.status).toBe("rejected");
     expect((result as PromiseRejectedResult).reason).toBeInstanceOf(UnrecoverableError);
-    expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows").reduce((sum, m) => sum + m.value, 0)).toBe(1);
+    expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows_total").reduce((sum, m) => sum + m.value, 0)).toBe(1);
   }, 60_000);
 
   describe("under the documented production role (NOSUPERUSER NOBYPASSRLS, tables FORCE RLS) — owner decision 58(a)", () => {
@@ -388,16 +388,16 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
 
       expect(result.status).toBe("rejected");
       expect((result as PromiseRejectedResult).reason).toBeInstanceOf(UnrecoverableError);
-      expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows").reduce((sum, m) => sum + m.value, 0)).toBe(3);
+      expect(metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows_total").reduce((sum, m) => sum + m.value, 0)).toBe(3);
       // The recall check read the tenant's vectors too: an observation, not a skip.
-      expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_ratio" && m.labels.table === "tracked_prompts")).toBe(true);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_ratio_total" && m.labels.table === "tracked_prompts")).toBe(true);
       expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total")).toBe(false);
     }, 120_000);
 
     it("AC14 / AC6 · a clean estate under that role is an explicit 0, not a failure", async () => {
       captureAlerts();
       await expect(createMaintenanceIntegrityHandler({ pool: noPool, env: roleEnv(prodRole, "pl") })(db, tick())).resolves.toBeUndefined();
-      const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows");
+      const orphan = metrics.filter((m) => m.name === "nominara_maintenance_orphan_fact_rows_total");
       expect(orphan).toHaveLength(1);
       expect(orphan[0]!.value).toBe(0);
     }, 60_000);
@@ -414,7 +414,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
       expect(result.status).toBe("rejected");
       expect(String((result as PromiseRejectedResult).reason)).toMatch(/definer_function/);
       // No false clean: neither the 0 observation nor a recall skip is emitted.
-      expect(metrics.some((m) => m.name === "nominara_maintenance_orphan_fact_rows")).toBe(false);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_orphan_fact_rows_total")).toBe(false);
       expect(metrics.some((m) => m.name === "nominara_maintenance_vector_recall_skipped_total")).toBe(false);
       expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_check_errors_total" && m.labels.check === "definer_function")).toBe(true);
       expect(lines.some((l) => l.includes("maintenance definer functions"))).toBe(true);
@@ -428,7 +428,7 @@ describe("STORY-013 · maintenance.integrity handler (nightly orphan scan, purge
       await holder.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [globalQueueLockKey("maintenance.integrity")]);
       await expect(run()).resolves.toBeUndefined();
       expect(metrics.some((m) => m.name === "nominara_maintenance_integrity_yielded_total")).toBe(true);
-      expect(metrics.some((m) => m.name === "nominara_maintenance_orphan_fact_rows")).toBe(false);
+      expect(metrics.some((m) => m.name === "nominara_maintenance_orphan_fact_rows_total")).toBe(false);
     } finally {
       await holder.end();
     }
