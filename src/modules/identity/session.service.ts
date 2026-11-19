@@ -8,6 +8,8 @@ import { pageFrom, type Page } from "../../api/pagination/page.js";
 import type { PaginationRequest } from "../../../contracts/common/pagination.schema.js";
 import type { SessionListItem } from "../../../contracts/identity/session-list-response.schema.js";
 import { PG_POOL } from "../../db/pg-pool.js";
+import { withTenantContext } from "../../tenancy/tenant-context.js";
+import { AuditChainService } from "../audit/audit-chain.service.js";
 import { importEd25519PrivateKeyFromDer, signAccessToken } from "../../lib/auth/access-token.js";
 import { computeCsrfToken } from "../../lib/auth/csrf.js";
 import { describeUserAgent, normalizeUserAgent } from "../../lib/auth/user-agent.js";
@@ -32,6 +34,19 @@ import { incrementCounter } from "../../lib/telemetry/metrics.js";
 import { isWorkspaceUsable, MembershipService } from "../workspaces/membership.service.js";
 
 const tracer = trace.getTracer("nominara.identity");
+
+// Batch 19 (owner decision 108(a)) - the two refresh-token security events are audit rows, not only a log line and a counter.
+const auditChain = new AuditChainService();
+
+interface PendingSecurityAudit {
+  readonly action: "session.reuse_detected" | "session.refresh_grace_reuse";
+  readonly severity: "critical" | "notice";
+  readonly sessionId: string;
+  readonly userId: string;
+  /** The workspace whose chain the row goes into; null when the session has none that still verifies, in which case NO row is written. */
+  readonly workspaceId: string | null;
+  readonly afterState: Record<string, string>;
+}
 
 // STORY-017 — dangerous area: rotation and reuse-detection logic. Full
 // history is checked (each refresh_tokens row is a distinct issued
@@ -280,6 +295,8 @@ export class SessionService {
         : null;
 
     let revokedSessionId: string | null = null;
+    // Batch 19 - written AFTER the rotation's connection is released (see the header: never a second connection from this pool while one is held).
+    let pendingAudit: PendingSecurityAudit | null = null;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -364,6 +381,14 @@ export class SessionService {
             `session.refresh_grace_reuse — refresh token grace-window reuse, same successor returned session_id=${graceSession.id}`,
           );
           incrementCounter("nominara_identity_session_refresh_grace_reuse_total", { session_id: graceSession.id });
+          pendingAudit = {
+            action: "session.refresh_grace_reuse",
+            severity: "notice",
+            sessionId: graceSession.id,
+            userId: graceSession.user_id,
+            workspaceId: active.ws,
+            afterState: { outcome: "same_successor_returned" },
+          };
 
           const { accessToken, csrfToken } = await this.mintAccessAndCsrf(
             graceSession.id,
@@ -379,11 +404,29 @@ export class SessionService {
 
         // Not grace-eligible: unchanged from pre-grace-window behaviour —
         // revoke the whole family and raise session.reuse_detected.
-        await client.query(
+        const revocation = await client.query(
           `UPDATE sessions SET revoked_at = now(), revoked_reason = 'reuse_detected' WHERE id = $1 AND revoked_at IS NULL`,
           [tokenRow.session_id],
         );
         await client.query("COMMIT");
+        // One row per family revoked: a replay of an already-revoked family changes nothing and adds nothing, so a holder of an old token cannot
+        // make the workspace's chain grow by presenting it again. The workspace is the session's own, and only while it still verifies for this
+        // user (the pre-read above): a former member's stale session writes nothing into a chain it no longer belongs to.
+        if (graceSession !== undefined && (revocation.rowCount ?? 0) > 0) {
+          pendingAudit = {
+            action: "session.reuse_detected",
+            severity: "critical",
+            sessionId: tokenRow.session_id,
+            userId: graceSession.user_id,
+            workspaceId:
+              graceSession.active_workspace_id !== null &&
+              graceSession.active_workspace_id === preActiveWorkspaceId &&
+              preVerified !== null
+                ? graceSession.active_workspace_id
+                : null,
+            afterState: { revoked_reason: "reuse_detected" },
+          };
+        }
         this.logger.warn(`refresh token reuse detected — session family revoked session_id=${tokenRow.session_id}`);
         incrementCounter("nominara_identity_session_reuse_detected_total", { session_id: tokenRow.session_id });
         // Flagged for the `finally` below, which removes the slot AFTER the
@@ -480,7 +523,65 @@ export class SessionService {
       // Never throws (see discardGraceSlot), so it cannot replace the
       // UnauthorizedException that is already on its way out.
       if (revokedSessionId !== null) await this.discardGraceSlot(revokedSessionId);
+      // Never throws either (see auditSecurityEvent).
+      if (pendingAudit !== null) await this.auditSecurityEvent(pendingAudit);
     }
+  }
+
+  /**
+   * Batch 19 (decision 108(a)) - the audit row for a session security event, on its own tenant-context transaction.
+   *
+   * NO WORKSPACE, NO ROW. `audit_log` is per-workspace and a session may have none (it signed in and never switched, or its workspace no longer
+   * verifies); inventing one would write into a chain the session has no business in. That outcome is counted, not silent, and the log line and
+   * the original metric still exist.
+   *
+   * NEVER THROWS. The rotation has already committed: a failed audit write must not turn a legitimate grace-window refresh into a failure, and
+   * must not replace the 401 a reuse is already on its way out with. It is NOT silent: an error log line carrying the session id and error class
+   * only, and a counter to alert on.
+   */
+  private async auditSecurityEvent(event: PendingSecurityAudit): Promise<void> {
+    if (event.workspaceId === null) {
+      incrementCounter("nominara_identity_session_security_event_unaudited_total", { event: event.action, reason: "no_verified_workspace" });
+      return;
+    }
+    const workspaceId = event.workspaceId;
+    await tracer.startActiveSpan("identity.session.security_audit", async (span) => {
+      span.setAttribute("nominara.audit.action", event.action);
+      span.setAttribute("nominara.workspace_id", workspaceId);
+      try {
+        const client = await this.pool.connect();
+        try {
+          await withTenantContext(client, { workspaceId, actorId: event.userId }, (tx) =>
+            auditChain.append(tx, {
+              workspaceId,
+              actorType: "user",
+              actorId: event.userId,
+              actorIp: null,
+              actorUa: null,
+              action: event.action,
+              resourceType: "session",
+              resourceId: event.sessionId,
+              beforeState: null,
+              afterState: event.afterState,
+              requestId: `auth.refresh:${uuidV7()}`,
+              supportGrantId: null,
+              severity: event.severity,
+            }),
+          );
+        } finally {
+          client.release();
+        }
+        incrementCounter("nominara_identity_session_security_event_audited_total", { event: event.action });
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        incrementCounter("nominara_identity_session_security_audit_failures_total", { event: event.action });
+        this.logger.error(
+          `${event.action} audit row not written session_id=${event.sessionId} workspace_id=${workspaceId} error=${error instanceof Error ? error.name : "unknown"}`,
+        );
+      } finally {
+        span.end();
+      }
+    });
   }
 
   /**
