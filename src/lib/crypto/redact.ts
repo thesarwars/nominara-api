@@ -40,12 +40,17 @@ export function isHighEntropySecret(value: string): boolean {
   return value.length >= HIGH_ENTROPY_MIN_LENGTH && entropy(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
 
+// Decision 111(a): a canonical UUID (8-4-4-4-12 hex, either case, no braces or urn: prefix) is an identifier, not a secret, though a
+// random one scores as high-entropy. Kept visible in audit rows. Applied to VALUES only: a secret-named key is masked before the
+// value is looked at (redactObject), and the exemption lives here rather than in isHighEntropySecret so other callers keep their rules.
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function redactValue(value: unknown): unknown {
   if (value === null || value === undefined) {
     return value;
   }
   if (typeof value === "string") {
-    return isHighEntropySecret(value) ? REDACTED : value;
+    return !CANONICAL_UUID.test(value) && isHighEntropySecret(value) ? REDACTED : value;
   }
   if (Array.isArray(value)) {
     return value.map((item) => redactValue(item));
