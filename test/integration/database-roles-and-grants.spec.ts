@@ -656,10 +656,16 @@ describe("STORY-010 · database roles, grants & connection limits", () => {
         await breakglassClient.end();
       }
 
-      // Give the log line a moment to actually land before reading.
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const logs = await readContainerLogs(sinceEpochSeconds);
+      // The log line lands asynchronously, and one read once came back empty (''): a single fixed sleep is a race. Poll the container logs until
+      // the line for THIS pid appears or the deadline passes. The deadline is well inside this test's 10_000 ms timeout (the connection above has
+      // already used a little of it, and the last read can take up to its own 2 s cap), and the pattern is unchanged.
       const pidPattern = new RegExp(`nominara_breakglass_login.*pid=${pid}(?!\\d)`);
+      const deadline = Date.now() + 6_000;
+      let logs = await readContainerLogs(sinceEpochSeconds);
+      while (!pidPattern.test(logs) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        logs = await readContainerLogs(sinceEpochSeconds);
+      }
       expect(logs).toMatch(pidPattern);
     },
     10_000,
