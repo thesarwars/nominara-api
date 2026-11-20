@@ -72,7 +72,11 @@ interface TrackedCompetitor {
  * rule — for the reason scorecards.service.ts gives at length.
  */
 /** STORY-090 AC8 - the member prompts of the chosen clusters, the predicate aggregateRange uses; parameter n is bound to uuid[] or NULL (the whole project). */
-function topicPredicate(promptColumn: string, n: number): string {
+function topicPredicate(promptColumn: "c.prompt_id" | "m.prompt_id", n: number): string {
+  // Interpolated into SQL text: the column is a closed literal type and n must be a positive integer, never caller data.
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error("topicPredicate: parameter index must be a positive integer");
+  }
   const p = "$" + String(n);
   return `(${p}::uuid[] IS NULL OR ${promptColumn} IN (
         SELECT tp.id FROM tracked_prompts tp
