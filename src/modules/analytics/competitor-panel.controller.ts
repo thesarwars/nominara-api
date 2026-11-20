@@ -23,7 +23,7 @@ export class CompetitorPanelController {
   @Get()
   @RequirePermission("tracking:read")
   @ProjectParam("id")
-  @ApiContract({ operationId: "getProjectCompetitorPanel", responseSchema: competitorPanelResponseSchema })
+  @ApiContract({ operationId: "getProjectCompetitorPanel", querySchema: competitorPanelQuerySchema, responseSchema: competitorPanelResponseSchema })
   competitorPanel(
     @Param("id") projectId: string,
     @Query(new ZodValidationPipe(competitorPanelQuerySchema)) query: CompetitorPanelQuery,

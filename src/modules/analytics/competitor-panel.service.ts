@@ -21,6 +21,7 @@ import {
 } from "../../lib/analytics/scorecard.js";
 import { dataSourceOf } from "../../lib/analytics/data-source.js";
 import { resolveWindow, TIMEFRAME_DAYS } from "../../lib/analytics/window.js";
+import { resolveTopicFilter } from "../../lib/analytics/topic-filter.js";
 import { SCORING_VERSION } from "../../lib/scoring/index.js";
 import { aggregateRange, measurementStatusSql } from "../../lib/rollup/aggregate-day.js";
 import { currentTenantStore } from "../../tenancy/tenant-context.js";
@@ -63,12 +64,25 @@ interface TrackedCompetitor {
 /**
  * The shared CTEs. Parameters: $1 project, $2 span start, $3 span end,
  * $4 timezone, $5 engine filter (text[] or null), $6 scoring version (STORY-136 AC9: only the current version's
- * captures and mentions are part of the figure).
+ * captures and mentions are part of the figure), $7 the topic-cluster filter (uuid[] or null, STORY-090 AC8: only the
+ * member prompts of those clusters; null is the whole project).
  *
  * `day_cells` repeats aggregateRange's window predicate character for
  * character — same timezone conversion, same inclusive ends, same measurement
  * rule — for the reason scorecards.service.ts gives at length.
  */
+/** STORY-090 AC8 - the member prompts of the chosen clusters, the predicate aggregateRange uses; parameter n is bound to uuid[] or NULL (the whole project). */
+function topicPredicate(promptColumn: "c.prompt_id" | "m.prompt_id", n: number): string {
+  // Interpolated into SQL text: the column is a closed literal type and n must be a positive integer, never caller data.
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error("topicPredicate: parameter index must be a positive integer");
+  }
+  const p = "$" + String(n);
+  return `(${p}::uuid[] IS NULL OR ${promptColumn} IN (
+        SELECT tp.id FROM tracked_prompts tp
+         WHERE tp.cluster_id = ANY(${p}::uuid[]) AND tp.project_id = $1 AND tp.workspace_id = app.current_workspace() AND tp.deleted_at IS NULL))`;
+}
+
 const CELLS_CTE = `day_cells AS (
   SELECT c.id, c.engine_key, (c.captured_at AT TIME ZONE $4)::date AS day,
          COALESCE(pe.weight, 1.0)::double precision AS w
@@ -79,6 +93,7 @@ const CELLS_CTE = `day_cells AS (
      AND ${measurementStatusSql()}
      AND ($5::text[] IS NULL OR c.engine_key = ANY($5::text[]))
      AND c.scoring_version = $6
+     AND ${topicPredicate("c.prompt_id", 7)}
 )`;
 
 const RANKED_CTE = `${CELLS_CTE},
@@ -121,17 +136,19 @@ export class CompetitorPanelService {
       projectId,
     ]);
     if (project.rows[0] === undefined) throw new NotFoundError({ message: "no such project" });
+    // STORY-090 AC8 - after the project check, so a missing project is still the 404. Null = no narrowing; ids the project lacks are a 400 naming `topics`.
+    const topics = await resolveTopicFilter(tx, projectId, query.topics);
     const brandLabel = project.rows[0].name;
 
     const tracked = await this.trackedCompetitors(tx, projectId);
     const [current, prior, facts, citations, h2h, detected, sources, weights, entitled] = await Promise.all([
-      aggregateRange(tx, projectId, window.from, window.to, window.timezone, SCORING_VERSION),
-      aggregateRange(tx, projectId, window.priorFrom, window.priorTo, window.timezone, SCORING_VERSION),
-      this.entityFacts(tx, projectId, window.priorFrom, window.to, window.timezone, requested),
-      this.citationShares(tx, projectId, window.priorFrom, window.to, window.from, window.timezone, requested),
-      this.headToHead(tx, projectId, window.from, window.to, window.timezone, requested),
-      this.detectedNotTracked(tx, projectId, requested),
-      this.dataSources(tx, projectId, window.from, window.to, window.timezone, requested),
+      aggregateRange(tx, projectId, window.from, window.to, window.timezone, SCORING_VERSION, undefined, topics ?? undefined),
+      aggregateRange(tx, projectId, window.priorFrom, window.priorTo, window.timezone, SCORING_VERSION, undefined, topics ?? undefined),
+      this.entityFacts(tx, projectId, window.priorFrom, window.to, window.timezone, requested, topics),
+      this.citationShares(tx, projectId, window.priorFrom, window.to, window.from, window.timezone, requested, topics),
+      this.headToHead(tx, projectId, window.from, window.to, window.timezone, requested, topics),
+      this.detectedNotTracked(tx, projectId, requested, topics),
+      this.dataSources(tx, projectId, window.from, window.to, window.timezone, requested, topics),
       this.engineWeights(tx, projectId),
       this.entitledEngines(tx, projectId),
     ]);
@@ -327,6 +344,7 @@ export class CompetitorPanelService {
       workspace_id: store.context.workspaceId,
       project_id: projectId,
       timeframe: query.timeframe,
+      topics: topics === null ? null : topics.length,
       engines: engines.length,
       rows: 1 + competitorRows.length + detectedRows.length,
       duration_ms: Date.now() - started,
@@ -366,8 +384,9 @@ export class CompetitorPanelService {
     to: string,
     timezone: string,
     engines: string[] | null,
+    topics: readonly string[] | null,
   ): Promise<WindowFacts> {
-    const params = [projectId, from, to, timezone, engines, SCORING_VERSION];
+    const params = [projectId, from, to, timezone, engines, SCORING_VERSION, topics];
     const totals = await tx.query<{ day: string; engine_key: string; cells: number; weight: number }>(
       `WITH ${CELLS_CTE}
        SELECT day::text, engine_key, count(*)::int AS cells, sum(w)::double precision AS weight
@@ -422,10 +441,11 @@ export class CompetitorPanelService {
     currentFrom: string,
     timezone: string,
     engines: string[] | null,
+    topics: readonly string[] | null,
   ): Promise<Map<string, number>> {
     const result = await tx.query<{ competitor_id: string; engine_key: string; is_current: boolean; owned: number; total: number }>(
       `WITH ${CELLS_CTE}
-       SELECT k.id AS competitor_id, dc.engine_key, (dc.day >= $7::date) AS is_current,
+       SELECT k.id AS competitor_id, dc.engine_key, (dc.day >= $8::date) AS is_current,
               COALESCE(sum(f.position_weight) FILTER (
                 WHERE f.domain = k.root_domain OR right(f.domain, length(k.root_domain) + 1) = '.' || k.root_domain
               ), 0)::double precision AS owned,
@@ -435,7 +455,7 @@ export class CompetitorPanelService {
          JOIN competitors k ON k.project_id = $1 AND k.deleted_at IS NULL AND k.root_domain IS NOT NULL
         WHERE f.http_status IS NOT NULL
         GROUP BY 1, 2, 3`,
-      [projectId, from, to, timezone, engines, SCORING_VERSION, currentFrom],
+      [projectId, from, to, timezone, engines, SCORING_VERSION, topics, currentFrom],
     );
     const shares = new Map<string, number>();
     for (const r of result.rows) {
@@ -452,6 +472,7 @@ export class CompetitorPanelService {
     to: string,
     timezone: string,
     engines: string[] | null,
+    topics: readonly string[] | null,
   ): Promise<Map<string, { both: number; wins: number }>> {
     const result = await tx.query<{ competitor_id: string; engine_key: string; both: number; wins: number }>(
       `WITH ${RANKED_CTE}
@@ -462,7 +483,7 @@ export class CompetitorPanelService {
          JOIN ranked k ON k.id = b.id AND k.ekey LIKE 'c:%'
         WHERE b.ekey = 'brand'
         GROUP BY 1, 2`,
-      [projectId, from, to, timezone, engines, SCORING_VERSION],
+      [projectId, from, to, timezone, engines, SCORING_VERSION, topics],
     );
     return new Map(result.rows.map((r) => [`${r.competitor_id}|${r.engine_key}`, { both: r.both, wins: r.wins }]));
   }
@@ -471,6 +492,7 @@ export class CompetitorPanelService {
     tx: ClientBase,
     projectId: string,
     engines: string[] | null,
+    topics: readonly string[] | null,
   ): Promise<{ key: string; label: string; appearances: number }[]> {
     // DISTINCT captures, not mention rows: an answer repeating a name ten
     // times is one appearance.
@@ -482,9 +504,10 @@ export class CompetitorPanelService {
           AND m.entity_type = 'other'
           AND m.captured_at >= now() - make_interval(days => $2::int)
           AND ($3::text[] IS NULL OR m.engine_key = ANY($3::text[]))
+          AND ${topicPredicate("m.prompt_id", 5)}
         GROUP BY 1
        HAVING count(DISTINCT m.result_id) >= $4::int`,
-      [projectId, DETECTED_WINDOW_DAYS, engines, DETECTED_MIN_APPEARANCES],
+      [projectId, DETECTED_WINDOW_DAYS, engines, DETECTED_MIN_APPEARANCES, topics],
     );
     return result.rows;
   }
@@ -497,6 +520,7 @@ export class CompetitorPanelService {
     to: string,
     timezone: string,
     engines: string[] | null,
+    topics: readonly string[] | null,
   ): Promise<Map<string, DataSource>> {
     const result = await tx.query<{ engine_key: string; live: string; demo: string }>(
       `SELECT c.engine_key,
@@ -508,8 +532,9 @@ export class CompetitorPanelService {
           AND ${measurementStatusSql()}
           AND ($5::text[] IS NULL OR c.engine_key = ANY($5::text[]))
           AND c.scoring_version = $7
+          AND ${topicPredicate("c.prompt_id", 8)}
         GROUP BY 1`,
-      [projectId, from, to, timezone, engines, DEMO_SEED_MARKER, SCORING_VERSION],
+      [projectId, from, to, timezone, engines, DEMO_SEED_MARKER, SCORING_VERSION, topics],
     );
     const sources = new Map<string, DataSource>();
     for (const row of result.rows) {

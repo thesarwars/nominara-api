@@ -42,6 +42,32 @@ describe("STORY-020 · redactState", () => {
     expect(result.sessionId).toBe(REDACTED);
   });
 
+  // Decision 111(a): a canonical UUID is an identifier, not a secret.
+  const UUID_A = "0192f3c4-7b1e-7c3a-9d2e-5f8a1b6c4d70";
+  it("decision 111(a): a canonical UUID under an innocuous key is kept (nested and in arrays)", () => {
+    expect(redactState({ request_id: UUID_A, nested: { ids: [UUID_A] } })).toEqual({ request_id: UUID_A, nested: { ids: [UUID_A] } });
+  });
+
+  it("decision 111(a): a UUID under a secret-named key is still masked", () => {
+    expect(redactState({ refresh_token: UUID_A, password: UUID_A })).toEqual({ refresh_token: REDACTED, password: REDACTED });
+  });
+
+  it("decision 111(a): a 36-char random non-UUID is still masked", () => {
+    const random = "aZ9kL2mQw7Tn1Xy8Rp3Bf6Hj0Cs4Vd5Gh7Jk";
+    expect(random).toHaveLength(36);
+    expect((redactState({ note: random }) as Record<string, unknown>).note).toBe(REDACTED);
+    // right shape of dashes but non-hex characters is not a UUID
+    const fake = "zZ9kL2mQ-w7Tn-1Xy8-Rp3B-f6Hj0Cs4Vd5G";
+    expect((redactState({ note: fake }) as Record<string, unknown>).note).toBe(REDACTED);
+  });
+
+  it("decision 111(a): uppercase canonical UUIDs are kept; braced or urn-prefixed forms are not canonical and stay masked", () => {
+    const upper = UUID_A.toUpperCase();
+    expect((redactState({ id: upper }) as Record<string, unknown>).id).toBe(upper);
+    expect((redactState({ id: `{${UUID_A}}` }) as Record<string, unknown>).id).toBe(REDACTED);
+    expect((redactState({ id: `urn:uuid:${UUID_A}` }) as Record<string, unknown>).id).toBe(REDACTED);
+  });
+
   it("leaves ordinary short/low-entropy string values under innocuous keys untouched", () => {
     const result = redactState({ status: "active", city: "Dhaka", note: "please review this project" });
     expect(result).toEqual({ status: "active", city: "Dhaka", note: "please review this project" });

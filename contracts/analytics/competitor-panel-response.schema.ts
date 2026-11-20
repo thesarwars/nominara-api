@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { dataSourceSchema } from "./data-source.schema.js";
+import { topicsFilterSchema } from "./topics-filter.schema.js";
 
 // NEW-C-1 — `GET /v1/projects/{id}/competitors/panel`, `api-specification.md`
 // §3's Analytics row ("per-engine comparison, head-to-head win rate,
@@ -17,6 +18,8 @@ export const competitorPanelQuerySchema = z
     timeframe: z.enum(["7d", "30d", "90d"]).default("30d"),
     /** Comma-separated engine keys. A NARROWING of the project's engine set. */
     engines: z.string().min(1).optional(),
+    /** STORY-090 AC8: comma-separated topic cluster ids of THIS project - every figure covers those clusters' member prompts. See topics-filter.schema.ts. */
+    topics: topicsFilterSchema.optional(),
   })
   .strict();
 
