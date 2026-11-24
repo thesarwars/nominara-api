@@ -64,7 +64,7 @@ describe("STORY-045 / decision 95(a) · the prompt.generate job", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE prompt_generations, credit_ledger, credit_wallets, usage_ledger, tracked_prompts, projects, workspaces CASCADE");
+    await db.query("TRUNCATE prompt_generations, credit_ledger, credit_wallets, usage_ledger, tracked_prompts, competitors, projects, workspaces CASCADE");
     ({ workspaceId, projectId } = await seedWorkspace("HubSpot CRM"));
   });
 
@@ -396,5 +396,55 @@ describe("STORY-045 / decision 95(a) · the prompt.generate job", () => {
     const id = await requestGeneration(workspaceId, projectId, FULL_CONTEXT);
     await expect(deliver(workspaceId, projectId, id, { embedder: brokenCompare }, 0, {})).resolves.toBeUndefined();
     expect(await generation(id)).toMatchObject({ status: "failed", failure_code: "generation_failed" });
+  });
+
+  // Decision 112: with no competitors in the request, the project's live competitors fill the competitor slot. head_to_head.a1 also needs a
+  // persona, which only the request carries, so the request here names a persona and no competitor.
+  async function addCompetitor(ws: string, project: string, name: string, deleted = false): Promise<void> {
+    await db.query(
+      `INSERT INTO competitors (id, workspace_id, project_id, name, deleted_at) VALUES ($1, $2, $3, $4, ${deleted ? "now()" : "NULL"})`,
+      [randomUUID(), ws, project, name],
+    );
+  }
+  const competitorTexts = async (project: string, archetype?: string): Promise<string[]> =>
+    (await db.query<{ text: string }>(
+      `SELECT text FROM tracked_prompts WHERE project_id = $1 AND deleted_at IS NULL ${archetype === undefined ? "" : "AND intent_archetype = $2"}`,
+      archetype === undefined ? [project] : [project, archetype],
+    )).rows.map((row) => row.text);
+  const PERSONA_ONLY = { brand_context: { personas: ["sales leaders"] } };
+
+  it("D112-1 · a stored competitor unlocks head_to_head when the request names none", async () => {
+    await addCompetitor(workspaceId, projectId, "Salesforce");
+    const id = await requestGeneration(workspaceId, projectId, PERSONA_ONLY);
+    await deliver(workspaceId, projectId, id);
+    expect((await generation(id))?.status).toBe("succeeded");
+    expect(await competitorTexts(projectId, "head_to_head")).toEqual(expect.arrayContaining([expect.stringContaining("Salesforce")]));
+  });
+
+  it("D112-2 · a deleted competitor fills nothing", async () => {
+    await addCompetitor(workspaceId, projectId, "Zoho", true);
+    const id = await requestGeneration(workspaceId, projectId, PERSONA_ONLY);
+    await deliver(workspaceId, projectId, id);
+    expect((await generation(id))?.status).toBe("succeeded");
+    expect((await competitorTexts(projectId)).some((text) => text.includes("Zoho"))).toBe(false);
+    expect((await competitorTexts(projectId, "head_to_head")).some((text) => text.startsWith("Is "))).toBe(false);
+  });
+
+  it("D112-3 · another workspace's competitor never leaks into this project's prompts", async () => {
+    const other = await seedWorkspace("Other CRM");
+    await addCompetitor(other.workspaceId, other.projectId, "LeakyRival");
+    const id = await requestGeneration(workspaceId, projectId, PERSONA_ONLY);
+    await deliver(workspaceId, projectId, id);
+    expect((await generation(id))?.status).toBe("succeeded");
+    expect((await competitorTexts(projectId)).some((text) => text.includes("LeakyRival"))).toBe(false);
+  });
+
+  it("D112-4 · request-supplied competitors win over the stored ones", async () => {
+    await addCompetitor(workspaceId, projectId, "Salesforce");
+    const id = await requestGeneration(workspaceId, projectId, { brand_context: { personas: ["sales leaders"], competitors: [{ name: "Pipedrive" }] } });
+    await deliver(workspaceId, projectId, id);
+    const texts = await competitorTexts(projectId);
+    expect(texts.some((text) => text.includes("Pipedrive"))).toBe(true);
+    expect(texts.some((text) => text.includes("Salesforce"))).toBe(false);
   });
 });

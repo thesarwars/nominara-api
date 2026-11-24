@@ -181,3 +181,48 @@ describe("STORY-045 / decision 95(a) · run", () => {
     expect(runGeneration.length).toBe(2);
   });
 });
+
+describe("decision 112 · the project's confirmed competitors fill the competitor slot", () => {
+  const NONE = { naturaliser: null, vectorDedupe: null, cache: null };
+  const prep = (project: Record<string, unknown>, request: Record<string, unknown> = {}) =>
+    ({ generationId: GEN, workspaceId: WS, projectId: PROJECT, request, project, existingHashes: new Map() }) as unknown as GenerationPrepared;
+  const headToHead = (pass: Awaited<ReturnType<typeof runGeneration>>) => pass.candidates.filter((c) => c.archetype === "head_to_head");
+
+  it("a stored competitor fills the competitor slot when the request supplies none (alternatives.a1, migration_switching.a1)", async () => {
+    const pass = await runGeneration(prep({ ...PROJECT_ROW, competitors: ["Salesforce"] }), NONE);
+    const ids = pass.candidates.filter((c) => c.slots.competitor === "Salesforce").map((c) => c.templateId);
+    expect(ids).toEqual(expect.arrayContaining(["alternatives.a1"]));
+  });
+
+  // head_to_head.a1 is "Is {brand} or {competitor} better for {persona}?": it needs a persona as well, which only the request carries.
+  it("a stored competitor unlocks head_to_head.a1 once a persona is known", async () => {
+    const pass = await runGeneration(prep({ ...PROJECT_ROW, competitors: ["Salesforce"] }, { brand_context: { personas: ["sales leaders"] } }), NONE);
+    expect(headToHead(pass).map((c) => [c.templateId, c.slots.competitor])).toEqual([["head_to_head.a1", "Salesforce"]]);
+  });
+
+  it("no stored and no supplied competitor: no competitor-named prompt", async () => {
+    const pass = await runGeneration(prep({ ...PROJECT_ROW, competitors: [] }), NONE);
+    expect(pass.candidates.some((c) => c.competitorNamed)).toBe(false);
+  });
+
+  it("request-supplied competitors win over the stored ones", async () => {
+    const pass = await runGeneration(prep({ ...PROJECT_ROW, competitors: ["Salesforce"] }, { brand_context: { competitors: [{ name: "Pipedrive" }] } }), NONE);
+    const named = pass.candidates.filter((c) => c.competitorNamed).map((c) => c.slots.competitor);
+    expect(named.length).toBeGreaterThan(0);
+    expect(named.every((n) => n === "Pipedrive")).toBe(true);
+  });
+
+  it("prepare reads only live competitors of this project in this workspace, inside the same transaction", async () => {
+    const { tx, sqls } = fakeTx((sql) => {
+      if (/FROM prompt_generations/.test(sql)) return { rows: [{ status: "pending", request: {} }] };
+      if (/FROM projects/.test(sql)) return { rows: [{ ...PROJECT_ROW, competitors: ["Salesforce"] }] };
+      return undefined;
+    });
+    const prepared = (await prepareGeneration(tx, PAYLOAD)) as GenerationPrepared;
+    expect(prepared.project.competitors).toEqual(["Salesforce"]);
+    const read = sqls.find((sql) => /FROM competitors/.test(sql))!;
+    expect(read).toMatch(/project_id = p\.id/);
+    expect(read).toMatch(/workspace_id = app\.current_workspace\(\)/);
+    expect(read).toMatch(/deleted_at IS NULL/);
+  });
+});
