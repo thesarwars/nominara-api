@@ -66,6 +66,8 @@ export interface ProjectContextRow {
   verticals: string[] | null;
   locale: string | null;
   brand_aliases: string[] | null;
+  /** Decision 112: the project's live competitors (primary first), the competitor slot's fallback when the request names none. */
+  competitors?: string[] | null;
 }
 
 export interface GenerationPrepared {
@@ -104,9 +106,12 @@ export async function prepareGeneration(tx: ClientBase, payload: GenerationJobPa
   if (generation === undefined || generation.status === "succeeded" || generation.status === "failed") return PHASES_DONE;
 
   const project = await tx.query<ProjectContextRow>(
-    `SELECT name, root_domain, category_slug, verticals, locale, brand_aliases
-       FROM projects
-      WHERE id = $1 AND workspace_id = app.current_workspace() AND deleted_at IS NULL`,
+    `SELECT p.name, p.root_domain, p.category_slug, p.verticals, p.locale, p.brand_aliases,
+            ARRAY(SELECT c.name FROM competitors c
+                   WHERE c.project_id = p.id AND c.workspace_id = app.current_workspace() AND c.deleted_at IS NULL
+                   ORDER BY c.is_primary DESC, c.created_at, c.id) AS competitors
+       FROM projects p
+      WHERE p.id = $1 AND p.workspace_id = app.current_workspace() AND p.deleted_at IS NULL`,
     [payload.projectId],
   );
   if (project.rows[0] === undefined) {
@@ -287,7 +292,15 @@ function slotContext(project: ProjectContextRow, request: GeneratePromptsRequest
     ...optional("brandName", value(supplied.brand_name, project.name)),
     ...optional("categorySlug", value(supplied.category_slug, project.category_slug)),
     ...optional("verticals", value(supplied.verticals, project.verticals)),
-    ...optional("competitors", supplied.competitors?.map((competitor) => competitor.name)),
+    // Decision 112: the request's competitors win; absent (or empty), the project's confirmed ones fill the slot.
+    ...optional(
+      "competitors",
+      supplied.competitors !== undefined && supplied.competitors.length > 0
+        ? supplied.competitors.map((competitor) => competitor.name)
+        : project.competitors !== undefined && project.competitors !== null && project.competitors.length > 0
+          ? project.competitors
+          : undefined,
+    ),
     ...optional("personas", supplied.personas),
     ...optional("sizeBands", supplied.size_bands),
     ...optional("integrations", supplied.integrations),
